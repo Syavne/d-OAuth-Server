@@ -10,32 +10,6 @@ boundary can reach.
 This document only records the gaps. It does not describe anything that is
 already implemented, and it does not propose code changes here.
 
-## What a database dump exposes today
-
-The baseline is better than a naive server's, because secrets are stored hashed
-or encrypted, and the key material lives outside the database. The table below
-is the full accounting.
-
-| Data | Protection at rest | If the dump leaks |
-| --- | --- | --- |
-| User passwords | Argon2id PHC, salted (`src/db/user_repo.rs`) | Offline cracking only. |
-| Client secrets | Argon2id PHC (`src/db/client_repo.rs`) | Offline cracking only. |
-| TOTP secrets | AES-256-GCM under HKDF-SHA256 (`src/crypto/totp.rs`, info `totp-gcm-v2`; pre-migration v1 blobs under bare `SHA256(totp_key)` still decrypt) | Safe only if the key is not in the dump. |
-| TOTP recovery codes | Argon2id PHC (`src/db/user_repo/totp.rs`) | Offline cracking only. |
-| DCR registration access tokens | Keyed HMAC hash (`src/db/client_repo.rs`) | Safe; the pepper is not in the database. |
-| Emails, client names, contacts, redirect URIs, scopes, entitlements | Plaintext | Full disclosure. |
-| `jwks` (client public keys) | Plaintext | Public by design. |
-| `tls_client_auth_subject_dn` and cert thumbprints | Plaintext | Identifier disclosure. |
-| `is_admin`, `disabled`, `must_change_password`, timestamps | Plaintext | Metadata disclosure. |
-
-The critical dependency is outside the database. The token pepper and the TOTP
-encryption key are supplied through environment variables or mounted files
-(`src/config/raw.rs`, `src/config/build.rs`), never through a table. A pure
-database dump therefore does not yield them, and every hashed or encrypted
-column above stays opaque. This separation is the single most important
-protection the server has today, and the gaps below are mostly about not
-depending on it alone.
-
 ## Gaps to plan and implement
 
 Each item names the risk, the change to plan, and the files it would touch. The

@@ -341,10 +341,11 @@ store can be shown untouched.
 | TOTP secrets | AES-256-GCM under HKDF-SHA256 (info `totp-gcm-v2`; pre-migration v1 blobs under bare `SHA256(totp_key)` still decrypt) | Readable only if the TOTP key also leaks. |
 | TOTP recovery codes | Argon2id PHC | Offline cracking only. |
 | DCR registration access tokens | Keyed HMAC (`registration_access_token_hash`) | Opaque while the pepper stays outside the dump. |
-| Emails, client names, contacts, redirect URIs, scopes, entitlements | Plaintext | Full disclosure. |
+| Emails, client names, contacts, redirect URIs, JAR `request_uris`, `jwks_uri`, scopes, entitlements | Plaintext | Full disclosure. |
 | Client public keys (`jwks`) | Plaintext | Public by design. |
 | `tls_client_auth_subject_dn` and certificate thumbprints | Plaintext | Identifier disclosure. |
-| `is_admin`, `disabled`, `must_change_password`, timestamps | Plaintext | Metadata disclosure. |
+| `is_admin`, `disabled`, `must_change_password`, `totp_enabled`, timestamps | Plaintext | Metadata disclosure. |
+| Client registration metadata (`grant_types`, `response_types`, `token_endpoint_auth_method`, `software_id`, `active`, `dpop_bound_access_tokens`, `client_id_issued_at`, `client_secret_expires_at`) and catalog metadata (scope/redirect `description`, `enabled`, `kind`, actor ids `granted_by`/`created_by`/`attached_by`) | Plaintext | Metadata disclosure. |
 
 If the key store leaked too, the dump is a full compromise: TOTP secrets
 decrypt, the Argon2id hashes are the only barrier left on passwords and client
