@@ -12,8 +12,8 @@ use testcontainers::{GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner
 use super::{
   AppState,
   test_support::{
-    TestError, TestResult, get_health, mark_migrated, postgres_container, redis_single_container,
-    single_redis_block, test_config,
+    TestError, TestResult, get_health, get_health_headers, mark_migrated, postgres_container,
+    redis_single_container, single_redis_block, test_config,
   },
 };
 use crate::test_guard::ContainerGuard;
@@ -55,6 +55,27 @@ async fn health_ready_single_reports_ready() -> TestResult {
     ready_body.get("status").and_then(|v| v.as_str()),
     Some("ready")
   );
+
+  // The health listener does not mount the public router's security-header
+  // layer, so the health router owns its own `no-store` hardening. Pin it here
+  // so a future route added to this listener cannot silently drop the policy.
+  for path in ["/health/live", "/health/ready"] {
+    let headers = get_health_headers(&state, path).await?;
+    assert_eq!(
+      headers
+        .get(axum::http::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok()),
+      Some("no-store"),
+      "{path} must forbid caching"
+    );
+    assert_eq!(
+      headers
+        .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+        .and_then(|value| value.to_str().ok()),
+      Some("nosniff"),
+      "{path} must forbid MIME sniffing"
+    );
+  }
   Ok(())
 }
 

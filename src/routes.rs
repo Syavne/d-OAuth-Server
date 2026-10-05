@@ -623,6 +623,31 @@ mod router_tests {
     Ok(())
   }
 
+  /// Metadata discovery is cacheable by design: an explicit positive
+  /// `Cache-Control`, not browser heuristic freshness.
+  #[tokio::test]
+  async fn router_metadata_carries_explicit_positive_cache_control() -> TestResult {
+    let (_, headers, _) = drive(
+      build_router(passthrough_state()?),
+      "GET",
+      "/.well-known/oauth-authorization-server",
+      &[],
+      "",
+    )
+    .await?;
+    let value = headers
+      .get(header::CACHE_CONTROL)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or_default();
+    if !value.starts_with("public") || !value.contains("max-age=") {
+      return Err(format!("metadata must carry a positive public max-age, got {value:?}").into());
+    }
+    if value.contains("no-store") {
+      return Err(format!("metadata must stay cacheable, got {value:?}").into());
+    }
+    Ok(())
+  }
+
   /// HSTS is emitted only when the TLS option is on (never plaintext).
   #[tokio::test]
   async fn router_hsts_disabled_when_plaintext() -> TestResult {

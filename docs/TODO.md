@@ -175,34 +175,13 @@ the mitigations to implement.
 - **Proposed change.** Restrict who may exec and audit it.
 - **Files.** `docs/OPERATIONS.md`, `docs/DEPLOYMENT.md`.
 
-## HTTP response hardening
-
-### 16. Make the HTTP cache policy explicit on every endpoint
-
-- **Risk.** `Cache-Control: no-store` is applied at a single choke point on the
-  public router (`src/middleware/security_headers.rs`), with `/.well-known/…`
-  metadata exempt, so it covers every OAuth endpoint today. The policy is
-  nevertheless implicit: metadata discovery is merely left unmarked and its
-  caching relies on browser heuristics, the plaintext health listener never
-  passes through the layer, and a handler exercised off-router would carry no
-  header. A new route mounted outside `build_router_with_options` would silently
-  miss the policy.
-- **Proposed change.** Make the policy explicit and complete: give
-  `/.well-known/oauth-authorization-server` a positive `Cache-Control` (for
-  example `public, max-age=…`) so metadata caching is intentional and tunable;
-  mark the health probes `no-store` (or mount the security-header layer on the
-  health listener); and consider `Vary: Cookie` on the authenticated pages as
-  defense in depth. Keep metadata cacheable; do not extend `no-store` to it.
-- **Files.** `src/middleware/security_headers.rs`, `src/routes.rs`,
-  `src/serve.rs`, `src/state/health.rs`, `docs/SECURITY.md`.
-
 ## Priority
 
 Ranked by value against effort:
 
 - **High value, low effort:** items 1, 2, 5.
 - **Medium:** items 3, 4.
-- **Lower, mostly operational:** items 6 and 16.
+- **Lower, mostly operational:** item 6.
 - **Container/host hardening:** items 7, 8, 9, 10 are high value and low effort;
   items 11, 12, 13 are medium/operational.
 
@@ -220,5 +199,3 @@ items 7 through 10 are high-value, low-effort container and host controls.
 - Should the pepper and TOTP key move to file-based secrets now, or wait for the
   envelope-encryption work (item 3)?
 - Is a sandboxed runtime class (gVisor/Kata) available in the target cluster?
-- Should metadata discovery carry an explicit positive `Cache-Control`, or is
-  leaving it to browser heuristics acceptable (item 16)?

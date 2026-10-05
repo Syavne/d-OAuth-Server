@@ -83,8 +83,15 @@ tracked in `docs/TODO.md`.
   session-bound CSRF token and the bound `request_id`), the `/authorize`
   redirects and error responses, the token endpoint (success and error), PAR,
   device authorization, DCR, introspection, and revocation.
-- OAuth metadata discovery is intentionally left cacheable; a metadata handler
-  that fails closed returns a `503` error, which is itself `no-store`.
+- The plaintext health listener does not mount the security-header layer, so
+  the health router inserts `Cache-Control: no-store` and
+  `X-Content-Type-Options: nosniff` on each probe response itself. A regression
+  test pins both headers so a route added to that listener cannot silently drop
+  the policy.
+- OAuth metadata discovery is cacheable by design and carries an explicit
+  positive `Cache-Control: public, max-age=3600` (not browser heuristic
+  freshness). A metadata handler that fails closed returns a `503` error, which
+  is itself `no-store`.
 
 ## Opaque tokens, hashed at rest
 

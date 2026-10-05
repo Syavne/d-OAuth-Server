@@ -126,6 +126,24 @@ pub async fn get_health(state: &AppState, path: &str) -> Result<(u16, Value), Te
   Ok((status, body))
 }
 
+/// Drive `GET <path>` at the health-only router and return its headers.
+///
+/// The health listener is built without the public router's security-header
+/// layer, so this probe verifies the header set the health router inserts on
+/// its own responses (`Cache-Control`, `X-Content-Type-Options`).
+pub async fn get_health_headers(
+  state: &AppState,
+  path: &str,
+) -> Result<axum::http::HeaderMap, TestError> {
+  use tower::ServiceExt as _;
+  let router = super::health_router(state.clone());
+  let request = axum::http::Request::builder()
+    .uri(path)
+    .body(axum::body::Body::empty())?;
+  let response = router.oneshot(request).await?;
+  Ok(response.headers().clone())
+}
+
 /// Freeze (`pause`) or resume (`unpause`) a container via the Docker CLI.
 pub async fn docker_pause(id: &str, pause: bool) -> Result<(), TestError> {
   let action = if pause { "pause" } else { "unpause" };

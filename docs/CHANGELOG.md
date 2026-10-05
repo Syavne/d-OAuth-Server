@@ -33,6 +33,16 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   hand-typing. The new `qrcode` dependency is pinned SVG-only (no `image`
   codecs); the text secret, URI, and one-time recovery codes are unchanged.
 
+### Changed
+
+- `GET /.well-known/oauth-authorization-server` now carries an explicit
+  `Cache-Control: public, max-age=3600` instead of relying on browser
+  heuristic freshness, so metadata caching is intentional and tunable. The
+  plaintext health listener (which does not mount the public router's
+  security-header layer) now sets `Cache-Control: no-store` and
+  `X-Content-Type-Options: nosniff` on its own probe responses, with a
+  regression test pinning both.
+
 ### Fixed
 
 - `GET /.well-known/oauth-authorization-server` reads the enabled scope catalog

@@ -49,6 +49,12 @@ pub const CORS_MAX_AGE_SECS: u64 = 600;
 pub const NO_STORE_VALUE: &str = "no-store";
 /// Legacy `Pragma` companion to `no-store` (RFC 6749 §5.1).
 pub const NO_CACHE_VALUE: &str = "no-cache";
+/// Positive `Cache-Control` for OAuth metadata discovery.
+///
+/// Metadata is public and changes only when the scope catalog or endpoints do,
+/// so caching it is intentional and safe. The explicit directive replaces
+/// browser heuristic freshness with a tunable, reviewable policy.
+pub const METADATA_CACHE_VALUE: &str = "public, max-age=3600";
 
 /// Whether `path` serves a server-rendered page (strict script policy).
 ///
@@ -165,6 +171,12 @@ fn insert_headers(headers: &mut axum::http::HeaderMap, page: bool, hsts: bool, c
     );
     headers.insert(header::PRAGMA, HeaderValue::from_static(NO_CACHE_VALUE));
   }
+  if cacheable {
+    headers.insert(
+      header::CACHE_CONTROL,
+      HeaderValue::from_static(METADATA_CACHE_VALUE),
+    );
+  }
   if hsts {
     headers.insert(
       header::STRICT_TRANSPORT_SECURITY,
@@ -267,7 +279,8 @@ mod tests {
   use axum::http::header;
 
   use super::{
-    HSTS_VALUE, NO_CACHE_VALUE, NO_STORE_VALUE, insert_headers, is_cacheable_path, is_page_path,
+    HSTS_VALUE, METADATA_CACHE_VALUE, NO_CACHE_VALUE, NO_STORE_VALUE, insert_headers,
+    is_cacheable_path, is_page_path,
   };
 
   #[test]
@@ -305,10 +318,15 @@ mod tests {
   }
 
   #[test]
-  fn cacheable_metadata_omits_storage_directives() {
+  fn cacheable_metadata_sets_positive_cache_control() {
     let mut headers = axum::http::HeaderMap::new();
     insert_headers(&mut headers, false, false, true);
-    assert!(!headers.contains_key(header::CACHE_CONTROL));
+    let cache_control = headers
+      .get(header::CACHE_CONTROL)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or_default();
+    assert_eq!(cache_control, METADATA_CACHE_VALUE);
+    assert!(!cache_control.contains("no-store"));
     assert!(!headers.contains_key(header::PRAGMA));
     assert!(!headers.contains_key(header::STRICT_TRANSPORT_SECURITY));
     for name in [

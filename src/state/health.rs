@@ -10,9 +10,16 @@
 
 use std::collections::HashSet;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use axum::body::Body;
+use axum::http::{HeaderValue, Request, Response, header};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use serde::Serialize;
 use tokio::time::timeout;
+use tower::{Layer, Service};
 
 use super::{AppState, MIGRATOR, READINESS_TIMEOUT};
 
@@ -85,9 +92,64 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// The dedicated health-only router (`/health/live` + `/health/ready` ONLY).
+///
+/// The plaintext health listener is built without the public router's
+/// [`crate::middleware::security_headers::SecurityHeadersLayer`], so each probe
+/// response owns its hardening here: `Cache-Control: no-store` and
+/// `X-Content-Type-Options: nosniff` are inserted directly rather than relying
+/// on an outer layer that this listener never mounts.
 pub fn health_router(state: AppState) -> axum::Router {
   axum::Router::new()
     .route("/health/live", get(live))
     .route("/health/ready", get(ready))
+    .layer(HealthHeadersLayer)
     .with_state(state)
+}
+
+/// Tower layer inserting the probe header set on every health response.
+#[derive(Debug, Clone, Copy)]
+struct HealthHeadersLayer;
+
+impl<S> Layer<S> for HealthHeadersLayer {
+  type Service = HealthHeadersService<S>;
+
+  fn layer(&self, inner: S) -> Self::Service {
+    HealthHeadersService { inner }
+  }
+}
+
+/// Service produced by [`HealthHeadersLayer`].
+#[derive(Debug, Clone, Copy)]
+struct HealthHeadersService<S> {
+  inner: S,
+}
+
+impl<S, B> Service<Request<B>> for HealthHeadersService<S>
+where
+  S: Service<Request<B>, Response = Response<Body>> + Clone + Send + 'static,
+  S::Future: Send + 'static,
+  S::Error: Send + 'static,
+  B: Send + 'static,
+{
+  type Response = Response<Body>;
+  type Error = S::Error;
+  type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+  fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    self.inner.poll_ready(cx)
+  }
+
+  fn call(&mut self, request: Request<B>) -> Self::Future {
+    let mut inner = self.inner.clone();
+    Box::pin(async move {
+      let mut response = inner.call(request).await?;
+      let headers = response.headers_mut();
+      headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+      headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+      );
+      Ok(response)
+    })
+  }
 }
