@@ -1,0 +1,67 @@
+# NetworkPolicy (task 46). Default-deny for the app pods.
+#
+# Selecting the pods below with BOTH policy types makes this a default-deny
+# for them in any CNI that enforces NetworkPolicy (Calico, Cilium, ...): only
+# the flows listed here are admitted, everything else is dropped. A CNI that
+# ignores NetworkPolicy does not apply this control; verify the cluster CNI.
+#
+# Egress:
+# - DNS only, to the `kube-system` namespace on port 53 (UDP + TCP). Adjust if
+#   CoreDNS runs elsewhere; NodeLocal DNSCache also lives in `kube-system`, so
+#   it is covered.
+# - Postgres (5432) and Redis (6379) anywhere else, with link-local
+#   `169.254.0.0/16` excluded so the cloud metadata endpoint
+#   (`169.254.169.254`) can never be reached. If Postgres/Redis run in-cluster,
+#   tighten the port-scoped `ipBlock` to their namespace/pod selector.
+# - Everything else, including the Kubernetes API and arbitrary HTTPS
+#   exfiltration, is denied. The app never calls the API and runs with
+#   `automountServiceAccountToken: false`.
+#
+# Ingress: only the public TLS port (8080) and the plaintext health port
+# (8081) are reachable. NetworkPolicy cannot name a Service (the Service is
+# virtual, and traffic arrives from the L4 gateway or the kubelet), so the
+# source is unrestricted but the ports are not. The Service keeps publishing
+# 8080 only; 8081 must never be internet-facing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: d-oauth-server
+  namespace: d-oauth
+  labels:
+    app.kubernetes.io/name: d-oauth-server
+    app.kubernetes.io/part-of: d-oauth
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: d-oauth-server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 8080
+          protocol: TCP
+        - port: 8081
+          protocol: TCP
+  egress:
+    # DNS (kube-dns / CoreDNS in kube-system).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Postgres + Redis ports only; link-local (metadata) excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6379
+          protocol: TCP

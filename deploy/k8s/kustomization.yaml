@@ -3,10 +3,14 @@
 # Validate: `kustomize build deploy/k8s`
 # Dry-run against a cluster: `kubectl apply --dry-run=server -k deploy/k8s`
 #
-# Release pinning: CI resolves the floating tags below to immutable digests
-# (`kustomize edit set image d-oauth-server=ghcr.io/...@sha256:<digest>`)
-# after `docker buildx bake` pushes, so a rollout can never float. The
-# committed file intentionally carries tags; the pinned build is what ships.
+# Release pinning: the `images` entry below carries a
+# placeholder digest, never a floating tag. The `pin-digest` job in
+# `.github/workflows/supply-chain.yml` overwrites `images[].digest` with the
+# digest of the signed multi-arch build (`docker buildx bake`) after every
+# push to main and re-runs `scripts/check_manifests.py --strict-digest`. The
+# per-workload `image:` fields in `deployment.yaml` / `migrate-job.yaml` also
+# carry the placeholder; this entry overrides them in `kustomize build`.
+# `:latest` is never a shippable reference.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: d-oauth
@@ -18,12 +22,18 @@ resources:
   - deployment.yaml
   - migrate-job.yaml
   - pdb.yaml
+  - networkpolicy.yaml
 images:
   - name: ghcr.io/d-oauth/d-oauth-server
     newName: ghcr.io/d-oauth/d-oauth-server
-    newTag: latest
+    # Placeholder (all zeroes), not a pullable reference: a rollout without
+    # the pin step fails closed instead of silently floating on a tag. CI
+    # replaces this with the released `sha256:<digest>` after signing.
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 # NOTE: no Ingress resource is shipped on purpose. In-process mTLS
 # verification needs L4/TCP passthrough (NLB gateway / TLSRoute); an L7
 # ingress that terminates TLS strips the client certificate. Adding an
 # Ingress while `D_OAUTH_TLS__CLIENT_CA_PATH` is set fails
-# `scripts/check_manifests.py`. See docs/DEPLOYMENT.md.
+# `scripts/check_manifests.py`. See docs/DEPLOYMENT.md. Pod egress and ingress
+# are constrained by `networkpolicy.yaml` (default-deny egress except DNS +
+# Postgres + Redis).

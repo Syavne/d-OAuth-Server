@@ -12,6 +12,15 @@ contract WITHOUT a live cluster:
 - Migration Job: exactly one, runs `migrate`, `restartPolicy: Never`.
 - PDB: `minAvailable: 2`.
 - Service: never exposes the health port (8081).
+- Hardening: `automountServiceAccountToken: false` and `fsGroup: 65532`; the
+  token pepper and TOTP key must be file-mounted from `d-oauth-secrets` at
+  `/run/secrets` (`defaultMode: 0400`) and referenced with
+  `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`; the inline
+  `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` envs FAIL.
+- NetworkPolicy: must select `app.kubernetes.io/name: d-oauth-server`, enable
+  `Ingress` + `Egress`, admit ingress only on 8080/8081, and allow egress only
+  on 53 (DNS), 5432 (Postgres), and 6379 (Redis) with `169.254.0.0/16`
+  excluded (cloud metadata).
 - No baked secrets: no PEM blocks in manifests; `REPLACE_ME` placeholders
   only inside `secret.yaml`; no secret-shaped keys in the ConfigMap.
 - L7-vs-L4 mTLS constraint: an L7 Ingress that terminates TLS while
@@ -52,6 +61,18 @@ CLIENT_CERT_ANNOTATIONS = (
   "haproxy.org/ssl-verify-client",
   "traefik.ingress.kubernetes.io/router.tls.options",
 )
+
+SECRET_NAME = "d-oauth-secrets"
+SECRETS_MOUNT_PATH = "/run/secrets"
+FS_GROUP = 65532
+SECRET_VOLUME_MODE = 0o400
+FILE_SECRET_ENV_KEYS = {
+  "D_OAUTH_TOKEN_PEPPER_FILE": "token-pepper",
+  "D_OAUTH_TOTP_ENCRYPTION_KEY_FILE": "totp-encryption-key",
+}
+INLINE_SECRET_ENVS = ("D_OAUTH_TOKEN_PEPPER", "D_OAUTH_TOTP_ENCRYPTION_KEY")
+REQUIRED_EGRESS_PORTS = (53, 5432, 6379)
+METADATA_CIDR = "169.254.0.0/16"
 
 
 class Failures:
@@ -118,6 +139,131 @@ def mtls_enabled(docs: list[dict]) -> bool:
   return False
 
 
+def octal_mode(value: object) -> int | None:
+  """Parse a YAML file mode (`0400`, `0o400`, `256`) into an int, or None."""
+  if isinstance(value, bool) or value is None:
+    return None
+  if isinstance(value, int):
+    return value
+  if isinstance(value, str):
+    text = value.strip().lower().replace("_", "")
+    try:
+      if text.startswith("0o"):
+        return int(text[2:], 8)
+      if text.startswith("0") and len(text) > 1:
+        return int(text, 8)
+      return int(text, 10)
+    except ValueError:
+      return None
+  return None
+
+
+def env_by_name(container: dict) -> dict[str, dict]:
+  envs: dict[str, dict] = {}
+  for entry in container.get("env") or []:
+    if isinstance(entry, dict) and entry.get("name"):
+      envs[entry["name"]] = entry
+  return envs
+
+
+def check_file_mounted_secrets(
+  workload: str, tpl: dict, container: dict, fails: Failures
+) -> None:
+  """Item 7: pepper/TOTP are 0400 files under /run/secrets, never inline env."""
+  cname = container.get("name", "?")
+  envs = env_by_name(container)
+  for inline in INLINE_SECRET_ENVS:
+    if inline in envs:
+      fails.add(
+        f"{workload}/{cname}: {inline} must not be injected as an env value; "
+        "use the file-mounted *_FILE form"
+      )
+  mount = next(
+    (
+      m
+      for m in container.get("volumeMounts") or []
+      if isinstance(m, dict) and m.get("mountPath") == SECRETS_MOUNT_PATH
+    ),
+    None,
+  )
+  if mount is None:
+    fails.add(
+      f"{workload}/{cname}: must mount the secret volume at {SECRETS_MOUNT_PATH}"
+    )
+  elif mount.get("readOnly") is not True:
+    fails.add(f"{workload}/{cname}: {SECRETS_MOUNT_PATH} must be readOnly")
+  items: dict[str, str] = {}
+  mode: int | None = None
+  for volume in tpl.get("volumes") or []:
+    if not isinstance(volume, dict):
+      continue
+    secret = volume.get("secret") or {}
+    if secret.get("secretName") != SECRET_NAME:
+      continue
+    mode = octal_mode(secret.get("defaultMode"))
+    for item in secret.get("items") or []:
+      if isinstance(item, dict) and item.get("key") and item.get("path"):
+        items[item["key"]] = item["path"]
+  if mode != SECRET_VOLUME_MODE:
+    fails.add(f"{workload}: {SECRET_NAME} volume defaultMode must be 0400")
+  for env_name, key in FILE_SECRET_ENV_KEYS.items():
+    if key not in items:
+      fails.add(f"{workload}: {SECRET_NAME} volume must project key {key!r}")
+      continue
+    expected = f"{SECRETS_MOUNT_PATH}/{items[key]}"
+    entry = envs.get(env_name) or {}
+    if (entry.get("value") or "").strip() != expected:
+      fails.add(f"{workload}/{cname}: {env_name} must point at {expected}")
+
+
+def policy_ports(rule: dict) -> set[int]:
+  ports: set[int] = set()
+  for port in rule.get("ports") or []:
+    if isinstance(port, dict) and isinstance(port.get("port"), int):
+      ports.add(port["port"])
+  return ports
+
+
+def check_networkpolicy(doc: dict, fails: Failures) -> None:
+  """Item 9: default-deny ingress/egress for the app pods."""
+  name = doc.get("metadata", {}).get("name", "?")
+  spec = doc.get("spec") or {}
+  selector = (spec.get("podSelector") or {}).get("matchLabels") or {}
+  if selector.get("app.kubernetes.io/name") != "d-oauth-server":
+    fails.add(
+      f"networkpolicy/{name}: podSelector must match "
+      "app.kubernetes.io/name: d-oauth-server"
+    )
+  if not {"Ingress", "Egress"} <= set(spec.get("policyTypes") or []):
+    fails.add(f"networkpolicy/{name}: policyTypes must include Ingress and Egress")
+  ingress_ports: set[int] = set()
+  for rule in spec.get("ingress") or []:
+    if isinstance(rule, dict):
+      ingress_ports |= policy_ports(rule)
+  if not {PUBLIC_PORT, HEALTH_PORT} <= ingress_ports:
+    fails.add(
+      f"networkpolicy/{name}: ingress must admit ports "
+      f"{PUBLIC_PORT} and {HEALTH_PORT}"
+    )
+  egress_ports: set[int] = set()
+  metadata_excluded = False
+  for rule in spec.get("egress") or []:
+    if not isinstance(rule, dict):
+      continue
+    egress_ports |= policy_ports(rule)
+    for peer in rule.get("to") or []:
+      block = (peer or {}).get("ipBlock") or {}
+      if METADATA_CIDR in (block.get("except") or []):
+        metadata_excluded = True
+  for port in REQUIRED_EGRESS_PORTS:
+    if port not in egress_ports:
+      fails.add(f"networkpolicy/{name}: egress must allow port {port}")
+  if not metadata_excluded:
+    fails.add(
+      f"networkpolicy/{name}: egress must exclude {METADATA_CIDR} (cloud metadata)"
+    )
+
+
 def check_deployment(doc: dict, fails: Failures, strict_digest: bool) -> None:
   name = doc.get("metadata", {}).get("name", "?")
   spec = doc.get("spec", {})
@@ -133,6 +279,13 @@ def check_deployment(doc: dict, fails: Failures, strict_digest: bool) -> None:
     fails.add(f"deployment/{name}: runAsUser must be 65532")
   if (pod_sc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
     fails.add(f"deployment/{name}: seccompProfile.type must be RuntimeDefault")
+  if tpl.get("automountServiceAccountToken") is not False:
+    fails.add(f"deployment/{name}: automountServiceAccountToken must be false")
+  if pod_sc.get("fsGroup") != FS_GROUP:
+    fails.add(
+      f"deployment/{name}: fsGroup must be {FS_GROUP} so the 0400 secret "
+      "files are readable by the runtime user"
+    )
   if not tpl.get("topologySpreadConstraints"):
     fails.add(f"deployment/{name}: topologySpreadConstraints required")
   for container in tpl.get("containers", []):
@@ -169,6 +322,7 @@ def check_deployment(doc: dict, fails: Failures, strict_digest: bool) -> None:
     image = container.get("image", "")
     if strict_digest and not DIGEST_RE.search(image):
       fails.add(f"deployment/{name}/{cname}: image must be digest-pinned")
+    check_file_mounted_secrets(f"deployment/{name}", tpl, container, fails)
 
 
 def check_job(doc: dict, fails: Failures, strict_digest: bool) -> None:
@@ -176,6 +330,13 @@ def check_job(doc: dict, fails: Failures, strict_digest: bool) -> None:
   spec = doc.get("spec", {}).get("template", {}).get("spec", {})
   if spec.get("restartPolicy") != "Never":
     fails.add(f"job/{name}: restartPolicy must be Never")
+  if spec.get("automountServiceAccountToken") is not False:
+    fails.add(f"job/{name}: automountServiceAccountToken must be false")
+  if (spec.get("securityContext") or {}).get("fsGroup") != FS_GROUP:
+    fails.add(
+      f"job/{name}: fsGroup must be {FS_GROUP} so the 0400 secret files are "
+      "readable by the runtime user"
+    )
   containers = spec.get("containers", [])
   if not any(
     "migrate" in " ".join(str(a) for a in (list(c.get("command", [])) + list(c.get("args", []))))
@@ -185,6 +346,7 @@ def check_job(doc: dict, fails: Failures, strict_digest: bool) -> None:
   for container in containers:
     if strict_digest and not DIGEST_RE.search(container.get("image", "")):
       fails.add(f"job/{name}: image must be digest-pinned")
+    check_file_mounted_secrets(f"job/{name}", spec, container, fails)
 
 
 def check_pdb(doc: dict, fails: Failures) -> None:
@@ -229,10 +391,17 @@ def main() -> int:
   fails.items.extend(load_fails.items)
 
   kinds = {d.get("kind") for d in docs}
-  for required in ("Deployment", "Service", "ConfigMap", "Secret", "Job", "PodDisruptionBudget"):
-    kind_name = "Job" if required == "Job" else required
+  for required in (
+    "Deployment",
+    "Service",
+    "ConfigMap",
+    "Secret",
+    "Job",
+    "PodDisruptionBudget",
+    "NetworkPolicy",
+  ):
     if required not in kinds:
-      fails.add(f"missing required kind: {required} ({kind_name})")
+      fails.add(f"missing required kind: {required}")
 
   check_pem_and_placeholders(docs, fails)
   for doc in by_kind(docs, "ConfigMap"):
@@ -245,6 +414,8 @@ def main() -> int:
     check_pdb(doc, fails)
   for doc in by_kind(docs, "Service"):
     check_service(doc, fails)
+  for doc in by_kind(docs, "NetworkPolicy"):
+    check_networkpolicy(doc, fails)
   check_l7_mtls(docs, fails)
 
   if fails.ok():

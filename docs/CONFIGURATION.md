@@ -36,20 +36,28 @@ with every `.` replaced by `__`, uppercased. For example:
 A secret may be given inline or as a mounted file. Inline wins when both are
 set. Mounted files are read and trimmed of trailing newlines.
 
+The key ring follows the same pattern: `token_pepper_file` and
+`totp_encryption_key_file` (environment spellings `D_OAUTH_TOKEN_PEPPER_FILE`
+and `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`) name mounted files. The cluster
+Deployment uses those file forms so the material never enters the process
+environment; mount them `0400` on a tmpfs (the shipped manifests project them
+at `/run/secrets` with group `65532`). The inline forms are retained and win
+when both are set, so an existing environment-based deployment still starts.
+
 ## Top-level keys
 
 | Key | Default | Rule |
 | --- | --- | --- |
 | `issuer` | required | Absolute `https` URL with no trailing slash and no whitespace in the authority. |
 | `bind_addr` | `0.0.0.0:8080` | A socket address. The TLS public listener. |
-| `health_addr` | `0.0.0.0:8081` | A socket address, never loopback. The plaintext health listener. |
+| `health_addr` | `0.0.0.0:8081` | A socket address. `serve` refuses a loopback address; `config check` does not. The plaintext health listener. |
 | `environment` | `production` | `production` or `development`. Development relaxes the database TLS requirement. |
 | `cookie_domain` | none (host-only) | Optional cookie domain. |
 | `cookie_secure` | `true` | Adds the `Secure` attribute. Set `false` only for localhost testing. |
 | `trusted_proxy` | none | An IP. When set, that proxy's forwarded client-cert and client-IP headers are honored. When unset, those headers are stripped. |
 | `allow_open_registration` | `false` | When false, DCR requires a valid initial-access token. |
 | `dcr_redirect_policy` | `catalog` | `catalog`, `catalog_loopback`, or `open`. See below. |
-| `cors_allowed_origins` | empty | An explicit origin allowlist. Empty means no CORS layer. A lone `*` is refused. |
+| `cors_allowed_origins` | empty | An explicit origin allowlist. Empty means no CORS layer. A lone `*` is silently dropped (no CORS layer, no error). |
 | `allow_token_exchange` | `false` | Enables the token-exchange grant. |
 | `token_exchange_allowlist` | empty | Rules of `{caller, subject, scopes[]}` for token exchange. |
 
@@ -129,7 +137,9 @@ rejected.
 | `totp_key_id` | `v1` | Version id carried in the encrypted TOTP blob. |
 
 The token pepper is required: without it the key ring cannot be built and the
-server refuses to start.
+server refuses to start. The shipped cluster manifests set
+`D_OAUTH_TOKEN_PEPPER_FILE` and `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` rather than
+the inline keys; see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Failure policy keys
 
@@ -218,12 +228,16 @@ the statement.
 - `trusted_proxy` is unset by default, so forwarded client-cert headers from an
   untrusted hop are stripped before any handler reads them.
 - CORS and open registration are off by default.
+- File-backed pepper/TOTP keys are read from a `0400` tmpfs file, never from
+  the process environment.
 
 ## Edge cases
 
 - `D_OAUTH_CONFIG` pointing at a missing file is not an error; the file is
   optional.
 - An inline `token_pepper` of only whitespace is treated as absent.
+- An unreadable `*_file` path is a load-time error (`ConfigError::SecretFile`),
+  never a silent fallback to an absent key.
 - `scope delete` and `redirect-uri delete` disable a referenced row instead of
   deleting it. See [OPERATIONS.md](OPERATIONS.md).
 - A deliberate mismatch of `dcr_redirect_policy = open` and mTLS is a deployment

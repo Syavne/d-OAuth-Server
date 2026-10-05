@@ -21,7 +21,13 @@
 #
 # mTLS is OFF here (no `D_OAUTH_TLS__CLIENT_CA_PATH`): the L4-passthrough
 # constraint is a cluster concern, documented in docs/DEPLOYMENT.md.
-# Secrets below are DEV-ONLY placeholders; cluster secrets are never baked.
+#
+# Secrets mirror the cluster's file-mount pattern: the
+# one-shot `gensecrets` service materializes DEV-ONLY placeholder values as
+# 0400 files owned by 65532 in the `devsecrets` volume, mounted at
+# /run/secrets; the app and migrate services read them through
+# D_OAUTH_TOKEN_PEPPER_FILE / D_OAUTH_TOTP_ENCRYPTION_KEY_FILE, so no key
+# material enters the process environment. Cluster secrets are never baked.
 
 name: d-oauth
 
@@ -71,6 +77,24 @@ services:
         chmod 600 /certs/tls.key
         chmod 644 /certs/tls.crt
 
+  # One-shot: DEV-ONLY pepper/TOTP key files, shaped like the cluster's tmpfs
+  # secret volume (0400, owned by 65532). Values are throwaway placeholders;
+  # never reuse them outside this local compose file.
+  gensecrets:
+    image: alpine:3.21
+    volumes:
+      - devsecrets:/run/secrets
+    command:
+      - sh
+      - -ec
+      - |
+        if [ ! -f /run/secrets/token-pepper ]; then
+          printf '%s' 'dev-only-pepper-ROTATE-IN-PROD-000000' > /run/secrets/token-pepper
+          printf '%s' 'dev-only-totp-key-ROTATE-IN-PROD-000' > /run/secrets/totp-encryption-key
+        fi
+        chown 65532:65532 /run/secrets/token-pepper /run/secrets/totp-encryption-key
+        chmod 400 /run/secrets/token-pepper /run/secrets/totp-encryption-key
+
   # Exactly-once migration (sqlx advisory lock). Replicas never migrate.
   migrate:
     build:
@@ -82,32 +106,7 @@ services:
     depends_on:
       gencerts:
         condition: service_completed_successfully
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      D_OAUTH_ISSUER: https://localhost:8080
-      D_OAUTH_ENVIRONMENT: development
-      D_OAUTH_BIND_ADDR: 0.0.0.0:8080
-      D_OAUTH_HEALTH_ADDR: 0.0.0.0:8081
-      D_OAUTH_TLS__CERT_PATH: /certs/tls.crt
-      D_OAUTH_TLS__KEY_PATH: /certs/tls.key
-      D_OAUTH_DATABASE__URL: postgres://oauth:oauth-dev-only@db:5432/oauth?sslmode=disable
-      D_OAUTH_REDIS__URL: redis://redis:6379
-      D_OAUTH_REDIS__DURABILITY: waitaof
-      D_OAUTH_TOKEN_PEPPER: dev-only-pepper-ROTATE-IN-PROD-000000
-      D_OAUTH_TOTP_ENCRYPTION_KEY: dev-only-totp-key-ROTATE-IN-PROD-000
-    volumes:
-      - certs:/certs:ro
-
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: d-oauth-server:local
-    depends_on:
-      migrate:
+      gensecrets:
         condition: service_completed_successfully
       db:
         condition: service_healthy
@@ -123,8 +122,38 @@ services:
       D_OAUTH_DATABASE__URL: postgres://oauth:oauth-dev-only@db:5432/oauth?sslmode=disable
       D_OAUTH_REDIS__URL: redis://redis:6379
       D_OAUTH_REDIS__DURABILITY: waitaof
-      D_OAUTH_TOKEN_PEPPER: dev-only-pepper-ROTATE-IN-PROD-000000
-      D_OAUTH_TOTP_ENCRYPTION_KEY: dev-only-totp-key-ROTATE-IN-PROD-000
+      D_OAUTH_TOKEN_PEPPER_FILE: /run/secrets/token-pepper
+      D_OAUTH_TOTP_ENCRYPTION_KEY_FILE: /run/secrets/totp-encryption-key
+    volumes:
+      - certs:/certs:ro
+      - devsecrets:/run/secrets:ro
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: d-oauth-server:local
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      gensecrets:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      D_OAUTH_ISSUER: https://localhost:8080
+      D_OAUTH_ENVIRONMENT: development
+      D_OAUTH_BIND_ADDR: 0.0.0.0:8080
+      D_OAUTH_HEALTH_ADDR: 0.0.0.0:8081
+      D_OAUTH_TLS__CERT_PATH: /certs/tls.crt
+      D_OAUTH_TLS__KEY_PATH: /certs/tls.key
+      D_OAUTH_DATABASE__URL: postgres://oauth:oauth-dev-only@db:5432/oauth?sslmode=disable
+      D_OAUTH_REDIS__URL: redis://redis:6379
+      D_OAUTH_REDIS__DURABILITY: waitaof
+      D_OAUTH_TOKEN_PEPPER_FILE: /run/secrets/token-pepper
+      D_OAUTH_TOTP_ENCRYPTION_KEY_FILE: /run/secrets/totp-encryption-key
     expose:
       - 8080
       - 8081
@@ -142,8 +171,10 @@ services:
       start_period: 10s
     volumes:
       - certs:/certs:ro
+      - devsecrets:/run/secrets:ro
 
 volumes:
   pgdata:
   redisdata:
   certs:
+  devsecrets:

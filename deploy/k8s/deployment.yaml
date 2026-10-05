@@ -10,6 +10,25 @@
 #   default `0.0.0.0:8081`); the public listener stays TLS-only.
 # - `terminationGracePeriodSeconds: 45` covers the server's 1s propagation
 #   grace + 30s drain budget (`src/serve.rs`: PROPAGATION_GRACE, DRAIN_DEADLINE).
+# - Host hardening: non-root 65532, read-only rootfs, ALL capabilities
+#   dropped, `allowPrivilegeEscalation: false`, `RuntimeDefault` seccomp, and
+#   `automountServiceAccountToken: false` (the server never calls the
+#   Kubernetes API). `networkpolicy.yaml` default-denies pod egress except DNS
+#   + Postgres + Redis.
+# - Secret material is file-mounted, never env-injected: the token pepper and
+#   TOTP key are projected from `d-oauth-secrets` into a tmpfs volume at
+#   `/run/secrets` (`defaultMode: 0400`, group 65532 via `fsGroup`) and read
+#   through `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`.
+#   The inline `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` forms
+#   remain supported and take precedence when both are set
+#   (`src/config/build.rs`), but this deployment never sets them, so no key
+#   material enters the process environment (`/proc/self/environ`, children,
+#   crash dumps, `docker inspect`).
+# - The image is digest-pinned. The all-zero digest below is a deliberate
+#   placeholder: the `pin-digest` job in `.github/workflows/supply-chain.yml`
+#   writes the real signed-build digest into the `images` entry of
+#   `kustomization.yaml`, which overrides this field on every workload.
+#   `:latest` is never a shippable reference.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -37,18 +56,28 @@ spec:
         app.kubernetes.io/part-of: d-oauth
     spec:
       terminationGracePeriodSeconds: 45
+      # The app never talks to the Kubernetes API; the auto-mounted service
+      # account token is pure attack surface, so it stays disabled.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        # Secret volumes are tmpfs; fsGroup makes the 0400 files readable by
+        # the runtime group so the pepper/TOTP keys can be mounted as files.
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: server
-          # Release pinning: CI resolves this tag to an immutable digest
-          # (`kustomize edit set image ...@sha256:<digest>`) before rollout;
-          # see `.github/workflows/supply-chain.yml` and `kustomization.yaml`.
-          image: ghcr.io/d-oauth/d-oauth-server:latest
+          # Digest-pinned reference. The all-zero digest
+          # is a deliberate placeholder, not a shippable reference: it fails
+          # closed instead of resolving a mutable tag. The `pin-digest` job in
+          # `.github/workflows/supply-chain.yml` writes the real signed-build
+          # digest into the `images` entry of `kustomization.yaml`; kustomize
+          # then applies that digest to this container and the migrate Job.
+          image: ghcr.io/d-oauth/d-oauth-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           ports:
             - name: public-tls
@@ -71,16 +100,15 @@ spec:
                 secretKeyRef:
                   name: d-oauth-secrets
                   key: redis-url
-            - name: D_OAUTH_TOKEN_PEPPER
-              valueFrom:
-                secretKeyRef:
-                  name: d-oauth-secrets
-                  key: token-pepper
-            - name: D_OAUTH_TOTP_ENCRYPTION_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: d-oauth-secrets
-                  key: totp-encryption-key
+            # File-mounted key material: the values stay
+            # in the tmpfs secret volume, never in the process environment.
+            # The inline D_OAUTH_TOKEN_PEPPER / D_OAUTH_TOTP_ENCRYPTION_KEY
+            # forms are still supported and take precedence when both are set
+            # (`src/config/build.rs`); this deployment deliberately uses files.
+            - name: D_OAUTH_TOKEN_PEPPER_FILE
+              value: /run/secrets/token-pepper
+            - name: D_OAUTH_TOTP_ENCRYPTION_KEY_FILE
+              value: /run/secrets/totp-encryption-key
           # Liveness is dependency-free by construction (`/health/live`
           # touches no Postgres/Redis), so a dependency outage never
           # triggers a restart storm — readiness absorbs it instead.
@@ -125,11 +153,27 @@ spec:
             - name: certs
               mountPath: /certs
               readOnly: true
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
       volumes:
         - name: certs
           secret:
             secretName: d-oauth-tls
             defaultMode: 0o400
+        # tmpfs-backed secret volume. `defaultMode:
+        # 0400` plus `fsGroup: 65532` leaves the projected files readable only
+        # by the runtime user/group. Only the two key files are projected;
+        # database-url and redis-url remain env secretKeyRefs by design.
+        - name: secrets
+          secret:
+            secretName: d-oauth-secrets
+            defaultMode: 0o400
+            items:
+              - key: token-pepper
+                path: token-pepper
+              - key: totp-encryption-key
+                path: totp-encryption-key
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone

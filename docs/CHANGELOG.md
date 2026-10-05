@@ -32,8 +32,22 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   QR code beside the text secret and URI, so users can scan instead of
   hand-typing. The new `qrcode` dependency is pinned SVG-only (no `image`
   codecs); the text secret, URI, and one-time recovery codes are unchanged.
+- A full-database-disclosure response procedure: `docs/SECURITY.md` gains the
+  dump blast-radius table and the ordered rotation (token pepper, TOTP key,
+  client secrets, DCR registration tokens), and `RUNBOOK.md` gains the
+  matching operator checklist with concrete commands.
+- Cluster hardening in `deploy/k8s`: the token pepper and TOTP key mount as
+  `0400` tmpfs files under `/run/secrets` (read through
+  `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, mirrored
+  in `compose.yaml`), the image reference is digest-pinned, a NetworkPolicy
+  default-denies pod egress except DNS plus Postgres/Redis, and
+  `automountServiceAccountToken` is `false`.
 
 ### Changed
+
+- TOTP secrets now encrypt under HKDF-SHA256 (info `totp-gcm-v2`) instead of
+  bare `SHA256(totp_key)`. New blobs carry format version 2; version-1 blobs
+  keep decrypting through a legacy fallback, so no re-enrollment is needed.
 
 - `GET /.well-known/oauth-authorization-server` now carries an explicit
   `Cache-Control: public, max-age=3600` instead of relying on browser

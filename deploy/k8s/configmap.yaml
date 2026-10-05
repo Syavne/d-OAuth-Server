@@ -3,7 +3,10 @@
 # Every key maps to a `D_OAUTH_*` environment variable read by
 # `Config::load` (prefix `D_OAUTH`, nested separator `__`). Secret material
 # (database/redis URLs, token pepper, TOTP key) lives in `secret.yaml` and
-# is NEVER added here.
+# is NEVER added here: the pepper and TOTP key are file-mounted by the
+# Deployment, and their `*_FILE` paths are declared in `deployment.yaml`,
+# not in this ConfigMap (`scripts/check_manifests.py` rejects a
+# secret-shaped key here).
 apiVersion: v1
 kind: ConfigMap
 metadata:

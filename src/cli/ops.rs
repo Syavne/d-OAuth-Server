@@ -43,7 +43,10 @@ pub async fn migrate() -> Result<(), CliError> {
   let pool = open_pool(&config).await?;
   MIGRATOR.run(&pool).await?;
   audit("migrate", "schema");
-  println!("applied {} migration(s)", MIGRATOR.migrations.len());
+  println!(
+    "schema current: {} known migration(s)",
+    MIGRATOR.migrations.len()
+  );
   Ok(())
 }
 

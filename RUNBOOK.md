@@ -1,8 +1,9 @@
-# Admin Bootstrap Operator Runbook
+# Operator Runbook
 
-How to create the first administrator of a fresh `d-oauth` install, and how
-to replace that bootstrap account immediately. There is no HTTP bootstrap
-endpoint: provisioning is CLI/Job only.
+How to create the first administrator of a fresh `d-oauth` install, how to
+replace that bootstrap account immediately, and how to respond to a full
+database disclosure. There is no HTTP bootstrap endpoint: provisioning is
+CLI/Job only.
 
 > Task 48 owns `SECURITY.md`; this file is the task-47 operator runbook.
 > The threat model and the replace-immediately rationale live there.
@@ -84,3 +85,70 @@ and TOTP-enrolled outcomes are emitted by the login flow itself.
 - The bootstrap password is never accepted via argv, never logged, and never
   stored (only its Argon2id hash reaches Postgres).
 - Bootstrap is CLI/Job only; no HTTP endpoint can create an admin.
+
+## 5. Full-database-disclosure response
+
+Use this when a PostgreSQL dump, backup, or read replica has left your control
+on unknown terms. The blast radius and the rationale for the order below are in
+[docs/SECURITY.md](docs/SECURITY.md); this is the operator checklist. Preserve
+evidence first: capture the audit stream and keep the `X-Request-Id`
+correlation. No step below writes a secret to a log.
+
+### Rotation order and commands
+
+- [ ] Confirm whether the key store leaked with the dump. The token pepper and
+      the TOTP encryption key live outside the database
+      (`D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOKEN_PEPPER_FILE`,
+      `D_OAUTH_TOTP_ENCRYPTION_KEY` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`); if it
+      is not provably untouched, assume it leaked and continue.
+- [ ] **1. Rotate the token pepper.** Point `D_OAUTH_TOKEN_PEPPER` (or
+      `D_OAUTH_TOKEN_PEPPER_FILE`) at a new value, bump
+      `D_OAUTH_TOKEN_PEPPER_ID`, and perform a rolling restart. Dropping the old
+      id invalidates every live opaque access and refresh token, so clients
+      re-authenticate.
+- [ ] Confirm opaque tokens are dead by re-authenticating a test client. Expect
+      `invalid_grant` for a token minted before the rotation.
+- [ ] **2. Rotate the TOTP encryption key.** Point
+      `D_OAUTH_TOTP_ENCRYPTION_KEY` (or `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`) at a
+      new value, bump `D_OAUTH_TOTP_KEY_ID`, and roll the replicas. Retain the
+      old key only until every user has re-enrolled.
+- [ ] Re-enroll every TOTP user before dropping the old key:
+      `d-oauth-server user enroll-totp --email <email>`
+      (prints the secret and `otpauth://` URI exactly once).
+- [ ] **3. Rotate every confidential client secret.** Read the current metadata,
+      then re-submit it through RFC 7592 `PUT /register/{client_id}` to mint a
+      new secret and a new registration token:
+
+      ```sh
+      curl -sS https://<issuer>/register/<client_id> \
+        -H "Authorization: Bearer <current-registration-access-token>"
+
+      curl -sS -X PUT https://<issuer>/register/<client_id> \
+        -H "Authorization: Bearer <current-registration-access-token>" \
+        -H 'Content-Type: application/json' \
+        --data @client-metadata.json
+      ```
+
+      The `PUT` response carries `client_secret` and
+      `registration_access_token` exactly once. Store both before the process
+      exits; the previous registration token immediately answers `403`.
+- [ ] **4. Rotate every DCR registration token.** Every successful `PUT` above
+      already rotated the registration token. If you also need new
+      registrations after the breach, issue a fresh single-use initial-access
+      token:
+      `d-oauth-server initial-access-token issue --uses <n> --ttl <seconds>`
+      (the raw token is printed once).
+- [ ] **5. Verify fail-closed behavior.** Readiness must report ready only with
+      both dependencies up:
+      `d-oauth-server healthcheck --url http://127.0.0.1:8081/health/ready`.
+      A dependency outage during recovery must yield `503`, never a fail-open
+      success.
+
+### What not to do
+
+- Do not rotate the TOTP key before the pepper: the pepper step is the only one
+  that retires live opaque tokens the dump cannot reconstruct.
+- Do not remove the old TOTP key before every user has re-enrolled.
+- Do not relax the fail-closed policy to keep the security endpoints up.
+- Do not paste the leaked registration tokens, client secrets, or the pepper
+  into a ticket, chat, or log.

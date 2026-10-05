@@ -40,6 +40,7 @@ One row per registered client (RFC 7591 / RFC 7592).
 | `software_id` | `text` | Metadata only. |
 | `active` | `bool` | Soft disable, default true. |
 | `registration_access_token_hash` | `text` | Keyed hash of the RFC 7592 management token. |
+| `dpop_bound_access_tokens` | `bool` | Whether this client's tokens require DPoP proof (`migrations/1791244800_client_dpop_bound.sql`). |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
 
 Two partial unique indexes enforce that a client certificate authenticates at
@@ -198,7 +199,7 @@ D_OAUTH_DATABASE__URL='postgres://oauth@db.example.com/oauth?sslmode=verify-full
   cargo run --bin d-oauth-server -- migrate
 ```
 
-The command prints `applied N migration(s)`. Run it as a cluster Job and let
+The command prints `schema current: N known migration(s)`. Run it as a cluster Job and let
 readiness gate the Deployment. To confirm a fresh install, check that the six
 tables exist and are empty:
 
@@ -212,6 +213,8 @@ SELECT version, success FROM _sqlx_migrations ORDER BY version;
 
 - `migrations/1791072000_oauth_clients.sql` for `oauth_clients`.
 - `migrations/1791158400_users.sql` for the other five tables and `citext`.
+- `migrations/1791244800_client_dpop_bound.sql` for `oauth_clients.dpop_bound_access_tokens`.
+- `migrations/1791331200_redirect_uri_kind.sql` for `redirect_uris.kind`.
 - `src/db/` for the repositories.
 - `src/state.rs` for `MIGRATOR`.
 - `src/cli/ops.rs` for the `migrate` command.

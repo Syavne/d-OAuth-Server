@@ -7,6 +7,13 @@
 # database; per-replica migration races and double-applies). The Deployment's
 # readiness gate (`_sqlx_migrations` version match) keeps new replicas out of
 # traffic until this Job succeeds.
+#
+# Hardened like the Deployment: non-root 65532,
+# read-only rootfs, ALL capabilities dropped, `automountServiceAccountToken:
+# false`, and the token pepper / TOTP key mounted as 0400 tmpfs files under
+# `/run/secrets` (read through the `*_FILE` variables) instead of env vars.
+# The image carries the same placeholder digest; `pin-digest` rewrites the
+# real digest in `kustomization.yaml` for every workload.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -27,16 +34,20 @@ spec:
         app.kubernetes.io/component: migrate
     spec:
       restartPolicy: Never
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: migrate
-          # Same pinning rule as the Deployment: CI resolves to a digest.
-          image: ghcr.io/d-oauth/d-oauth-server:latest
+          # Same pinning rule as the Deployment: placeholder digest, never a
+          # shippable `:latest`; CI resolves it via `kustomization.yaml`.
+          image: ghcr.io/d-oauth/d-oauth-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           # Overrides the image ENTRYPOINT (["/d-oauth-server","serve"]).
           command: ["/d-oauth-server", "migrate"]
@@ -54,16 +65,12 @@ spec:
                 secretKeyRef:
                   name: d-oauth-secrets
                   key: redis-url
-            - name: D_OAUTH_TOKEN_PEPPER
-              valueFrom:
-                secretKeyRef:
-                  name: d-oauth-secrets
-                  key: token-pepper
-            - name: D_OAUTH_TOTP_ENCRYPTION_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: d-oauth-secrets
-                  key: totp-encryption-key
+            # File-mounted key material, same pattern as the Deployment; the
+            # inline forms remain supported by `Config` but are not used here.
+            - name: D_OAUTH_TOKEN_PEPPER_FILE
+              value: /run/secrets/token-pepper
+            - name: D_OAUTH_TOTP_ENCRYPTION_KEY_FILE
+              value: /run/secrets/totp-encryption-key
           resources:
             requests:
               cpu: 50m
@@ -81,8 +88,20 @@ spec:
             - name: certs
               mountPath: /certs
               readOnly: true
+            - name: secrets
+              mountPath: /run/secrets
+              readOnly: true
       volumes:
         - name: certs
           secret:
             secretName: d-oauth-tls
             defaultMode: 0o400
+        - name: secrets
+          secret:
+            secretName: d-oauth-secrets
+            defaultMode: 0o400
+            items:
+              - key: token-pepper
+                path: token-pepper
+              - key: totp-encryption-key
+                path: totp-encryption-key

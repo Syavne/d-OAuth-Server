@@ -3,8 +3,10 @@
 //!
 //! Nothing here ever logs or prints a secret. TOTP secrets are encrypted with
 //! AES-256-GCM under a key derived from the active [`crate::keys::KeyRing`]
-//! TOTP key; the stored blob carries the key id so retained keys keep
-//! decrypting after rotation. `keygen` emits an ES256 keypair for test fixtures
+//! TOTP key via HKDF-SHA256 (info `totp-gcm-v2`); the stored blob carries the
+//! key id so retained keys keep decrypting after rotation. Version-1 blobs
+//! (bare `SHA256(totp_key)`) still decrypt via a legacy fallback. `keygen`
+//! emits an ES256 keypair for test fixtures
 //! and client-side DPoP keys only — never an AS signing key.
 
 use base64::{
@@ -12,17 +14,24 @@ use base64::{
 };
 use ring::{
   aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
+  hkdf,
   rand::{SecureRandom as _, SystemRandom},
   signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _},
 };
 use secrecy::ExposeSecret as _;
+#[cfg(test)]
 use sha2::{Digest as _, Sha256};
 
 use super::context::CliError;
 use crate::config::Config;
 
-/// Current TOTP-blob format version.
-const TOTP_BLOB_VERSION: u8 = 1;
+/// Current TOTP-blob format version (HKDF-SHA256 writes).
+const TOTP_BLOB_VERSION: u8 = 2;
+/// Legacy blob version (bare-`SHA256(totp_key)` writes): decrypt-only.
+#[cfg(test)]
+const TOTP_BLOB_V1: u8 = 1;
+/// HKDF domain-separation label binding the derived key to TOTP AES-GCM use.
+const HKDF_INFO: &[u8] = b"totp-gcm-v2";
 /// AES-GCM nonce length.
 const NONCE_LEN: usize = 12;
 /// AES-256 key length.
@@ -75,7 +84,7 @@ pub fn token_hash(config: &Config, token: &str) -> Result<String, CliError> {
 
 /// Encrypt a TOTP secret with the active TOTP-encryption key.
 ///
-/// Blob layout: `version(1) || kid_len(1) || kid || nonce(12) || ciphertext+tag`.
+/// Blob layout: `version(2) || kid_len(1) || kid || nonce(12) || ciphertext+tag`.
 /// The key id travels with the blob so retained keys decrypt after rotation.
 ///
 /// # Errors
@@ -90,7 +99,8 @@ pub fn encrypt_totp(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliErro
   if kid.len() > u8::MAX as usize {
     return Err(CliError::Crypto("TOTP key id is too long".to_owned()));
   }
-  let key = derive_key(secret.expose_secret().as_bytes());
+  let key = derive_key(secret.expose_secret().as_bytes())
+    .map_err(|_| CliError::Crypto("TOTP key derivation failed".to_owned()))?;
   let mut nonce_bytes = [0u8; NONCE_LEN];
   SystemRandom::new()
     .fill(&mut nonce_bytes)
@@ -119,6 +129,10 @@ pub fn encrypt_totp(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliErro
 
 /// Decrypt a TOTP secret previously produced by [`encrypt_totp`].
 ///
+/// Version-2 blobs open under the HKDF-SHA256 key; legacy version-1 blobs
+/// first try the HKDF key, then fall back to the bare-`SHA256(totp_key)` key,
+/// so rows written before the HKDF migration keep decrypting.
+///
 /// Currently exercised only by tests; the login/verification path (a later
 /// task) is the production consumer.
 ///
@@ -127,9 +141,10 @@ pub fn encrypt_totp(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliErro
 /// authentication failure.
 #[cfg(test)]
 pub fn decrypt_totp(config: &Config, blob: &[u8]) -> Result<String, CliError> {
-  if blob.len() < 2 + NONCE_LEN || blob[0] != TOTP_BLOB_VERSION {
+  if blob.len() < 2 + NONCE_LEN || (blob[0] != TOTP_BLOB_VERSION && blob[0] != TOTP_BLOB_V1) {
     return Err(CliError::Crypto("malformed TOTP blob".to_owned()));
   }
+  let version = blob[0];
   let kid_len = blob[1] as usize;
   let header = 2 + kid_len;
   if blob.len() < header + NONCE_LEN {
@@ -141,20 +156,40 @@ pub fn decrypt_totp(config: &Config, blob: &[u8]) -> Result<String, CliError> {
     .keys
     .totp_key_by_id(kid)
     .ok_or_else(|| CliError::Crypto(format!("unknown TOTP key id: {kid}")))?;
-  let key = derive_key(secret.expose_secret().as_bytes());
+  let ikm = secret.expose_secret().as_bytes();
 
   let mut nonce_bytes = [0u8; NONCE_LEN];
   nonce_bytes.copy_from_slice(&blob[header..header + NONCE_LEN]);
-  let mut ciphertext = blob[header + NONCE_LEN..].to_vec();
+  let ciphertext = &blob[header + NONCE_LEN..];
 
-  let unbound = UnboundKey::new(&AES_256_GCM, &key)
+  if version == TOTP_BLOB_VERSION {
+    let key =
+      derive_key(ikm).map_err(|_| CliError::Crypto("TOTP key derivation failed".to_owned()))?;
+    return open_with_key(&key, &nonce_bytes, ciphertext);
+  }
+  if let Ok(key) = derive_key(ikm)
+    && let Ok(plaintext) = open_with_key(&key, &nonce_bytes, ciphertext)
+  {
+    return Ok(plaintext);
+  }
+  open_with_key(&derive_key_legacy(ikm), &nonce_bytes, ciphertext)
+}
+
+#[cfg(test)]
+fn open_with_key(
+  key: &[u8; KEY_LEN],
+  nonce_bytes: &[u8; NONCE_LEN],
+  ciphertext: &[u8],
+) -> Result<String, CliError> {
+  let mut in_out = ciphertext.to_vec();
+  let unbound = UnboundKey::new(&AES_256_GCM, key)
     .map_err(|_| CliError::Crypto("TOTP key rejected by AEAD".to_owned()))?;
   let opening = LessSafeKey::new(unbound);
   let plaintext = opening
     .open_in_place(
-      Nonce::assume_unique_for_key(nonce_bytes),
+      Nonce::assume_unique_for_key(*nonce_bytes),
       Aad::empty(),
-      &mut ciphertext,
+      &mut in_out,
     )
     .map_err(|_| CliError::Crypto("TOTP secret decryption failed".to_owned()))?;
   String::from_utf8(plaintext.to_vec())
@@ -223,11 +258,28 @@ pub fn generate_es256() -> Result<KeypairPem, CliError> {
   })
 }
 
-fn derive_key(totp_key: &[u8]) -> [u8; KEY_LEN] {
+fn derive_key(totp_key: &[u8]) -> Result<[u8; KEY_LEN], ring::error::Unspecified> {
+  let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(totp_key);
+  let okm = prk.expand(&[HKDF_INFO], HkdfAesKey)?;
+  let mut key = [0u8; KEY_LEN];
+  okm.fill(&mut key)?;
+  Ok(key)
+}
+
+#[cfg(test)]
+fn derive_key_legacy(totp_key: &[u8]) -> [u8; KEY_LEN] {
   let digest = Sha256::digest(totp_key);
   let mut key = [0u8; KEY_LEN];
   key.copy_from_slice(&digest);
   key
+}
+
+struct HkdfAesKey;
+
+impl hkdf::KeyType for HkdfAesKey {
+  fn len(&self) -> usize {
+    KEY_LEN
+  }
 }
 
 fn numeric_key_id(key_id: &str) -> u32 {

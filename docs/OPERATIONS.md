@@ -35,7 +35,8 @@ d-oauth-server config check
   durability contract, and runs the TLS public listener plus the plaintext
   health listener. It never migrates. It drains on `SIGTERM`.
 - `migrate` applies forward-only migrations under sqlx's advisory lock and
-  prints `applied N migration(s)`.
+  prints `schema current: N known migration(s)` (`N` is the embedded count,
+  not the delta just applied).
 - `config check` validates configuration and prints `config ok: issuer=...`.
 
 ### Users

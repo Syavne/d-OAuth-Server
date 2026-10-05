@@ -29,6 +29,7 @@ the library.
 | `src/protocol/` | OAuth endpoints and grants. See [OAUTH.md](OAUTH.md). |
 | `src/ui/` | Server-rendered login, consent, and device pages (Askama templates) plus the embedded same-origin stylesheet served at `/assets/app.css`. |
 | `src/middleware/` | Request id, tracing and redaction, rate limiting, security headers, and audit. |
+| `src/resilience.rs` | Load-shed, concurrency-limit, and timeout guard between CORS and rate limiting. |
 | `src/routes.rs` | Router assembly and the middleware order. |
 | `src/serve.rs`, `src/tls.rs` | Listener bootstrap and the custom TLS accept loop. |
 | `src/state.rs`, `src/state/` | `AppState`, the topology-aware Redis connection, health endpoints. |
@@ -51,10 +52,12 @@ is fixed in `build_router_with_options` in `src/routes.rs`:
    them. Without a configured proxy, proxy evidence is never trusted.
 3. CORS: answers preflights from the explicit allowlist. Absent when the
    allowlist is empty, which is the default.
-4. Rate limit: enforces the per-IP and per-client budgets. Health and metadata
+4. Resilience: sheds excess load, caps concurrency, and times out slow
+   handlers before they reach rate limiting.
+5. Rate limit: enforces the per-IP and per-client budgets. Health and metadata
    have no rule and pass through; those handlers fail closed on their own.
-5. Body limit: caps request bodies at 2 MiB.
-6. Security headers: adds `Referrer-Policy`, `X-Content-Type-Options`, a CSP
+6. Body limit: caps request bodies at 2 MiB.
+7. Security headers: adds `Referrer-Policy`, `X-Content-Type-Options`, a CSP
    with `frame-ancestors 'none'`, HSTS on the TLS listener, and
    `Cache-Control: no-store` on every response except `/.well-known/…` metadata.
 

@@ -1,12 +1,12 @@
 //! `login_totp` unit suite: RFC 6238 vectors, ±1-step window, AEAD wrap.
 
 use base32::Alphabet;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 
 use super::{
-  RECOVERY_CODE_COUNT, TOTP_STEP_SECS, TotpError, build_totp, decrypt_secret, encrypt_secret,
-  generate_recovery_codes, generate_secret, normalize_recovery_code, otpauth_uri, qr_svg,
-  replay_fingerprint, verify_window,
+  RECOVERY_CODE_COUNT, TOTP_BLOB_VERSION, TOTP_STEP_SECS, TotpError, build_totp, decrypt_secret,
+  derive_key, derive_key_legacy, encrypt_secret, generate_recovery_codes, generate_secret,
+  normalize_recovery_code, otpauth_uri, qr_svg, replay_fingerprint, verify_window,
 };
 use crate::keys::{KeyId, KeyRing};
 
@@ -229,6 +229,83 @@ fn login_totp_qr_svg_rejects_oversized_uri() -> Result<(), TotpError> {
   let oversized = "A".repeat(4000);
   if !matches!(qr_svg(&oversized), Err(TotpError::Qr)) {
     return Err(TotpError::Qr);
+  }
+  Ok(())
+}
+
+#[test]
+fn login_totp_hkdf_differs_from_legacy_sha256() -> Result<(), TotpError> {
+  use sha2::{Digest as _, Sha256};
+  let ikm = b"test-totp-key-0123456789abcdef";
+  let hkdf_key = derive_key(ikm).map_err(|_| TotpError::Encrypt)?;
+  let digest = Sha256::digest(ikm);
+  if hkdf_key.as_slice() == digest.as_slice() {
+    return Err(TotpError::Encrypt);
+  }
+  if derive_key_legacy(ikm).as_slice() != digest.as_slice() {
+    return Err(TotpError::Decrypt);
+  }
+  Ok(())
+}
+
+#[test]
+fn login_totp_new_blobs_use_version_two() -> Result<(), TotpError> {
+  let ring = test_ring()?;
+  let blob = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ")?;
+  if TOTP_BLOB_VERSION != 2 || blob.first().copied() != Some(2) {
+    return Err(TotpError::Encrypt);
+  }
+  if decrypt_secret(&ring, &blob)? != "GEZDGNBVGY3TQOJQ" {
+    return Err(TotpError::Decrypt);
+  }
+  Ok(())
+}
+
+// Build a legacy v1 blob (version 1, AES-256-GCM under SHA256(totp_key))
+// exactly as the pre-HKDF writer did, to prove old rows still decrypt.
+fn encrypt_v1_legacy_blob(ring: &KeyRing, plaintext: &str) -> Result<Vec<u8>, TotpError> {
+  use ring::{
+    aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
+    rand::{SecureRandom as _, SystemRandom},
+  };
+  let (key_id, secret) = ring.active_totp_key().ok_or(TotpError::Encrypt)?;
+  let kid = key_id.as_str().as_bytes();
+  if kid.len() > usize::from(u8::MAX) {
+    return Err(TotpError::Encrypt);
+  }
+  let key = derive_key_legacy(secret.expose_secret().as_bytes());
+  let mut nonce_bytes = [0u8; 12];
+  SystemRandom::new()
+    .fill(&mut nonce_bytes)
+    .map_err(|_| TotpError::UnavailableRandomness)?;
+  let sealing =
+    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).map_err(|_| TotpError::Encrypt)?);
+  let mut in_out = plaintext.as_bytes().to_vec();
+  sealing
+    .seal_in_place_append_tag(
+      Nonce::assume_unique_for_key(nonce_bytes),
+      Aad::empty(),
+      &mut in_out,
+    )
+    .map_err(|_| TotpError::Encrypt)?;
+  let mut blob = Vec::with_capacity(2 + kid.len() + 12 + in_out.len());
+  blob.push(1u8);
+  blob.push(kid.len() as u8);
+  blob.extend_from_slice(kid);
+  blob.extend_from_slice(&nonce_bytes);
+  blob.extend_from_slice(&in_out);
+  Ok(blob)
+}
+
+#[test]
+fn login_totp_decrypts_legacy_v1_sha256_blob() -> Result<(), TotpError> {
+  let ring = test_ring()?;
+  let blob = encrypt_v1_legacy_blob(&ring, "GEZDGNBVGY3TQOJQ")?;
+  if blob.first().copied() != Some(1) {
+    return Err(TotpError::Encrypt);
+  }
+  if decrypt_secret(&ring, &blob)? != "GEZDGNBVGY3TQOJQ" {
+    return Err(TotpError::Decrypt);
   }
   Ok(())
 }

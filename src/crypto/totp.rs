@@ -6,10 +6,12 @@
 //! SHA-1, 6 digits, with the validator accepting one step of look-ahead and
 //! look-behind.
 //!
-//! The encrypted-secret blob layout mirrors `cli::secret` (`version(1) ||
+//! The encrypted-secret blob layout mirrors `cli::secret` (`version(2) ||
 //! kid_len(1) || kid || nonce(12) || ciphertext+tag`, AES-256-GCM under
-//! `SHA256(totp_key)`), so CLI-provisioned secrets decrypt here and
-//! login-provisioned secrets stay CLI-readable. The two implementations are
+//! HKDF-SHA256(`totp_key`, info `totp-gcm-v2`)), so CLI-provisioned secrets
+//! decrypt here and login-provisioned secrets stay CLI-readable. Version-1
+//! blobs (AES-256-GCM under bare `SHA256(totp_key)`) still decrypt via a
+//! legacy fallback. The two implementations are
 //! intentionally small duplicates: `crypto` cannot depend on `cli`.
 //!
 //! No error variant carries a secret, code, or key: failures collapse to
@@ -22,6 +24,7 @@ use qrcode::{QrCode, render::svg};
 use rand::{TryRng as _, rngs::SysRng};
 use ring::{
   aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
+  hkdf,
   rand::{SecureRandom as _, SystemRandom},
 };
 use secrecy::ExposeSecret as _;
@@ -40,8 +43,12 @@ pub const TOTP_DIGITS: u8 = 6;
 pub const USED_CODE_TTL: Duration = Duration::from_secs(180);
 /// Recovery codes minted per enrollment.
 pub const RECOVERY_CODE_COUNT: usize = 10;
-/// Current encrypted-secret blob format version.
-const TOTP_BLOB_VERSION: u8 = 1;
+/// Current encrypted-secret blob format version (HKDF-SHA256 writes).
+const TOTP_BLOB_VERSION: u8 = 2;
+/// Legacy blob version (bare-`SHA256(totp_key)` writes): decrypt-only.
+const TOTP_BLOB_V1: u8 = 1;
+/// HKDF domain-separation label binding the derived key to TOTP AES-GCM use.
+const HKDF_INFO: &[u8] = b"totp-gcm-v2";
 /// AES-GCM nonce length.
 const NONCE_LEN: usize = 12;
 
@@ -281,7 +288,7 @@ pub async fn verify_and_claim(
 
 /// Encrypt a TOTP secret under the active TOTP-encryption key.
 ///
-/// Blob layout mirrors `cli::secret`: `version(1) || kid_len(1) || kid ||
+/// Blob layout mirrors `cli::secret`: `version(2) || kid_len(1) || kid ||
 /// nonce(12) || ciphertext+tag`.
 ///
 /// # Errors
@@ -294,7 +301,7 @@ pub fn encrypt_secret(keys: &KeyRing, plaintext: &str) -> Result<Vec<u8>, TotpEr
   if kid.len() > usize::from(u8::MAX) {
     return Err(TotpError::Encrypt);
   }
-  let key = derive_key(secret.expose_secret().as_bytes());
+  let key = derive_key(secret.expose_secret().as_bytes()).map_err(|_| TotpError::Encrypt)?;
   let mut nonce_bytes = [0u8; NONCE_LEN];
   SystemRandom::new()
     .fill(&mut nonce_bytes)
@@ -321,14 +328,19 @@ pub fn encrypt_secret(keys: &KeyRing, plaintext: &str) -> Result<Vec<u8>, TotpEr
 /// Decrypt a secret previously produced by [`encrypt_secret`], trying the key
 /// named in the blob (retained keys keep decrypting after rotation).
 ///
+/// Version-2 blobs open under the HKDF-SHA256 key; legacy version-1 blobs
+/// first try the HKDF key, then fall back to the bare-`SHA256(totp_key)` key,
+/// so rows written before the HKDF migration keep decrypting.
+///
 /// # Errors
 ///
 /// Returns [`TotpError::Decrypt`] for a malformed blob, an unknown key id, or
 /// an authentication failure. The reason is never distinguished.
 pub fn decrypt_secret(keys: &KeyRing, blob: &[u8]) -> Result<String, TotpError> {
-  if blob.len() < 2 + NONCE_LEN || blob[0] != TOTP_BLOB_VERSION {
+  if blob.len() < 2 + NONCE_LEN || (blob[0] != TOTP_BLOB_VERSION && blob[0] != TOTP_BLOB_V1) {
     return Err(TotpError::Decrypt);
   }
+  let version = blob[0];
   let kid_len = usize::from(blob[1]);
   let header = 2 + kid_len;
   if blob.len() < header + NONCE_LEN {
@@ -337,17 +349,41 @@ pub fn decrypt_secret(keys: &KeyRing, blob: &[u8]) -> Result<String, TotpError> 
   let kid = core::str::from_utf8(blob.get(2..header).unwrap_or_default())
     .map_err(|_| TotpError::Decrypt)?;
   let secret = keys.totp_key_by_id(kid).ok_or(TotpError::Decrypt)?;
-  let key = derive_key(secret.expose_secret().as_bytes());
+  let ikm = secret.expose_secret().as_bytes();
   let mut nonce_bytes = [0u8; NONCE_LEN];
   nonce_bytes.copy_from_slice(&blob[header..header + NONCE_LEN]);
-  let mut ciphertext = blob[header + NONCE_LEN..].to_vec();
+  let ciphertext = &blob[header + NONCE_LEN..];
+  if version == TOTP_BLOB_VERSION {
+    let key = derive_key(ikm).map_err(|_| TotpError::Decrypt)?;
+    return open_with_key(&key, &nonce_bytes, ciphertext);
+  }
+  if let Ok(key) = derive_key(ikm)
+    && let Ok(plaintext) = open_with_key(&key, &nonce_bytes, ciphertext)
+  {
+    return Ok(plaintext);
+  }
+  open_with_key(&derive_key_legacy(ikm), &nonce_bytes, ciphertext)
+}
+
+/// Open `ciphertext` (with trailing GCM tag) under `key`, returning UTF-8.
+///
+/// # Errors
+///
+/// Returns [`TotpError::Decrypt`] for an authentication failure or
+/// non-UTF-8 plaintext. The reason is never distinguished.
+fn open_with_key(
+  key: &[u8; 32],
+  nonce_bytes: &[u8; NONCE_LEN],
+  ciphertext: &[u8],
+) -> Result<String, TotpError> {
+  let mut in_out = ciphertext.to_vec();
   let opening =
-    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).map_err(|_| TotpError::Decrypt)?);
+    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| TotpError::Decrypt)?);
   let plaintext = opening
     .open_in_place(
-      Nonce::assume_unique_for_key(nonce_bytes),
+      Nonce::assume_unique_for_key(*nonce_bytes),
       Aad::empty(),
-      &mut ciphertext,
+      &mut in_out,
     )
     .map_err(|_| TotpError::Decrypt)?;
   String::from_utf8(plaintext.to_vec()).map_err(|_| TotpError::Decrypt)
@@ -380,12 +416,32 @@ pub fn qr_svg(uri: &str) -> Result<String, TotpError> {
   })
 }
 
-/// Derive the AES-256 key from configured TOTP key material (SHA-256).
-fn derive_key(totp_key: &[u8]) -> [u8; 32] {
+/// Derive the AES-256 key from configured TOTP key material via HKDF-SHA256
+/// (RFC 5869, empty salt, info `totp-gcm-v2` domain-separating TOTP use).
+fn derive_key(totp_key: &[u8]) -> Result<[u8; 32], ring::error::Unspecified> {
+  let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(totp_key);
+  let okm = prk.expand(&[HKDF_INFO], HkdfAesKey)?;
+  let mut key = [0u8; 32];
+  okm.fill(&mut key)?;
+  Ok(key)
+}
+
+/// Legacy derivation (bare `SHA256(totp_key)`): decrypt-only fallback for
+/// version-1 blobs written before the HKDF migration.
+fn derive_key_legacy(totp_key: &[u8]) -> [u8; 32] {
   let digest = Sha256::digest(totp_key);
   let mut key = [0u8; 32];
   key.copy_from_slice(&digest);
   key
+}
+
+/// `ring::hkdf` output-length marker for a 256-bit AES key.
+struct HkdfAesKey;
+
+impl hkdf::KeyType for HkdfAesKey {
+  fn len(&self) -> usize {
+    32
+  }
 }
 
 /// Lowercase hex encoding of raw bytes.

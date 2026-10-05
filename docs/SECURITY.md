@@ -56,13 +56,16 @@ class, or runtime setting).
 | Application-level RCE in a parser (form bodies, DPoP/JAR/`private_key_jwt` JWTs, DCR JSON, `jwks_uri`/`request_uri` fetches) | `#![forbid(unsafe_code)]`, no `unwrap`/`panic` in request paths, rustls/ring (no OpenSSL), fuzz targets for token-form/DCR-JSON/JAR-claims | Fuzzing is not exhaustive. |
 | Dependency / supply-chain compromise | Committed `Cargo.lock`, `cargo deny`/`cargo audit` in CI, SBOM + provenance + keyless cosign, digest-pinned bases | A zero-day in a trusted crate. |
 | Container escape via kernel or runtime bug | Non-root UID 65532, read-only root filesystem, all capabilities dropped, `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault` | A kernel LPE or runc bug, mitigated but not eliminated. |
-| Secret exfiltration from the process environment | Secrets are injected at runtime, not baked into image layers; the pepper/TOTP key live outside the database | An attacker with code execution reads env vars directly (see `docs/TODO.md` item 7). |
+| Secret exfiltration from the process environment | Secrets are injected at runtime, not baked into image layers; the pepper/TOTP key live outside the database; the Deployment mounts the pepper and TOTP key as `0400` tmpfs files under `/run/secrets` and reads them through `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, so no key material enters the environment | `database-url` and `redis-url` are still `secretKeyRef` environment values; an attacker with code execution reads those. |
 | Exposed management surface | The plaintext health listener (8081) is unauthenticated but not published in the Service (only 8080 is) | A misconfigured Service/Ingress could expose it; it must never be internet-facing. |
 | Host access via mounted volumes | `/certs` is mounted read-only at mode `0400`; no Docker socket is mounted | Operator misconfiguration. |
-| Image/registry compromise | Digest pinning and cosign verification in CI | The base manifest still uses a mutable `:latest` tag that CI rewrites to a digest before rollout (see `docs/TODO.md` item 8). |
+| Unrestricted pod egress (SSRF to metadata, exfiltration) | `networkpolicy.yaml` default-denies egress except DNS (53 to `kube-system`) and Postgres/Redis (5432/6379), with link-local `169.254.0.0/16` excluded; ingress is limited to pod ports 8080/8081 | Enforcement depends on a NetworkPolicy-capable CNI; a cluster that ignores NetworkPolicy gets no benefit. |
+| Kubernetes API access from the pod | `automountServiceAccountToken: false`; the binary never calls the API | A future feature that needs the API would have to re-enable it deliberately. |
+| Image/registry compromise | Digest pinning, cosign verification, and a committed digest reference with no shippable `:latest`; CI writes the signed build digest into `kustomization.yaml` | A registry compromise before the digest is recorded still ships; the pin step must run. |
 
-Last reviewed: 2026-10-04. The mitigations to close the residual risks are
-tracked in `docs/TODO.md`.
+Last reviewed: 2026-10-04. File-mounted key material, digest pinning,
+NetworkPolicy, and `automountServiceAccountToken: false` are implemented in
+the shipped manifests; the remaining mitigations are tracked in `docs/TODO.md`.
 
 ## Toplevel rules
 
@@ -274,6 +277,60 @@ security rationale and checklist.
 5. Preserve logs. The `X-Request-Id` header correlates a request to its logs;
    audit events never contain a secret.
 
+### Full-database-disclosure blast radius
+
+A full dump is worse than one leaked token: it exposes the whole directory and
+every hash or ciphertext at once. The token pepper and the TOTP encryption key
+are supplied outside the database (environment variable or mounted file), so a
+pure dump does not carry them; treat them as compromised anyway unless the key
+store can be shown untouched.
+
+| Dumped class | Protection at rest | What the dump yields |
+| --- | --- | --- |
+| User passwords | Argon2id PHC, salted | Offline cracking only. |
+| Client secrets | Argon2id PHC | Offline cracking only. |
+| TOTP secrets | AES-256-GCM under HKDF-SHA256 (info `totp-gcm-v2`; pre-migration v1 blobs under bare `SHA256(totp_key)` still decrypt) | Readable only if the TOTP key also leaks. |
+| TOTP recovery codes | Argon2id PHC | Offline cracking only. |
+| DCR registration access tokens | Keyed HMAC (`registration_access_token_hash`) | Opaque while the pepper stays outside the dump. |
+| Emails, client names, contacts, redirect URIs, scopes, entitlements | Plaintext | Full disclosure. |
+| Client public keys (`jwks`) | Plaintext | Public by design. |
+| `tls_client_auth_subject_dn` and certificate thumbprints | Plaintext | Identifier disclosure. |
+| `is_admin`, `disabled`, `must_change_password`, timestamps | Plaintext | Metadata disclosure. |
+
+If the key store leaked too, the dump is a full compromise: TOTP secrets
+decrypt, the Argon2id hashes are the only barrier left on passwords and client
+secrets, and registration-access-token hashes can be recomputed. Respond in the
+order below.
+
+### Full-database-disclosure rotation order
+
+Rotate in this order. Each step retires a class of credential the dump already
+exposed; do not skip ahead because a later step looks cheaper.
+
+1. **Token pepper first.** Make a new pepper active and remove the old key id.
+   Removing the old id kills every live opaque access and refresh token, so
+   every grant is forced back through authentication. This is the only step
+   that retires tokens the dump cannot reconstruct. Retain the old id only to
+   keep live tokens verifying, which is the opposite of what a breach response
+   wants; a full disclosure drops it.
+2. **TOTP encryption key second.** Make a new key active. Existing TOTP blobs
+   stay readable only while the old key is retained; once it is removed every
+   user must re-enroll. Re-enroll with `user enroll-totp` before the old key is
+   dropped, or the user cannot complete TOTP.
+3. **Client secrets third.** Rotate every confidential client secret through
+   RFC 7592 `PUT /register/{client_id}`, which mints a fresh secret when the
+   method is secret-based and returns it once.
+4. **DCR registration tokens last.** The same `PUT /register/{client_id}` call
+   rotates the registration access token on every update, and the response
+   carries the only copy. Do not re-issue DCR tokens by replaying an
+   initial-access token; it is single-use and consumed at registration.
+
+The seven security endpoints stay fail-closed throughout. A Postgres or Redis
+outage while responding returns `503 temporarily_unavailable` with
+`Retry-After: 1`, never a fail-open success; do not relax the policy to keep
+service up mid-rotation. The operator checklist with concrete commands is in
+[RUNBOOK.md](../RUNBOOK.md).
+
 ## Edge cases
 
 - A Redis flush loses ephemeral tokens but not clients, users, scopes, or
@@ -298,4 +355,4 @@ security rationale and checklist.
 - `src/config/policy.rs` for the fail-closed policy.
 - `src/middleware/` for redaction, rate limiting, and security headers.
 - `src/cli/admin.rs` for bootstrap.
-- `RUNBOOK.md` for the operator bootstrap procedure.
+- `RUNBOOK.md` for the operator runbook (admin bootstrap, full-database-disclosure response).

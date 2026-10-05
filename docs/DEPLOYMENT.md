@@ -218,7 +218,9 @@ A correct Deployment has these properties:
 - Stateless replicas, three or more. Every replica shares the same external
   Postgres and Redis, so no replica holds state another needs.
 - `runAsNonRoot`, `runAsUser: 65532`, `readOnlyRootFilesystem`, a
-  `seccompProfile` of `RuntimeDefault`, and `capabilities.drop: ["ALL"]`.
+  `seccompProfile` of `RuntimeDefault`, `capabilities.drop: ["ALL"]`, and
+  `automountServiceAccountToken: false`: the server never calls the Kubernetes
+  API, so the projected service-account token would be pure attack surface.
 - Resource requests and limits.
 - A `startupProbe` and `livenessProbe` on `/health/live`, and a
   `readinessProbe` on `/health/ready`, all an HTTP GET against the plaintext
@@ -229,7 +231,14 @@ A correct Deployment has these properties:
 - A `PodDisruptionBudget` with `minAvailable: 2`, and
   `topologySpreadConstraints` so replicas spread across nodes.
 - A `Service`, a `ConfigMap` for non-secret settings, and a `Secret` for
-  secret material. Secrets are mounted or injected, never baked into the image.
+  secret material. Secrets are mounted or injected, never baked into the
+  image. The token pepper and TOTP key are file-mounted under `/run/secrets`
+  (see below), not injected into the environment.
+- A `NetworkPolicy` that default-denies pod egress except DNS, Postgres, and
+  Redis, and admits ingress only on the two pod ports (see below).
+- A digest-pinned image reference. The release pipeline replaces the committed
+  placeholder digest in `kustomization.yaml` with the signed build digest;
+  `:latest` is never a shippable reference.
 - Client-CA material mounted read-only if in-process mTLS is used.
 
 ### Migrations run once
@@ -242,6 +251,51 @@ migration that is not yet in `_sqlx_migrations` reports not ready.
 
 Migrations must be expand/contract so version N-1 and N replicas serve during a
 rollout. See [DATABASE.md](DATABASE.md).
+
+### Secret material as files
+
+The Deployment does not put the token pepper or the TOTP encryption key in the
+environment. It projects the two keys of the `d-oauth-secrets` Secret into a
+tmpfs volume at `/run/secrets`, `defaultMode: 0400`, with the pod's `fsGroup`
+set to `65532`, and points the loader at them:
+
+```text
+D_OAUTH_TOKEN_PEPPER_FILE=/run/secrets/token-pepper
+D_OAUTH_TOTP_ENCRYPTION_KEY_FILE=/run/secrets/totp-encryption-key
+```
+
+Only the runtime user/group can read the files, so the key material never
+appears in `/proc/self/environ`, in child processes, in `docker inspect` /
+`kubectl describe` output, or in a crash dump. `database.url` and `redis.url`
+are still `secretKeyRef` environment values; prefer `database.password_file`
+where the deployment can split the credential from the URL. The inline
+`D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` forms remain supported
+and take precedence when both are set (`src/config/build.rs`), so an existing
+environment-based deployment still starts; the shipped manifests deliberately
+never set them. The migrate Job mounts the same files. To rotate, replace the
+Secret and roll the replicas; see [CONFIGURATION.md](CONFIGURATION.md).
+
+### Network policy
+
+`networkpolicy.yaml` selects pods labeled
+`app.kubernetes.io/name: d-oauth-server` (the app replicas and the migrate Job)
+and enables both `Ingress` and `Egress` policy types, which makes it a
+default-deny for those pods on any CNI that enforces NetworkPolicy (Calico,
+Cilium, and similar). A CNI that ignores NetworkPolicy gets no benefit from the
+manifest; verify the cluster CNI applies it.
+
+- Egress admits DNS to the `kube-system` namespace on port 53 (UDP and TCP)
+  and the Postgres (5432) and Redis (6379) ports to any address except
+  `169.254.0.0/16`. The link-local exclusion means a cloud metadata endpoint
+  such as `169.254.169.254` can never be reached, closing the SSRF-to-metadata
+  and arbitrary-exfiltration paths.
+- Ingress admits only the public TLS port (8080) and the plaintext health port
+  (8081). The Service still publishes only 8080.
+- If Postgres and Redis run in-cluster behind known labels, tighten the
+  port-scoped `ipBlock` to their `namespaceSelector`/`podSelector`. If CoreDNS
+  runs outside `kube-system`, adjust the DNS rule. A gateway in another
+  namespace is still admitted because the ingress rule constrains ports, not
+  sources.
 
 ### Multi-replica validation
 
@@ -302,6 +356,10 @@ The image pipeline is gated on:
   surface to the binary.
 - Non-root with a read-only root filesystem.
 - Secrets and CA material are mounted, never baked into the image or manifests.
+- The token pepper and TOTP key are `0400` tmpfs files, not environment
+  variables, and the pod carries no service-account token.
+- A NetworkPolicy default-denies pod egress except DNS, Postgres, and Redis,
+  and admits ingress only on the two pod ports.
 - Health routes are unreachable from the public listener, so the probe port is
   not a second API surface.
 - Liveness never touches a dependency, so a dependency outage does not trigger
@@ -316,6 +374,10 @@ The image pipeline is gated on:
   until the schema matches.
 - A replica that has no shared state is a bug: token state is in Redis, not in
   the process.
+- A CNI that does not enforce NetworkPolicy leaves pod egress unrestricted;
+  verify the cluster CNI applies the policy before relying on it.
+- Shipping the committed placeholder digest without running the release
+  pipeline fails closed: the image cannot be pulled. Run `pin-digest` first.
 
 ## Operational runbook
 
@@ -350,15 +412,19 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
   cosign signing, digest pinning of `deploy/k8s/kustomization.yaml`, and the
   weekly rebuild.
 - `deploy/k8s/` for the cluster manifests: `namespace.yaml`, `configmap.yaml`
-  (non-secret settings only), `secret.yaml` (placeholder keys, replaced by the
-  secret manager), `service.yaml` (public TLS port only, never the health
-  port), `deployment.yaml` (3 stateless replicas, probes on the plaintext
-  health listener, PDB + topology spread), `migrate-job.yaml` (exactly-once
-  schema migration, never per replica), `pdb.yaml` (`minAvailable: 2`),
-  `kustomization.yaml` (CI pins the image digest here at release), and
-  `tls-secret.example.yaml` (how to provision `/certs`, never applied).
-  No Ingress is shipped: mTLS requires L4/TCP passthrough.
+  (non-secret settings only), `secret.yaml` (placeholder keys, file-mounted by
+  the workloads and replaced by the secret manager), `service.yaml` (public
+  TLS port only, never the health port), `deployment.yaml` (3 stateless
+  replicas, probes on the plaintext health listener, PDB + topology spread,
+  `automountServiceAccountToken: false`, pepper/TOTP file mounts),
+  `migrate-job.yaml` (exactly-once schema migration, never per replica),
+  `networkpolicy.yaml` (default-deny egress except DNS/Postgres/Redis, ingress
+  to the two pod ports), `pdb.yaml` (`minAvailable: 2`), `kustomization.yaml`
+  (committed placeholder digest; the release pipeline pins the real image
+  digest here), and `tls-secret.example.yaml` (how to provision `/certs`,
+  never applied). No Ingress is shipped: mTLS requires L4/TCP passthrough.
 - `compose.yaml` for the local 3-replica proof (one Postgres + one Redis,
-  one-shot `migrate`, random host ports so `--scale app=3` never collides).
+  one-shot `migrate`, file-mounted dev secrets under `/run/secrets`, random
+  host ports so `--scale app=3` never collides).
 - `scripts/check_manifests.py` for the manifest policy lint, including the
   L7-ingress-with-client-cert-auth rejection.

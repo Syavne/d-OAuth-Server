@@ -19,7 +19,7 @@ is the full accounting.
 | --- | --- | --- |
 | User passwords | Argon2id PHC, salted (`src/db/user_repo.rs`) | Offline cracking only. |
 | Client secrets | Argon2id PHC (`src/db/client_repo.rs`) | Offline cracking only. |
-| TOTP secrets | AES-256-GCM under `SHA256(totp_key)` (`src/crypto/totp.rs`) | Safe only if the key is not in the dump. |
+| TOTP secrets | AES-256-GCM under HKDF-SHA256 (`src/crypto/totp.rs`, info `totp-gcm-v2`; pre-migration v1 blobs under bare `SHA256(totp_key)` still decrypt) | Safe only if the key is not in the dump. |
 | TOTP recovery codes | Argon2id PHC (`src/db/user_repo/totp.rs`) | Offline cracking only. |
 | DCR registration access tokens | Keyed HMAC hash (`src/db/client_repo.rs`) | Safe; the pepper is not in the database. |
 | Emails, client names, contacts, redirect URIs, scopes, entitlements | Plaintext | Full disclosure. |
@@ -51,17 +51,7 @@ list is deliberately short and ordered by value.
 - **Files.** `src/db/user_repo.rs`, `src/db/client_repo.rs`,
   `src/db/redirect_repo.rs`, `src/keys.rs`, `migrations/`.
 
-### 2. Strengthen TOTP key derivation
-
-- **Risk.** The TOTP encryption key is derived with a bare `SHA256(totp_key)`
-  (`src/crypto/totp.rs`) and no KDF stretching. If the key file leaks alongside
-  the dump, every TOTP secret falls immediately. A low-entropy passphrase is
-  cheap to brute-force when a single hash is all that stands in the way.
-- **Proposed change.** Derive the AES key with Argon2id or HKDF from a
-  high-entropy key, so a leaked passphrase costs an attacker real work.
-- **Files.** `src/crypto/totp.rs`, `src/cli/secret.rs`.
-
-### 3. Envelope encryption with per-row DEKs
+### 2. Envelope encryption with per-row DEKs
 
 - **Risk.** One static key encrypts every TOTP secret. There is no per-row data
   key, so there is no way to rotate the master key without re-encrypting the
@@ -70,28 +60,17 @@ list is deliberately short and ordered by value.
   key, which makes rotation incremental and limits a single leak's blast radius.
 - **Files.** `src/crypto/totp.rs`, `src/keys.rs`.
 
-### 4. KMS/HSM-backed master key
+### 3. KMS/HSM-backed master key
 
-- **Risk.** The master keys are plain environment variables or files. Where they
-  are stored, who can read them, and whether they ever end up in the same backup
-  as the database is undocumented and unenforced.
+- **Risk.** The master keys live in environment variables, files, or a
+  secrets manager, but nothing enforces where they are stored or keeps them
+  out of the same backup as the database.
 - **Proposed change.** Document, and optionally support, a master key held in a
   KMS or HSM. At a minimum, document the hard requirement that the key never
   lives with the database backup.
 - **Files.** `src/config/`, `docs/DEPLOYMENT.md`, `docs/SECURITY.md`.
 
-### 5. Breach-response runbook
-
-- **Risk.** There is no documented procedure for what to rotate after a dump, or
-  in what order. The [SECURITY.md](SECURITY.md) operational runbook covers an
-  incident in general terms but not a full database disclosure.
-- **Proposed change.** Document the blast radius and the rotation order: rotate
-  the token pepper first so all opaque tokens die, then rotate the TOTP key so
-  users re-enroll, then rotate client secrets, then rotate DCR registration
-  tokens.
-- **Files.** `docs/SECURITY.md`, `RUNBOOK.md`.
-
-### 6. Database access hardening
+### 4. Database access hardening
 
 - **Risk.** There is no tamper-evidence or audit trail for database access, and
   no guidance on encrypted backups or Postgres-level encryption such as TDE or
@@ -117,50 +96,14 @@ the mitigations to implement.
 
 ### Mitigations to plan and implement
 
-### 7. Move secrets from environment variables to files
-
-- **Risk.** Environment variables are readable by the process
-  (`/proc/self/environ`), appear in `docker inspect`, are inherited by children,
-  and leak into logs and crash dumps; an attacker with code execution reads the
-  token pepper and TOTP key directly.
-- **Proposed change.** Mount the pepper and TOTP key as files (tmpfs, mode
-  `0400`, owned by 65532) and use the already-supported
-  `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` variables
-  (`src/config/raw.rs`, `src/config/build.rs`).
-- **Files.** `deploy/k8s/deployment.yaml`, `deploy/k8s/secret.yaml`,
-  `compose.yaml`, `docs/DEPLOYMENT.md`, `docs/CONFIGURATION.md`.
-
-### 8. Pin the image by digest in the committed manifest
-
-- **Risk.** The base manifest uses a mutable `:latest` tag with
-  `imagePullPolicy: IfNotPresent`; a compromised registry tag could be pulled if
-  the CI digest-rewrite step does not run.
-- **Proposed change.** Commit the digest-pinned image reference.
-- **Files.** `deploy/k8s/deployment.yaml`, `deploy/k8s/kustomization.yaml`.
-
-### 9. Add a NetworkPolicy
-
-- **Risk.** Unrestricted pod egress allows SSRF-to-metadata and data
-  exfiltration.
-- **Proposed change.** Restrict egress to Postgres and Redis only, and ingress
-  to the Service.
-- **Files.** `deploy/k8s/` (new `networkpolicy.yaml`), `docs/DEPLOYMENT.md`.
-
-### 10. Disable the service-account token
-
-- **Risk.** The app never calls the Kubernetes API, so the auto-mounted service
-  account token is pure attack surface.
-- **Proposed change.** Set `automountServiceAccountToken: false` on the pod.
-- **Files.** `deploy/k8s/deployment.yaml`.
-
-### 11. Strengthen runtime isolation
+### 5. Strengthen runtime isolation
 
 - **Risk.** A kernel or runtime escape is possible after code execution.
 - **Proposed change.** Consider a sandboxed runtime class (gVisor/Kata) and a
   custom seccomp allowlist instead of `RuntimeDefault`.
 - **Files.** `deploy/k8s/deployment.yaml`, `docs/DEPLOYMENT.md`.
 
-### 12. Continuous fuzzing and dependency review
+### 6. Continuous fuzzing and dependency review
 
 - **Risk.** CI-only fuzzing and `cargo deny` do not catch a zero-day in a
   trusted crate.
@@ -168,7 +111,7 @@ the mitigations to implement.
   `cargo vet`/`cargo crev` review.
 - **Files.** `.github/workflows/`, `fuzz/`, `deny.toml`.
 
-### 13. Restrict and audit container exec
+### 7. Restrict and audit container exec
 
 - **Risk.** `docker exec` / `kubectl exec` into the running container bypasses
   every image control.
@@ -179,23 +122,18 @@ the mitigations to implement.
 
 Ranked by value against effort:
 
-- **High value, low effort:** items 1, 2, 5.
-- **Medium:** items 3, 4.
-- **Lower, mostly operational:** item 6.
-- **Container/host hardening:** items 7, 8, 9, 10 are high value and low effort;
-  items 11, 12, 13 are medium/operational.
+- **Medium:** items 1, 2, 3. Item 1 is medium/high effort because it needs a
+  migration plus a blind index with uniqueness and rotation handling.
+- **Lower, mostly operational:** item 4.
+- **Container/host hardening:** items 5, 6, 7 are medium/operational.
 
-Recommendation: implement 1, 2, 5, 7, 8, 9, and 10 first. Item 1 closes the
-largest plaintext disclosure, item 2 removes an easy offline win if the key file
-leaks, item 5 is mostly writing down a procedure the team already needs, and
-items 7 through 10 are high-value, low-effort container and host controls.
+Recommendation: implement item 1 next. It closes the largest plaintext
+disclosure; items 2 and 3 then reduce the cost of a future key compromise.
 
 ## Open questions
 
-- Is the token pepper and TOTP key supplied through environment variables,
-  mounted files, or a secrets manager in the target deployment? This decides
-  whether envelope encryption (item 3) is worth building at all.
 - Should PII encryption (item 1) be mandatory or gated behind configuration?
-- Should the pepper and TOTP key move to file-based secrets now, or wait for the
-  envelope-encryption work (item 3)?
+- Is the token pepper and TOTP key held in mounted files or a secrets manager
+  in the target deployment? This decides whether envelope encryption (item 2)
+  is worth building at all.
 - Is a sandboxed runtime class (gVisor/Kata) available in the target cluster?

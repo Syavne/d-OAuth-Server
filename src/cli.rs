@@ -298,7 +298,7 @@ pub enum ClientCommand {
 pub enum ConfigCommand {
   /// Apply a declarative file idempotently (scopes, redirect URIs, entitlements).
   Sync {
-    /// YAML/JSON declarative file.
+    /// JSON declarative file.
     #[arg(long, value_name = "PATH")]
     file: PathBuf,
   },
