@@ -323,27 +323,57 @@ default-deny for those pods on any CNI that enforces NetworkPolicy (Calico,
 Cilium, and similar). A CNI that ignores NetworkPolicy gets no benefit from the
 manifest; verify the cluster CNI applies it.
 
-- Egress admits DNS to the `kube-system` namespace on port 53 (UDP and TCP)
-  and the Postgres (5432) and Redis (6379) ports to any address except
-  `169.254.0.0/16`. The link-local exclusion means a cloud metadata endpoint
-  such as `169.254.169.254` can never be reached, closing the SSRF-to-metadata
-  and arbitrary-exfiltration paths.
+- Egress admits DNS to the `kube-system` namespace on port 53 (UDP and TCP) and
+  Postgres (5432) and Redis (6379) scoped to the namespace that hosts them —
+  `d-oauth` in the reference deployment, matching the ConfigMap DSNs
+  (`*.d-oauth.svc.cluster.local`). It carries no `ipBlock: 0.0.0.0/0` peer, so
+  neither port is an exfiltration channel to an arbitrary internet host;
+  `scripts/check_manifests.py` rejects one if it is reintroduced.
+- Tightening further: AND a `podSelector` for the database/cache pod labels into
+  the same `to` entry to admit only those pods rather than their whole namespace
+  (a whole-namespace selector is the portable choice across CNIs; a
+  `podSelector` is tighter but depends on the CNI resolving a Service backend
+  for egress policy).
+- A managed database outside the cluster cannot be named by a selector. Give its
+  private endpoint a specific `ipBlock` CIDR (never `0.0.0.0/0`) or, on a CNI
+  with FQDN policy (Cilium `toFQDNs`), the DNS name. Every `ipBlock` peer must
+  exclude `169.254.0.0/16` so the cloud metadata endpoint (`169.254.169.254`)
+  can never be reached.
 - Ingress admits only the public TLS port (8080) and the plaintext health port
   (8081). The Service still publishes only 8080.
-- If Postgres and Redis run in-cluster behind known labels, tighten the
-  port-scoped `ipBlock` to their `namespaceSelector`/`podSelector`. If CoreDNS
-  runs outside `kube-system`, adjust the DNS rule. A gateway in another
-  namespace is still admitted because the ingress rule constrains ports, not
-  sources.
+- If the data services run in another namespace, point the egress selector at
+  it. If CoreDNS runs outside `kube-system`, adjust the DNS rule. A gateway in
+  another namespace is still admitted because the ingress rule constrains
+  ports, not sources.
 
 The policy deliberately denies outbound HTTPS (443). The JAR `request_uri`
-fetch (`src/jose/jar/fetch.rs`) retrieves a pre-registered request object from
-a publicly routable HTTPS host, so it cannot reach its target under the shipped
-default-deny. A deployment that relies on remote request objects must add a
-scoped egress rule to that specific host on 443 — never a blanket 443
-allowance, which would restore arbitrary exfiltration. A deployment that does
-not can leave the default-deny in place and treat remote `request_uri` as
-unavailable. The tension is recorded in [TODO.md](TODO.md).
+fetch (`src/jose/jar/fetch.rs`) retrieves a pre-registered request object from a
+publicly routable HTTPS host, so remote request objects are unavailable under
+the shipped default-deny and the fetch fails closed with
+`invalid_request_object`. A deployment that relies on them must allow the
+specific request-object host on 443 — but base Kubernetes `NetworkPolicy`
+cannot name a hostname, so this needs a CNI with FQDN policy (Cilium) or an
+egress proxy/gateway; a blanket 443 allowance is never correct, because it
+restores arbitrary exfiltration. On Cilium, an additive policy such as:
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: d-oauth-request-uri
+  namespace: d-oauth
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: d-oauth-server
+  egress:
+    - toFQDNs:
+        - matchName: request-objects.example.com
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+```
 
 ### Database access and backups
 
@@ -466,8 +496,9 @@ The image pipeline is gated on:
   rootfs, no capabilities, and no shell, but still bypass the application's own
   auth; restrict `pods/exec` with RBAC and audit it (see
   [OPERATIONS.md](OPERATIONS.md)).
-- A NetworkPolicy default-denies pod egress except DNS, Postgres, and Redis,
-  and admits ingress only on the two pod ports.
+- A NetworkPolicy default-denies pod egress except DNS and the namespace
+  hosting Postgres/Redis scoped to ports 5432/6379, forbids an internet-wide
+  `0.0.0.0/0` peer, and admits ingress only on the two pod ports.
 - Health routes are unreachable from the public listener, so the probe port is
   not a second API surface.
 - Liveness never touches a dependency, so a dependency outage does not trigger
@@ -527,8 +558,9 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
   probes on the plaintext health listener, PDB + topology spread,
   `automountServiceAccountToken: false`, every secret file-mounted),
   `migrate-job.yaml` (exactly-once schema migration, never per replica),
-  `networkpolicy.yaml` (default-deny egress except DNS/Postgres/Redis, ingress
-  to the two pod ports), `pdb.yaml` (`minAvailable: 2`), `kustomization.yaml`
+  `networkpolicy.yaml` (default-deny egress except DNS + Postgres/Redis scoped
+  to their namespace, no `0.0.0.0/0` peer; ingress to the two pod ports),
+  `pdb.yaml` (`minAvailable: 2`), `kustomization.yaml`
   (committed placeholder digest; the release pipeline pins the real image
   digest here), and `tls-secret.example.yaml` (how to provision `/certs`,
   never applied). No Ingress is shipped: mTLS requires L4/TCP passthrough.

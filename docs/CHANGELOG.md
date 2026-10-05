@@ -40,8 +40,11 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   `0400` tmpfs files under `/run/secrets` (read through
   `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, mirrored
   in `compose.yaml`), the image reference is digest-pinned, a NetworkPolicy
-  default-denies pod egress except DNS plus Postgres/Redis, and
-  `automountServiceAccountToken` is `false`.
+  default-denies pod egress except DNS plus Postgres/Redis scoped to their
+  namespace (no internet-wide `0.0.0.0/0` peer; `scripts/check_manifests.py`
+  rejects one), and `automountServiceAccountToken` is `false`. Remote JAR
+  `request_uri` is documented as unsupported under the default-deny, with the
+  Cilium FQDN opt-in path in `docs/DEPLOYMENT.md`.
 
 ### Changed
 

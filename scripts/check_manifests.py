@@ -25,9 +25,10 @@ contract WITHOUT a live cluster:
   may embed a password (it belongs in the Secret, read through the
   `*_PASSWORD_FILE` form).
 - NetworkPolicy: must select `app.kubernetes.io/name: d-oauth-server`, enable
-  `Ingress` + `Egress`, admit ingress only on 8080/8081, and allow egress only
-  on 53 (DNS), 5432 (Postgres), and 6379 (Redis) with `169.254.0.0/16`
-  excluded (cloud metadata).
+  `Ingress` + `Egress`, admit ingress only on 8080/8081, allow egress only on
+  53 (DNS), 5432 (Postgres), and 6379 (Redis), forbid an internet-wide
+  `0.0.0.0/0` egress peer, and require any `ipBlock` peer to exclude
+  `169.254.0.0/16` (cloud metadata).
 - No baked secrets: no PEM blocks in manifests; `REPLACE_ME` placeholders
   only inside `secret.yaml`; no secret-shaped keys in the ConfigMap.
 - L7-vs-L4 mTLS constraint: an L7 Ingress that terminates TLS while
@@ -48,6 +49,7 @@ requires every workload image to be digest-pinned (`@sha256:<64 hex>`).
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import re
 import sys
 from pathlib import Path
@@ -284,6 +286,20 @@ def policy_ports(rule: dict) -> set[int]:
   return ports
 
 
+def ip_network_contains(cidr: str, inner: str) -> bool:
+  try:
+    outer = ipaddress.ip_network(cidr)
+    sub = ipaddress.ip_network(inner)
+  except ValueError:
+    return False
+  if outer.version != sub.version:
+    return False
+  return (
+    int(sub.network_address) >= int(outer.network_address)
+    and int(sub.broadcast_address) <= int(outer.broadcast_address)
+  )
+
+
 def check_networkpolicy(doc: dict, fails: Failures) -> None:
   """Item 9: default-deny ingress/egress for the app pods."""
   name = doc.get("metadata", {}).get("name", "?")
@@ -306,22 +322,30 @@ def check_networkpolicy(doc: dict, fails: Failures) -> None:
       f"{PUBLIC_PORT} and {HEALTH_PORT}"
     )
   egress_ports: set[int] = set()
-  metadata_excluded = False
   for rule in spec.get("egress") or []:
     if not isinstance(rule, dict):
       continue
     egress_ports |= policy_ports(rule)
     for peer in rule.get("to") or []:
       block = (peer or {}).get("ipBlock") or {}
-      if METADATA_CIDR in (block.get("except") or []):
-        metadata_excluded = True
+      cidr = block.get("cidr")
+      if not cidr:
+        continue
+      if cidr in ("0.0.0.0/0", "::/0"):
+        fails.add(
+          f"networkpolicy/{name}: egress peer {cidr} is internet-wide; scope "
+          "Postgres/Redis to a namespace/pod selector or a specific CIDR"
+        )
+      elif ip_network_contains(cidr, METADATA_CIDR) and METADATA_CIDR not in (
+        block.get("except") or []
+      ):
+        fails.add(
+          f"networkpolicy/{name}: egress ipBlock {cidr} must exclude "
+          f"{METADATA_CIDR} (cloud metadata)"
+        )
   for port in REQUIRED_EGRESS_PORTS:
     if port not in egress_ports:
       fails.add(f"networkpolicy/{name}: egress must allow port {port}")
-  if not metadata_excluded:
-    fails.add(
-      f"networkpolicy/{name}: egress must exclude {METADATA_CIDR} (cloud metadata)"
-    )
 
 
 def check_deployment(doc: dict, fails: Failures, strict_digest: bool) -> None:

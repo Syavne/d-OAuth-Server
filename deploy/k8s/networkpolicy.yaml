@@ -9,10 +9,18 @@
 # - DNS only, to the `kube-system` namespace on port 53 (UDP + TCP). Adjust if
 #   CoreDNS runs elsewhere; NodeLocal DNSCache also lives in `kube-system`, so
 #   it is covered.
-# - Postgres (5432) and Redis (6379) anywhere else, with link-local
-#   `169.254.0.0/16` excluded so the cloud metadata endpoint
-#   (`169.254.169.254`) can never be reached. If Postgres/Redis run in-cluster,
-#   tighten the port-scoped `ipBlock` to their namespace/pod selector.
+# - Postgres (5432) and Redis (6379) scoped to the namespace that hosts them.
+#   The reference ConfigMap DSNs point at `*.d-oauth.svc.cluster.local`, so the
+#   default selects the `d-oauth` namespace. There is deliberately NO
+#   `ipBlock: 0.0.0.0/0` peer: that would leave both ports as an exfiltration
+#   channel to any internet host. Point the selector at the data namespace if
+#   it differs, and AND in a `podSelector` for their labels to admit only the
+#   database and cache pods rather than the whole namespace.
+# - A managed database outside the cluster cannot be named by a selector. Give
+#   its private endpoint a specific `ipBlock` CIDR (never `0.0.0.0/0`) or, on a
+#   CNI with FQDN policy (Cilium `toFQDNs`), the DNS name. Every `ipBlock` peer
+#   must exclude `169.254.0.0/16` so the cloud metadata endpoint
+#   (`169.254.169.254`) can never be reached.
 # - Everything else, including the Kubernetes API and arbitrary HTTPS
 #   exfiltration, is denied. The app never calls the API and runs with
 #   `automountServiceAccountToken: false`.
@@ -54,12 +62,13 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # Postgres + Redis ports only; link-local (metadata) excluded.
+    # Postgres + Redis, scoped to their namespace (the reference deployment
+    # runs the data services alongside the app in `d-oauth`). No internet-wide
+    # `ipBlock`: these ports are not an exfiltration channel.
     - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 169.254.0.0/16
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: d-oauth
       ports:
         - port: 5432
           protocol: TCP

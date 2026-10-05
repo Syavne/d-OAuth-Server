@@ -36,4 +36,4 @@ images:
 # Ingress while `D_OAUTH_TLS__CLIENT_CA_PATH` is set fails
 # `scripts/check_manifests.py`. See docs/DEPLOYMENT.md. Pod egress and ingress
 # are constrained by `networkpolicy.yaml` (default-deny egress except DNS +
-# Postgres + Redis).
+# Postgres/Redis scoped to their namespace).

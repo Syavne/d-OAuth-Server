@@ -313,6 +313,10 @@ Reference: RFC 9101 §4.1 and §5.2, RFC 9126 §2 and §3.
 - A `request_uri` is a one-time, client-bound PAR handle or an exactly
   pre-registered URI. It is fetched only with the SSRF guard: https only, no
   redirects, global IPs only, size and time capped.
+- A remote (pre-registered, non-PAR) `request_uri` is fetched over outbound
+  HTTPS, which the shipped cluster network policy default-denies. It is
+  available only when the deployment adds a scoped egress allowance for the
+  specific host; see [DEPLOYMENT.md](DEPLOYMENT.md#network-policy).
 
 ## Security properties
 
