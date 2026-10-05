@@ -171,6 +171,53 @@ Reference: RFC 9126, RFC 9101.
 - There is no authorization-server JWT-signing key and no `jwks_uri`. The
   `keygen` command emits keys for test fixtures and client-side DPoP only.
 
+## Master key custody
+
+- The token pepper and the TOTP-encryption key are the server's master keys.
+  They live in the versioned `KeyRing` (`src/keys.rs`), loaded once at startup
+  from configuration. Nothing re-reads or fetches them later.
+- **Hard requirement.** A master key must never be stored in Postgres, captured
+  in the same backup or restore as Postgres, baked into an image layer, placed
+  in a ConfigMap, or injected into the process environment by the shipped
+  manifests. A database dump plus its backup must not yield either key.
+- Losing the token pepper invalidates every live opaque access and refresh
+  token, because only keyed HMAC hashes are persisted and the pepper is the
+  HMAC key.
+- The real config surface is small: inline `token_pepper` /
+  `totp_encryption_key`, or the mounted-file forms `token_pepper_file` /
+  `totp_encryption_key_file`. When both are set the inline value wins
+  (`resolve_secret` in `src/config/build.rs`). The key ids default to `v1`
+  through `token_pepper_id` / `totp_key_id` (`src/config/raw.rs`).
+- The shipped cluster manifests never use the inline or environment forms: the
+  Secret file-mounts the keys `0400` on a tmpfs volume at `/run/secrets`, and
+  the loader reads them through `D_OAUTH_TOKEN_PEPPER_FILE` /
+  `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` (`deploy/k8s/secret.yaml`,
+  `deploy/k8s/configmap.yaml`). The ConfigMap carries only non-secret settings.
+- **The server does not talk to a KMS or an HSM.** It has no cloud SDK and no
+  key-fetch code path. Sourcing a key from a KMS/HSM or a secret manager is the
+  deployment's responsibility; this section is a documented contract, not an
+  implemented feature.
+
+Custody, in order of preference:
+
+- **Preferred.** The key is held in a KMS/HSM or a secret manager that never
+  co-locates the key with the database backup: cloud KMS, Vault Transit, or a
+  PKCS#11 HSM.
+- **Acceptable.** A secret manager writes a `0400` tmpfs file that the server
+  reads through its `*_FILE` key. This is what the shipped manifests expect.
+- **Forbidden.** The key is in the database, in a database backup, in an image
+  layer, in the ConfigMap, or in the process environment of the shipped
+  manifests.
+
+Custody and rotation interact. Retain the old pepper key id for at least the
+refresh lifetime, or live tokens stop verifying; retain the old TOTP key id
+only long enough to re-enroll users, then drop it. The full order is above; a
+rotation that removes an id early is a deliberate invalidation of what that key
+protects.
+
+The operator procedure for custody and KMS/HSM sourcing lives in
+[DEPLOYMENT.md](DEPLOYMENT.md#master-key-custody-and-kmshsm).
+
 ## Fail-closed policy
 
 The seven security endpoints (`authorize`, `token`, `introspect`, `revoke`,

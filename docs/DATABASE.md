@@ -181,6 +181,93 @@ during the rollout. Do not do it.
 - Foreign keys with `ON DELETE CASCADE` keep the join tables consistent, and a
   scope referenced by `user_scopes` is disabled rather than deleted.
 
+## Access hardening
+
+This section records the controls an operator can put around the database. The
+server does not create, ship, or enforce any of them; each is a deployment
+choice. What the server does do is connect with one role and store secrets
+hashed or encrypted, as described in [Security properties](#security-properties).
+
+### Risk baseline: no application audit trail
+
+The schema tables above are domain state. None is an audit log, and the server
+writes no per-access row outside them, so a reader of the schema can run a
+`SELECT` or a `COPY ... TO` and leave nothing behind in the database. A dump is
+silent by construction. Tamper-evidence has to come from PostgreSQL and the
+operator's logging, not from an application table.
+
+### Least privilege
+
+`database.url` (`src/config/db.rs`) carries a single DSN, so by default the
+server connects with one role for both migrations and runtime. Two separate
+roles reduce the blast radius:
+
+| Role | Privileges | Used by |
+| --- | --- | --- |
+| Migration role | Owns the schema and holds the `citext` privilege. `CREATE EXTENSION IF NOT EXISTS citext` needs superuser or trusted-extension rights, so this role must have them (see [The citext extension](#the-citext-extension)). | `migrate` |
+| Runtime role | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the six domain tables, plus read access to `_sqlx_migrations`. No DDL and no superuser. | `serve` |
+
+The migration role runs once per release; the runtime role is the only one the
+long-lived replicas hold. The server neither creates nor enforces roles. An
+operator grants them and points each subcommand's DSN at the right one.
+
+### Connection and transport
+
+- Production requires `sslmode=verify-full` with a pinned CA
+  (`database.root_cert_path`, `/certs/db-ca.crt`); validation fails closed at
+  startup if it is missing.
+- Prefer a private network or a unix socket and keep the Postgres listener off
+  the public internet. The shipped manifest uses the in-cluster Service DNS
+  name, not an external endpoint.
+- Passwords are file-mounted rather than embedded in the DSN
+  (`deploy/k8s/secret.yaml`).
+
+### Audit and tamper-evidence
+
+- `pgaudit` with, for example, `pgaudit.log = 'write,ddl,role'` records the
+  statements that matter here: data changes, schema changes, and role changes.
+- `log_connections` and `log_disconnections`, plus `log_statement = 'ddl'`,
+  capture who connected and when.
+- Ship Postgres logs to a separate append-only or central store, so a dump
+  cannot also erase its own record.
+- Alert on `pg_dump`, `COPY ... TO`, and any role or permission change.
+- WAL archiving (`archive_mode`) gives a durable, append-only record of every
+  change and lets a restore reach a point in time.
+
+The server contributes no audit rows of its own, so coverage depends entirely on
+the Postgres configuration and the operator's log pipeline.
+
+### Encrypted backups
+
+- `pg_dump`, `pg_basebackup`, and pgBackRest output must be encrypted at rest.
+- Custody the backup key separately from the database, and never co-locate it
+  with the master keys ([SECURITY.md](SECURITY.md#master-key-custody)).
+- Store backups off-site and test restores.
+- A backup is a full copy of the plaintext PII columns exactly as a live dump
+  is, so it carries the same disclosure risk and needs the same handling.
+
+### Postgres-level encryption
+
+Three layers, complementary rather than substitutes:
+
+| Layer | Scope | Protects against | State here |
+| --- | --- | --- | --- |
+| Disk/volume encryption | Cloud EBS/PD or filesystem | Stolen or mislaid media | Operator choice, not shipped |
+| TDE (`pg_tde`) | Whole database files | Stolen data files at rest | Where the engine supports it, not shipped |
+| `pgcrypto` | Selected columns | A dump of those columns | An alternative, not the current implementation |
+
+The application already does its own crypto before a row is written: passwords
+and client secrets are Argon2id PHC, and TOTP secrets are AES-256-GCM under
+HKDF-SHA256 (`src/crypto/totp.rs`). `pgcrypto` is an alternative for the
+plaintext PII columns, but it moves key custody into the SQL path and is not
+used today.
+
+### See also
+
+- [DEPLOYMENT.md](DEPLOYMENT.md#database-access-and-backups) for the connection,
+  TLS, and backup runbook.
+- [SECURITY.md](SECURITY.md#master-key-custody) for key custody.
+
 ## Edge cases
 
 - Deleting a scope or redirect URI that is still referenced does not cascade

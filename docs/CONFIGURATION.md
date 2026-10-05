@@ -145,6 +145,15 @@ server refuses to start. The shipped cluster manifests set
 `D_OAUTH_TOKEN_PEPPER_FILE` and `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` rather than
 the inline keys; see [DEPLOYMENT.md](DEPLOYMENT.md).
 
+These two values are the server's master keys and are supplied entirely by the
+deployment. There is a hard custody requirement that they never live in the
+database or in the same backup as the database; a KMS/HSM or a secret manager
+should hold them and inject them through a `*_FILE` path. The server has no
+built-in KMS integration and never fetches a key itself. The full contract and
+the forbidden locations are in
+[SECURITY.md](SECURITY.md#master-key-custody); the operator procedure is in
+[DEPLOYMENT.md](DEPLOYMENT.md#master-key-custody-and-kmshsm).
+
 ## Failure policy keys
 
 Security endpoints are always fail-closed. Setting `open` on any of them is a

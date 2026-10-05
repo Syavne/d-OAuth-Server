@@ -2,9 +2,10 @@
 
 This is a backlog of deferred hardening work. Each item is a candidate to be
 planned and implemented later; none of them is a current defect that makes the
-server unusable. The items came out of a threat-model review that asked one
-question: if an attacker walks off with a full dump of the PostgreSQL database,
-what can they still read or crack, and what should we do about it?
+server unusable. The items came out of a threat-model review that asked two
+questions: what an attacker can still read or crack from a full dump of the
+PostgreSQL database, and what an attacker already inside the image's trust
+boundary can reach.
 
 This document only records the gaps. It does not describe anything that is
 already implemented, and it does not propose code changes here.
@@ -60,24 +61,6 @@ list is deliberately short and ordered by value.
   key, which makes rotation incremental and limits a single leak's blast radius.
 - **Files.** `src/crypto/totp.rs`, `src/keys.rs`.
 
-### 3. KMS/HSM-backed master key
-
-- **Risk.** The master keys live in environment variables, files, or a
-  secrets manager, but nothing enforces where they are stored or keeps them
-  out of the same backup as the database.
-- **Proposed change.** Document, and optionally support, a master key held in a
-  KMS or HSM. At a minimum, document the hard requirement that the key never
-  lives with the database backup.
-- **Files.** `src/config/`, `docs/DEPLOYMENT.md`, `docs/SECURITY.md`.
-
-### 4. Database access hardening
-
-- **Risk.** There is no tamper-evidence or audit trail for database access, and
-  no guidance on encrypted backups or Postgres-level encryption such as TDE or
-  `pgcrypto`. A dump could be taken by a read-only job and leave no trace.
-- **Proposed change.** Document the controls and, where they fit, implement them.
-- **Files.** `docs/DATABASE.md`, `docs/DEPLOYMENT.md`.
-
 ## Container and host hardening
 
 The attack surface and the controls already in place are documented in
@@ -86,7 +69,7 @@ It answers a second threat-model question: if an attacker is already inside the
 image's trust boundary, how could they reach the container or the host, and how
 should we reduce that risk? The remaining vectors are narrow.
 
-### 5. NetworkPolicy versus remote `request_uri`
+### 3. NetworkPolicy versus remote `request_uri`
 
 - **Risk.** The default-deny egress blocks outbound HTTPS, so the JAR
   `request_uri` fetch (`src/jose/jar/fetch.rs`) cannot reach a publicly routable
@@ -98,7 +81,7 @@ should we reduce that risk? The remaining vectors are narrow.
   option because it restores arbitrary exfiltration.
 - **Files.** `deploy/k8s/networkpolicy.yaml`, `docs/DEPLOYMENT.md`.
 
-### 6. Narrow Postgres/Redis egress to their destination
+### 4. Narrow Postgres/Redis egress to their destination
 
 - **Risk.** `networkpolicy.yaml` allows egress to *any* address on ports 5432 and
   6379 (link-local excluded), so those ports are an exfiltration channel to an
@@ -113,14 +96,13 @@ should we reduce that risk? The remaining vectors are narrow.
 
 Ranked by value against effort:
 
-- **Medium:** items 1, 2, 3. Item 1 is medium/high effort because it needs a
+- **Medium:** items 1 and 2. Item 1 is medium/high effort because it needs a
   migration plus a blind index with uniqueness and rotation handling.
-- **Lower, mostly operational:** item 4.
-- **Container/host hardening:** item 5 is the concrete correctness risk; item 6
+- **Container/host hardening:** item 3 is the concrete correctness risk; item 4
   is the egress-narrowing follow-up.
 
 Recommendation: implement item 1 next. It closes the largest plaintext
-disclosure; items 2 and 3 then reduce the cost of a future key compromise.
+disclosure; item 2 then reduces the cost of a future key compromise.
 
 ## Open questions
 
@@ -129,6 +111,6 @@ disclosure; items 2 and 3 then reduce the cost of a future key compromise.
   in the target deployment? This decides whether envelope encryption (item 2)
   is worth building at all.
 - Which target environments rely on remote JAR `request_uri` objects? This
-  decides whether item 5 needs a scoped egress rule or only documentation.
-- Do Postgres and Redis run in-cluster? This decides whether item 6 can narrow
+  decides whether item 3 needs a scoped egress rule or only documentation.
+- Do Postgres and Redis run in-cluster? This decides whether item 4 can narrow
   egress to their namespace/selector.

@@ -284,6 +284,36 @@ The migrate Job mounts the same files. To rotate a password, update it in
 Postgres/Redis and the Secret together, then roll the replicas; see
 [CONFIGURATION.md](CONFIGURATION.md) and [OPERATIONS.md](OPERATIONS.md).
 
+### Master key custody and KMS/HSM
+
+The token pepper and the TOTP-encryption key are the server's master keys. The
+binary never fetches a key and carries no cloud KMS or HSM SDK; it reads the
+material from `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`
+(or the inline forms), so custody is entirely the deployment's responsibility.
+Treat this as a hard requirement, not a preference:
+
+- **Never co-locate the key with the database.** The keys must not live in a
+  Postgres table, in the database backup, or in any archive that also carries a
+  dump. A dump plus its backup must not yield them.
+- **Never bake the key into the image or the ConfigMap.** The shipped manifests
+  keep only placeholder keys in `secret.yaml` and mount them `0400` on tmpfs at
+  `/run/secrets`; a secret-shaped key in `configmap.yaml` or a PEM in any
+  manifest is rejected by `scripts/check_manifests.py`.
+- **Prefer a KMS/HSM or a secret manager.** A key held in a cloud KMS
+  (AWS KMS, GCP KMS, Azure Key Vault), Vault Transit, or a PKCS#11 HSM is the
+  strongest option; a secret manager (external-secrets, sealed-secrets, Vault
+  agent) that projects the value to a `0400` tmpfs file is the acceptable
+  minimum. Either way the value reaches the process only through the `*_FILE`
+  path and never through the environment.
+- **Keep the backup key separate too.** If the database backup is encrypted, its
+  key is a second secret and is custodied under the same rule, apart from the
+  backup it protects.
+
+Rotation keeps the chain honest: retaining the old pepper key id is what lets
+live tokens verify until they expire, and retaining the old TOTP key id is only
+long enough to re-enroll users. The full contract, the forbidden locations, and
+the reasoning are in [SECURITY.md](SECURITY.md#master-key-custody).
+
 ### Network policy
 
 `networkpolicy.yaml` selects pods labeled
@@ -314,6 +344,45 @@ scoped egress rule to that specific host on 443 — never a blanket 443
 allowance, which would restore arbitrary exfiltration. A deployment that does
 not can leave the default-deny in place and treat remote `request_uri` as
 unavailable. The tension is recorded in [TODO.md](TODO.md).
+
+### Database access and backups
+
+The schema is plaintext PII plus hashed or encrypted secrets, so the database
+and every copy of it are in scope for the full-disclosure threat model. The
+server opens one DSN as one role; it does not create roles, audit rows, or
+encrypted backups, so those controls live with the operator. Apply at least:
+
+- **Separate the roles.** Run migrations as a schema-owning role that holds the
+  `citext` privilege the `users` migration needs, and run replicas as a runtime
+  role limited to `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the six tables — no
+  DDL, no superuser. The migration Job and the Deployment can then use different
+  credentials.
+- **Encrypt the transport and pin the CA.** Production requires
+  `sslmode=verify-full` with `database.root_cert_path` pointed at the Postgres
+  CA (`/certs/db-ca.crt` in the shipped ConfigMap). Keep the listener on a
+  private network or a unix socket, never the public internet.
+- **Make access auditable and tamper-evident.** Enable `pgaudit`
+  (`pgaudit.log = 'write,ddl,role'`), `log_connections`, `log_disconnections`,
+  and `log_statement = 'ddl'`; ship the log stream to an append-only or central
+  store the database role cannot rewrite; enable WAL archiving (`archive_mode`)
+  as a durable record; and alert on `pg_dump`, `COPY TO`, and role or
+  permission changes. A read-only dump otherwise leaves no trace.
+- **Encrypt the backups and their keys.** `pg_dump`, `pg_basebackup`, and
+  pgBackRest output must be encrypted at rest, stored off-site, and restore
+  tested. The backup is a full copy of the plaintext PII columns, so treat it
+  exactly like a live dump; the backup key is custodied separately and never
+  with the database (see
+  [SECURITY.md](SECURITY.md#master-key-custody)).
+- **Consider Postgres-level encryption.** Disk or volume encryption (cloud
+  EBS/PD or a filesystem layer) protects stolen media; `pg_tde` or an engine's
+  TDE protects the data files; `pgcrypto` can encrypt selected PII columns at
+  the SQL layer. The application already encrypts TOTP secrets with AES-256-GCM
+  and hashes passwords and client secrets with Argon2id, so `pgcrypto` is an
+  alternative, not the current design, and it moves key custody into the SQL
+  path.
+
+The controls, the privilege split, and the `pgcrypto` trade-off are described in
+[DATABASE.md](DATABASE.md#access-hardening).
 
 ### Multi-replica validation
 
