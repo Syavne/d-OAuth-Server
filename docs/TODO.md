@@ -80,43 +80,34 @@ list is deliberately short and ordered by value.
 
 ## Container and host hardening
 
-The attack surface and the existing controls are documented in
-[SECURITY.md](SECURITY.md); this section lists only the mitigations to close the
-residual risks.
+The attack surface and the controls already in place are documented in
+[SECURITY.md](SECURITY.md); this section lists only the mitigations that remain.
+It answers a second threat-model question: if an attacker is already inside the
+image's trust boundary, how could they reach the container or the host, and how
+should we reduce that risk? The remaining vectors are narrow.
 
-This section covers a second threat-model question: if an attacker is already
-inside the image's trust boundary, how could they reach the container or the
-host, and how should we reduce that risk? The image is already hardened: it runs
-as non-root UID 65532, uses a read-only root filesystem, drops all capabilities,
-sets `allowPrivilegeEscalation: false` and `seccompProfile: RuntimeDefault`,
-ships no shell, builds a static musl binary from digest-pinned bases, and
-produces an SBOM, provenance, and a cosign signature in CI. The remaining vectors
-are therefore narrow, and none of them is a current defect. This section lists
-the mitigations to implement.
+### 5. NetworkPolicy versus remote `request_uri`
 
-### Mitigations to plan and implement
+- **Risk.** The default-deny egress blocks outbound HTTPS, so the JAR
+  `request_uri` fetch (`src/jose/jar/fetch.rs`) cannot reach a publicly routable
+  request-object host. A deployment either relies on a feature that silently
+  fails, or loosens egress further than intended.
+- **Proposed change.** Decide per deployment: allow the specific request-object
+  host on 443 with a scoped rule, or document that remote `request_uri` is
+  unavailable under the shipped policy. A blanket 443 allowance is not an
+  option because it restores arbitrary exfiltration.
+- **Files.** `deploy/k8s/networkpolicy.yaml`, `docs/DEPLOYMENT.md`.
 
-### 5. Strengthen runtime isolation
+### 6. Narrow Postgres/Redis egress to their destination
 
-- **Risk.** A kernel or runtime escape is possible after code execution.
-- **Proposed change.** Consider a sandboxed runtime class (gVisor/Kata) and a
-  custom seccomp allowlist instead of `RuntimeDefault`.
-- **Files.** `deploy/k8s/deployment.yaml`, `docs/DEPLOYMENT.md`.
-
-### 6. Continuous fuzzing and dependency review
-
-- **Risk.** CI-only fuzzing and `cargo deny` do not catch a zero-day in a
-  trusted crate.
-- **Proposed change.** Run the fuzz targets continuously and add
-  `cargo vet`/`cargo crev` review.
-- **Files.** `.github/workflows/`, `fuzz/`, `deny.toml`.
-
-### 7. Restrict and audit container exec
-
-- **Risk.** `docker exec` / `kubectl exec` into the running container bypasses
-  every image control.
-- **Proposed change.** Restrict who may exec and audit it.
-- **Files.** `docs/OPERATIONS.md`, `docs/DEPLOYMENT.md`.
+- **Risk.** `networkpolicy.yaml` allows egress to *any* address on ports 5432 and
+  6379 (link-local excluded), so those ports are an exfiltration channel to an
+  arbitrary internet host, not only the database and cache.
+- **Proposed change.** Where Postgres and Redis run in-cluster, replace the
+  `ipBlock: 0.0.0.0/0` peer with their `namespaceSelector`/`podSelector` so only
+  the real endpoints are reachable; keep a port-scoped rule only for an external
+  managed database.
+- **Files.** `deploy/k8s/networkpolicy.yaml`, `docs/DEPLOYMENT.md`.
 
 ## Priority
 
@@ -125,7 +116,8 @@ Ranked by value against effort:
 - **Medium:** items 1, 2, 3. Item 1 is medium/high effort because it needs a
   migration plus a blind index with uniqueness and rotation handling.
 - **Lower, mostly operational:** item 4.
-- **Container/host hardening:** items 5, 6, 7 are medium/operational.
+- **Container/host hardening:** item 5 is the concrete correctness risk; item 6
+  is the egress-narrowing follow-up.
 
 Recommendation: implement item 1 next. It closes the largest plaintext
 disclosure; items 2 and 3 then reduce the cost of a future key compromise.
@@ -136,4 +128,7 @@ disclosure; items 2 and 3 then reduce the cost of a future key compromise.
 - Is the token pepper and TOTP key held in mounted files or a secrets manager
   in the target deployment? This decides whether envelope encryption (item 2)
   is worth building at all.
-- Is a sandboxed runtime class (gVisor/Kata) available in the target cluster?
+- Which target environments rely on remote JAR `request_uri` objects? This
+  decides whether item 5 needs a scoped egress rule or only documentation.
+- Do Postgres and Redis run in-cluster? This decides whether item 6 can narrow
+  egress to their namespace/selector.

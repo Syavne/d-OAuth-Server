@@ -91,6 +91,9 @@ Production requires `sslmode=verify-full` in `database.url` unless
 | `database.require_verify_full` | `true` |
 
 `max_connections` must be greater than zero and at least `min_connections`.
+`database.root_cert_path` (or `sslrootcert` in the URL) is required in practice
+for `sslmode=verify-full` unless the server certificate chains to a system root;
+the cluster ConfigMap pins `/certs/db-ca.crt`.
 
 ## Redis keys
 
@@ -123,7 +126,8 @@ none, is rejected as ambiguous.
 
 Durability must match the topology. Single node requires `waitaof` or
 `appendfsync_always`; replicated topologies require `wait`. A mismatch is
-rejected.
+rejected. `redis.password_file` holds the raw password and is applied to the
+connection directly, so it may contain any bytes (no URL encoding required).
 
 ## Key-ring keys
 

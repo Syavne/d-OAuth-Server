@@ -103,6 +103,56 @@ async fn health_single_uses_password_from_config() -> TestResult {
   Ok(())
 }
 
+/// Single node with a URL-significant AUTH password: the mounted-file
+/// password is applied programmatically, so `/ ? # % @ :` never misroute.
+#[tokio::test]
+async fn health_redis_single_password_special_chars_connects() -> TestResult {
+  let secret = "p/a?s#s%e@c:d";
+  let (_pg, pg_url) = postgres_container().await?;
+  let (_redis, redis_url) = redis_single_container(Some(secret)).await?;
+  let pw_path = std::env::temp_dir().join("d-oauth-health-redis-pw-special.txt");
+  std::fs::write(&pw_path, format!("{secret}\n"))
+    .map_err(|_| TestError::Body("pw write".into()))?;
+  let redis_block = serde_json::json!({
+    "url": redis_url,
+    "durability": "waitaof",
+    "aof_required": false,
+    "password_file": pw_path.to_string_lossy(),
+  });
+  let config = test_config(&pg_url, redis_block)?;
+  let state = AppState::connect(Arc::new(config)).await?;
+  mark_migrated(&state).await?;
+  let (ready_status, _) = get_health(&state, "/health/ready").await?;
+  assert_eq!(ready_status, 200);
+  let _ = std::fs::remove_file(&pw_path);
+  Ok(())
+}
+
+/// Single node where the URL carries userinfo but no password: the
+/// mounted-file password must still be applied, never silently dropped.
+#[tokio::test]
+async fn health_redis_single_password_userinfo_url_connects() -> TestResult {
+  let secret = "health-redis-pw-userinfo-4d1";
+  let (_pg, pg_url) = postgres_container().await?;
+  let (_redis, redis_url) = redis_single_container(Some(secret)).await?;
+  let userinfo_url = redis_url.replacen("://", "://default@", 1);
+  let pw_path = std::env::temp_dir().join("d-oauth-health-redis-pw-userinfo.txt");
+  std::fs::write(&pw_path, format!("{secret}\n"))
+    .map_err(|_| TestError::Body("pw write".into()))?;
+  let redis_block = serde_json::json!({
+    "url": userinfo_url,
+    "durability": "waitaof",
+    "aof_required": false,
+    "password_file": pw_path.to_string_lossy(),
+  });
+  let config = test_config(&pg_url, redis_block)?;
+  let state = AppState::connect(Arc::new(config)).await?;
+  mark_migrated(&state).await?;
+  let (ready_status, _) = get_health(&state, "/health/ready").await?;
+  assert_eq!(ready_status, 200);
+  let _ = std::fs::remove_file(&pw_path);
+  Ok(())
+}
 /// Start a Sentinel pair: `master` serves data, `sentinel` monitors it.
 /// Returns the guards plus the sentinel bridge address.
 async fn sentinel_pair() -> Result<(ContainerGuard, ContainerGuard, String), TestError> {

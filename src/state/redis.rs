@@ -18,7 +18,7 @@
 use std::fmt;
 
 use redis::{
-  AsyncConnectionConfig, Client, RedisFuture, Value,
+  AsyncConnectionConfig, Client, ConnectionInfo, IntoConnectionInfo, RedisFuture, Value,
   aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig},
   cluster::ClusterClientBuilder,
   cluster_async::ClusterConnection,
@@ -90,30 +90,34 @@ impl ConnectionLike for RedisConn {
   }
 }
 
-/// Inject `cfg.password` (mounted secret file) into a bare `redis://` URL.
+/// Apply `cfg.password` (mounted secret file) to a bare `redis://` URL.
 ///
-/// Passwords containing URL-significant bytes must already be percent-encoded
-/// in the URL itself; this only handles the common alphanumeric-secret case.
-fn single_url(url: &secrecy::SecretString, password: Option<&secrecy::SecretString>) -> String {
-  let url = url.expose_secret().to_owned();
-  let Some(password) = password else {
-    return url;
-  };
-  if url.contains('@') {
-    return url;
+/// The URL is parsed into a [`ConnectionInfo`] first and the password is set
+/// programmatically, so the secret never passes through URL string
+/// interpolation: any password bytes are safe (no percent-encoding needed),
+/// and a `Some` password is always applied even when the URL already carries
+/// userinfo without a password.
+fn single_connection_info(
+  url: &secrecy::SecretString,
+  password: Option<&secrecy::SecretString>,
+) -> Result<ConnectionInfo, redis::RedisError> {
+  let mut info: ConnectionInfo = url.expose_secret().into_connection_info()?;
+  if let Some(password) = password {
+    let redis_settings = info
+      .redis_settings()
+      .clone()
+      .set_password(password.expose_secret());
+    info = info.set_redis_settings(redis_settings);
   }
-  match url.split_once("://") {
-    Some((scheme, rest)) => format!("{scheme}://:{}@{rest}", password.expose_secret()),
-    None => url,
-  }
+  Ok(info)
 }
 
 async fn connect_single(
   config: &RedisConfig,
   url: &secrecy::SecretString,
 ) -> Result<RedisConn, StateError> {
-  let url = single_url(url, config.password.as_ref());
-  let client = Client::open(url.as_str()).map_err(StateError::Redis)?;
+  let info = single_connection_info(url, config.password.as_ref()).map_err(StateError::Redis)?;
+  let client = Client::open(info).map_err(StateError::Redis)?;
   let manager_config = ConnectionManagerConfig::new()
     .set_number_of_retries(config.retry_budget as usize)
     .set_min_delay(config.retry_min_delay)

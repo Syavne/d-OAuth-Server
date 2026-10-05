@@ -42,7 +42,7 @@ fn has_explicit_sslmode(url: &str) -> bool {
 }
 
 /// Build `PgConnectOptions` from [`DbConfig`] without opening connections.
-fn connect_options(
+pub(crate) fn connect_options(
   db: &DbConfig,
   environment: Environment,
 ) -> Result<PgConnectOptions, StateError> {

@@ -8,7 +8,6 @@
 
 use std::{io::Read as _, path::Path, sync::Arc};
 
-use secrecy::ExposeSecret as _;
 use sqlx::PgPool;
 
 use crate::config::Config;
@@ -108,11 +107,12 @@ impl Context {
 /// Returns [`CliError::Database`] when the pool cannot connect.
 pub async fn open_pool(config: &Config) -> Result<PgPool, CliError> {
   let db = &config.database;
+  let options = crate::state::connect_options(db, config.environment)?;
   let pool = sqlx::postgres::PgPoolOptions::new()
     .max_connections(db.max_connections)
     .min_connections(0)
     .acquire_timeout(db.acquire_timeout)
-    .connect(db.url.expose_secret())
+    .connect_with(options)
     .await?;
   Ok(pool)
 }

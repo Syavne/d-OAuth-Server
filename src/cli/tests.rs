@@ -677,3 +677,38 @@ fn admin_bootstrap_runbook_matches_cli() -> Result<(), TestError> {
   }
   Ok(())
 }
+
+/// `open_pool` must honor the mounted database password: a passwordless DSN
+/// plus `password_file` connects (the cluster migrate-Job contract).
+#[tokio::test]
+async fn open_pool_uses_mounted_database_password() -> Result<(), TestError> {
+  let (_postgres, pg_url) = test_support::postgres_container().await?;
+  let user_prefix = "postgres://postgres";
+  let user_end = user_prefix.len();
+  assert!(pg_url.starts_with(&format!("{user_prefix}:")));
+  let at = pg_url
+    .find('@')
+    .ok_or(TestError::Missing("container url carries userinfo"))?;
+  let password = pg_url[user_end + 1..at].to_owned();
+  let passwordless = format!("{}{}", &pg_url[..user_end], &pg_url[at..]);
+  let pw_path = std::env::temp_dir().join(format!(
+    "d-oauth-cli-open-pool-pw-{}.txt",
+    uuid::Uuid::new_v4()
+  ));
+  std::fs::write(&pw_path, format!("{password}\n"))?;
+  let fixture = serde_json::json!({
+    "issuer": "https://auth.example.test",
+    "environment": "development",
+    "tls": {"cert_path": "/tmp/cli-test-cert.pem", "key_path": "/tmp/cli-test-key.pem"},
+    "database": {"url": passwordless, "password_file": pw_path.to_string_lossy()},
+    "redis": {"url": "redis://127.0.0.1:6379", "durability": "waitaof"},
+    "token_pepper": "cli-test-pepper-0123456789abcdef",
+    "totp_encryption_key": "cli-test-totp-key-0123456789abcdef",
+  });
+  let source = ::config::Config::try_from(&fixture)?;
+  let config = Config::from_source(source)?;
+  let pool = super::context::open_pool(&config).await?;
+  sqlx::query("SELECT 1").execute(&pool).await?;
+  let _ = std::fs::remove_file(&pw_path);
+  Ok(())
+}

@@ -12,11 +12,18 @@ contract WITHOUT a live cluster:
 - Migration Job: exactly one, runs `migrate`, `restartPolicy: Never`.
 - PDB: `minAvailable: 2`.
 - Service: never exposes the health port (8081).
-- Hardening: `automountServiceAccountToken: false` and `fsGroup: 65532`; the
-  token pepper and TOTP key must be file-mounted from `d-oauth-secrets` at
-  `/run/secrets` (`defaultMode: 0400`) and referenced with
-  `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`; the inline
-  `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` envs FAIL.
+- Hardening: `automountServiceAccountToken: false` and `fsGroup: 65532`; every
+  secret (token pepper, TOTP key, database and Redis passwords) must be
+  file-mounted from `d-oauth-secrets` at `/run/secrets` (`defaultMode: 0400`)
+  and referenced with its `*_FILE` variable; the inline
+  `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` envs FAIL, and any
+  workload env that injects a secret FAILS (`secretKeyRef`, `envFrom.secretRef`,
+  a literal value embedding a DSN password, or a workload redefinition of
+  `D_OAUTH_DATABASE__URL` / `D_OAUTH_REDIS__URL`).
+- ConfigMap: the ConfigMap referenced by a workload `envFrom` must provide the
+  passwordless `D_OAUTH_DATABASE__URL` / `D_OAUTH_REDIS__URL` DSNs, and neither
+  may embed a password (it belongs in the Secret, read through the
+  `*_PASSWORD_FILE` form).
 - NetworkPolicy: must select `app.kubernetes.io/name: d-oauth-server`, enable
   `Ingress` + `Egress`, admit ingress only on 8080/8081, and allow egress only
   on 53 (DNS), 5432 (Postgres), and 6379 (Redis) with `169.254.0.0/16`
@@ -54,6 +61,8 @@ SECRET_NAME_RE = re.compile(r"(?i)(pepper|password|secret|private[_-]?key|totp)"
 PEM_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|-----BEGIN CERTIFICATE-----")
 DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
 HIGH_ENTROPY_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=_-]{32,}$")
+# A DSN that carries `user:password@` (or `:password@`) embeds a credential.
+EMBEDDED_PASSWORD_RE = re.compile(r"://[^/@?#]*:[^/@?#]*@")
 
 CLIENT_CERT_ANNOTATIONS = (
   "nginx.ingress.kubernetes.io/auth-tls-verify-client",
@@ -69,8 +78,11 @@ SECRET_VOLUME_MODE = 0o400
 FILE_SECRET_ENV_KEYS = {
   "D_OAUTH_TOKEN_PEPPER_FILE": "token-pepper",
   "D_OAUTH_TOTP_ENCRYPTION_KEY_FILE": "totp-encryption-key",
+  "D_OAUTH_DATABASE__PASSWORD_FILE": "database-password",
+  "D_OAUTH_REDIS__PASSWORD_FILE": "redis-password",
 }
 INLINE_SECRET_ENVS = ("D_OAUTH_TOKEN_PEPPER", "D_OAUTH_TOTP_ENCRYPTION_KEY")
+PASSWORDLESS_DSN_KEYS = ("D_OAUTH_DATABASE__URL", "D_OAUTH_REDIS__URL")
 REQUIRED_EGRESS_PORTS = (53, 5432, 6379)
 METADATA_CIDR = "169.254.0.0/16"
 
@@ -122,13 +134,39 @@ def check_pem_and_placeholders(docs: list[dict], fails: Failures) -> None:
       fails.add(f"{src}: placeholder belongs only in secret.yaml")
 
 
-def check_configmap(doc: dict, fails: Failures) -> None:
+def check_configmap(doc: dict, fails: Failures, requires_dsn: bool) -> None:
   data = doc.get("data") or {}
   for key in data:
     if SECRET_NAME_RE.search(key):
       fails.add(f"configmap: secret-shaped key {key!r} must live in the Secret")
-  if (data.get("D_OAUTH_TLS__CLIENT_CA_PATH") or "").strip():
-    pass  # mTLS on: L7 check below becomes load-bearing.
+  if not requires_dsn:
+    return
+  for key in PASSWORDLESS_DSN_KEYS:
+    value = (data.get(key) or "").strip()
+    if not value:
+      fails.add(
+        f"configmap: {key} is required; the workloads take the DSN from here "
+        "and the password from the mounted *_PASSWORD_FILE"
+      )
+    elif EMBEDDED_PASSWORD_RE.search(value):
+      fails.add(
+        f"configmap: {key} must not embed a password; move it to the Secret "
+        "and use the *_PASSWORD_FILE form"
+      )
+
+
+def referenced_configmaps(docs: list[dict]) -> set[str]:
+  """Names of ConfigMaps any workload pulls into the environment via `envFrom`."""
+  names: set[str] = set()
+  for kind in ("Deployment", "Job"):
+    for doc in by_kind(docs, kind):
+      tpl = (doc.get("spec") or {}).get("template", {}).get("spec", {})
+      for container in tpl.get("containers") or []:
+        for ref in container.get("envFrom") or []:
+          name = ((ref or {}).get("configMapRef") or {}).get("name")
+          if name:
+            names.add(name)
+  return names
 
 
 def mtls_enabled(docs: list[dict]) -> bool:
@@ -172,6 +210,28 @@ def check_file_mounted_secrets(
   """Item 7: pepper/TOTP are 0400 files under /run/secrets, never inline env."""
   cname = container.get("name", "?")
   envs = env_by_name(container)
+  for ref in container.get("envFrom") or []:
+    if isinstance(ref, dict) and "secretRef" in ref:
+      fails.add(
+        f"{workload}/{cname}: envFrom.secretRef injects every secret into the "
+        "environment; mount the keys as files instead"
+      )
+  for name, entry in envs.items():
+    if "secretKeyRef" in (entry.get("valueFrom") or {}):
+      fails.add(
+        f"{workload}/{cname}: env {name} injects a secret via secretKeyRef; "
+        "mount it as a file and reference the *_FILE form"
+      )
+    if name in PASSWORDLESS_DSN_KEYS:
+      fails.add(
+        f"{workload}/{cname}: {name} must come from the ConfigMap, not the "
+        "workload env (an inline value could embed a password)"
+      )
+    value = entry.get("value")
+    if isinstance(value, str) and EMBEDDED_PASSWORD_RE.search(value):
+      fails.add(
+        f"{workload}/{cname}: env {name} embeds a password; mount it as a file"
+      )
   for inline in INLINE_SECRET_ENVS:
     if inline in envs:
       fails.add(
@@ -404,8 +464,10 @@ def main() -> int:
       fails.add(f"missing required kind: {required}")
 
   check_pem_and_placeholders(docs, fails)
+  required_dsn_configmaps = referenced_configmaps(docs)
   for doc in by_kind(docs, "ConfigMap"):
-    check_configmap(doc, fails)
+    name = (doc.get("metadata") or {}).get("name")
+    check_configmap(doc, fails, requires_dsn=name in required_dsn_configmaps)
   for doc in by_kind(docs, "Deployment"):
     check_deployment(doc, fails, args.strict_digest)
   for doc in by_kind(docs, "Job"):

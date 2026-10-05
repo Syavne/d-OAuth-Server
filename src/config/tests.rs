@@ -287,3 +287,18 @@ fn config_env_double_underscore_maps_to_nested_snake_keys() -> Result<(), Box<dy
   );
   Ok(())
 }
+
+#[test]
+fn read_secret_file_preserves_surrounding_spaces() -> Result<(), Box<dyn Error>> {
+  use secrecy::ExposeSecret as _;
+  let path = std::env::temp_dir().join(format!(
+    "d-oauth-read-secret-file-{}.txt",
+    std::process::id()
+  ));
+  std::fs::write(&path, "  spaced-secret  \n")?;
+  let secret = super::read_secret_file(Some(path.as_path()))?;
+  let _ = std::fs::remove_file(&path);
+  let secret = secret.ok_or("secret file returned None")?;
+  assert_eq!(secret.expose_secret(), "  spaced-secret  ");
+  Ok(())
+}

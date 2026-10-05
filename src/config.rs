@@ -326,7 +326,9 @@ pub(crate) fn read_secret_file(path: Option<&Path>) -> Result<Option<SecretStrin
         path: path.to_path_buf(),
         source,
       })?;
-      Ok(Some(SecretString::from(contents.trim().to_owned())))
+      Ok(Some(SecretString::from(
+        contents.trim_end_matches(['\r', '\n']).to_owned(),
+      )))
     }
   }
 }

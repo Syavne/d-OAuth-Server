@@ -21,6 +21,7 @@ mod tests_resilience;
 mod tests_topology;
 
 pub use health::health_router;
+pub(crate) use pg::connect_options;
 pub use redis::RedisConn;
 pub use sentinel::SentinelConn;
 

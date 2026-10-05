@@ -5,7 +5,8 @@
 #   fuzz-build (nightly leg inside `fuzz/`, so the pinned stable
 #   `rust-toolchain.toml` at the root is never violated).
 # Scheduled legs (not per-PR):
-#   mutants (weekly budgeted mutation run over the pure security modules).
+#   mutants (weekly budgeted mutation run over the pure security modules),
+#   fuzz-run (bounded run of every fuzz target; the per-PR leg only builds).
 #
 # Must NOT gate on miri for tokio/sqlx/redis; no lint suppressions anywhere.
 
@@ -157,6 +158,55 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Build all fuzz targets
         run: cargo fuzz build
+
+  fuzz-run:
+    name: fuzz-run
+    # Scheduled bounded fuzzing. `fuzz-build` (above) only compiles the
+    # targets per PR; this leg actually executes them, so a crash is found
+    # without a human starting it. It is bounded and scheduled, not 24/7:
+    # continuous coverage is OSS-Fuzz/ClusterFuzzLite, tracked in docs/TODO.md.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [token_form, dcr_json, jar_claims]
+    defaults:
+      run:
+        working-directory: fuzz
+    steps:
+      - uses: actions/checkout@v4
+      # `fuzz/rust-toolchain.toml` selects nightly; the root stable pin is
+      # untouched, exactly as in `fuzz-build`.
+      - name: Install cargo-fuzz (nightly)
+        run: cargo install cargo-fuzz --locked
+      # `uses` steps resolve paths from the workspace root, not the job's
+      # `working-directory`; keep the fuzz/ prefix explicit.
+      - name: Restore corpus for ${{ matrix.target }}
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }} (bounded)
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=600 -rss_limit_mb=2048
+      # Save only on success; a per-run key grows the corpus while the prefix
+      # `restore-keys` always pick the newest entry.
+      - name: Save corpus for ${{ matrix.target }}
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
 
   mutants:
     name: mutants

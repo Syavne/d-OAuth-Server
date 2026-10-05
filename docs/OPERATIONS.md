@@ -243,6 +243,12 @@ survives a Redis loss.
 - A restricted session (forced password change or missing TOTP) cannot reach
   `/authorize`, the OAuth endpoints, or admin-gated actions.
 - Secrets stay out of argv, logs, and audit events.
+- The container is non-root with a read-only rootfs and no shell, and every
+  secret is a mounted file, so `kubectl exec` / `docker exec` reads no
+  credential from the environment. Exec still bypasses the application's own
+  authorization — the binary *is* the admin CLI — so it must be restricted.
+- Grant `pods/exec` only to a break-glass role and enable Kubernetes audit
+  logging for the `pods/exec` subresource.
 
 ## Edge cases
 
@@ -264,6 +270,9 @@ survives a Redis loss.
   entitlements; `user create` for users.
 - Key rotation: overlap the pepper for at least the refresh lifetime.
 - Backup: `pg_dump` Postgres; Redis is not backed up.
+- Access: prefer running admin commands as a one-shot Job (or the local CLI
+  against the database) over `exec` into a running replica. If `exec` is
+  needed, restrict `pods/exec` to a break-glass role and audit the subresource.
 - Health: liveness `GET /health/live`, readiness `GET /health/ready` on the
   plaintext health listener.
 

@@ -230,16 +230,18 @@ A correct Deployment has these properties:
   grace budget.
 - A `PodDisruptionBudget` with `minAvailable: 2`, and
   `topologySpreadConstraints` so replicas spread across nodes.
-- A `Service`, a `ConfigMap` for non-secret settings, and a `Secret` for
-  secret material. Secrets are mounted or injected, never baked into the
-  image. The token pepper and TOTP key are file-mounted under `/run/secrets`
-  (see below), not injected into the environment.
+- A `Service`, a `ConfigMap` for non-secret settings (including the
+  passwordless DSNs), and a `Secret` for secret material. Every secret is
+  file-mounted under `/run/secrets` (see below), never injected into the
+  environment or baked into the image.
 - A `NetworkPolicy` that default-denies pod egress except DNS, Postgres, and
   Redis, and admits ingress only on the two pod ports (see below).
 - A digest-pinned image reference. The release pipeline replaces the committed
   placeholder digest in `kustomization.yaml` with the signed build digest;
   `:latest` is never a shippable reference.
-- Client-CA material mounted read-only if in-process mTLS is used.
+- Client-CA material mounted read-only if in-process mTLS is used. The Postgres
+  CA for `sslmode=verify-full` is mounted at `/certs/db-ca.crt` and pinned with
+  `database.root_cert_path` (`d-oauth-tls` also carries a `db-ca.crt` key).
 
 ### Migrations run once
 
@@ -254,26 +256,33 @@ rollout. See [DATABASE.md](DATABASE.md).
 
 ### Secret material as files
 
-The Deployment does not put the token pepper or the TOTP encryption key in the
-environment. It projects the two keys of the `d-oauth-secrets` Secret into a
-tmpfs volume at `/run/secrets`, `defaultMode: 0400`, with the pod's `fsGroup`
-set to `65532`, and points the loader at them:
+The Deployment puts no secret in the environment. It projects every key of the
+`d-oauth-secrets` Secret into a tmpfs volume at `/run/secrets`,
+`defaultMode: 0400`, with the pod's `fsGroup` set to `65532`, and points the
+loader at them:
 
 ```text
 D_OAUTH_TOKEN_PEPPER_FILE=/run/secrets/token-pepper
 D_OAUTH_TOTP_ENCRYPTION_KEY_FILE=/run/secrets/totp-encryption-key
+D_OAUTH_DATABASE__PASSWORD_FILE=/run/secrets/database-password
+D_OAUTH_REDIS__PASSWORD_FILE=/run/secrets/redis-password
 ```
 
-Only the runtime user/group can read the files, so the key material never
-appears in `/proc/self/environ`, in child processes, in `docker inspect` /
-`kubectl describe` output, or in a crash dump. `database.url` and `redis.url`
-are still `secretKeyRef` environment values; prefer `database.password_file`
-where the deployment can split the credential from the URL. The inline
-`D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` forms remain supported
-and take precedence when both are set (`src/config/build.rs`), so an existing
-environment-based deployment still starts; the shipped manifests deliberately
-never set them. The migrate Job mounts the same files. To rotate, replace the
-Secret and roll the replicas; see [CONFIGURATION.md](CONFIGURATION.md).
+The passwordless DSNs are non-secret and live in the ConfigMap
+(`D_OAUTH_DATABASE__URL` with `sslmode=verify-full` and `D_OAUTH_REDIS__URL`);
+only the passwords come from the Secret files. Only the runtime user/group can
+read the files, so no credential or key material ever appears in
+`/proc/self/environ`, in child processes, in `docker inspect` / `kubectl
+describe` output, or in a crash dump — a `kubectl exec` into the container
+reads nothing useful from the environment. `scripts/check_manifests.py` fails
+the build if a workload injects a secret through a `secretKeyRef` env, or if a
+ConfigMap DSN embeds a password. The inline `D_OAUTH_TOKEN_PEPPER` /
+`D_OAUTH_TOTP_ENCRYPTION_KEY` forms remain supported and take precedence when
+both are set (`src/config/build.rs`), so an existing environment-based
+deployment still starts; the shipped manifests deliberately never set them.
+The migrate Job mounts the same files. To rotate a password, update it in
+Postgres/Redis and the Secret together, then roll the replicas; see
+[CONFIGURATION.md](CONFIGURATION.md) and [OPERATIONS.md](OPERATIONS.md).
 
 ### Network policy
 
@@ -297,12 +306,35 @@ manifest; verify the cluster CNI applies it.
   namespace is still admitted because the ingress rule constrains ports, not
   sources.
 
+The policy deliberately denies outbound HTTPS (443). The JAR `request_uri`
+fetch (`src/jose/jar/fetch.rs`) retrieves a pre-registered request object from
+a publicly routable HTTPS host, so it cannot reach its target under the shipped
+default-deny. A deployment that relies on remote request objects must add a
+scoped egress rule to that specific host on 443 — never a blanket 443
+allowance, which would restore arbitrary exfiltration. A deployment that does
+not can leave the default-deny in place and treat remote `request_uri` as
+unavailable. The tension is recorded in [TODO.md](TODO.md).
+
 ### Multi-replica validation
 
 A local compose file is the intended way to prove shared-state behavior: three
 app replicas against one Postgres and one Redis, completing an
 authorization-code flow whose token issued by one replica is introspectable via
 another. The compose file is the local analogue of the cluster manifests.
+
+## Optional: sandboxed runtime class
+
+`RuntimeDefault` seccomp plus non-root, dropped capabilities, and a read-only
+rootfs already block most post-RCE paths. A deployment that also wants to
+contain a kernel or runtime escape can run under a sandboxed runtime class
+(gVisor or Kata Containers). The manifests do not set `runtimeClassName`
+because availability is cluster-specific: if the target cluster provides one,
+set it on the Deployment and the migrate Job and verify that the health probes
+and the Postgres/Redis connections still work under the sandboxed syscall
+surface. A custom seccomp allowlist is deliberately not shipped — maintaining
+one by hand across toolchain and dependency upgrades costs more than the
+marginal reduction over `RuntimeDefault`. This is an operational option, not a
+code change.
 
 ## Graceful shutdown
 
@@ -349,6 +381,8 @@ The image pipeline is gated on:
 - Digest pinning, with a periodic rebuild so base digests advance.
 - `cargo deny check` in CI, which enforces the ring-only TLS policy in
   `deny.toml`.
+- A per-PR fuzz build plus a scheduled bounded run of every fuzz target
+  (`.github/workflows/ci.yml`); a crash uploads its artifact and fails the run.
 
 ## Security properties
 
@@ -356,8 +390,13 @@ The image pipeline is gated on:
   surface to the binary.
 - Non-root with a read-only root filesystem.
 - Secrets and CA material are mounted, never baked into the image or manifests.
-- The token pepper and TOTP key are `0400` tmpfs files, not environment
-  variables, and the pod carries no service-account token.
+- Every secret — token pepper, TOTP key, and the database and Redis passwords —
+  is a `0400` tmpfs file, not an environment variable, and the pod carries no
+  service-account token.
+- `kubectl exec` / `docker exec` reach a non-root process with a read-only
+  rootfs, no capabilities, and no shell, but still bypass the application's own
+  auth; restrict `pods/exec` with RBAC and audit it (see
+  [OPERATIONS.md](OPERATIONS.md)).
 - A NetworkPolicy default-denies pod egress except DNS, Postgres, and Redis,
   and admits ingress only on the two pod ports.
 - Health routes are unreachable from the public listener, so the probe port is
@@ -412,11 +451,12 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
   cosign signing, digest pinning of `deploy/k8s/kustomization.yaml`, and the
   weekly rebuild.
 - `deploy/k8s/` for the cluster manifests: `namespace.yaml`, `configmap.yaml`
-  (non-secret settings only), `secret.yaml` (placeholder keys, file-mounted by
-  the workloads and replaced by the secret manager), `service.yaml` (public
-  TLS port only, never the health port), `deployment.yaml` (3 stateless
-  replicas, probes on the plaintext health listener, PDB + topology spread,
-  `automountServiceAccountToken: false`, pepper/TOTP file mounts),
+  (non-secret settings only, including the passwordless DSNs), `secret.yaml`
+  (placeholder secrets — pepper, TOTP key, database and Redis passwords — all
+  file-mounted and replaced by the secret manager), `service.yaml` (public TLS
+  port only, never the health port), `deployment.yaml` (3 stateless replicas,
+  probes on the plaintext health listener, PDB + topology spread,
+  `automountServiceAccountToken: false`, every secret file-mounted),
   `migrate-job.yaml` (exactly-once schema migration, never per replica),
   `networkpolicy.yaml` (default-deny egress except DNS/Postgres/Redis, ingress
   to the two pod ports), `pdb.yaml` (`minAvailable: 2`), `kustomization.yaml`

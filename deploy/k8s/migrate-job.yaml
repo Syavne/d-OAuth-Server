@@ -10,10 +10,11 @@
 #
 # Hardened like the Deployment: non-root 65532,
 # read-only rootfs, ALL capabilities dropped, `automountServiceAccountToken:
-# false`, and the token pepper / TOTP key mounted as 0400 tmpfs files under
-# `/run/secrets` (read through the `*_FILE` variables) instead of env vars.
-# The image carries the same placeholder digest; `pin-digest` rewrites the
-# real digest in `kustomization.yaml` for every workload.
+# false`, and every secret (token pepper, TOTP key, DB/Redis passwords) mounted
+# as 0400 tmpfs files under `/run/secrets` (read through the `*_FILE`
+# variables) instead of env vars. The image carries the same placeholder
+# digest; `pin-digest` rewrites the real digest in `kustomization.yaml` for
+# every workload.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -55,18 +56,12 @@ spec:
             - configMapRef:
                 name: d-oauth-config
           env:
-            - name: D_OAUTH_DATABASE__URL
-              valueFrom:
-                secretKeyRef:
-                  name: d-oauth-secrets
-                  key: database-url
-            - name: D_OAUTH_REDIS__URL
-              valueFrom:
-                secretKeyRef:
-                  name: d-oauth-secrets
-                  key: redis-url
-            # File-mounted key material, same pattern as the Deployment; the
-            # inline forms remain supported by `Config` but are not used here.
+            # Same file-only secret rule as the Deployment; the DSNs come from
+            # the ConfigMap.
+            - name: D_OAUTH_DATABASE__PASSWORD_FILE
+              value: /run/secrets/database-password
+            - name: D_OAUTH_REDIS__PASSWORD_FILE
+              value: /run/secrets/redis-password
             - name: D_OAUTH_TOKEN_PEPPER_FILE
               value: /run/secrets/token-pepper
             - name: D_OAUTH_TOTP_ENCRYPTION_KEY_FILE
@@ -101,6 +96,10 @@ spec:
             secretName: d-oauth-secrets
             defaultMode: 0o400
             items:
+              - key: database-password
+                path: database-password
+              - key: redis-password
+                path: redis-password
               - key: token-pepper
                 path: token-pepper
               - key: totp-encryption-key

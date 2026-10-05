@@ -2,11 +2,13 @@
 #
 # Every key maps to a `D_OAUTH_*` environment variable read by
 # `Config::load` (prefix `D_OAUTH`, nested separator `__`). Secret material
-# (database/redis URLs, token pepper, TOTP key) lives in `secret.yaml` and
-# is NEVER added here: the pepper and TOTP key are file-mounted by the
-# Deployment, and their `*_FILE` paths are declared in `deployment.yaml`,
-# not in this ConfigMap (`scripts/check_manifests.py` rejects a
-# secret-shaped key here).
+# (the database/redis passwords, token pepper, TOTP key) lives in
+# `secret.yaml` and is NEVER added here. The passwordless DSNs below are not
+# secret and live here; the workloads add the passwords from mounted files
+# (`D_OAUTH_DATABASE__PASSWORD_FILE` / `D_OAUTH_REDIS__PASSWORD_FILE`), and
+# their `*_FILE` paths are declared in `deployment.yaml`, not in this
+# ConfigMap (`scripts/check_manifests.py` rejects a secret-shaped key here and
+# a DSN with an embedded password).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,6 +22,15 @@ data:
   D_OAUTH_ENVIRONMENT: "production"
   D_OAUTH_BIND_ADDR: "0.0.0.0:8080"
   D_OAUTH_HEALTH_ADDR: "0.0.0.0:8081"
+  # Passwordless DSN. Production requires `sslmode=verify-full`; the password
+  # comes from the mounted `database-password` file. `verify-full` also needs a
+  # trusted CA: put the Postgres CA at `/certs/db-ca.crt` (a `db-ca.crt` key on
+  # the `d-oauth-tls` Secret; see tls-secret.example.yaml) and the root_cert_path
+  # below pins it. A server with a publicly-trusted certificate can drop the
+  # root_cert_path and rely on system roots instead. Edit the host/user/database
+  # for the target environment.
+  D_OAUTH_DATABASE__URL: "postgres://oauth@postgres.d-oauth.svc.cluster.local:5432/oauth?sslmode=verify-full"
+  D_OAUTH_DATABASE__ROOT_CERT_PATH: "/certs/db-ca.crt"
   D_OAUTH_TLS__CERT_PATH: "/certs/tls.crt"
   D_OAUTH_TLS__KEY_PATH: "/certs/tls.key"
   # Client-CA enables in-process mTLS verification. While set, the cluster
@@ -27,6 +38,9 @@ data:
   # terminates TLS strips the client certificate. See docs/DEPLOYMENT.md and
   # scripts/check_manifests.py, which rejects the forbidden pairing.
   D_OAUTH_TLS__CLIENT_CA_PATH: "/certs/client-ca.crt"
-  # Single-Redis topology takes a plain URL; the contract the server asserts
-  # at startup is noeviction + AOF, configured on the Redis side.
+  # Single-Redis topology takes a bare URL (no credentials; the mounted
+  # `redis-password` file is injected at connect time). The durability
+  # contract the server asserts at startup is noeviction + AOF, configured on
+  # the Redis side.
+  D_OAUTH_REDIS__URL: "redis://redis.d-oauth.svc.cluster.local:6379"
   D_OAUTH_REDIS__DURABILITY: "waitaof"

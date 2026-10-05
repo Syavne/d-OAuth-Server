@@ -15,15 +15,16 @@
 #   `automountServiceAccountToken: false` (the server never calls the
 #   Kubernetes API). `networkpolicy.yaml` default-denies pod egress except DNS
 #   + Postgres + Redis.
-# - Secret material is file-mounted, never env-injected: the token pepper and
-#   TOTP key are projected from `d-oauth-secrets` into a tmpfs volume at
-#   `/run/secrets` (`defaultMode: 0400`, group 65532 via `fsGroup`) and read
-#   through `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`.
-#   The inline `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` forms
-#   remain supported and take precedence when both are set
-#   (`src/config/build.rs`), but this deployment never sets them, so no key
-#   material enters the process environment (`/proc/self/environ`, children,
-#   crash dumps, `docker inspect`).
+# - Secret material is file-mounted, never env-injected: the token pepper,
+#   TOTP key, and the Postgres/Redis passwords are projected from
+#   `d-oauth-secrets` into a tmpfs volume at `/run/secrets` (`defaultMode:
+#   0400`, group 65532 via `fsGroup`) and read through their `*_FILE`
+#   variables. The passwordless DSNs come from the ConfigMap. The inline
+#   `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` forms remain
+#   supported and take precedence when both are set (`src/config/build.rs`),
+#   but this deployment never sets them, so no secret enters the process
+#   environment (`/proc/self/environ`, children, crash dumps, `docker
+#   inspect`) — a `kubectl exec` reads nothing from the environment.
 # - The image is digest-pinned. The all-zero digest below is a deliberate
 #   placeholder: the `pin-digest` job in `.github/workflows/supply-chain.yml`
 #   writes the real signed-build digest into the `images` entry of
@@ -90,21 +91,14 @@ spec:
             - configMapRef:
                 name: d-oauth-config
           env:
-            - name: D_OAUTH_DATABASE__URL
-              valueFrom:
-                secretKeyRef:
-                  name: d-oauth-secrets
-                  key: database-url
-            - name: D_OAUTH_REDIS__URL
-              valueFrom:
-                secretKeyRef:
-                  name: d-oauth-secrets
-                  key: redis-url
-            # File-mounted key material: the values stay
-            # in the tmpfs secret volume, never in the process environment.
-            # The inline D_OAUTH_TOKEN_PEPPER / D_OAUTH_TOTP_ENCRYPTION_KEY
-            # forms are still supported and take precedence when both are set
-            # (`src/config/build.rs`); this deployment deliberately uses files.
+            # Every secret is a file, never an env value: code execution in
+            # the container cannot read the DB/Redis credentials or key
+            # material from the environment. The DSNs (non-secret) come from
+            # the ConfigMap above.
+            - name: D_OAUTH_DATABASE__PASSWORD_FILE
+              value: /run/secrets/database-password
+            - name: D_OAUTH_REDIS__PASSWORD_FILE
+              value: /run/secrets/redis-password
             - name: D_OAUTH_TOKEN_PEPPER_FILE
               value: /run/secrets/token-pepper
             - name: D_OAUTH_TOTP_ENCRYPTION_KEY_FILE
@@ -161,15 +155,19 @@ spec:
           secret:
             secretName: d-oauth-tls
             defaultMode: 0o400
-        # tmpfs-backed secret volume. `defaultMode:
-        # 0400` plus `fsGroup: 65532` leaves the projected files readable only
-        # by the runtime user/group. Only the two key files are projected;
-        # database-url and redis-url remain env secretKeyRefs by design.
+        # tmpfs-backed secret volume. `defaultMode: 0400` plus `fsGroup:
+        # 65532` leaves the projected files readable only by the runtime
+        # user/group. Every secret is projected here; nothing is injected
+        # through a `secretKeyRef` env.
         - name: secrets
           secret:
             secretName: d-oauth-secrets
             defaultMode: 0o400
             items:
+              - key: database-password
+                path: database-password
+              - key: redis-password
+                path: redis-password
               - key: token-pepper
                 path: token-pepper
               - key: totp-encryption-key
