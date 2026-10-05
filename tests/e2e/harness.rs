@@ -1,9 +1,11 @@
 //! Shared E2E harness for the task-43 conformance + abuse suites.
 //!
 //! Every test boots the REAL production router ([`d_oauth::routes::build_router`],
-//! unmodified) over a REAL loopback TCP socket, against REAL testcontainers
-//! Postgres + Redis with the shipped migrations applied. Nothing is mocked;
-//! every assertion reads an HTTP status/header/body observed through `reqwest`.
+//! unmodified) over a REAL loopback TCP socket, against the REAL shared
+//! Postgres + Redis from `compose.test.yaml`
+//! (`docker compose -f compose.test.yaml up -d`) with the shipped migrations
+//! applied. Nothing is mocked; every assertion reads an HTTP
+//! status/header/body observed through `reqwest`.
 //!
 //! TLS termination is intentionally NOT re-proven here: the task-41
 //! `bootstrap` suite already drives mutual-TLS through the production accept
@@ -14,6 +16,12 @@
 //! (DPoP proofs, PAR pushes, device flow, introspection, revocation) is
 //! hand-rolled `reqwest` so the suite never depends on crate support the
 //! extensions do not have.
+//!
+//! Isolation: each `World` migrates a freshly created database on the shared
+//! server and uses unique Redis key prefixes, so parallel tests never share
+//! state (and never FLUSH shared state).
+//!
+//! [`Store`]: d_oauth::store::Store
 
 use std::net::SocketAddr;
 
@@ -26,86 +34,37 @@ use d_oauth::{
   state::{AppState, RedisConn, StateError},
   store::Store,
 };
-use testcontainers::{
-  ContainerAsync, GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 
-/// RAII owner of one testcontainer with synchronous removal on drop.
+// `tests/common/mod.rs` is the single definition of the shared-service
+// helpers (`pg_server_url`, `redis_url`, `unique_prefixes`); this `#[path]`
+// include (relative to `tests/e2e/`) keeps the e2e harness on the same
+// contract without duplicating it.
+#[path = "../common/mod.rs"]
+mod common;
+
+use common::{pg_server_url, redis_url, unique_prefixes};
+use sqlx::{Executor as _, postgres::PgPoolOptions};
+
+/// Placeholder guard kept so [`World`]'s shape is unchanged.
 ///
-/// Under nextest each test is its own process, so the fire-and-forget removal
-/// that `testcontainers` schedules on `Drop` never runs and the container
-/// leaks. This guard takes the container out of itself, removes it on a fresh
-/// OS thread + fresh current-thread runtime, and joins — the same pattern as
-/// the crate's `test_guard`, inlined here so this suite owns every item it
-/// compiles (no shared-module dead code, no suppressions).
+/// With shared external services there is no per-test container to guard;
+/// per-World isolation comes from a fresh database plus unique Redis key
+/// prefixes instead. The fields exist only so every existing caller keeps
+/// compiling unchanged.
 pub struct E2EGuard {
-  /// The live container, `None` only while `Drop` is running.
-  inner: Option<ContainerAsync<GenericImage>>,
+  /// Unused; present only to preserve the struct shape.
+  _placeholder: (),
 }
 
-impl E2EGuard {
-  /// Take ownership of a started container.
-  pub fn new(container: ContainerAsync<GenericImage>) -> Self {
-    Self {
-      inner: Some(container),
-    }
-  }
-
-  /// Host port mapped from a container port.
-  pub async fn get_host_port_ipv4(
-    &self,
-    port: u16,
-  ) -> Result<u16, testcontainers::TestcontainersError> {
-    // `inner` is `None` only inside `Drop` on this same value (which holds
-    // `&mut self`), so every observable call sees `Some`; a missing value
-    // reports the mapping error rather than panicking.
-    match &self.inner {
-      Some(container) => container.get_host_port_ipv4(port).await,
-      None => Err(testcontainers::TestcontainersError::Other(
-        "container guard is being dropped".into(),
-      )),
-    }
-  }
-}
-
-impl Drop for E2EGuard {
-  fn drop(&mut self) {
-    if let Some(container) = self.inner.take() {
-      let id = container.id().to_string();
-      let thread_id = id.clone();
-      let outcome = std::thread::spawn(move || match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-      {
-        Ok(runtime) => {
-          if let Err(error) = runtime.block_on(container.rm()) {
-            eprintln!("e2e guard: failed to remove container {thread_id}: {error}");
-          }
-        }
-        Err(error) => {
-          eprintln!("e2e guard: failed to build removal runtime for {thread_id}: {error}");
-        }
-      })
-      .join();
-      if outcome.is_err() {
-        eprintln!("e2e guard: removal thread failed for container {id}");
-      }
-    }
-  }
-}
 /// Argon2id work factor for seeded client secrets (fast: test-only).
 const SEED_MEM_KIB: u32 = 8;
-/// Throwaway Postgres superuser password (alphanumeric: safe in URLs).
-const PG_PASSWORD: &str = "e2etask43secret";
+
+/// Hint shown when the shared test services are unreachable.
+const COMPOSE_HINT: &str = "run `docker compose -f compose.test.yaml up -d`";
 
 /// Harness failure (no `unwrap`/`expect`/`panic` under the deny lints).
 #[derive(Debug, thiserror::Error)]
 pub enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A database operation failed.
   #[error("database error: {0}")]
   Database(#[from] sqlx::Error),
@@ -139,13 +98,13 @@ pub fn ensure(cond: bool, message: impl Into<String>) -> Result<(), TestError> {
   if cond { Ok(()) } else { Err(fail(message)) }
 }
 
-/// Live world for one E2E test: guarded containers, migrated DB, connected
+/// Live world for one E2E test: shared-service handles, migrated DB, connected
 /// state, the production router on a loopback socket, and a redirect-free
 /// `reqwest` client pointed at it.
 pub struct World {
-  /// Postgres container (guarded: synchronously removed on drop).
+  /// Placeholder (no per-test container under shared services).
   _postgres: E2EGuard,
-  /// Redis container (guarded: synchronously removed on drop).
+  /// Placeholder (no per-test container under shared services).
   _redis: E2EGuard,
   /// Migrated Postgres pool (same database the router serves).
   pub pool: sqlx::PgPool,
@@ -170,14 +129,24 @@ impl Drop for World {
 }
 
 impl World {
-  /// Start one world: containers, migrations, connected state, live router.
+  /// Start one world: fresh DB + unique Redis prefixes on the shared
+  /// services, migrations, connected state, live router.
   ///
   /// `rate_limit` is the `rate_limit` table of the config fixture, so the
   /// abuse suite can pin tiny budgets while conformance runs wide open.
   pub async fn start(rate_limit: serde_json::Value) -> Result<Self, TestError> {
-    let (postgres, pg_url) = start_postgres().await?;
-    let (redis, redis_url) = start_redis().await?;
-    let pool = sqlx::PgPool::connect(&pg_url).await?;
+    let pg_url = fresh_db_url().await?;
+    let redis_url = redis_url();
+    let (token_prefix, ratelimit_prefix) = unique_prefixes();
+    let pool = PgPoolOptions::new()
+      .max_connections(4)
+      .connect(&pg_url)
+      .await
+      .map_err(|error| {
+        fail(format!(
+          "cannot reach shared test Postgres at {pg_url}: {error}; {COMPOSE_HINT}"
+        ))
+      })?;
     d_oauth::state::MIGRATOR
       .run(&pool)
       .await
@@ -190,7 +159,12 @@ impl World {
       "health_addr": "127.0.0.1:0",
       "tls": {"cert_path": "/tmp/e2e-cert.pem", "key_path": "/tmp/e2e-key.pem"},
       "database": {"url": pg_url},
-      "redis": {"url": redis_url, "durability": "waitaof"},
+      "redis": {
+        "url": redis_url,
+        "durability": "waitaof",
+        "token_key_prefix": token_prefix,
+        "ratelimit_key_prefix": ratelimit_prefix,
+      },
       "token_pepper": "e2e-test-pepper-0123456789abcdef",
       "totp_encryption_key": "e2e-test-totp-key-0123456789abcdef",
       "rate_limit": rate_limit,
@@ -198,7 +172,13 @@ impl World {
     });
     let config =
       Config::from_source(::config::Config::try_from(&fixture).map_err(ConfigError::from)?)?;
-    let state = AppState::connect(std::sync::Arc::new(config)).await?;
+    let state = AppState::connect(std::sync::Arc::new(config))
+      .await
+      .map_err(|error| {
+        fail(format!(
+          "cannot connect shared test services ({COMPOSE_HINT}): {error}"
+        ))
+      })?;
     let store = Store::from_config(&state.config.redis);
     let service = TokenService::new(&state.config.ttl, &state.keys)
       .map_err(|error| fail(format!("token service failed: {error}")))?;
@@ -218,8 +198,8 @@ impl World {
       .timeout(std::time::Duration::from_secs(10))
       .build()?;
     Ok(Self {
-      _postgres: postgres,
-      _redis: redis,
+      _postgres: E2EGuard { _placeholder: () },
+      _redis: E2EGuard { _placeholder: () },
       pool,
       state,
       store,
@@ -303,36 +283,30 @@ impl World {
   }
 }
 
-/// Start Postgres and return the guard plus a plaintext URL.
-async fn start_postgres() -> Result<(E2EGuard, String), TestError> {
-  let container = GenericImage::new("postgres", "latest")
-    .with_exposed_port(5432.tcp())
-    .with_wait_for(WaitFor::message_on_stderr(
-      "database system is ready to accept connections",
-    ))
-    .with_wait_for(WaitFor::message_on_stdout(
-      "database system is ready to accept connections",
-    ))
-    .with_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
-    .start()
-    .await?;
-  let guarded = E2EGuard::new(container);
-  let port = guarded.get_host_port_ipv4(5432).await?;
-  let url = format!("postgres://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres?sslmode=disable");
-  Ok((guarded, url))
-}
-
-/// Start a single-node Redis with AOF on (satisfies the durability contract).
-async fn start_redis() -> Result<(E2EGuard, String), TestError> {
-  let container = GenericImage::new("redis", "7.2-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = E2EGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  Ok((guarded, format!("redis://127.0.0.1:{port}")))
+/// Create a uniquely named database on the shared Postgres server and return
+/// a URL pointing at it (the caller connects and migrates).
+async fn fresh_db_url() -> Result<String, TestError> {
+  let server = pg_server_url();
+  let admin = PgPoolOptions::new()
+    .max_connections(1)
+    .connect(&server)
+    .await
+    .map_err(|error| {
+      fail(format!(
+        "cannot reach shared test Postgres at {server}: {error}; {COMPOSE_HINT}"
+      ))
+    })?;
+  let name = format!("e2e_{}", uuid::Uuid::new_v4().simple());
+  // `CREATE DATABASE` cannot take a bind parameter, and `Pool`'s `Executor`
+  // requires a `'static` query, so leak this one tiny test-only string.
+  let ddl: &'static str = Box::leak(format!("CREATE DATABASE \"{name}\"").into_boxed_str());
+  let created = admin
+    .execute(ddl)
+    .await
+    .map_err(|error| fail(format!("failed to create test database {name}: {error}")));
+  admin.close().await;
+  created?;
+  Ok(server.replacen("/postgres?", &format!("/{name}?"), 1))
 }
 
 /// Default (wide-open) rate-limit table for conformance worlds.

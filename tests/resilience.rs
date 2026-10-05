@@ -74,7 +74,7 @@ fn pg_url_for(port: u16) -> String {
 
 /// Start Postgres and return the guard plus a plaintext URL.
 async fn postgres_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("postgres", "latest")
+  let container = GenericImage::new("postgres", "16-alpine")
     .with_exposed_port(5432.tcp())
     .with_wait_for(WaitFor::message_on_stderr(
       "database system is ready to accept connections",

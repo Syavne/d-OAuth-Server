@@ -126,8 +126,13 @@ jobs:
           tool: nextest
       - name: Install redis-server (in-process Sentinel/Cluster fixtures)
         run: sudo apt-get update && sudo apt-get install -y redis-server
-      - name: Full test suite (testcontainers provide Postgres/Redis)
+      - name: Start shared test services (Postgres + Redis)
+        run: docker compose -f compose.test.yaml up -d
+      - name: Full test suite (shared services; testcontainers for lifecycle)
         run: cargo nextest run --all-targets
+      - name: Stop shared test services
+        if: always()
+        run: docker compose -f compose.test.yaml down -v
 
   doc-tests:
     name: doc-tests

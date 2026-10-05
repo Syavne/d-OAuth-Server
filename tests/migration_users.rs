@@ -1,4 +1,4 @@
-//! `test(migration_users)` — real-Postgres (testcontainers) tests for
+//! `test(migration_users)` — real-Postgres (shared external server) tests for
 //! `migrations/*_users.sql`: the users / scopes / user_scopes / redirect_uris
 //! / client_redirect_uris half of the six-table schema.
 //!
@@ -9,7 +9,8 @@
 //! second migration run, and the checksum guard rejecting a tampered
 //! already-applied migration.
 //!
-//! One Postgres container is shared for the whole binary; each test migrates a
+//! The shared Postgres server comes from `compose.test.yaml`
+//! (`docker compose -f compose.test.yaml up -d`); each test migrates a
 //! freshly created database so the tests stay isolated under parallel execution.
 
 use std::{
@@ -24,24 +25,39 @@ use sqlx::{
   migrate::{MigrateError, Migrator},
   postgres::PgPoolOptions,
 };
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 
 #[path = "../src/test_guard.rs"]
 #[allow(dead_code)]
 mod test_guard;
 
-use test_guard::{ContainerGuard, Lease, Shared};
+use test_guard::{Lease, Shared};
 
 /// Embedded migrations — the exact compile-time set `d_oauth::state::MIGRATOR`
 /// serves from (task 8's `oauth_clients` + this task's `users`).
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-/// Test Postgres superuser password.
-const PG_PASSWORD: &str = "migration-users-secret";
+/// URL of the shared test Postgres server (the `postgres` maintenance DB).
+///
+/// Overridable via `D_OAUTH_TEST_POSTGRES_URL`; the default matches
+/// `compose.test.yaml` (`test-db`, port 5433). Start it with
+/// `docker compose -f compose.test.yaml up -d`.
+fn pg_server_url() -> String {
+  match std::env::var("D_OAUTH_TEST_POSTGRES_URL") {
+    Ok(url) => url,
+    Err(_) => {
+      "postgres://postgres:oauth-test-only@127.0.0.1:5433/postgres?sslmode=disable".to_owned()
+    }
+  }
+}
+
+/// The shared Postgres server address.
+///
+/// Compose-first: no container is booted here. The lease only keeps the
+/// address alive for the test; the server itself is shared across all test
+/// processes via `compose.test.yaml`.
+struct Db {
+  url: String,
+}
 
 /// Boxed test error (no `unwrap`/`expect` under the crate deny lints).
 type TestError = Box<dyn Error + Send + Sync>;
@@ -49,52 +65,32 @@ type TestError = Box<dyn Error + Send + Sync>;
 /// Fallible test body.
 type TestResult = Result<(), TestError>;
 
-/// The shared Postgres server plus the guard keeping it alive.
-///
-/// The guard removes the container synchronously once the last test in the
-/// process releases the shared slot.
-struct Db {
-  _container: ContainerGuard,
-  url: String,
-}
-
 /// The one Postgres server reused by every test in this binary.
 static DB: Shared<Db> = Shared::new();
 
-/// Start (once) and return a lease on the shared Postgres server.
+/// Resolve (once) and return a lease on the shared Postgres server.
 ///
-/// The lease must stay alive as long as the server is used; dropping the last
-/// lease removes the shared container deterministically.
+/// Compose-first: no container is booted. The lease must stay alive as long
+/// as the server is used; bind it (usually as `_db`) for the test duration.
+/// A connection failure names the compose file to start instead of surfacing
+/// a bare driver error.
 async fn shared_db() -> Result<Lease<Db>, TestError> {
   DB.lease::<TestError>(async {
-    let (container, url) = start_postgres().await?;
-    Ok(Db {
-      _container: container,
-      url,
-    })
+    let url = pg_server_url();
+    let probe = PgPoolOptions::new()
+      .max_connections(1)
+      .connect(&url)
+      .await
+      .map_err(|error| {
+        format!(
+          "cannot reach shared test Postgres at {url}: {error}; \
+           run `docker compose -f compose.test.yaml up -d`"
+        )
+      })?;
+    probe.close().await;
+    Ok(Db { url })
   })
   .await
-}
-
-/// Start a `postgres:latest` container and return it with a plaintext URL.
-///
-/// The guard removes the container synchronously when the test drops it.
-async fn start_postgres() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("postgres", "latest")
-    .with_exposed_port(5432.tcp())
-    .with_wait_for(WaitFor::message_on_stderr(
-      "database system is ready to accept connections",
-    ))
-    .with_wait_for(WaitFor::message_on_stdout(
-      "database system is ready to accept connections",
-    ))
-    .with_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(5432).await?;
-  let url = format!("postgres://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres?sslmode=disable");
-  Ok((guarded, url))
 }
 
 /// Create a uniquely named database on the shared server and pool to it.

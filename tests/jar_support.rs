@@ -1,8 +1,13 @@
 //! Shared scaffolding for the `test(jar)` suites.
 //!
-//! Fixture client projection, JWKS, shared Redis container, and outcome
+//! Fixture client projection, JWKS, shared Redis handles, and outcome
 //! helpers. Included via `#[path]` from `jar.rs` and `jar_request_uri.rs`;
 //! this file itself carries no tests.
+//!
+//! Redis comes from the shared services in `compose.test.yaml`
+//! (`docker compose -f compose.test.yaml up -d`); each `store_conn` call
+//! uses unique key prefixes, so parallel tests never share state (and never
+//! FLUSH shared state).
 
 use std::{collections::HashMap, time::Duration};
 
@@ -13,17 +18,17 @@ use d_oauth::{
   store::Store,
 };
 use serde_json::{Value, json};
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
+
+#[path = "common/mod.rs"]
+mod common;
+
+use common::{redis_url, unique_prefixes};
 
 #[path = "../src/test_guard.rs"]
 #[allow(dead_code)]
 mod test_guard;
 
-use test_guard::{ContainerGuard, Lease, Shared};
+use test_guard::{Lease, Shared};
 use time::OffsetDateTime;
 
 /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -32,9 +37,9 @@ pub type TestResult = Result<(), TestError>;
 /// Errors raised by the JAR test scaffolding itself.
 #[derive(Debug, thiserror::Error)]
 pub enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
+  /// The shared test service is unreachable (usually: compose not started).
+  #[error("test setup: {0}")]
+  Setup(String),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -97,54 +102,55 @@ pub fn test_client(auth_method: &str, request_uris: Option<Value>) -> Client {
   }
 }
 
-/// Shared Redis server plus the guard keeping it alive.
+/// Shared Redis server handle (no per-test container: the URL points at the
+/// shared services from `compose.test.yaml`).
 ///
-/// The guard removes the container synchronously once the last test in the
-/// process releases the shared slot.
+/// The lease keeps the shared slot alive; bind it (usually as `_redis`) for
+/// the duration of the test.
 pub struct JarRedis {
-  _container: ContainerGuard,
   url: String,
 }
 
 static JAR_REDIS: Shared<JarRedis> = Shared::new();
 
-/// Start the shared Redis once; each test connects its own manager.
+/// Resolve the shared Redis URL once; each test connects its own manager.
 ///
-/// The returned lease keeps the shared container alive; bind it (usually as
+/// The returned lease keeps the shared slot alive; bind it (usually as
 /// `_redis`) for the duration of the test.
 async fn shared_redis() -> Result<Lease<JarRedis>, TestError> {
   JAR_REDIS
-    .lease::<TestError>(async {
-      let container = GenericImage::new("redis", "7.2-alpine")
-        .with_exposed_port(6379.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .with_cmd(["redis-server", "--appendonly", "yes"])
-        .start()
-        .await?;
-      let guarded = ContainerGuard::new(container);
-      let port = guarded.get_host_port_ipv4(6379).await?;
-      Ok(JarRedis {
-        _container: guarded,
-        url: format!("redis://127.0.0.1:{port}"),
-      })
-    })
+    .lease::<TestError>(async { Ok(JarRedis { url: redis_url() }) })
     .await
 }
 
-/// A connected [`RedisConn`] plus [`Store`] over the shared container.
+/// A connected [`RedisConn`] plus [`Store`] over the shared Redis.
 ///
-/// The returned lease keeps the shared container alive; bind it (usually as
-/// `_redis`) for the duration of the test.
+/// The returned lease keeps the shared slot alive; bind it (usually as
+/// `_redis`) for the duration of the test. Key prefixes are unique per
+/// call, so parallel tests never share state.
 pub async fn store_conn() -> Result<(Lease<JarRedis>, RedisConn, Store), TestError> {
   let redis = shared_redis().await?;
-  let client = redis::Client::open(redis.url.as_str())?;
+  let client = redis::Client::open(redis.url.as_str()).map_err(|error| {
+    TestError::Setup(format!(
+      "cannot reach shared test Redis at {}: {error}; run `docker compose -f compose.test.yaml up -d`",
+      redis.url,
+    ))
+  })?;
   let config = redis::aio::ConnectionManagerConfig::new()
     .set_response_timeout(Some(Duration::from_secs(10)))
     .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, config).await?;
+  let manager = redis::aio::ConnectionManager::new_with_config(client, config)
+    .await
+    .map_err(|error| {
+      TestError::Setup(format!(
+        "cannot reach shared test Redis at {}: {error}; run `docker compose -f compose.test.yaml up -d`",
+        redis.url,
+      ))
+    })?;
+  let (token_prefix, ratelimit_prefix) = unique_prefixes();
   let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    token_prefix,
+    ratelimit_prefix,
     d_oauth::config::DurabilityMode::WaitAof,
   );
   Ok((redis, RedisConn::Single(manager), store))

@@ -278,9 +278,12 @@ fn check_challenge_shape(challenge: &str) -> Result<(), AppError> {
 /// Render a direct error page: HTTP 400 HTML, no `Location`.
 fn error_page(error: &AppError) -> Response {
   let body = format!(
-    "<!doctype html><html><body><h1>{}</h1><p>{}</p></body></html>",
-    escape_html(error.code().as_str()),
-    escape_html(error.description()),
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+    <link rel=\"stylesheet\" href=\"/assets/app.css\">\
+    <title>{code}</title></head><body><h1>{code}</h1><p>{description}</p></body></html>",
+    code = escape_html(error.code().as_str()),
+    description = escape_html(error.description()),
   );
   let mut response = Html(body).into_response();
   *response.status_mut() = StatusCode::BAD_REQUEST;

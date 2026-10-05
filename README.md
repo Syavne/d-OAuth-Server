@@ -29,8 +29,9 @@ state is in Redis, so replicas are interchangeable.
 - PostgreSQL 14 or newer with the `citext` extension available.
 - Redis 7.2 or newer, with persistence enabled and eviction off.
 - A TLS certificate and key for the public listener.
-- Docker, for the container image and for the integration tests that use
-  testcontainers.
+- Docker, for the container image, for the shared test Postgres and Redis in
+  `compose.test.yaml`, and for the tests that still use testcontainers (the
+  unit-test helpers under `src/` and the lifecycle suite).
 - `cargo-nextest` for the test suite:
   `cargo install cargo-nextest --locked`.
 
@@ -142,15 +143,27 @@ full grant behavior.
 
 ## Tests
 
-The authoritative suite:
+The authoritative suite. The integration and end-to-end tests connect to the
+shared Postgres and Redis from `compose.test.yaml` (Postgres on
+`127.0.0.1:5433`, Redis on `127.0.0.1:6380`), so start the services first and
+tear them down with `down -v`:
 
 ```bash
+docker compose -f compose.test.yaml up -d
 cargo nextest run --all-targets
 cargo test --doc
+docker compose -f compose.test.yaml down -v
 ```
 
-The integration and end-to-end tests start real Postgres and Redis containers,
-so Docker must be running. To iterate on one area, filter by name:
+Override the endpoints with `D_OAUTH_TEST_POSTGRES_URL` and
+`D_OAUTH_TEST_REDIS_URL`. Each test gets its own freshly created database and
+unique Redis key prefixes, so tests run in parallel and nothing flushes shared
+state. Killing the suite mid-run no longer orphans containers: the lifecycle
+tests still `rm` theirs on drop. Testcontainers remains only for the unit-test
+helpers under `src/` and for `tests/resilience.rs`, which stops and restarts
+containers; `tests/topology.rs` is the other lifecycle suite and spawns
+in-process `redis-test` Sentinel/Cluster fixtures that need a `redis-server`
+binary. Docker must be running. To iterate on one area, filter by name:
 
 ```bash
 cargo nextest run -E 'test(refresh_rotation)'

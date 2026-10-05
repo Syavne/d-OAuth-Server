@@ -1,9 +1,13 @@
-//! `test(user_repo)` — real `testcontainers` Postgres + Redis coverage for
+//! `test(user_repo)` — shared-services Postgres + Redis coverage for
 //! `db/{user_repo,scope_repo,user_scope_repo}` and the Redis lockout counters.
 //!
-//! Postgres backs the user/scope/entitlement assertions; a single-node Redis
-//! backs the failed-login/lockout assertions. Test bodies use `Result` + `?`
-//! (`unwrap`/`expect`/`panic` are denied workspace-wide).
+//! Postgres backs the user/scope/entitlement assertions; the shared Redis
+//! backs the failed-login/lockout assertions. Both come from
+//! `compose.test.yaml` (`docker compose -f compose.test.yaml up -d`); each
+//! test migrates a freshly created database and uses unique Redis key
+//! prefixes, so parallel tests never share state (and never FLUSH shared
+//! state). Test bodies use `Result` + `?` (`unwrap`/`expect`/`panic` are
+//! denied workspace-wide).
 
 use std::{error::Error, time::Duration};
 
@@ -15,21 +19,14 @@ use d_oauth::{
     user_repo::{self, LockoutPolicy, NewUser, PasswordVerdict},
     user_scope_repo,
   },
-  state::{MIGRATOR, RedisConn},
+  state::RedisConn,
   store::Store,
 };
 use sqlx::PgPool;
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 
-#[path = "../src/test_guard.rs"]
-#[allow(dead_code)]
-mod test_guard;
+mod common;
 
-use test_guard::ContainerGuard;
+use common::{fresh_migrated_db, redis_url, unique_prefixes};
 
 /// Boxed test error.
 type TestError = Box<dyn Error + Send + Sync>;
@@ -37,14 +34,10 @@ type TestError = Box<dyn Error + Send + Sync>;
 /// Fallible test body.
 type TestResult = Result<(), TestError>;
 
-/// Throwaway Postgres superuser password.
-const PG_PASSWORD: &str = "user-repo-test-secret";
-
-/// Fast Argon2id parameters keep container-backed tests quick.
+/// Fast Argon2id parameters keep the hashing-dependent tests quick.
 fn fast_params() -> Result<Argon2Params, TestError> {
   Ok(Argon2Params::new(8, 1, 1, 32)?)
 }
-
 /// Build a `NewUser` with a freshly hashed password.
 fn new_user(
   email: &str,
@@ -60,56 +53,31 @@ fn new_user(
   })
 }
 
-/// Start Postgres, apply every migration, and return the pool.
-///
-/// The guard removes the container synchronously when the test drops it.
-async fn postgres_pool() -> Result<(ContainerGuard, PgPool), TestError> {
-  let container = GenericImage::new("postgres", "latest")
-    .with_exposed_port(5432.tcp())
-    .with_wait_for(WaitFor::message_on_stderr(
-      "database system is ready to accept connections",
-    ))
-    .with_wait_for(WaitFor::message_on_stdout(
-      "database system is ready to accept connections",
-    ))
-    .with_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(5432).await?;
-  let url = format!("postgres://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres?sslmode=disable");
-  let pool = PgPool::connect(&url).await?;
-  MIGRATOR.run(&pool).await?;
-  Ok((guarded, pool))
+/// A pool on a freshly created, fully migrated database on the shared
+/// test Postgres (see `tests/common/mod.rs`).
+async fn postgres_pool() -> Result<PgPool, TestError> {
+  Ok(fresh_migrated_db().await?)
 }
 
-/// Start a single-node Redis and return a [`RedisConn`] plus [`Store`].
-///
-/// The guard removes the container synchronously when the test drops it.
-async fn redis_store() -> Result<(ContainerGuard, RedisConn, Store), TestError> {
-  let container = GenericImage::new("redis", "7.2-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(vec!["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(url.as_str())?;
-  let manager = redis::aio::ConnectionManager::new(client).await?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
-  Ok((guarded, RedisConn::Single(manager), store))
+/// A [`RedisConn`] plus [`Store`] on the shared test Redis with unique key
+/// prefixes, so parallel tests never share state.
+async fn redis_store() -> Result<(RedisConn, Store), TestError> {
+  let url = redis_url();
+  let client = redis::Client::open(url.as_str()).map_err(|error| {
+    format!("cannot reach shared test Redis at {url}: {error}; run `docker compose -f compose.test.yaml up -d`")
+  })?;
+  let manager = redis::aio::ConnectionManager::new(client).await.map_err(|error| {
+    format!("cannot reach shared test Redis at {url}: {error}; run `docker compose -f compose.test.yaml up -d`")
+  })?;
+  let (token_prefix, ratelimit_prefix) = unique_prefixes();
+  let store = Store::from_parts(token_prefix, ratelimit_prefix, DurabilityMode::WaitAof);
+  Ok((RedisConn::Single(manager), store))
 }
 
 /// Create/find normalizes the email and rejects a case-variant duplicate.
 #[tokio::test]
 async fn user_repo_create_and_find_is_case_insensitive() -> TestResult {
-  let (_pg, pool) = postgres_pool().await?;
+  let pool = postgres_pool().await?;
 
   let created = user_repo::create_user(
     &pool,
@@ -146,7 +114,7 @@ async fn user_repo_create_and_find_is_case_insensitive() -> TestResult {
 /// Password verification matches/mismatches and refuses disabled accounts.
 #[tokio::test]
 async fn user_repo_verify_password() -> TestResult {
-  let (_pg, pool) = postgres_pool().await?;
+  let pool = postgres_pool().await?;
   let user = user_repo::create_user(
     &pool,
     &new_user("carol@example.com", "s3cret", false, true)?,
@@ -178,7 +146,7 @@ async fn user_repo_verify_password() -> TestResult {
 /// TOTP secret set/clear/toggle plus one-time recovery-code consumption.
 #[tokio::test]
 async fn user_repo_totp_and_recovery_codes() -> TestResult {
-  let (_pg, pool) = postgres_pool().await?;
+  let pool = postgres_pool().await?;
   let user =
     user_repo::create_user(&pool, &new_user("dave@example.com", "pw", false, false)?).await?;
 
@@ -202,7 +170,7 @@ async fn user_repo_totp_and_recovery_codes() -> TestResult {
 /// Admin counting/promote/demote and password rotation semantics.
 #[tokio::test]
 async fn user_repo_admin_and_password_rotation() -> TestResult {
-  let (_pg, pool) = postgres_pool().await?;
+  let pool = postgres_pool().await?;
   assert!(!user_repo::has_any_admin(&pool).await?);
 
   let user =
@@ -235,7 +203,7 @@ async fn user_repo_admin_and_password_rotation() -> TestResult {
 /// entitlement round-trips.
 #[tokio::test]
 async fn user_repo_scope_and_entitlement_round_trip() -> TestResult {
-  let (_pg, pool) = postgres_pool().await?;
+  let pool = postgres_pool().await?;
 
   let created = scope_repo::upsert(&pool, "api:read", "Read API").await?;
   assert!(created.enabled);
@@ -269,7 +237,7 @@ async fn user_repo_scope_and_entitlement_round_trip() -> TestResult {
 /// and TTL expiry both unlock; a correct password while locked is still gated.
 #[tokio::test]
 async fn user_repo_lockout_locks_after_threshold_and_clears() -> TestResult {
-  let (_redis, mut conn, store) = redis_store().await?;
+  let (mut conn, store) = redis_store().await?;
   let policy = LockoutPolicy::new(3, Duration::from_millis(600)).ok_or("invalid policy")?;
   let label = "Locked@Example.com";
 
@@ -314,8 +282,8 @@ async fn user_repo_lockout_locks_after_threshold_and_clears() -> TestResult {
 /// locked: the repo verifies the secret but `is_locked_out` must deny login.
 #[tokio::test]
 async fn user_repo_lockout_gate_rejects_correct_password() -> TestResult {
-  let (_pg, pool) = postgres_pool().await?;
-  let (_redis, mut conn, store) = redis_store().await?;
+  let pool = postgres_pool().await?;
+  let (mut conn, store) = redis_store().await?;
   user_repo::create_user(
     &pool,
     &new_user("gina@example.com", "correct", false, false)?,

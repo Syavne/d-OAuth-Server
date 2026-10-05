@@ -18,6 +18,7 @@
 use std::time::Duration;
 
 use base32::Alphabet;
+use qrcode::{QrCode, render::svg};
 use rand::{TryRng as _, rngs::SysRng};
 use ring::{
   aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
@@ -62,6 +63,9 @@ pub enum TotpError {
   /// The blob is malformed, names an unknown key, or fails authentication.
   #[error("TOTP secret cannot be decrypted")]
   Decrypt,
+  /// The enrollment URI is too long to encode as a QR code.
+  #[error("TOTP QR rendering failed")]
+  Qr,
   /// The replay store was unreachable.
   #[error("TOTP replay store unavailable")]
   Store(#[from] redis::RedisError),
@@ -359,6 +363,21 @@ pub fn otpauth_uri(issuer: &str, account: &str, secret_b32: &str) -> String {
     secret_b32,
     percent_encode(issuer)
   )
+}
+
+/// Render an `otpauth://` enrollment URI as a self-contained SVG QR code.
+///
+/// The output is inline SVG with no external references, no `<image>`, and no
+/// script, so it embeds directly in a server-rendered page under a
+/// `script-src 'none'` policy. An over-long URI maps to [`TotpError::Qr`]; no
+/// secret or URI content is logged.
+pub fn qr_svg(uri: &str) -> Result<String, TotpError> {
+  let code = QrCode::new(uri.as_bytes()).map_err(|_| TotpError::Qr)?;
+  let mut svg = code.render::<svg::Color>().min_dimensions(200, 200).build();
+  Ok(match svg.find("<svg") {
+    Some(start) => svg.split_off(start),
+    None => svg,
+  })
 }
 
 /// Derive the AES-256 key from configured TOTP key material (SHA-256).

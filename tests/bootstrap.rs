@@ -1,10 +1,15 @@
-//! `test(bootstrap)` — real `serve` bootstrap over live containers (plan todo 41).
+//! `test(bootstrap)` — real `serve` bootstrap over the shared test services
+//! (plan todo 41).
 //!
 //! Both tests boot the actual `d-oauth-server` binary (never an in-process
 //! router): `config check` first (fail-fast env smoke), then `migrate` (the
 //! only path that applies migrations — `serve` never does), then `serve`
 //! with a TLS public listener (PKI client-CA, the mTLS reachability
-//! contract) plus the plaintext pod-IP health listener.
+//! contract) plus the plaintext pod-IP health listener. Postgres and Redis
+//! come from `compose.test.yaml`
+//! (`docker compose -f compose.test.yaml up -d`); each test uses a freshly
+//! created database and unique Redis key prefixes, so parallel tests never
+//! share state (and never FLUSH shared state).
 //!
 //! * `bootstrap_serve_tls_mtls_registered_completes_unregistered_rejected`:
 //!   `/health/ready` is 200 beforehand, mutual-TLS traffic flows through
@@ -28,9 +33,7 @@
 #[allow(dead_code)]
 mod certs;
 
-#[path = "../src/test_guard.rs"]
-#[allow(dead_code)]
-mod test_guard;
+mod common;
 
 use std::{
   net::SocketAddr,
@@ -40,18 +43,11 @@ use std::{
   time::{Duration, Instant},
 };
 
+use common::{pg_server_url, redis_url, unique_prefixes};
 use d_oauth::protocol::mtls;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
+use sqlx::{Executor as _, postgres::PgPoolOptions};
 
-use test_guard::ContainerGuard;
-
-/// Throwaway Postgres superuser password (alphanumeric: safe in URLs).
-const PG_PASSWORD: &str = "bootstraptestsecret";
 /// Registered `tls_client_auth` client for the mTLS test.
 const CLIENT_ID: &str = "bootstrap-tls-client";
 /// Subject DN of the CA-signed fixture, in [`mtls::subject_dn`] rendering.
@@ -62,9 +58,9 @@ const PKI_THUMBPRINT: &str = "PC8ir71uIdRIdw1XFkMmoFvGC8Ud4CANxkk4x3BWqAc";
 /// Test-body error.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
+  /// The shared test service is unreachable (usually: compose not started).
+  #[error("test setup: {0}")]
+  Setup(String),
   /// A sqlx operation failed.
   #[error("database error: {0}")]
   Database(#[from] sqlx::Error),
@@ -99,11 +95,9 @@ enum TestError {
 
 type TestResult<T = ()> = Result<T, TestError>;
 
-/// Live world for one test: guarded containers, ports, fixture files, and
+/// Live world for one test: shared-service URLs, ports, fixture files, and
 /// the config file the child `serve` process boots from.
 struct World {
-  _postgres: ContainerGuard,
-  _redis: ContainerGuard,
   pg_url: String,
   tls_port: u16,
   health_port: u16,
@@ -140,42 +134,42 @@ async fn free_port() -> Result<u16, TestError> {
   Ok(listener.local_addr()?.port())
 }
 
-/// Start Postgres and return the guard plus a plaintext URL.
-async fn start_postgres() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("postgres", "latest")
-    .with_exposed_port(5432.tcp())
-    .with_wait_for(WaitFor::message_on_stderr(
-      "database system is ready to accept connections",
-    ))
-    .with_wait_for(WaitFor::message_on_stdout(
-      "database system is ready to accept connections",
-    ))
-    .with_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(5432).await?;
-  let url = format!("postgres://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres?sslmode=disable");
-  Ok((guarded, url))
+/// Hint shown when the shared test services are unreachable.
+const COMPOSE_HINT: &str = "run `docker compose -f compose.test.yaml up -d`";
+
+/// Create a uniquely named database on the shared Postgres server and return
+/// a URL pointing at it (the child `serve` process migrates it via its own
+/// `migrate` subcommand, like production).
+async fn fresh_db_url() -> Result<String, TestError> {
+  let server = pg_server_url();
+  let admin = PgPoolOptions::new()
+    .max_connections(1)
+    .connect(&server)
+    .await
+    .map_err(|error| {
+      TestError::Setup(format!(
+        "cannot reach shared test Postgres at {server}: {error}; {COMPOSE_HINT}"
+      ))
+    })?;
+  let name = format!("bootstrap_{}", uuid::Uuid::new_v4().simple());
+  // `CREATE DATABASE` cannot take a bind parameter, and `Pool`'s `Executor`
+  // requires a `'static` query, so leak this one tiny test-only string.
+  let ddl: &'static str = Box::leak(format!("CREATE DATABASE \"{name}\"").into_boxed_str());
+  let created = admin
+    .execute(ddl)
+    .await
+    .map_err(|error| TestError::Setup(format!("failed to create test database {name}: {error}")));
+  admin.close().await;
+  created?;
+  Ok(server.replacen("/postgres?", &format!("/{name}?"), 1))
 }
 
-/// Start a single-node Redis with AOF on (satisfies the durability contract).
-async fn start_redis() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("redis", "7.2-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  Ok((guarded, format!("redis://127.0.0.1:{port}")))
-}
-
-/// Build one test world: containers, ports, PEM fixture files, config file.
+/// Build one test world: shared-service URLs, ports, PEM fixture files,
+/// config file.
 async fn build_world() -> Result<World, TestError> {
-  let (postgres, pg_url) = start_postgres().await?;
-  let (redis, redis_url) = start_redis().await?;
+  let pg_url = fresh_db_url().await?;
+  let redis_url = redis_url();
+  let (token_prefix, ratelimit_prefix) = unique_prefixes();
   let tls_port = free_port().await?;
   let health_port = free_port().await?;
   let dir = std::env::temp_dir().join(format!("bootstrap-test-{}", uuid::Uuid::new_v4()));
@@ -197,7 +191,12 @@ async fn build_world() -> Result<World, TestError> {
       "client_ca_path": path_string(&ca_path)?,
     },
     "database": {"url": pg_url.clone()},
-    "redis": {"url": redis_url, "durability": "waitaof"},
+    "redis": {
+      "url": redis_url,
+      "durability": "waitaof",
+      "token_key_prefix": token_prefix,
+      "ratelimit_key_prefix": ratelimit_prefix,
+    },
     "token_pepper": "bootstrap-test-pepper-0123456789abcdef",
     "totp_encryption_key": "bootstrap-test-totp-key-0123456789abcdef",
   });
@@ -209,8 +208,6 @@ async fn build_world() -> Result<World, TestError> {
   )?;
   let stem = config_file.with_extension("");
   Ok(World {
-    _postgres: postgres,
-    _redis: redis,
     pg_url,
     tls_port,
     health_port,

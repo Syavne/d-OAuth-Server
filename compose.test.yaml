@@ -1,0 +1,44 @@
+# Test-only shared services for the compose-first integration harness.
+#
+# Starts ONE Postgres + ONE Redis shared by every test process. Per-test
+# isolation comes from the harness itself (fresh `CREATE DATABASE` per test,
+# unique Redis key prefixes per test) — never from per-test containers, and
+# never via FLUSHALL/FLUSHDB (nextest runs tests in parallel processes).
+#
+# Credentials and ports match the harness defaults exactly
+# (`D_OAUTH_TEST_POSTGRES_URL` / `D_OAUTH_TEST_REDIS_URL` overrides in
+# `tests/common/mod.rs`):
+#
+#   docker compose -f compose.test.yaml up -d
+#   cargo nextest run -E 'test(migration_users_creates_schema_and_second_run_is_noop)'
+#   docker compose -f compose.test.yaml down -v
+#
+# Ports 5433/6380 avoid clashing with a developer's local 5432/6379.
+# This file is test-only; the local proof deployment stays in `compose.yaml`.
+
+name: d-oauth-test
+
+services:
+  test-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: oauth-test-only
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  test-redis:
+    image: redis:7-alpine
+    # Mirrors the server's durability contract: AOF on, eviction off.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

@@ -2,11 +2,13 @@
 //!
 //! Pure `proptest` properties over `store::tokens::derive_rotation_id`
 //! (deterministic, 64 lowercase hex chars, input-sensitive) plus
-//! container-backed rotation invariants over a real single-node Redis
-//! (AOF on, `WaitAof` durability): first rotation applies, an idempotent
-//! retry replays identical tokens, an unknown token is absent, and a foreign
-//! client mismatches. Containers are owned by `ContainerGuard` (never
-//! `ContainerAsync` directly). No `unwrap`/`expect`/`panic` anywhere.
+//! shared-service rotation invariants over the real Redis from
+//! `compose.test.yaml` (`docker compose -f compose.test.yaml up -d`, AOF on,
+//! `WaitAof` durability): first rotation applies, an idempotent retry replays
+//! identical tokens, an unknown token is absent, and a foreign client
+//! mismatches. Each test uses unique key prefixes, so parallel tests never
+//! share state (and never FLUSH shared state). No `unwrap`/`expect`/`panic`
+//! anywhere.
 
 use std::{
   sync::atomic::{AtomicU64, Ordering},
@@ -25,24 +27,17 @@ use d_oauth::{
   },
 };
 use proptest::prelude::*;
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 
-#[path = "../src/test_guard.rs"]
-#[allow(dead_code)]
-mod test_guard;
+mod common;
 
-use test_guard::ContainerGuard;
+use common::{redis_url, unique_prefixes};
 
 /// Test-body error.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
+  /// The shared test service is unreachable (usually: compose not started).
+  #[error("test setup: {0}")]
+  Setup(String),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -107,30 +102,29 @@ proptest! {
   }
 }
 
-/// Start a single-node Redis with AOF on (the `WaitAof` barrier needs it).
-async fn redis_single() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("redis", "7.2-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  Ok((guarded, format!("redis://127.0.0.1:{port}")))
+/// URL of the shared test Redis (see `tests/common/mod.rs`).
+fn redis_single() -> String {
+  redis_url()
 }
 
 async fn direct_store(url: &str) -> Result<(RedisConn, Store), TestError> {
-  let client = redis::Client::open(url)?;
+  let client = redis::Client::open(url).map_err(|error| {
+    TestError::Setup(format!(
+      "cannot reach shared test Redis at {url}: {error}; run `docker compose -f compose.test.yaml up -d`"
+    ))
+  })?;
   let manager_config = redis::aio::ConnectionManagerConfig::new()
     .set_response_timeout(Some(Duration::from_secs(10)))
     .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
+  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config)
+    .await
+    .map_err(|error| {
+      TestError::Setup(format!(
+        "cannot reach shared test Redis at {url}: {error}; run `docker compose -f compose.test.yaml up -d`"
+      ))
+    })?;
+  let (token_prefix, ratelimit_prefix) = unique_prefixes();
+  let store = Store::from_parts(token_prefix, ratelimit_prefix, DurabilityMode::WaitAof);
   Ok((RedisConn::Single(manager), store))
 }
 
@@ -178,7 +172,7 @@ fn rotation_input(
 /// Rotation applies once, replays idempotently, and rejects strangers.
 #[tokio::test]
 async fn rotation_apply_replay_absent_mismatch() -> TestResult {
-  let (_guard, url) = redis_single().await?;
+  let url = redis_single();
   let (mut conn, store) = direct_store(&url).await?;
   let pepper = b"rotation-proptest-pepper";
   let client = unique("client");

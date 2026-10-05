@@ -26,17 +26,7 @@ use d_oauth::{
     self, MtlsCnf, MtlsError, PROXY_CERT_HEADER, PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS,
   },
 };
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
-
-#[path = "../src/test_guard.rs"]
-#[allow(dead_code)]
-mod test_guard;
-
-use test_guard::ContainerGuard;
+mod common;
 
 /// The `oauth_clients` migration, embedded byte-for-byte from the repo.
 const OAUTH_CLIENTS_SQL: &str = include_str!("../migrations/1791072000_oauth_clients.sql");
@@ -44,26 +34,13 @@ const OAUTH_CLIENTS_SQL: &str = include_str!("../migrations/1791072000_oauth_cli
 /// The forward-only client column additions the repository queries need.
 const CLIENT_DPOP_BOUND_SQL: &str = include_str!("../migrations/1791244800_client_dpop_bound.sql");
 
-/// Throwaway Postgres superuser password.
-const PG_PASSWORD: &str = "mtls-test-secret";
-
-/// Start a fresh Postgres and connect a pool to it. The returned guard
-/// must stay alive for the duration of the test; dropping it removes the
-/// container synchronously.
-async fn mtls_postgres() -> Result<(ContainerGuard, sqlx::PgPool), TestError> {
-  let container = GenericImage::new("postgres", "latest")
-    .with_exposed_port(5432.tcp())
-    .with_wait_for(WaitFor::message_on_stderr(
-      "database system is ready to accept connections",
-    ))
-    .with_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(5432).await?;
-  let url = format!("postgres://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres?sslmode=disable");
-  let pool = sqlx::PgPool::connect(&url).await?;
-  Ok((guarded, pool))
+/// Start a fresh database on the shared test Postgres and connect a pool
+/// to it (see `tests/common/mod.rs`). Each test migrates its own database,
+/// so parallel tests never share state.
+async fn mtls_postgres() -> Result<sqlx::PgPool, TestError> {
+  common::postgres()
+    .await
+    .map_err(|error| TestError::Setup(error.to_string()))
 }
 
 /// Apply the embedded migration script exactly as the migrator would.
@@ -86,9 +63,9 @@ const PKI_DN: &str = "CN=mtls-pki-client, O=Example";
 /// Test-body error.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
+  /// The shared test service is unreachable (usually: compose not started).
+  #[error("test setup: {0}")]
+  Setup(String),
   /// A sqlx operation failed.
   #[error("database error: {0}")]
   Database(#[from] sqlx::Error),
@@ -210,7 +187,7 @@ fn mtls_subject_dn_renders_rfc4514() -> TestResult {
 /// A registered self-signed certificate binds `cnf.x5t#S256`.
 #[tokio::test]
 async fn mtls_registered_thumbprint_binds_cnf() -> TestResult {
-  let (_container, pool) = mtls_postgres().await?;
+  let pool = mtls_postgres().await?;
   mtls_migrate(&pool).await?;
   insert_mtls_client(
     &pool,
@@ -233,7 +210,7 @@ async fn mtls_registered_thumbprint_binds_cnf() -> TestResult {
 /// A CA-issued certificate binds via subject DN under `tls_client_auth`.
 #[tokio::test]
 async fn mtls_pki_subject_dn_binds_cnf() -> TestResult {
-  let (_container, pool) = mtls_postgres().await?;
+  let pool = mtls_postgres().await?;
   mtls_migrate(&pool).await?;
   insert_mtls_client(&pool, "mtls-pki", "tls_client_auth", Some(PKI_DN), None).await?;
   let client = client_repo::find_active_by_client_id(&pool, "mtls-pki")
@@ -248,7 +225,7 @@ async fn mtls_pki_subject_dn_binds_cnf() -> TestResult {
 /// An unregistered certificate is rejected as `invalid_client`.
 #[tokio::test]
 async fn mtls_unregistered_thumbprint_rejected_as_invalid_client() -> TestResult {
-  let (_container, pool) = mtls_postgres().await?;
+  let pool = mtls_postgres().await?;
   mtls_migrate(&pool).await?;
   insert_mtls_client(
     &pool,
@@ -271,7 +248,7 @@ async fn mtls_unregistered_thumbprint_rejected_as_invalid_client() -> TestResult
 /// A missing certificate rejects every mTLS-registered client.
 #[tokio::test]
 async fn mtls_missing_cert_rejects_mtls_clients() -> TestResult {
-  let (_container, pool) = mtls_postgres().await?;
+  let pool = mtls_postgres().await?;
   mtls_migrate(&pool).await?;
   let pinned = fixture_client("self_signed_tls_client_auth", None, Some(SELF_THUMBPRINT));
   let result = mtls::authenticate(&pool, &pinned, None).await;

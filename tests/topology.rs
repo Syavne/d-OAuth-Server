@@ -9,11 +9,12 @@
 //!   boots and a `{state}`-tagged key round-trips through
 //!   `ClusterClient` (the single-slot convention the token store relies on).
 //!
-//! Docker/testcontainers parity for CI environments without a `redis-server`
+//! Shared-service parity for CI environments without a `redis-server`
 //! binary:
-//! * `topology_single_node_store_roundtrip` — same assertions shape against a
-//!   `redis:7.2-alpine` container owned by `ContainerGuard`, driving the real
-//!   `Store::put_access`/`get_access` through our key layout.
+//! * `topology_single_node_store_roundtrip` — same assertions shape against
+//!   the shared Redis from `compose.test.yaml`
+//!   (`docker compose -f compose.test.yaml up -d`) with unique key prefixes,
+//!   driving the real `Store::put_access`/`get_access` through our key layout.
 //!
 //! The `redis-test` legs skip gracefully (green, noted on stderr) when no
 //! `redis-server` binary is on `PATH`; CI installs one via apt (see
@@ -38,24 +39,17 @@ use redis_test::{
   cluster::{RedisCluster, RedisClusterConfiguration},
   sentinel::RedisSentinelCluster,
 };
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 
-#[path = "../src/test_guard.rs"]
-#[allow(dead_code)]
-mod test_guard;
+mod common;
 
-use test_guard::ContainerGuard;
+use common::{redis_url, unique_prefixes};
 
 /// Test-body error.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
+  /// The shared test service is unreachable (usually: compose not started).
+  #[error("test setup: {0}")]
+  Setup(String),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -229,32 +223,30 @@ async fn topology_cluster_single_slot_roundtrip() -> TestResult {
   Ok(())
 }
 
-/// Parity leg that needs only Docker: the real token-store access path
-/// against a single node, so CI stays green where no `redis-server` binary
-/// exists but Docker does.
+/// Parity leg that needs only the shared services: the real token-store
+/// access path against the shared Redis with unique key prefixes, so CI
+/// stays green where no `redis-server` binary exists but Docker does.
 #[tokio::test]
 async fn topology_single_node_store_roundtrip() -> TestResult {
-  let container = GenericImage::new("redis", "7.2-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://127.0.0.1:{port}");
-
-  let client = redis::Client::open(url.as_str())?;
+  let url = redis_url();
+  let client = redis::Client::open(url.as_str()).map_err(|error| {
+    TestError::Setup(format!(
+      "cannot reach shared test Redis at {url}: {error}; run `docker compose -f compose.test.yaml up -d`"
+    ))
+  })?;
   let manager_config = redis::aio::ConnectionManagerConfig::new()
     .set_response_timeout(Some(Duration::from_secs(10)))
     .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config)
+    .await
+    .map_err(|error| {
+      TestError::Setup(format!(
+        "cannot reach shared test Redis at {url}: {error}; run `docker compose -f compose.test.yaml up -d`"
+      ))
+    })?;
   let mut conn = RedisConn::Single(manager);
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
+  let (token_prefix, ratelimit_prefix) = unique_prefixes();
+  let store = Store::from_parts(token_prefix, ratelimit_prefix, DurabilityMode::WaitAof);
 
   let token_hash = "topology-parity-probe";
   let record = AccessRecord {

@@ -1,8 +1,8 @@
 //! `test(e2e_)` token-grant rows over the live router: the wired dispatcher.
 //!
 //! Every test boots the REAL production router ([`d_oauth::routes::build_router`])
-//! over a REAL loopback socket against REAL testcontainers Postgres + Redis
-//! and asserts only observable HTTP behavior: the five grants dispatch, the
+//! over a REAL loopback socket against the shared Postgres + Redis from
+//! `compose.test.yaml` and asserts only observable HTTP behavior: the five grants dispatch, the
 //! sender-constraint matrix holds, and every failure is the specified 4xx.
 //!
 //! The `oauth2` crate drives the baseline shapes (PKCE material, code

@@ -381,6 +381,8 @@ fn push_percent_encoded(out: &mut String, text: &str) {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Authorize</title></head><body>\
   <h1>Authorize {{ client_name }}</h1>\
   <p><strong>{{ client_name }}</strong> is requesting access.</p>\

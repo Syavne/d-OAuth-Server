@@ -1,0 +1,235 @@
+/* Shared same-origin stylesheet for every server-rendered page.
+ *
+ * Embedded at compile time (`include_str!`) and served from `/assets/app.css`
+ * so `style-src 'self'` covers it without inline styles. No imports, no remote
+ * URLs, no web fonts, no JavaScript. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --text: #1b1f24;
+  --muted: #59616c;
+  --border: #d5dae0;
+  --field: #f7f8fa;
+  --accent: #0b5cad;
+  --accent-hover: #094b8e;
+  --accent-contrast: #ffffff;
+  --focus: #0b5cad;
+  --alert-bg: #fdeceb;
+  --alert-border: #b3261e;
+  --alert-text: #7d1c17;
+  --code: #eef1f4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131619;
+    --surface: #1d2227;
+    --text: #e9ebee;
+    --muted: #a4acb7;
+    --border: #363d45;
+    --field: #15191d;
+    --accent: #77b3ec;
+    --accent-hover: #9ac8f2;
+    --accent-contrast: #10161c;
+    --focus: #9ac8f2;
+    --alert-bg: #3b1e1d;
+    --alert-border: #e58078;
+    --alert-text: #f7cec9;
+    --code: #262c32;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  max-width: 40rem;
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 3rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+  font-size: 1rem;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+  -webkit-text-size-adjust: 100%;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0 0 1rem;
+  color: var(--text);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+
+h1 {
+  font-size: 1.6rem;
+}
+
+h2 {
+  font-size: 1.3rem;
+}
+
+h3 {
+  font-size: 1.1rem;
+}
+
+p {
+  margin: 0 0 1rem;
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 0.15em;
+}
+
+a:hover {
+  color: var(--accent-hover);
+}
+
+ul {
+  margin: 0 0 1rem;
+  padding-left: 1.5rem;
+}
+
+li {
+  margin: 0.3rem 0;
+}
+
+/* Recovery codes and one-time secrets: monospace, spaced for transcription. */
+li strong {
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.25rem;
+  background: var(--code);
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    "Liberation Mono",
+    monospace;
+  letter-spacing: 0.03em;
+  overflow-wrap: anywhere;
+}
+
+strong {
+  font-weight: 600;
+}
+
+/* Error and status messages: a distinct, non-color-only surface. */
+[role="alert"] {
+  margin: 0 0 1.25rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--alert-border);
+  border-left-width: 0.35rem;
+  border-radius: 0.4rem;
+  background: var(--alert-bg);
+  color: var(--alert-text);
+  font-weight: 600;
+}
+
+/* Forms are the card surface: background + border + padding separate them
+ * from the page without extra markup. */
+form {
+  margin: 0 0 1.5rem;
+  padding: 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  background: var(--surface);
+}
+
+label {
+  display: block;
+  margin: 0 0 0.35rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+input:not([type="hidden"]),
+textarea {
+  display: block;
+  width: 100%;
+  min-height: 2.75rem;
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--field);
+  color: var(--text);
+  /* 16px floor stops iOS Safari from zooming the layout on focus. */
+  font-family: inherit;
+  font-size: 1rem;
+}
+
+input[type="hidden"] {
+  display: none;
+}
+
+input::placeholder {
+  color: var(--muted);
+}
+
+button {
+  min-height: 2.75rem;
+  padding: 0.65rem 1.25rem;
+  border: 1px solid transparent;
+  border-radius: 0.4rem;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--accent-hover);
+}
+
+/* Deny/destructive choices read as secondary next to Approve. */
+button[value="deny"] {
+  border-color: var(--border);
+  background: transparent;
+  color: var(--accent);
+}
+
+button[value="deny"]:hover {
+  border-color: var(--accent);
+  background: var(--field);
+}
+
+/* Keyboard focus only: a visible ring on every interactive control. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (max-width: 30rem) {
+  body {
+    padding: 1.25rem 0.875rem 2rem;
+  }
+
+  form {
+    padding: 1.1rem;
+  }
+
+  button {
+    width: 100%;
+  }
+}

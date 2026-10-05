@@ -69,7 +69,7 @@ use crate::state::{AppState, health_router};
 use crate::store::pending::PendingAuth;
 use crate::store::{Store, pending};
 use crate::ui::device::DeviceForm;
-use crate::ui::{consent, device as device_page, login};
+use crate::ui::{assets, consent, device as device_page, login};
 
 /// Largest accepted request body (2 MiB; DCR may carry an inline `jwks`).
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -117,6 +117,7 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axu
   let resilience = ResilienceConfig::from_policy(&state.config.failure_policy);
 
   let router = axum::Router::new()
+    .route("/assets/app.css", get(assets::stylesheet))
     .route(
       "/.well-known/oauth-authorization-server",
       get(metadata::metadata),
@@ -469,6 +470,7 @@ mod router_tests {
     let router = build_router(passthrough_state()?);
     let form = [("content-type", "application/x-www-form-urlencoded")];
     let routes: &[Route<'_>] = &[
+      ("GET", "/assets/app.css", &[]),
       ("GET", "/.well-known/oauth-authorization-server", &[]),
       ("GET", "/authorize?client_id=nobody", &[]),
       ("POST", "/par", &form),

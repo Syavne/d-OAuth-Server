@@ -5,7 +5,7 @@ use secrecy::SecretString;
 
 use super::{
   RECOVERY_CODE_COUNT, TOTP_STEP_SECS, TotpError, build_totp, decrypt_secret, encrypt_secret,
-  generate_recovery_codes, generate_secret, normalize_recovery_code, otpauth_uri,
+  generate_recovery_codes, generate_secret, normalize_recovery_code, otpauth_uri, qr_svg,
   replay_fingerprint, verify_window,
 };
 use crate::keys::{KeyId, KeyRing};
@@ -205,6 +205,30 @@ fn login_totp_otpauth_uri_carries_secret_and_params() -> Result<(), TotpError> {
   let uri = otpauth_uri("Example AS", "user@example.test", "GEZDGNBVGY3TQOJQ");
   if !uri.starts_with("otpauth://totp/") || !uri.contains("secret=GEZDGNBVGY3TQOJQ") {
     return Err(TotpError::InvalidSecret);
+  }
+  Ok(())
+}
+
+#[test]
+fn login_totp_qr_svg_is_self_contained() -> Result<(), TotpError> {
+  let uri = otpauth_uri("Example AS", "user@example.test", &rfc_secret());
+  let svg = qr_svg(&uri)?;
+  if !svg.starts_with("<svg") || !svg.trim_end().ends_with("</svg>") {
+    return Err(TotpError::Qr);
+  }
+  for forbidden in ["<script", "<image", "href="] {
+    if svg.contains(forbidden) {
+      return Err(TotpError::Qr);
+    }
+  }
+  Ok(())
+}
+
+#[test]
+fn login_totp_qr_svg_rejects_oversized_uri() -> Result<(), TotpError> {
+  let oversized = "A".repeat(4000);
+  if !matches!(qr_svg(&oversized), Err(TotpError::Qr)) {
+    return Err(TotpError::Qr);
   }
   Ok(())
 }

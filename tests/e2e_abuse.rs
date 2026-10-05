@@ -1,8 +1,8 @@
 //! `test(e2e_)` abuse matrix over the live router: wired-endpoint rows.
 //!
 //! Every test boots the REAL production router over a REAL loopback socket
-//! against REAL testcontainers Postgres + Redis (see `e2e/harness.rs`) and
-//! asserts only observable HTTP behavior. `#[test]` names all start with
+//! against the shared Postgres + Redis from `compose.test.yaml` (see
+//! `e2e/harness.rs`) and asserts only observable HTTP behavior. `#[test]` names all start with
 //! `e2e_` so `cargo nextest run -E 'test(e2e_)'` selects exactly this suite.
 //!
 //! Rows whose endpoint is wired live here; `/token` grant rows live in

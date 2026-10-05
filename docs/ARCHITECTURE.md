@@ -27,7 +27,7 @@ the library.
 | `src/db/` | Postgres repositories for the six domain tables. See [DATABASE.md](DATABASE.md). |
 | `src/store/` | Redis ephemeral state and the durability barrier. See [REDIS.md](REDIS.md). |
 | `src/protocol/` | OAuth endpoints and grants. See [OAUTH.md](OAUTH.md). |
-| `src/ui/` | Server-rendered login, consent, and device pages (Askama templates). |
+| `src/ui/` | Server-rendered login, consent, and device pages (Askama templates) plus the embedded same-origin stylesheet served at `/assets/app.css`. |
 | `src/middleware/` | Request id, tracing and redaction, rate limiting, security headers, and audit. |
 | `src/routes.rs` | Router assembly and the middleware order. |
 | `src/serve.rs`, `src/tls.rs` | Listener bootstrap and the custom TLS accept loop. |

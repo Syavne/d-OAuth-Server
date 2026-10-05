@@ -78,8 +78,16 @@ right reason.
 cargo nextest run -E 'test(<behavior_name>)'   # red, then green
 ```
 
-Use real Postgres and Redis through testcontainers for integration. Prefer a
-real object or an in-memory fake over a mock. Assert the observable contract.
+Integration tests use the real shared Postgres and Redis from
+`compose.test.yaml` (`docker compose -f compose.test.yaml up -d`: Postgres on
+`127.0.0.1:5433`, Redis on `127.0.0.1:6380`; override with
+`D_OAUTH_TEST_POSTGRES_URL` and `D_OAUTH_TEST_REDIS_URL`). They get per-test
+isolation from a fresh database and unique Redis key prefixes. Testcontainers
+remains only for unit-test helpers under `src/` and for `tests/resilience.rs`,
+which stops and restarts containers; `tests/topology.rs` uses in-process
+`redis-test` fixtures that need a `redis-server` binary. Prefer a real object or
+an in-memory fake over a mock. Assert the observable contract. Tear the services
+down with `docker compose -f compose.test.yaml down -v`.
 
 Quality gates for any change:
 

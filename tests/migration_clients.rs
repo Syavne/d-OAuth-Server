@@ -34,7 +34,7 @@ fn migration_clients_is_embedded_in_migrator() {
 /// column outside the plan was added.
 #[tokio::test]
 async fn migration_clients_columns_match_plan() -> Result<(), TestError> {
-  let (_container, pool) = postgres().await?;
+  let pool = postgres().await?;
   migrate(&pool, OAUTH_CLIENTS_SQL).await?;
 
   let expected: BTreeSet<(String, String, String)> = [
@@ -82,7 +82,7 @@ async fn migration_clients_columns_match_plan() -> Result<(), TestError> {
 /// indexes on the mTLS identity columns exist and are shaped as specified.
 #[tokio::test]
 async fn migration_clients_indexes_are_unique_and_partial() -> Result<(), TestError> {
-  let (_container, pool) = postgres().await?;
+  let pool = postgres().await?;
   migrate(&pool, OAUTH_CLIENTS_SQL).await?;
 
   let defs = client_indexes(&pool).await?;
@@ -132,7 +132,7 @@ async fn migration_clients_indexes_are_unique_and_partial() -> Result<(), TestEr
 /// violate a unique index; NULL identity fields remain unconstrained.
 #[tokio::test]
 async fn migration_clients_reject_ambiguous_identities() -> Result<(), TestError> {
-  let (_container, pool) = postgres().await?;
+  let pool = postgres().await?;
   migrate(&pool, OAUTH_CLIENTS_SQL).await?;
 
   let alpha = insert_client(
@@ -216,7 +216,7 @@ async fn migration_clients_reject_ambiguous_identities() -> Result<(), TestError
 /// to false, so pre-existing rows stay unconstrained.
 #[tokio::test]
 async fn migration_clients_dpop_bound_column_defaults_false() -> Result<(), TestError> {
-  let (_container, pool) = postgres().await?;
+  let pool = postgres().await?;
   migrate(&pool, OAUTH_CLIENTS_SQL).await?;
   migrate(
     &pool,

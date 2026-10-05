@@ -16,8 +16,9 @@ with the [README](../README.md) and [OPERATIONS.md](OPERATIONS.md).
   and `clippy`). `rustup` installs it automatically on first build.
 - [`cargo-nextest`](https://nexte.st/) for the test suite:
   `cargo install cargo-nextest --locked`.
-- Docker for the integration tests, which start real Postgres and Redis
-  containers through `testcontainers`.
+- Docker, to run the shared test Postgres and Redis from
+  `compose.test.yaml` (`docker compose -f compose.test.yaml up -d`), and for
+  the lifecycle tests that still use `testcontainers`.
 - `sqlx-cli` only when you add or change a SQL query or a migration:
   `cargo install sqlx-cli --locked --features runtime-tokio,tls-rustls-ring`.
 
@@ -48,9 +49,13 @@ cargo audit
 cargo deny check
 ```
 
-`cargo nextest run` is the authoritative test entry point. It runs unit,
-integration (testcontainers), and end-to-end tests. `cargo test --doc` runs the
-doc examples separately because nextest does not cover doctests.
+Start the shared test services before `cargo nextest run --all-targets`:
+`docker compose -f compose.test.yaml up -d`, then tear them down with
+`docker compose -f compose.test.yaml down -v`. `cargo nextest run` is the
+authoritative test entry point. It runs unit, integration, and end-to-end tests;
+the integration tests use the shared services, and the lifecycle suites keep
+`testcontainers`. `cargo test --doc` runs the doc examples separately because
+nextest does not cover doctests.
 
 ### Narrow scope while developing
 
@@ -66,9 +71,30 @@ touched code. The full suite runs once, at integration time.
 
 ### Database-backed tests
 
-Integration tests start their own Postgres and Redis containers and apply the
-embedded migrations. They need a working Docker daemon, no more. Migrations are
-never run by the test process against a shared database.
+Integration tests connect to the shared Postgres and Redis started from
+`compose.test.yaml`:
+
+```bash
+docker compose -f compose.test.yaml up -d
+cargo nextest run --all-targets
+docker compose -f compose.test.yaml down -v
+```
+
+The defaults are Postgres on `127.0.0.1:5433` and Redis on `127.0.0.1:6380`,
+overridable through `D_OAUTH_TEST_POSTGRES_URL` and `D_OAUTH_TEST_REDIS_URL`.
+Each test isolates itself with a freshly created database and unique Redis key
+prefixes, so parallel tests never share state and nothing is flushed.
+Migrations are never run by the test process against the shared `postgres`
+database; a test that asserts on a migration applies it to its own fresh
+database.
+
+The lifecycle tests are the exception. `tests/resilience.rs` stops and restarts
+containers through `testcontainers`; the guards synchronously `rm` them on drop,
+so killing the suite mid-run no longer orphans containers. `tests/topology.rs`
+spawns in-process `redis-test` Sentinel/Cluster fixtures, which need a real
+`redis-server` binary. Unit-test helpers under `src/` also still use
+`testcontainers`. They need a working Docker daemon and, for the in-process
+topology fixtures, the `redis-server` binary.
 
 ## Module conventions
 
@@ -112,8 +138,12 @@ Every behavior change follows red, green, refactor:
 2. Green: write the smallest change that makes the test pass.
 3. Refactor: restructure with the test green as the safety net.
 
-Prefer a real object or an in-memory fake over a mock. Use `testcontainers` for
-Postgres and Redis. Assert the observable contract, not an implementation dump.
+Write the test against the shared Postgres and Redis from
+`compose.test.yaml` (defaults `127.0.0.1:5433` and `127.0.0.1:6380`, override
+with `D_OAUTH_TEST_POSTGRES_URL` / `D_OAUTH_TEST_REDIS_URL`), with a fresh
+database and unique Redis prefixes per test. Keep `testcontainers` for the
+stop/start lifecycle cases only. Prefer a real object or an in-memory fake over
+a mock. Assert the observable contract, not an implementation dump.
 
 ## Commit style
 

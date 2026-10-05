@@ -6,6 +6,7 @@
 //!
 //! TODO(task 25): wire re-exports for `login`/`consent`/`device`.
 
+pub mod assets;
 pub mod consent;
 pub mod device;
 pub mod login;

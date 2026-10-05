@@ -175,42 +175,6 @@ the mitigations to implement.
 - **Proposed change.** Restrict who may exec and audit it.
 - **Files.** `docs/OPERATIONS.md`, `docs/DEPLOYMENT.md`.
 
-## Frontend usability
-
-The server-rendered pages (`src/ui/`) are intentionally minimal unstyled HTML
-with no JavaScript (the page CSP sets `script-src 'none'`). This section lists
-the usability work to make them presentable without weakening that posture:
-any styling must keep the CSP and the login CSRF tokens intact.
-
-### 14. Prettify frontend screens
-
-- **Problem.** The login, consent, device, password-change, and TOTP pages are
-  bare HTML. They work but look unfinished, which undermines trust in a
-  security-critical flow.
-- **Proposed change.** Add a small shared stylesheet served from the binary
-  (same-origin, no external assets, no inline scripts) with a clean, readable
-  layout for every page: consistent headings, readable forms, visible error
-  states (`role="alert"` preserved), and a responsive width. Keep zero
-  JavaScript so `script-src 'none'` still holds; if any inline `<style>` is
-  used, scope the CSP with a hash rather than `unsafe-inline`.
-- **Files.** `src/ui/` (all page templates), `src/routes.rs` (middleware order
-  if a static-asset route is added), `docs/ARCHITECTURE.md` (if the CSP
-  changes).
-
-### 15. Add QR code generation for TOTP enrollment
-
-- **Problem.** TOTP setup shows the `otpauth://` URI as text
-  (`src/crypto/totp.rs`), so enrolling means hand-typing the secret into the
-  authenticator app. Users expect to scan a QR code.
-- **Proposed change.** Render the enrollment secret as a QR code
-  server-side (e.g. the `qrcode` crate emitting SVG embedded in the page),
-  so no client-side script is needed and `script-src 'none'` still holds.
-  Keep showing the secret in text form as a fallback, alongside the recovery
-  codes already displayed once at enrollment.
-- **Files.** `src/crypto/totp.rs` (URI builder), `src/ui/login.rs` (TOTP setup
-  template), `Cargo.toml`/`Cargo.lock` (new dependency, must pass
-  `cargo deny check`).
-
 ## HTTP response hardening
 
 ### 16. Make the HTTP cache policy explicit on every endpoint

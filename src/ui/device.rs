@@ -296,6 +296,8 @@ fn unhex(text: &str) -> Result<Vec<u8>, ()> {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Device verification</title></head><body>\
   <h1>Enter the code shown on your device</h1>\
   {% if has_error %}<p role=\"alert\">{{ error }}</p>{% endif %}\
@@ -316,6 +318,8 @@ struct EntryTemplate {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Authorize device</title></head><body>\
   <h1>Authorize this device?</h1>\
   <p>Code <strong>{{ user_code_display }}</strong></p>\
@@ -340,6 +344,8 @@ struct ReviewTemplate {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Device {{ verdict }}</title></head><body>\
   {% if approved %}<h1>Device approved</h1>\
   <p>You may return to your device; it will pick up the authorization.</p>\

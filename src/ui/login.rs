@@ -1015,15 +1015,17 @@ pub struct ConfirmForm {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Sign in</title></head><body>\
   <h1>Sign in</h1>\
   {% if has_client %}<p>Continue to <strong>{{ client }}</strong>.</p>{% endif %}\
   {% if has_error %}<p role=\"alert\">{{ error }}</p>{% endif %}\
   <form method=\"post\" action=\"/login\">\
   <label for=\"email\">Email</label>\
-  <input id=\"email\" name=\"email\" type=\"email\" value=\"{{ email }}\" autocomplete=\"username\">\
+  <input id=\"email\" name=\"email\" type=\"email\" value=\"{{ email }}\" inputmode=\"email\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\">\
   <label for=\"password\">Password</label>\
-  <input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\">\
+  <input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" autocapitalize=\"none\" spellcheck=\"false\">\
   <label for=\"code\">Authenticator code or recovery code</label>\
   <input id=\"code\" name=\"code\" autocomplete=\"one-time-code\">\
   <input type=\"hidden\" name=\"csrf\" value=\"{{ csrf }}\">\
@@ -1043,14 +1045,16 @@ struct LoginTemplate {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Change password</title></head><body>\
   <h1>Change your password</h1>\
   {% if has_error %}<p role=\"alert\">{{ error }}</p>{% endif %}\
   <form method=\"post\" action=\"/login/change-password\">\
   <label for=\"new_password\">New password (at least 12 characters)</label>\
-  <input id=\"new_password\" name=\"new_password\" type=\"password\" autocomplete=\"new-password\">\
+  <input id=\"new_password\" name=\"new_password\" type=\"password\" autocomplete=\"new-password\" autocapitalize=\"none\" spellcheck=\"false\">\
   <label for=\"confirm\">Confirm new password</label>\
-  <input id=\"confirm\" name=\"confirm\" type=\"password\" autocomplete=\"new-password\">\
+  <input id=\"confirm\" name=\"confirm\" type=\"password\" autocomplete=\"new-password\" autocapitalize=\"none\" spellcheck=\"false\">\
   <input type=\"hidden\" name=\"csrf\" value=\"{{ csrf }}\">\
   <button type=\"submit\">Change password</button></form></body></html>",
   ext = "html"
@@ -1065,9 +1069,12 @@ struct PasswordTemplate {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Set up authenticator</title></head><body>\
   <h1>Set up your authenticator</h1>\
-  <p>Scan the secret into your authenticator app, then confirm with a code.</p>\
+  <p>Scan the QR code or enter the secret into your authenticator app, then confirm with a code.</p>\
+  <div class=\"qr\">{{ qr_svg|safe }}</div>\
   <p>Secret: <strong>{{ secret }}</strong></p>\
   <p>URI: {{ uri }}</p>\
   <p>Recovery codes (shown once, store them safely):</p>\
@@ -1075,7 +1082,7 @@ struct PasswordTemplate {
   {% if has_error %}<p role=\"alert\">{{ error }}</p>{% endif %}\
   <form method=\"post\" action=\"/login/totp/confirm\">\
   <label for=\"code\">Authenticator code</label>\
-  <input id=\"code\" name=\"code\" autocomplete=\"one-time-code\">\
+  <input id=\"code\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" pattern=\"[0-9]*\" autocapitalize=\"none\" spellcheck=\"false\">\
   <input type=\"hidden\" name=\"csrf\" value=\"{{ csrf }}\">\
   <button type=\"submit\">Confirm</button></form></body></html>",
   ext = "html"
@@ -1084,6 +1091,7 @@ struct SetupTemplate {
   csrf: String,
   secret: String,
   uri: String,
+  qr_svg: String,
   codes: Vec<String>,
   error: String,
   has_error: bool,
@@ -1093,12 +1101,14 @@ struct SetupTemplate {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Confirm authenticator</title></head><body>\
   <h1>Confirm your authenticator</h1>\
   {% if has_error %}<p role=\"alert\">{{ error }}</p>{% endif %}\
   <form method=\"post\" action=\"/login/totp/confirm\">\
   <label for=\"code\">Authenticator code</label>\
-  <input id=\"code\" name=\"code\" autocomplete=\"one-time-code\">\
+  <input id=\"code\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" pattern=\"[0-9]*\" autocapitalize=\"none\" spellcheck=\"false\">\
   <input type=\"hidden\" name=\"csrf\" value=\"{{ csrf }}\">\
   <button type=\"submit\">Confirm</button></form></body></html>",
   ext = "html"
@@ -1113,6 +1123,8 @@ struct ConfirmTemplate {
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Signed in</title></head><body>\
   <h1>Signed in</h1><p>You are signed in.</p>\
   <form method=\"post\" action=\"/logout\">\
@@ -1129,6 +1141,8 @@ struct SuccessTemplate;
 #[derive(Template)]
 #[template(
   source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
   <title>Signed out</title></head><body>\
   <h1>Signed out</h1><p>Your session has ended.</p>\
   <p><a href=\"/login\">Sign in again</a>.</p></body></html>",
@@ -1325,14 +1339,21 @@ pub async fn get_totp_setup(State(state): State<AppState>, jar: CookieJar) -> Re
   }
   let mut deps = deps_of(&state, &mut conn, &store);
   match provision_totp(&mut deps, &session_id).await {
-    Ok(offer) => render(SetupTemplate {
-      csrf: form_token(&live.meta.csrf_secret, TOTP_CONFIRM_ACTION),
-      secret: offer.secret,
-      uri: offer.otpauth_uri,
-      codes: offer.recovery_codes,
-      error: String::new(),
-      has_error: false,
-    }),
+    Ok(offer) => {
+      let qr_svg = match totp::qr_svg(&offer.otpauth_uri) {
+        Ok(svg) => svg,
+        Err(_) => return AppError::server_error().into_response(),
+      };
+      render(SetupTemplate {
+        csrf: form_token(&live.meta.csrf_secret, TOTP_CONFIRM_ACTION),
+        secret: offer.secret,
+        uri: offer.otpauth_uri,
+        qr_svg,
+        codes: offer.recovery_codes,
+        error: String::new(),
+        has_error: false,
+      })
+    }
     Err(error) => error.into_response(),
   }
 }
@@ -1548,6 +1569,8 @@ fn render(template: impl Template) -> Response {
 fn login_rejected_page(email: &str) -> String {
   format!(
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+    <link rel=\"stylesheet\" href=\"/assets/app.css\">\
     <title>Sign in</title></head><body>\
     <h1>Sign in</h1>\
     <p role=\"alert\">{INVALID_CREDENTIALS}</p>\

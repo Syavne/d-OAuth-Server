@@ -24,6 +24,14 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   and `client attach|detach-redirect-uri` accept `--kind`, and `config sync` file
   entries accept a `kind` field. A client may register at most one enabled
   `post_logout` URI.
+- The server-rendered pages (login, consent, device, TOTP) now share an embedded
+  same-origin stylesheet served at `GET /assets/app.css` (`src/ui/app.css`). It
+  adds no JavaScript and needs no CSP change: the page policy's existing
+  `style-src 'self'` covers it, so `script-src 'none'` still holds.
+- TOTP enrollment now renders the `otpauth://` URI as a server-side inline SVG
+  QR code beside the text secret and URI, so users can scan instead of
+  hand-typing. The new `qrcode` dependency is pinned SVG-only (no `image`
+  codecs); the text secret, URI, and one-time recovery codes are unchanged.
 
 ### Fixed
 
