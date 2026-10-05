@@ -1,0 +1,143 @@
+# Supply-chain gate (task 46). Coordinates with task 42's `ci.yml`.
+#
+# Per-PR legs: `manifest-lint` (kustomize build + scripts/check_manifests.py,
+# including the L7-vs-L4 mTLS pairing check).
+# Per-push-to-main legs: multi-arch `docker buildx bake` with SBOM +
+# provenance, trivy/grype gating HIGH/CRITICAL, keyless cosign signing, and
+# digest pinning of `deploy/k8s/kustomization.yaml` (strict lint re-run).
+# Scheduled legs (weekly rebuild, Monday 04:00 UTC): rebuild + rescan + resign
+# so base-image digests advance even without code changes.
+#
+# The L7 mTLS constraint is DOCUMENTED (docs/DEPLOYMENT.md) and lint-checked
+# here; it is explicitly NOT exercised end-to-end in CI.
+
+name: supply-chain
+
+on:
+  push:
+    branches: ["main"]
+  pull_request: {}
+  schedule:
+    # Weekly rebuild (Monday 04:00 UTC).
+    - cron: "0 4 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY_IMAGE: ghcr.io/d-oauth/d-oauth-server
+  SQLX_OFFLINE: "true"
+
+jobs:
+  manifest-lint:
+    name: manifest-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install pyyaml + kustomize
+        run: |
+          pip install pyyaml
+          curl -sSfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz \
+            | tar -xzf - kustomize && sudo mv kustomize /usr/local/bin/
+      - name: Kustomize build
+        run: kustomize build deploy/k8s
+      - name: Manifest policy lint (probes, PDB, no-baked-secrets, L7-vs-L4 mTLS)
+        run: python3 scripts/check_manifests.py
+
+  build:
+    name: build
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.bake.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Multi-arch bake with SBOM + provenance
+        id: bake
+        run: |
+          TAG="sha-${GITHUB_SHA::12}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          docker buildx bake image \
+            --set "image.tags=${REGISTRY_IMAGE}:${TAG}" \
+            --set image.output="type=registry" \
+            --sbom=true \
+            --provenance=mode=max \
+            --metadata-file /tmp/bake-metadata.json
+          python3 -c "
+          import json
+          meta = json.load(open('/tmp/bake-metadata.json'))
+          node = meta['image']['containerimage.digest']
+          open('${GITHUB_OUTPUT}', 'a').write(f'digest={node}\n')
+          "
+      - name: SBOM (syft, committed as artifact)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY_IMAGE }}@${{ steps.bake.outputs.digest }}
+          artifact-name: sbom.spdx.json
+      - name: Scan (trivy, gate HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY_IMAGE }}@${{ steps.bake.outputs.digest }}
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+      - name: Scan (grype, gate high/critical)
+        uses: anchore/scan-action@v4
+        with:
+          image: ${{ env.REGISTRY_IMAGE }}@${{ steps.bake.outputs.digest }}
+          fail-build: true
+          severity-cutoff: high
+      - uses: sigstore/cosign-installer@v3
+      - name: Keyless sign (cosign, OIDC)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign "${REGISTRY_IMAGE}@${{ steps.bake.outputs.digest }}"
+          cosign attest --predicate /tmp/bake-metadata.json \
+            "${REGISTRY_IMAGE}@${{ steps.bake.outputs.digest }}"
+
+  pin-digest:
+    name: pin-digest
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Pin kustomization to the built digest + strict lint
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          pip install pyyaml
+          python3 - "${DIGEST}" <<'EOF'
+          import sys
+          from pathlib import Path
+          import yaml
+          digest = sys.argv[1]
+          assert digest.startswith("sha256:"), f"bad digest: {digest}"
+          path = Path("deploy/k8s/kustomization.yaml")
+          doc = yaml.safe_load(path.read_text())
+          for img in doc.get("images", []):
+              if img.get("name") == "ghcr.io/d-oauth/d-oauth-server":
+                  img.pop("newTag", None)
+                  img["digest"] = digest
+          path.write_text(yaml.safe_dump(doc, sort_keys=False))
+          EOF
+          python3 scripts/check_manifests.py --strict-digest

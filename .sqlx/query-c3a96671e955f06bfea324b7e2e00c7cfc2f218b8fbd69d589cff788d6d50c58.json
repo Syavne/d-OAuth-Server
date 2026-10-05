@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT scope_name FROM user_scopes\n        WHERE user_id = $1 ORDER BY scope_name",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "scope_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "user_scopes",
+            "name": "scope_name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c3a96671e955f06bfea324b7e2e00c7cfc2f218b8fbd69d589cff788d6d50c58"
+}

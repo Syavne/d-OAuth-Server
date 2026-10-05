@@ -1,0 +1,8 @@
+!.env.example
+.env
+.env.*
+.omo/
+.opencode/
+/target
+__pycache__/
+scripts/__pycache__/

@@ -1,0 +1,24 @@
+# ClusterIP Service for the public TLS listener only (task 46).
+#
+# Port 8080 is the TLS public listener. The plaintext health listener (8081)
+# is intentionally NOT exposed here: kubelet probes reach it via the pod IP,
+# and external traffic must never hit it. mTLS deployments sit behind an
+# L4/TCP passthrough (NLB gateway / TLSRoute), never an L7 ingress that
+# terminates TLS — see docs/DEPLOYMENT.md.
+apiVersion: v1
+kind: Service
+metadata:
+  name: d-oauth-server
+  namespace: d-oauth
+  labels:
+    app.kubernetes.io/name: d-oauth-server
+    app.kubernetes.io/part-of: d-oauth
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: d-oauth-server
+  ports:
+    - name: public-tls
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

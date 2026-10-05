@@ -1,0 +1,29 @@
+# Non-secret server settings (task 46).
+#
+# Every key maps to a `D_OAUTH_*` environment variable read by
+# `Config::load` (prefix `D_OAUTH`, nested separator `__`). Secret material
+# (database/redis URLs, token pepper, TOTP key) lives in `secret.yaml` and
+# is NEVER added here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d-oauth-config
+  namespace: d-oauth
+  labels:
+    app.kubernetes.io/name: d-oauth-server
+    app.kubernetes.io/part-of: d-oauth
+data:
+  D_OAUTH_ISSUER: "https://auth.example.com"
+  D_OAUTH_ENVIRONMENT: "production"
+  D_OAUTH_BIND_ADDR: "0.0.0.0:8080"
+  D_OAUTH_HEALTH_ADDR: "0.0.0.0:8081"
+  D_OAUTH_TLS__CERT_PATH: "/certs/tls.crt"
+  D_OAUTH_TLS__KEY_PATH: "/certs/tls.key"
+  # Client-CA enables in-process mTLS verification. While set, the cluster
+  # MUST use L4/TCP passthrough (NLB gateway / TLSRoute); an L7 ingress that
+  # terminates TLS strips the client certificate. See docs/DEPLOYMENT.md and
+  # scripts/check_manifests.py, which rejects the forbidden pairing.
+  D_OAUTH_TLS__CLIENT_CA_PATH: "/certs/client-ca.crt"
+  # Single-Redis topology takes a plain URL; the contract the server asserts
+  # at startup is noeviction + AOF, configured on the Redis side.
+  D_OAUTH_REDIS__DURABILITY: "waitaof"

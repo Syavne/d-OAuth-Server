@@ -1,0 +1,7 @@
+# cargo-fuzz project layout (task 42). Fuzzing needs a nightly toolchain:
+# the root `rust-toolchain.toml` stays pinned to stable, and this file
+# overrides the toolchain for the `fuzz/` directory only (rustup applies the
+# nearest `rust-toolchain.toml` to the working directory). CI runs
+# `cargo fuzz build` with `fuzz/` as its working directory.
+[toolchain]
+channel = "nightly"

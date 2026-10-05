@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM redirect_uris WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM client_redirect_uris WHERE redirect_uri_id = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4037d743e3683a32cd7ae9b06f8acc080e0279f890d9e92a1b9c426f140e24e5"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM client_redirect_uris WHERE client_id = $1 AND redirect_uri_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a767bfb9fc4258b18a5faa7e541431839b6072177df6258a3e87d8c0cc9ee9c0"
+}

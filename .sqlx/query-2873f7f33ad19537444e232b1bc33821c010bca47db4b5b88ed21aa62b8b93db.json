@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users\n            SET totp_recovery_code_hashes = $2::text::jsonb, updated_at = now()\n          WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2873f7f33ad19537444e232b1bc33821c010bca47db4b5b88ed21aa62b8b93db"
+}

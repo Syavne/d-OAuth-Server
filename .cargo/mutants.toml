@@ -1,0 +1,15 @@
+# cargo-mutants budget for the scheduled mutation job (task 42).
+#
+# Scoped to the pure, container-free security modules so the weekly CI leg
+# needs no Docker: scope parsing, redirect matching, PKCE, and the token
+# primitives. The time budget lives in CI (`.github/workflows/ci.yml` runs
+# `cargo mutants --timeout 1800 --test-tool nextest` with a 60-minute step
+# backstop). Task 43 scopes `--file <module>` runs over the
+# security-critical modules against the fast test subset.
+examine_globs = [
+  "src/crypto/ct.rs",
+  "src/crypto/pkce.rs",
+  "src/crypto/tokens.rs",
+  "src/protocol/scope.rs",
+  "src/protocol/redirect_repo.rs",
+]

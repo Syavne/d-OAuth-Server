@@ -1,0 +1,145 @@
+# Stateless multi-replica Deployment (task 46).
+#
+# - 3 replicas sharing one Postgres + one Redis: no replica holds state
+#   another needs (tokens live in Redis under `{state}`-tagged keys).
+# - `serve` NEVER migrates; the separate `migrate-job.yaml` owns the schema.
+#   Readiness (`/health/ready`) compares `_sqlx_migrations` against the
+#   binary's embedded migrations, so new replicas stay out of traffic until
+#   the Job has applied the schema (expand/contract keeps N-1 serving).
+# - Probes hit the PLAINTEXT pod-IP health listener (`health_addr`,
+#   default `0.0.0.0:8081`); the public listener stays TLS-only.
+# - `terminationGracePeriodSeconds: 45` covers the server's 1s propagation
+#   grace + 30s drain budget (`src/serve.rs`: PROPAGATION_GRACE, DRAIN_DEADLINE).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: d-oauth-server
+  namespace: d-oauth
+  labels:
+    app.kubernetes.io/name: d-oauth-server
+    app.kubernetes.io/part-of: d-oauth
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Keep every old replica serving while the migration Job + new
+      # replicas converge (expand/contract upgrades).
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: d-oauth-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: d-oauth-server
+        app.kubernetes.io/part-of: d-oauth
+    spec:
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          # Release pinning: CI resolves this tag to an immutable digest
+          # (`kustomize edit set image ...@sha256:<digest>`) before rollout;
+          # see `.github/workflows/supply-chain.yml` and `kustomization.yaml`.
+          image: ghcr.io/d-oauth/d-oauth-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: public-tls
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: d-oauth-config
+          env:
+            - name: D_OAUTH_DATABASE__URL
+              valueFrom:
+                secretKeyRef:
+                  name: d-oauth-secrets
+                  key: database-url
+            - name: D_OAUTH_REDIS__URL
+              valueFrom:
+                secretKeyRef:
+                  name: d-oauth-secrets
+                  key: redis-url
+            - name: D_OAUTH_TOKEN_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: d-oauth-secrets
+                  key: token-pepper
+            - name: D_OAUTH_TOTP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: d-oauth-secrets
+                  key: totp-encryption-key
+          # Liveness is dependency-free by construction (`/health/live`
+          # touches no Postgres/Redis), so a dependency outage never
+          # triggers a restart storm — readiness absorbs it instead.
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 8081
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8081
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Fail-closed: 503 while Postgres/Redis are unreachable OR the
+          # `_sqlx_migrations` version does not match the binary (i.e. the
+          # migrate Job has not run yet on a fresh/rolling deploy).
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8081
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: certs
+          secret:
+            secretName: d-oauth-tls
+            defaultMode: 0o400
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: d-oauth-server
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: d-oauth-server

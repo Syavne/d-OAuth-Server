@@ -1,0 +1,135 @@
+# AGENTS.md
+
+Guidance for AI assistants working in this repository. Read this first; the
+guides under `docs/` carry the depth.
+
+## What this is
+
+An OAuth 2.1-only authorization server in Rust. Durable domain state is in
+PostgreSQL; all ephemeral state is in Redis. The crate is one library
+(`src/lib.rs`) plus a thin binary (`src/main.rs`). No HTTP admin API; the CLI is
+the admin surface.
+
+## Module map and where to add what
+
+| Add a... | To this module | Notes |
+| --- | --- | --- |
+| Configuration key or validation rule | `src/config.rs`, `src/config/` | Add to the raw serde struct, then validate in the matching submodule. Update [docs/CONFIGURATION.md](docs/CONFIGURATION.md). |
+| Key-ring behavior | `src/keys.rs` | Versioned ids only; never print key material. |
+| Crypto primitive (hash, compare, PKCE, TOTP) | `src/crypto/` | Constant-time for secret compares. |
+| JOSE verification (DPoP, JAR, `private_key_jwt`) | `src/jose/` | Reject fail-closed with the exact error code. |
+| Postgres query or repository | `src/db/` | `query!`/`query_as!` macros; regenerate `.sqlx`. |
+| Redis record or Lua script | `src/store/` | Keep every key under `{state}`; update [docs/REDIS.md](docs/REDIS.md). |
+| OAuth endpoint or grant | `src/protocol/` | Cite the RFC section in a comment. Update [docs/OAUTH.md](docs/OAUTH.md). |
+| Login, consent, or device page | `src/ui/` | Keep CSP and CSRF intact. |
+| Cross-cutting HTTP concern | `src/middleware/` | Mind the layer order in `src/routes.rs`. |
+| Endpoint or layer order | `src/routes.rs` | Update [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). |
+| Listener or shutdown behavior | `src/serve.rs`, `src/tls.rs` | Update [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). |
+| Health or topology behavior | `src/state/` | Readiness is fail-closed. |
+| CLI command or flag | `src/cli.rs`, `src/cli/` | Match the flag exactly in [docs/OPERATIONS.md](docs/OPERATIONS.md). |
+| Error code or HTTP mapping | `src/error.rs` | Add the variant and its status together. |
+
+If a change spans modules, put the logic in the module that owns the behavior
+and call into it from the others.
+
+## Strict Rust rules
+
+- Plain, idiomatic Rust. Edition 2024. 2-space indent (`rustfmt.toml`).
+- `#![forbid(unsafe_code)]` is on the crate. Never add `unsafe`.
+- No `unwrap`, `expect`, or `panic` in request paths. Clippy denies them.
+- Typed errors with `thiserror`. Map a dependency failure to the right
+  client-safe error, do not stringify it.
+- Use `tokio` and `axum` idioms: `async` handlers, `tower` layers, no blocking
+  work on the runtime thread.
+- Secrets use `secrecy` and `zeroize`. A secret-holding type must not print the
+  secret in `Debug`.
+- Use constant-time comparison (`subtle`) for any secret or token compare.
+- No business logic in `main.rs`.
+- Keep files focused; split by responsibility rather than growing a module.
+- Import grouping is `StdExternalCrate`.
+
+## Security checklist
+
+Before finishing any change, confirm:
+
+- [ ] Secret and token comparisons are constant time.
+- [ ] No secret, token, password, or OTP in a log, error body, metric label, or
+      evidence file.
+- [ ] Security endpoints fail closed: a dependency outage yields `503`, never a
+      fail-open success and never a `500` or panic.
+- [ ] A code, PAR handle, or device code is single-use and consumed atomically.
+- [ ] DPoP and `private_key_jwt` `jti` replay markers are written with `SET NX`.
+- [ ] Redirect URI match is exact, with the RFC 8252 loopback exception only.
+- [ ] PKCE is `S256` only; `plain` is rejected; a missing verifier cannot
+      downgrade.
+- [ ] Scope is intersected, never widened on refresh.
+- [ ] Only hashed or encrypted secrets are stored; no raw token at rest.
+- [ ] A sender-constrained grant re-verifies a fresh proof on every use.
+- [ ] `private_key_jwt` is treated as authentication only, never as a binding.
+- [ ] The change does not introduce a wildcard scope, redirect URI, or CORS
+      origin.
+
+## TDD workflow
+
+Red, green, refactor. Write the failing test first and confirm it fails for the
+right reason.
+
+```bash
+cargo nextest run -E 'test(<behavior_name>)'   # red, then green
+```
+
+Use real Postgres and Redis through testcontainers for integration. Prefer a
+real object or an in-memory fake over a mock. Assert the observable contract.
+
+Quality gates for any change:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo nextest run --all-targets
+cargo test --doc
+python3 scripts/check_doc_links.py
+```
+
+When a query or migration is added or changed, regenerate and commit the
+offline cache:
+
+```bash
+cargo sqlx prepare --workspace
+```
+
+## File-scope discipline
+
+- A delegated or subagent change runs only the narrowest name-filtered test for
+  the touched code, for example `cargo nextest run -E 'test(admin_bootstrap)'`.
+  Never the full suite, and never repo-wide setup.
+- The primary agent runs the full authoritative suite after integration:
+  `cargo nextest run --all-targets` followed by `cargo test --doc`.
+
+## Documentation contract
+
+Documentation is part of the change, not a follow-up. Any behavior change
+updates the relevant guide in the same commit:
+
+- OAuth flow, grants, error codes: `docs/OAUTH.md`.
+- Threat model, attack surface, tokens, sender constraints, admin runbook:
+  `docs/SECURITY.md`.
+- Modules, lifecycle, topology: `docs/ARCHITECTURE.md`.
+- Config keys and defaults: `docs/CONFIGURATION.md`.
+- Schema and migrations: `docs/DATABASE.md`.
+- Redis keys, TTLs, durability: `docs/REDIS.md`.
+- Image, manifests, probes: `docs/DEPLOYMENT.md`.
+- CLI and runbooks: `docs/OPERATIONS.md`, `RUNBOOK.md`.
+- This file, when the module map or rules change.
+
+A change to the deployment surface (a new listener, mount, dependency class, or
+runtime setting) updates the attack-surface section in `docs/SECURITY.md`.
+
+A command in a doc must match the real CLI. Then run the link check:
+
+```bash
+python3 scripts/check_doc_links.py
+```
+
+The CI `doc-links` job runs the same check, so a stale file or heading
+reference fails the build.

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM user_scopes WHERE user_id = $1 AND scope_name = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "879bb901f5d8cfd90276ce795bce23135b242a9cbb396ee408c2cbdd789f0b00"
+}

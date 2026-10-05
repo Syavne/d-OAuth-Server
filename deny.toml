@@ -1,0 +1,53 @@
+# Supply-chain gates for the OAuth 2.1 authorization server (task 42).
+#
+# Ring-only TLS: `openssl-sys`, `aws-lc-sys`, and `native-tls` must never enter
+# the graph (see the `bans` deny list below). `cargo deny check` runs in CI.
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# RUSTSEC-2023-0071 (rsa Marvin timing): no patched release exists upstream
+# ("No safe upgrade is available"); this crate uses RSA for signature
+# verification only (JWK-selected `DecodingKey`), never RSA decryption, so
+# the padding-timing oracle does not apply. Re-evaluate when rsa ships a fix.
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "unpatched upstream; RSA verify-only, never decryption" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Ring-only TLS policy: no OpenSSL, no AWS-LC, no platform TLS anywhere in
+# the graph (main or dev). A duplicated dependency that pulls one of these
+# in fails CI until the duplicate is removed.
+deny = [
+  { crate = "openssl-sys", reason = "ring-only TLS: no OpenSSL anywhere in the graph" },
+  { crate = "aws-lc-sys", reason = "ring-only TLS: no AWS-LC anywhere in the graph" },
+  { crate = "native-tls", reason = "ring-only TLS: no platform TLS anywhere in the graph" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "ISC",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "BSL-1.0",
+  "Zlib",
+  "OpenSSL",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "MPL-2.0",
+  # Mozilla root-store data (via webpki-roots); OSI-approved data license.
+  "CDLA-Permissive-2.0",
+]
+exceptions = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

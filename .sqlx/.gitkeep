@@ -1,0 +1,9 @@
+SQLx offline query cache (`.sqlx/`) is committed so
+`SQLX_OFFLINE=true cargo check` works without a live database.
+
+Generated with `cargo sqlx prepare` against a live testcontainers
+database; CI runs `cargo sqlx prepare --check`.
+
+This placeholder keeps the directory committed while the cache is empty
+(todo 1 scaffolding has no queries yet; the first query-bearing todo
+populates it).

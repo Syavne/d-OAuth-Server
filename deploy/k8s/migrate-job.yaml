@@ -1,0 +1,88 @@
+# Exactly-once schema migration Job (task 46).
+#
+# Run BEFORE the Deployment rolls (CI applies the Job, waits for completion,
+# then rolls the Deployment). `migrate` applies forward-only sqlx migrations
+# under Postgres advisory lock, so concurrent starts serialize and the schema
+# is applied exactly once — replicas MUST NOT migrate (they share one
+# database; per-replica migration races and double-applies). The Deployment's
+# readiness gate (`_sqlx_migrations` version match) keeps new replicas out of
+# traffic until this Job succeeds.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: d-oauth-migrate
+  namespace: d-oauth
+  labels:
+    app.kubernetes.io/name: d-oauth-server
+    app.kubernetes.io/part-of: d-oauth
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: d-oauth-server
+        app.kubernetes.io/part-of: d-oauth
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # Same pinning rule as the Deployment: CI resolves to a digest.
+          image: ghcr.io/d-oauth/d-oauth-server:latest
+          imagePullPolicy: IfNotPresent
+          # Overrides the image ENTRYPOINT (["/d-oauth-server","serve"]).
+          command: ["/d-oauth-server", "migrate"]
+          envFrom:
+            - configMapRef:
+                name: d-oauth-config
+          env:
+            - name: D_OAUTH_DATABASE__URL
+              valueFrom:
+                secretKeyRef:
+                  name: d-oauth-secrets
+                  key: database-url
+            - name: D_OAUTH_REDIS__URL
+              valueFrom:
+                secretKeyRef:
+                  name: d-oauth-secrets
+                  key: redis-url
+            - name: D_OAUTH_TOKEN_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: d-oauth-secrets
+                  key: token-pepper
+            - name: D_OAUTH_TOTP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: d-oauth-secrets
+                  key: totp-encryption-key
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: certs
+          secret:
+            secretName: d-oauth-tls
+            defaultMode: 0o400

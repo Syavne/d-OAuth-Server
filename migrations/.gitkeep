@@ -1,0 +1,4 @@
+Placeholder so `sqlx::migrate!()` compiles before todos 8/9 land.
+
+sqlx ignores files that are not `<VERSION>_<DESCRIPTION>.sql`; this file
+is never treated as a migration. Todos 8/9 add the real migrations here.

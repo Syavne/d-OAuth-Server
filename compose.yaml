@@ -1,0 +1,149 @@
+# Local multi-replica validation (task 46).
+#
+# Three stateless app replicas against ONE Postgres + ONE Redis — the local
+# analogue of `deploy/k8s`. Proves shared-state behavior: a token issued by
+# one replica is usable/introspectable via another, and migrations apply
+# exactly once via the one-shot `migrate` service (never per replica).
+#
+#   docker compose up --build --scale app=3
+#   docker compose port app 8080   # per-replica host ports (assigned randomly)
+#
+# Validation sketch (public listener is TLS with a throwaway self-signed
+# cert, so use -sk; `<port-N>` from `docker compose port`):
+#
+#   curl -sk https://127.0.0.1:<port-1>/.well-known/oauth-authorization-server
+#   # complete an authorization-code+PKCE flow against replica 1, then
+#   # introspect the token against replica 2 — shared Redis makes it work.
+#
+# Host ports are assigned RANDOMLY per replica (short-syntax `"8080"`), so
+# `--scale app=3` never collides. The health listener (8081) is exposed, not
+# published — same rule as the cluster Service.
+#
+# mTLS is OFF here (no `D_OAUTH_TLS__CLIENT_CA_PATH`): the L4-passthrough
+# constraint is a cluster concern, documented in docs/DEPLOYMENT.md.
+# Secrets below are DEV-ONLY placeholders; cluster secrets are never baked.
+
+name: d-oauth
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: oauth
+      POSTGRES_PASSWORD: oauth-dev-only
+      POSTGRES_DB: oauth
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oauth -d oauth"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    # The server asserts this contract at startup: noeviction + AOF.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: throwaway self-signed server cert for the local TLS listener.
+  gencerts:
+    image: alpine:3.21
+    volumes:
+      - certs:/certs
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache openssl >/dev/null
+        if [ ! -f /certs/tls.crt ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout /certs/tls.key -out /certs/tls.crt \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+        fi
+        chown 65532:65532 /certs/tls.crt /certs/tls.key
+        chmod 600 /certs/tls.key
+        chmod 644 /certs/tls.crt
+
+  # Exactly-once migration (sqlx advisory lock). Replicas never migrate.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: d-oauth-server:local
+    entrypoint: ["/d-oauth-server"]
+    command: ["migrate"]
+    depends_on:
+      gencerts:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      D_OAUTH_ISSUER: https://localhost:8080
+      D_OAUTH_ENVIRONMENT: development
+      D_OAUTH_BIND_ADDR: 0.0.0.0:8080
+      D_OAUTH_HEALTH_ADDR: 0.0.0.0:8081
+      D_OAUTH_TLS__CERT_PATH: /certs/tls.crt
+      D_OAUTH_TLS__KEY_PATH: /certs/tls.key
+      D_OAUTH_DATABASE__URL: postgres://oauth:oauth-dev-only@db:5432/oauth?sslmode=disable
+      D_OAUTH_REDIS__URL: redis://redis:6379
+      D_OAUTH_REDIS__DURABILITY: waitaof
+      D_OAUTH_TOKEN_PEPPER: dev-only-pepper-ROTATE-IN-PROD-000000
+      D_OAUTH_TOTP_ENCRYPTION_KEY: dev-only-totp-key-ROTATE-IN-PROD-000
+    volumes:
+      - certs:/certs:ro
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: d-oauth-server:local
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      D_OAUTH_ISSUER: https://localhost:8080
+      D_OAUTH_ENVIRONMENT: development
+      D_OAUTH_BIND_ADDR: 0.0.0.0:8080
+      D_OAUTH_HEALTH_ADDR: 0.0.0.0:8081
+      D_OAUTH_TLS__CERT_PATH: /certs/tls.crt
+      D_OAUTH_TLS__KEY_PATH: /certs/tls.key
+      D_OAUTH_DATABASE__URL: postgres://oauth:oauth-dev-only@db:5432/oauth?sslmode=disable
+      D_OAUTH_REDIS__URL: redis://redis:6379
+      D_OAUTH_REDIS__DURABILITY: waitaof
+      D_OAUTH_TOKEN_PEPPER: dev-only-pepper-ROTATE-IN-PROD-000000
+      D_OAUTH_TOTP_ENCRYPTION_KEY: dev-only-totp-key-ROTATE-IN-PROD-000
+    expose:
+      - 8080
+      - 8081
+    # Random host ports per replica: `--scale app=3` never collides.
+    ports:
+      - "8080"
+      - "8081"
+    read_only: true
+    # Shell-less self-probe: no shell or curl in the distroless image.
+    healthcheck:
+      test: ["CMD", "/d-oauth-server", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - certs:/certs:ro
+
+volumes:
+  pgdata:
+  redisdata:
+  certs:

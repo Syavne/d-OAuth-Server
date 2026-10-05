@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3d1994de8f9ebe039fc4ce9da5b94e1161bb106db1f6ea82304083e9f56e9cda # shrinks to uri = "https://client0example?test/cb/"

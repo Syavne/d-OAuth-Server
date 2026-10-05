@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM scopes\n        WHERE name = $1\n          AND NOT EXISTS (SELECT 1 FROM user_scopes WHERE scope_name = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "92060f3b75340d2d5a61056948f670713ca01afb9db6e505e21eb6b69607940c"
+}

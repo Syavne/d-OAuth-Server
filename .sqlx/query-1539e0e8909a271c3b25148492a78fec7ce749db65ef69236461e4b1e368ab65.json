@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_clients SET client_secret_hash = $2, client_secret_expires_at = $3, updated_at = now() WHERE client_id = $1 AND active = true",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1539e0e8909a271c3b25148492a78fec7ce749db65ef69236461e4b1e368ab65"
+}

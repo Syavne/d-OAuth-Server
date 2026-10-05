@@ -1,0 +1,12 @@
+---
+source: src/error.rs
+expression: rendered_snapshot
+---
+{
+  "body": {
+    "error": "invalid_client",
+    "error_description": "Client authentication failed (for example, unknown client, no client authentication included, or unsupported authentication method)."
+  },
+  "status": 401,
+  "www_authenticate": "Basic realm=\"oauth\""
+}

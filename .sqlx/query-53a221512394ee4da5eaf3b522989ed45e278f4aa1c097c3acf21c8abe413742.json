@@ -1,0 +1,256 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, client_id, client_secret_expires_at, client_id_issued_at, client_name, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, tls_client_auth_subject_dn, tls_client_auth_cert_thumbprint, request_uris, contacts, software_id, dpop_bound_access_tokens, active, created_at, updated_at FROM oauth_clients WHERE client_id = $1 AND active = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "client_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "client_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "client_secret_expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "client_secret_expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "client_id_issued_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "client_id_issued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "client_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "client_name"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "grant_types",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "grant_types"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "response_types",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "response_types"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "scope",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "scope"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "token_endpoint_auth_method",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "token_endpoint_auth_method"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "jwks",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "jwks"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "jwks_uri",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "jwks_uri"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "tls_client_auth_subject_dn",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "tls_client_auth_subject_dn"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "tls_client_auth_cert_thumbprint",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "tls_client_auth_cert_thumbprint"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "request_uris",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "request_uris"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "contacts",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "contacts"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "software_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "software_id"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "dpop_bound_access_tokens",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "dpop_bound_access_tokens"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "active",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "active"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "53a221512394ee4da5eaf3b522989ed45e278f4aa1c097c3acf21c8abe413742"
+}

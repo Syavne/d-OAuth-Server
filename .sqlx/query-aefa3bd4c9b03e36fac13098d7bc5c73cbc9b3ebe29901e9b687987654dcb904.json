@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO user_scopes (user_id, scope_name, granted_at, granted_by)\n       VALUES ($1, $2, now(), $3)\n       ON CONFLICT (user_id, scope_name) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aefa3bd4c9b03e36fac13098d7bc5c73cbc9b3ebe29901e9b687987654dcb904"
+}

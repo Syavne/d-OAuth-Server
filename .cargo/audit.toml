@@ -1,0 +1,5 @@
+# `cargo audit` policy (task 42). Mirrors the `deny.toml` triage: the only
+# known advisory has no patched release and does not apply here (RSA
+# verify-only, never decryption). Re-evaluate when rsa ships a fix.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

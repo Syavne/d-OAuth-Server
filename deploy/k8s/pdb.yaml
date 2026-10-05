@@ -1,0 +1,18 @@
+# PodDisruptionBudget: voluntary disruptions keep quorum (task 46).
+#
+# 3 replicas with `minAvailable: 2`: drains, node upgrades, and rolling
+# deploys may take at most one replica at a time, so an
+# authorization-code+PKCE flow always has a quorum serving it.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: d-oauth-server
+  namespace: d-oauth
+  labels:
+    app.kubernetes.io/name: d-oauth-server
+    app.kubernetes.io/part-of: d-oauth
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: d-oauth-server

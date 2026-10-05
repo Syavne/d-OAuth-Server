@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE scopes SET enabled = $2, updated_at = now() WHERE name = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "051fc39f1d1dcda37f4582cffcd8ffa1ec04e2e0529093cdda95c25e8ec65ec7"
+}

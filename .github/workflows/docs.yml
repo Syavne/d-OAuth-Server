@@ -1,0 +1,43 @@
+# Documentation quality gate (task 48).
+#
+# Runs the local link checker over README.md, AGENTS.md, and docs/*.md so a
+# stale file or heading reference fails CI. This is the "markdown-link-check
+# equivalent" named by the task; it is deliberately offline (only relative
+# links are validated) so the job needs no network beyond checkout/setup.
+#
+# Task 42 owns the main CI workflow. This job is intentionally a separate
+# workflow file so it can be added to that pipeline as a required step
+# (`docs` job name) without a conflict, and it also runs standalone.
+name: docs
+
+on:
+  push:
+    paths:
+      - "README.md"
+      - "AGENTS.md"
+      - "docs/**"
+      - "scripts/check_doc_links.py"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "README.md"
+      - "AGENTS.md"
+      - "docs/**"
+      - "scripts/check_doc_links.py"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  link-check:
+    name: docs link-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check documentation links
+        run: python3 scripts/check_doc_links.py

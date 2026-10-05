@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS ( SELECT 1 FROM scopes AS s WHERE s.name = $2 AND s.enabled = true AND EXISTS ( SELECT 1 FROM oauth_clients AS c WHERE c.client_id = $1 AND c.active = true AND $2 = ANY(string_to_array(c.scope, ' ')) ) ) AS \"allowed!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "allowed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a035a5f82aabf067f01152a83712e5825fc7684b66e76733f7020c4f26bf5ab6"
+}

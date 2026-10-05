@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM client_redirect_uris WHERE client_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bb513ae7c858d859eb1dba88f62a6fd7a9cc270b99c1d91fdcbe4f16d1d3bc66"
+}

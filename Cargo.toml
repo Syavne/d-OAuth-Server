@@ -1,0 +1,84 @@
+[package]
+name = "d-oauth"
+version = "0.1.0"
+edition = "2024"
+description = "OAuth 2.1-only authorization server"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "d_oauth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "d-oauth-server"
+path = "src/main.rs"
+
+[dependencies]
+argon2 = "0.6.0"
+askama = "0.16.1"
+axum = "0.8"
+axum-extra = { version = "0.12.6", features = ["cookie"] }
+backon = "1.6.0"
+base32 = "0.5.1"
+base64 = "0.23.1"
+base64ct = "1.8.3"
+clap = { version = "4.6.7", features = ["derive"] }
+config = "0.15.27"
+hmac = "0.13.0"
+hyper = "1.11.1"
+hyper-util = { version = "0.1.21", features = ["server-auto", "tokio", "service"] }
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+password-hash = "0.6.1"
+rand = { version = "0.10.3", features = ["std_rng"] }
+redis = { version = "1.7.1", features = ["tokio-comp", "connection-manager", "sentinel", "cluster-async", "tls-rustls", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+# Task 22: the JAR validator fetches pre-registered `request_uri` objects
+# through an SSRF-guarded client (https-only, no redirects, size/timeout
+# caps). Pinned spec mirrors the existing dev entry; the dev copy is kept
+# so test-only users of reqwest keep compiling.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+ring = "0.17"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.15.1"
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "migrate", "macros", "uuid", "time", "tls-rustls-ring-webpki"] }
+subtle = "2.6.1"
+thiserror = "2.0.21"
+time = "0.3.55"
+tokio = { version = "1.53.2", features = ["full", "macros", "rt-multi-thread", "net", "signal", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+totp-rs = "6.0.0"
+tower = { version = "0.5.3", features = ["util", "timeout", "limit", "load-shed"] }
+tower-http = { version = "0.7.1", features = ["cors", "limit"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+uuid = { version = "1.27.0", features = ["v4", "v7"] }
+validator = "0.21.0"
+x509-parser = "0.18.1"
+zeroize = "1.9.0"
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+insta = "1.49.0"
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
+proptest = "1.11.0"
+redis-test = "1.0.4"
+testcontainers = "0.27"
+testcontainers-modules = "0.15.0"
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

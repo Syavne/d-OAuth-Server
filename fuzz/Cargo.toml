@@ -1,0 +1,37 @@
+[package]
+name = "d-oauth-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: the fuzz crate is never built by the pinned stable
+# toolchain at the repo root (`cargo nextest run --all-targets` ignores it).
+# It builds only under the nightly leg in CI (`fuzz/rust-toolchain.toml`).
+[workspace]
+
+[dependencies]
+base64 = "0.23"
+libfuzzer-sys = "0.4"
+serde_json = "1"
+time = "0.3"
+uuid = "1"
+
+[dependencies.d-oauth]
+path = ".."
+
+# Explicit binaries: nightly cargo rejects `cargo build --bins` (which
+# `cargo fuzz build` issues) when the manifest declares no targets.
+[[bin]]
+name = "token_form"
+path = "fuzz_targets/token_form.rs"
+
+[[bin]]
+name = "dcr_json"
+path = "fuzz_targets/dcr_json.rs"
+
+[[bin]]
+name = "jar_claims"
+path = "fuzz_targets/jar_claims.rs"

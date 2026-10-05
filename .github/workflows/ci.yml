@@ -1,0 +1,168 @@
+# Main quality gate (task 42).
+#
+# Per-PR legs (all must be green):
+#   fmt, clippy, audit, deny, sqlx-prepare-check, nextest, doc-tests,
+#   fuzz-build (nightly leg inside `fuzz/`, so the pinned stable
+#   `rust-toolchain.toml` at the root is never violated).
+# Scheduled legs (not per-PR):
+#   mutants (weekly budgeted mutation run over the pure security modules).
+#
+# Must NOT gate on miri for tokio/sqlx/redis; no lint suppressions anywhere.
+
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request: {}
+  schedule:
+    # Weekly budgeted mutation run (Sunday 03:00 UTC).
+    - cron: "0 3 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy (all targets, warnings denied)
+        run: cargo clippy --all-targets -- -D warnings
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit advisories
+        run: cargo audit
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Check supply chain (ring-only TLS enforced in deny.toml)
+        run: cargo deny check
+
+  sqlx-prepare-check:
+    name: sqlx-prepare-check
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: sqlxcheck
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --locked --version 0.9.0 --no-default-features --features postgres,rustls
+      - name: Apply migrations to the check database
+        env:
+          DATABASE_URL: postgres://postgres:sqlxcheck@127.0.0.1:5432/postgres
+        run: cargo sqlx migrate run
+      - name: Fail if the committed .sqlx cache is stale
+        env:
+          DATABASE_URL: postgres://postgres:sqlxcheck@127.0.0.1:5432/postgres
+        run: cargo sqlx prepare --check --workspace
+
+  doc-links:
+    name: doc-links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check documentation links (markdown-link-check equivalent)
+        run: python3 scripts/check_doc_links.py
+
+  nextest:
+    name: nextest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Install redis-server (in-process Sentinel/Cluster fixtures)
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Full test suite (testcontainers provide Postgres/Redis)
+        run: cargo nextest run --all-targets
+
+  doc-tests:
+    name: doc-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Documentation tests
+        run: cargo test --doc
+
+  fuzz-build:
+    name: fuzz-build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fuzz
+    steps:
+      - uses: actions/checkout@v4
+      # The `fuzz/rust-toolchain.toml` in the working directory selects
+      # nightly via rustup override; the root stable pin is untouched.
+      - name: Install cargo-fuzz (nightly, per fuzz/rust-toolchain.toml)
+        run: cargo install cargo-fuzz --locked
+      - name: Build all fuzz targets
+        run: cargo fuzz build
+
+  mutants:
+    name: mutants
+    # Scheduled budgeted job only: never blocks a PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Budgeted mutation run (see .cargo/mutants.toml)
+        run: cargo mutants --timeout 1800 --test-tool nextest

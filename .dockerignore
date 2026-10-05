@@ -1,0 +1,16 @@
+# Keep the build context small; the target dir and VCS metadata must never
+# reach the builder. `.sqlx/` and `Cargo.lock` are REQUIRED in the context
+# (offline, --locked build), so they are deliberately NOT ignored.
+!.env.example
+*.orig
+*.rej
+.codegraph/
+.env
+.env.*
+.git/
+.omo/
+.opencode/
+__pycache__/
+fuzz/
+scripts/__pycache__/
+target/

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO client_redirect_uris (client_id, redirect_uri_id, attached_at, attached_by) VALUES ($1, $2, now(), $3) ON CONFLICT (client_id, redirect_uri_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f69fc462b7b018428c5b9551903a4655de48b2e2583b7239c2723a92aaf023b3"
+}
