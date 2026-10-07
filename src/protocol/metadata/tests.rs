@@ -38,6 +38,7 @@ fn test_config() -> Result<Config, ConfigError> {
     "redis": {"url": "redis://127.0.0.1:1", "durability": "waitaof"},
     "token_pepper": "metadata-test-pepper-0123456789abcdef",
     "totp_encryption_key": "metadata-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "metadata-test-pii-key-0123456789abcdef",
   });
   let source = ::config::Config::try_from(&fixture)?;
   Config::from_source(source)
@@ -61,6 +62,7 @@ fn test_state(pool: &sqlx::PgPool) -> TestResult<AppState> {
     redis: RedisConn::Single(manager),
     config,
     keys,
+    transition_unsafe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     clock: Clock::system(),
   })
 }

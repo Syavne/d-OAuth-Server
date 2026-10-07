@@ -120,6 +120,7 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
     "redis": {"url": redis_url, "durability": "waitaof"},
     "token_pepper": "device-test-pepper-0123456789abcdef",
     "totp_encryption_key": "device-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "device-test-pii-key-0123456789abcdef",
     "rate_limit": {"enabled": true, "window_secs": 60, "per_ip": 120,
       "per_client": 300, "login_per_ip": 20, "token_per_client": 60},
   });
@@ -140,6 +141,7 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
 
 async fn insert_client(
   pool: &PgPool,
+  keys: &crate::keys::KeyRing,
   client_id: &str,
   method: TokenEndpointAuthMethod,
   secret: Option<&str>,
@@ -171,7 +173,7 @@ async fn insert_client(
     dpop_bound_access_tokens: false,
     registration_access_token_hash: None,
   };
-  client_repo::insert(pool, &new).await?;
+  client_repo::insert(pool, keys, false, &new).await?;
   Ok(())
 }
 
@@ -257,6 +259,7 @@ async fn test_device_authorize_public_client_issues_code_and_interval() -> TestR
   let client_id = unique("public");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -357,6 +360,7 @@ async fn test_device_authorize_confidential_client_secret_post() -> TestResult {
   let client_id = unique("conf");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &client_id,
     TokenEndpointAuthMethod::ClientSecretPost,
     Some("post-secret"),
@@ -415,6 +419,7 @@ async fn test_device_authorize_public_client_without_dpop_rejected() -> TestResu
   let client_id = unique("nodpop");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -450,6 +455,7 @@ async fn test_device_authorize_over_registered_scope_rejected() -> TestResult {
   let client_id = unique("scope");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -488,6 +494,7 @@ async fn test_device_authorize_approval_transitions_state() -> TestResult {
   let client_id = unique("approve");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -566,7 +573,15 @@ async fn test_device_authorize_unknown_and_expired_user_code_rejected() -> TestR
 
   // An issued code whose records vanished (TTL expiry) resolves to nothing.
   let client_id = unique("expired");
-  insert_client(&h.pool, &client_id, TokenEndpointAuthMethod::None, None, "").await?;
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+    "",
+  )
+  .await?;
   let key = fresh_key()?;
   let htu = device_htu(&h.config);
   let proof = mint_proof(&key, &htu, &unique("jti"), now_unix())?;

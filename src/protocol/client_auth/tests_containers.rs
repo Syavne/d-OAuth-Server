@@ -29,6 +29,7 @@ use crate::{
   crypto::secret::{Argon2Params, hash_secret},
   db::{NewClient, TokenEndpointAuthMethod, client_repo, test_support::Db},
   error::{AppError, OAuthErrorCode},
+  keys::{KeyId, KeyRing},
   state::RedisConn,
   store::Store,
   test_guard::{ContainerGuard, Lease},
@@ -49,6 +50,9 @@ enum TestError {
   /// A database operation failed.
   #[error("database error: {0}")]
   Database(#[from] sqlx::Error),
+  /// An application error from a repository helper.
+  #[error("app error: {0}")]
+  App(#[from] AppError),
   /// A crypto, encoding, or JWT operation failed.
   #[error("test crypto error: {0}")]
   Crypto(String),
@@ -66,6 +70,7 @@ struct Harness {
   conn: RedisConn,
   store: Store,
   endpoint: String,
+  keys: KeyRing,
 }
 
 /// Fresh Postgres database plus a throwaway Redis for one test.
@@ -102,6 +107,18 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
     conn: RedisConn::Single(manager),
     store,
     endpoint: token_endpoint("https://auth.example.com"),
+    keys: KeyRing::from_parts(
+      vec![(
+        KeyId::new("v1"),
+        SecretString::from("client-auth-test-pepper"),
+      )],
+      vec![(
+        KeyId::new("v1"),
+        SecretString::from("client-auth-test-totp"),
+      )],
+      vec![(KeyId::new("v1"), SecretString::from("client-auth-test-pii"))],
+    )
+    .map_err(|error| TestError::Crypto(format!("{error:?}")))?,
   };
   Ok((guarded, h))
 }
@@ -110,6 +127,7 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
 fn stores_of(h: &mut Harness) -> AuthStores<'_> {
   AuthStores {
     pool: &h.pool,
+    keys: &h.keys,
     conn: &mut h.conn,
     store: &h.store,
   }
@@ -136,6 +154,18 @@ async fn insert_client(
   jwks: Option<serde_json::Value>,
   jwks_uri: Option<&str>,
 ) -> TestResult {
+  let keys = KeyRing::from_parts(
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("client-auth-test-pepper"),
+    )],
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("client-auth-test-totp"),
+    )],
+    vec![(KeyId::new("v1"), SecretString::from("client-auth-test-pii"))],
+  )
+  .map_err(|error| TestError::Crypto(format!("{error:?}")))?;
   let params =
     Argon2Params::new(8, 1, 1, 32).map_err(|error| TestError::Crypto(format!("{error}")))?;
   let secret_hash = secret
@@ -162,7 +192,7 @@ async fn insert_client(
     dpop_bound_access_tokens: false,
     registration_access_token_hash: None,
   };
-  client_repo::insert(pool, &new).await?;
+  client_repo::insert(pool, &keys, false, &new).await?;
   Ok(())
 }
 

@@ -15,6 +15,7 @@ async fn test_grant_device_expired_token_after_ttl() -> TestResult {
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,

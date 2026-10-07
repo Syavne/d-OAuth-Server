@@ -71,6 +71,7 @@ pub(super) fn test_config(redis_url: &str, rate_limit: Value) -> Result<Config, 
     "redis": {"url": redis_url, "durability": "waitaof"},
     "token_pepper": "ratelimit-test-pepper-0123456789abcdef",
     "totp_encryption_key": "ratelimit-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "ratelimit-test-pii-key-0123456789abcdef",
     "rate_limit": rate_limit,
   });
   let source = ::config::Config::try_from(&fixture)?;
@@ -90,6 +91,7 @@ fn build_state(
     redis: RedisConn::Single(manager),
     config,
     keys,
+    transition_unsafe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     clock: Clock::system(),
   }
 }

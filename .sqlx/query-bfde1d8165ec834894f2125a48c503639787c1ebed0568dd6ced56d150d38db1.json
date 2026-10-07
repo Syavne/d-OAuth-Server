@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(SELECT 1 FROM oauth_clients WHERE (tls_client_auth_cert_thumbprint_index = ANY($1) OR (tls_client_auth_cert_thumbprint IS NOT NULL AND tls_client_auth_cert_thumbprint = $2)) AND id <> $3) AS \"exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "bfde1d8165ec834894f2125a48c503639787c1ebed0568dd6ced56d150d38db1"
+}

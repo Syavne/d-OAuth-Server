@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(\n         SELECT 1 FROM users\n          WHERE email_index = ANY($1)\n             OR (email_enc IS NULL AND email = $2::text::citext)\n       ) AS \"exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c04af456919cef4b8bd5f911731f8c62b0566a1f3c24fee377cf9be326671715"
+}

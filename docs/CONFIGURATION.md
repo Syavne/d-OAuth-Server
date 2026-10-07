@@ -36,13 +36,16 @@ with every `.` replaced by `__`, uppercased. For example:
 A secret may be given inline or as a mounted file. Inline wins when both are
 set. Mounted files are read and trimmed of trailing newlines.
 
-The key ring follows the same pattern: `token_pepper_file` and
-`totp_encryption_key_file` (environment spellings `D_OAUTH_TOKEN_PEPPER_FILE`
-and `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`) name mounted files. The cluster
-Deployment uses those file forms so the material never enters the process
-environment; mount them `0400` on a tmpfs (the shipped manifests project them
-at `/run/secrets` with group `65532`). The inline forms are retained and win
-when both are set, so an existing environment-based deployment still starts.
+The key ring follows the same pattern: `token_pepper_file`,
+`totp_encryption_key_file`, and `pii_encryption_key_file` (environment
+spellings `D_OAUTH_TOKEN_PEPPER_FILE`, `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, and
+`D_OAUTH_PII_ENCRYPTION_KEY_FILE`) name mounted files. The cluster Deployment
+uses those file forms so the material never enters the process environment;
+mount them `0400` on a tmpfs (the shipped manifests project them at
+`/run/secrets` with group `65532`). The inline forms are retained and win when
+both are set, so an existing environment-based deployment still starts. Each
+purpose also has an optional retained previous key (`*_previous_key` and its
+`*_previous_key_file` form) so a rotation can keep old ciphertext readable.
 
 ## Top-level keys
 
@@ -139,14 +142,47 @@ connection directly, so it may contain any bytes (no URL encoding required).
 | `totp_encryption_key` | none | Inline AES-256-GCM key for TOTP secrets. Required to enroll TOTP. |
 | `totp_encryption_key_file` | none | Mounted TOTP key. |
 | `totp_key_id` | `v1` | Version id carried in the encrypted TOTP blob. |
+| `totp_previous_key` | none | Optional retained previous TOTP key for rotation. |
+| `totp_previous_key_file` | none | Mounted previous TOTP key. |
+| `totp_previous_key_id` | none | Required when a previous TOTP key is set; must differ from `totp_key_id`. |
+| `pii_encryption_key` | none | Inline AES-256-GCM master key for PII field encryption and blind indexes. Required unless `pii_encryption_key_file` is set. |
+| `pii_encryption_key_file` | none | Mounted PII key. |
+| `pii_key_id` | `v1` | Version id carried in every `_enc` blob and blind index. |
+| `pii_previous_key` | none | Optional retained previous PII key for rotation. |
+| `pii_previous_key_file` | none | Mounted previous PII key. |
+| `pii_previous_key_id` | none | Required when a previous PII key is set; must differ from `pii_key_id`. |
+| `pii_dual_write` | `false` | Rolling-upgrade switch. `true` also writes the plaintext column and emits v2 TOTP blobs so version N-1 replicas keep working; `false` is encrypt-only. |
 
-The token pepper is required: without it the key ring cannot be built and the
-server refuses to start. The shipped cluster manifests set
-`D_OAUTH_TOKEN_PEPPER_FILE` and `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` rather than
-the inline keys; see [DEPLOYMENT.md](DEPLOYMENT.md).
+The exact environment spellings:
 
-These two values are the server's master keys and are supplied entirely by the
-deployment. There is a hard custody requirement that they never live in the
+| Key | Environment variable |
+| --- | --- |
+| `token_pepper` | `D_OAUTH_TOKEN_PEPPER` |
+| `token_pepper_file` | `D_OAUTH_TOKEN_PEPPER_FILE` |
+| `token_pepper_id` | `D_OAUTH_TOKEN_PEPPER_ID` |
+| `totp_encryption_key` | `D_OAUTH_TOTP_ENCRYPTION_KEY` |
+| `totp_encryption_key_file` | `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` |
+| `totp_key_id` | `D_OAUTH_TOTP_KEY_ID` |
+| `totp_previous_key` | `D_OAUTH_TOTP_PREVIOUS_KEY` |
+| `totp_previous_key_file` | `D_OAUTH_TOTP_PREVIOUS_KEY_FILE` |
+| `totp_previous_key_id` | `D_OAUTH_TOTP_PREVIOUS_KEY_ID` |
+| `pii_encryption_key` | `D_OAUTH_PII_ENCRYPTION_KEY` |
+| `pii_encryption_key_file` | `D_OAUTH_PII_ENCRYPTION_KEY_FILE` |
+| `pii_key_id` | `D_OAUTH_PII_KEY_ID` |
+| `pii_previous_key` | `D_OAUTH_PII_PREVIOUS_KEY` |
+| `pii_previous_key_file` | `D_OAUTH_PII_PREVIOUS_KEY_FILE` |
+| `pii_previous_key_id` | `D_OAUTH_PII_PREVIOUS_KEY_ID` |
+| `pii_dual_write` | `D_OAUTH_PII_DUAL_WRITE` |
+
+The token pepper and the PII field-encryption key are required: without either
+the key ring cannot be built and the server refuses to start with
+`MissingPiiKey` (or `MissingPepper`). The shipped cluster manifests set
+`D_OAUTH_TOKEN_PEPPER_FILE`, `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, and
+`D_OAUTH_PII_ENCRYPTION_KEY_FILE` rather than the inline keys; see
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
+These three values are the server's master keys and are supplied entirely by
+the deployment. There is a hard custody requirement that they never live in the
 database or in the same backup as the database; a KMS/HSM or a secret manager
 should hold them and inject them through a `*_FILE` path. The server has no
 built-in KMS integration and never fetches a key itself. The full contract and
@@ -241,14 +277,21 @@ the statement.
 - `trusted_proxy` is unset by default, so forwarded client-cert headers from an
   untrusted hop are stripped before any handler reads them.
 - CORS and open registration are off by default.
-- File-backed pepper/TOTP keys are read from a `0400` tmpfs file, never from
-  the process environment.
+- File-backed pepper/TOTP/PII keys are read from a `0400` tmpfs file, never
+  from the process environment.
 
 ## Edge cases
 
 - `D_OAUTH_CONFIG` pointing at a missing file is not an error; the file is
   optional.
 - An inline `token_pepper` of only whitespace is treated as absent.
+- A blank `pii_previous_key` / `totp_previous_key` (including a zero-byte or
+  whitespace-only `*_previous_key_file`) is treated as absent, so an empty mount
+  never becomes a live key.
+- A previous key with no `*_previous_key_id`, a blank id, or an id equal to the
+  active id is a load-time error (`ConfigError::MissingPreviousKeyId`).
+- A previous key set while its active key is absent is `MissingPiiKey` /
+  `MissingTotpKey`, so a retained key can never silently become the active one.
 - An unreadable `*_file` path is a load-time error (`ConfigError::SecretFile`),
   never a silent fallback to an absent key.
 - `scope delete` and `redirect-uri delete` disable a referenced row instead of

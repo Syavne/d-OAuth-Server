@@ -24,8 +24,8 @@ use d_oauth::protocol::scope::ScopeSet;
 use d_oauth::protocol::token::ClientKind;
 use dpop::DpopKey;
 use harness::{
-  TestError, World, attach_redirect, ensure, fail, json_body, open_rate_limit, seed_client,
-  seed_client_bound, seed_scope,
+  SeedClientOpts, TestError, World, attach_redirect, ensure, fail, json_body, open_rate_limit,
+  seed_client, seed_client_bound, seed_scope,
 };
 use oauth2::TokenResponse as _;
 
@@ -43,6 +43,7 @@ async fn setup() -> Result<World, TestError> {
   let world = World::start(open_rate_limit()).await?;
   seed_client(
     &world.pool,
+    &world.state.keys,
     CLIENT_ID,
     Some(CLIENT_SECRET),
     &[
@@ -58,6 +59,7 @@ async fn setup() -> Result<World, TestError> {
   .await?;
   seed_client(
     &world.pool,
+    &world.state.keys,
     PUBLIC_ID,
     None,
     &["authorization_code", "refresh_token"],
@@ -67,8 +69,8 @@ async fn setup() -> Result<World, TestError> {
   .await?;
   seed_scope(&world.pool, "read").await?;
   seed_scope(&world.pool, "write").await?;
-  attach_redirect(&world.pool, CLIENT_ID, REDIRECT_URI).await?;
-  attach_redirect(&world.pool, PUBLIC_ID, REDIRECT_URI).await?;
+  attach_redirect(&world.pool, &world.state.keys, CLIENT_ID, REDIRECT_URI).await?;
+  attach_redirect(&world.pool, &world.state.keys, PUBLIC_ID, REDIRECT_URI).await?;
   Ok(world)
 }
 
@@ -436,12 +438,15 @@ async fn e2e_dpop_bound_client_requires_fresh_proof() -> Result<(), TestError> {
   let world = World::start(open_rate_limit()).await?;
   seed_client_bound(
     &world.pool,
+    &world.state.keys,
     BOUND_ID,
     Some(BOUND_SECRET),
-    &["client_credentials"],
-    "read",
-    TokenEndpointAuthMethod::ClientSecretBasic,
-    true,
+    &SeedClientOpts {
+      grants: &["client_credentials"],
+      scope: "read",
+      method: TokenEndpointAuthMethod::ClientSecretBasic,
+      dpop_bound: true,
+    },
   )
   .await?;
   seed_scope(&world.pool, "read").await?;
@@ -487,16 +492,19 @@ async fn e2e_dpop_bound_auth_code_requires_fresh_proof() -> Result<(), TestError
   let world = World::start(open_rate_limit()).await?;
   seed_client_bound(
     &world.pool,
+    &world.state.keys,
     BOUND_ID,
     Some(BOUND_SECRET),
-    &["authorization_code"],
-    "read",
-    TokenEndpointAuthMethod::ClientSecretBasic,
-    true,
+    &SeedClientOpts {
+      grants: &["authorization_code"],
+      scope: "read",
+      method: TokenEndpointAuthMethod::ClientSecretBasic,
+      dpop_bound: true,
+    },
   )
   .await?;
   seed_scope(&world.pool, "read").await?;
-  attach_redirect(&world.pool, BOUND_ID, REDIRECT_URI).await?;
+  attach_redirect(&world.pool, &world.state.keys, BOUND_ID, REDIRECT_URI).await?;
 
   let (challenge, verifier) = oauth2_pkce();
   let code = issue_conf_code(&world, BOUND_ID, &challenge).await?;

@@ -10,6 +10,21 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Added
 
+- Application-level envelope encryption for the PII directory: emails, client
+  names, contacts, redirect URIs, JAR request URIs, JWKS URLs, software ids, and
+  mTLS subject DNs/thumbprints are sealed with versioned AES-256-GCM under a new
+  mandatory `pii_encryption_key`, and the looked-up or unique values carry a
+  keyed-HMAC blind index. TOTP secrets move to a per-row envelope (blob version
+  3) so a DEK can be re-wrapped without re-encrypting the secret. New
+  `pii backfill`, `pii verify`, and `pii rotate` commands run the one-shot
+  migration and PII key rotation, and `totp rewrap` re-wraps the TOTP DEKs. The
+  expansion adds `_enc`/`_index` columns; the backfill blanks the plaintext
+  columns but this release does **not** drop them (the contract drop is a later
+  release).
+- Documentation for the encryption model, the new keys, the
+  expand/dual-write/scale-to-zero-backfill/cutover rollout, and the PII/TOTP
+  rotation runbooks across `docs/DATABASE.md`, `docs/SECURITY.md`,
+  `docs/CONFIGURATION.md`, and `docs/OPERATIONS.md`.
 - `GET /logout` (a server-specific session endpoint, not an OAuth 2.1 or OIDC
   feature) ends the browser session so a different user can sign in. It destroys
   the session and expires the cookie, then renders a neutral page or redirects to
@@ -48,6 +63,11 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Changed
 
+- The key ring now holds three independent chains (token pepper, TOTP
+  encryption key, and PII field-encryption key), each with an optional retained
+  previous key. `pii_dual_write` (default `false`, encrypt-only) turns on
+  dual-write for the rolling-upgrade window; readiness fails closed while the
+  switch is off and any blanked plaintext PII column still holds a value.
 - TOTP secrets now encrypt under HKDF-SHA256 (info `totp-gcm-v2`) instead of
   bare `SHA256(totp_key)`. New blobs carry format version 2; version-1 blobs
   keep decrypting through a legacy fallback, so no re-enrollment is needed.
@@ -59,6 +79,14 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   security-header layer) now sets `Cache-Control: no-store` and
   `X-Content-Type-Options: nosniff` on its own probe responses, with a
   regression test pinning both.
+
+### Security
+
+- A PII or TOTP ciphertext that fails to open (tamper, truncation, or a missing
+  key id) is fail-closed: the request returns `503 temporarily_unavailable` and
+  emits a `pii.decrypt_failure` audit event carrying only the request id, never
+  a value. Full-blob substitution by an attacker with database write access
+  remains out of the threat model and is documented in `docs/SECURITY.md`.
 
 ### Fixed
 

@@ -141,7 +141,7 @@ async fn login_bootstrap_full_cycle_clears_restriction() -> TestResult {
       }
     }
   }
-  let fresh = user_repo::find_by_email(&h.pool, &user.email)
+  let fresh = user_repo::find_by_email(&h.pool, &h.config.keys, &user.email)
     .await?
     .ok_or_else(|| unexpected("the user must exist"))?;
   if fresh.must_change_password {
@@ -354,5 +354,92 @@ async fn login_logout_destroys_session() -> TestResult {
   }
   // Idempotent: a second logout still succeeds.
   logout(&mut h.conn, &h.store, &full).await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn login_totp_enrollment() -> TestResult {
+  let mut h = harness().await?;
+  // Mixed case on purpose: the promoted session subject must be the
+  // normalized plaintext email.
+  let user = create_user(
+    &mut h,
+    "Enroll-New@Example.Test",
+    "temp-password-10",
+    true,
+    false,
+  )
+  .await?;
+  let restricted = restricted_login(&mut h, &user.email, &user.password, None).await?;
+  {
+    let mut deps = deps_of(&mut h);
+    match change_password(
+      &mut deps,
+      &restricted,
+      "new-strong-password-10",
+      "new-strong-password-10",
+    )
+    .await?
+    {
+      PasswordOutcome::StillRestricted { .. } => {}
+      PasswordOutcome::Promoted { .. } => {
+        return Err(unexpected("promotion needs TOTP enrollment first"));
+      }
+    }
+  }
+  let offer = {
+    let mut deps = deps_of(&mut h);
+    provision_totp(&mut deps, &restricted).await?
+  };
+  if offer.recovery_codes.len() != totp::RECOVERY_CODE_COUNT {
+    return Err(unexpected("enrollment must mint recovery codes"));
+  }
+  // A wrong confirmation code is rejected exactly as before.
+  let bad = wrong_for_secret(&offer.secret, h.counter)?;
+  {
+    let mut deps = deps_of(&mut h);
+    match confirm_totp(&mut deps, &restricted, &bad).await? {
+      ConfirmOutcome::Rejected => {}
+      _ => return Err(unexpected("a wrong confirmation code must be rejected")),
+    }
+  }
+  // The correct code completes enrollment and promotes the session.
+  let verifier = totp::build_totp(&offer.secret)?;
+  let code = verifier
+    .generate(h.counter * totp::TOTP_STEP_SECS)
+    .to_string();
+  let full = {
+    let mut deps = deps_of(&mut h);
+    match confirm_totp(&mut deps, &restricted, &code).await? {
+      ConfirmOutcome::Completed {
+        session_id,
+        redirect_to,
+      } => {
+        if redirect_to != LOGIN_SUCCESS_PATH {
+          return Err(unexpected("an unbound completion lands on success"));
+        }
+        session_id
+      }
+      _ => {
+        return Err(unexpected(
+          "a correct confirmation must complete enrollment",
+        ));
+      }
+    }
+  };
+  if full == restricted {
+    return Err(unexpected("completion must re-issue the session"));
+  }
+  let live = load_session(&mut h.conn, &h.store, &full)
+    .await?
+    .ok_or_else(|| unexpected("the re-issued session must be stored"))?;
+  if live.record.subject != "enroll-new@example.test" {
+    return Err(unexpected(
+      "the session subject must be the normalized plaintext email",
+    ));
+  }
+  if !live.record.mfa_verified || live.record.restricted {
+    return Err(unexpected("the re-issued session must be full"));
+  }
   Ok(())
 }

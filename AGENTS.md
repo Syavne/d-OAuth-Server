@@ -17,6 +17,7 @@ the admin surface.
 | Configuration key or validation rule | `src/config.rs`, `src/config/` | Add to the raw serde struct, then validate in the matching submodule. Update [docs/CONFIGURATION.md](docs/CONFIGURATION.md). |
 | Key-ring behavior | `src/keys.rs` | Versioned ids only; never print key material. |
 | Crypto primitive (hash, compare, PKCE, TOTP) | `src/crypto/` | Constant-time for secret compares. |
+| PII field codec / blind index | `src/crypto/field.rs` | Versioned AES-256-GCM; never log plaintext or key material. |
 | JOSE verification (DPoP, JAR, `private_key_jwt`) | `src/jose/` | Reject fail-closed with the exact error code. |
 | Postgres query or repository | `src/db/` | `query!`/`query_as!` macros; regenerate `.sqlx`. |
 | Redis record or Lua script | `src/store/` | Keep every key under `{state}`; update [docs/REDIS.md](docs/REDIS.md). |

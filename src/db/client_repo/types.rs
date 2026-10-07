@@ -2,6 +2,8 @@
 //! [`ClientMetadata`] update set, [`NewClient`] insert input, and the
 //! [`TokenEndpointAuthMethod`] allowlist.
 
+use std::fmt;
+
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -30,7 +32,12 @@ pub enum ClientRepoError {
 ///
 /// This is the safe projection: it never contains `client_secret_hash` or
 /// `registration_access_token_hash`.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` redacts every sealed PII field (RFC 7591 §3.2.2 metadata): the
+/// rendered form carries `[REDACTED]` for `client_name`, `jwks_uri`,
+/// `tls_client_auth_subject_dn`, `tls_client_auth_cert_thumbprint`,
+/// `request_uris`, `contacts`, and `software_id`, so PII never reaches a log.
+#[derive(Clone, PartialEq)]
 pub struct Client {
   /// Surrogate primary key.
   pub id: Uuid,
@@ -74,6 +81,36 @@ pub struct Client {
   pub updated_at: OffsetDateTime,
 }
 
+impl fmt::Debug for Client {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Client")
+      .field("id", &self.id)
+      .field("client_id", &self.client_id)
+      .field("client_secret_expires_at", &self.client_secret_expires_at)
+      .field("client_id_issued_at", &self.client_id_issued_at)
+      .field("client_name", &"[REDACTED]")
+      .field("grant_types", &self.grant_types)
+      .field("response_types", &self.response_types)
+      .field("scope", &self.scope)
+      .field(
+        "token_endpoint_auth_method",
+        &self.token_endpoint_auth_method,
+      )
+      .field("jwks", &self.jwks)
+      .field("jwks_uri", &"[REDACTED]")
+      .field("tls_client_auth_subject_dn", &"[REDACTED]")
+      .field("tls_client_auth_cert_thumbprint", &"[REDACTED]")
+      .field("request_uris", &"[REDACTED]")
+      .field("contacts", &"[REDACTED]")
+      .field("software_id", &"[REDACTED]")
+      .field("dpop_bound_access_tokens", &self.dpop_bound_access_tokens)
+      .field("active", &self.active)
+      .field("created_at", &self.created_at)
+      .field("updated_at", &self.updated_at)
+      .finish()
+  }
+}
+
 impl Client {
   /// Parse this client's registered `token_endpoint_auth_method`.
   ///
@@ -91,7 +128,10 @@ impl Client {
 /// This is exactly the column set [`super::update_metadata`] may write;
 /// identity, secret, issue time, active flag, and registration token are
 /// deliberately absent so a metadata update can never touch them.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` redacts the sealed PII subset with the same `[REDACTED]` rule as
+/// [`Client`].
+#[derive(Clone, PartialEq)]
 pub struct ClientMetadata {
   /// Human-readable client name.
   pub client_name: String,
@@ -119,6 +159,29 @@ pub struct ClientMetadata {
   pub software_id: Option<String>,
   /// Whether the client registers DPoP-bound access tokens (RFC 9449 §5).
   pub dpop_bound_access_tokens: bool,
+}
+
+impl fmt::Debug for ClientMetadata {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("ClientMetadata")
+      .field("client_name", &"[REDACTED]")
+      .field("grant_types", &self.grant_types)
+      .field("response_types", &self.response_types)
+      .field("scope", &self.scope)
+      .field(
+        "token_endpoint_auth_method",
+        &self.token_endpoint_auth_method,
+      )
+      .field("jwks", &self.jwks)
+      .field("jwks_uri", &"[REDACTED]")
+      .field("tls_client_auth_subject_dn", &"[REDACTED]")
+      .field("tls_client_auth_cert_thumbprint", &"[REDACTED]")
+      .field("request_uris", &"[REDACTED]")
+      .field("contacts", &"[REDACTED]")
+      .field("software_id", &"[REDACTED]")
+      .field("dpop_bound_access_tokens", &self.dpop_bound_access_tokens)
+      .finish()
+  }
 }
 
 /// Input for [`super::insert`].

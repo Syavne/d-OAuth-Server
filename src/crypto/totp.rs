@@ -6,13 +6,18 @@
 //! SHA-1, 6 digits, with the validator accepting one step of look-ahead and
 //! look-behind.
 //!
-//! The encrypted-secret blob layout mirrors `cli::secret` (`version(2) ||
-//! kid_len(1) || kid || nonce(12) || ciphertext+tag`, AES-256-GCM under
-//! HKDF-SHA256(`totp_key`, info `totp-gcm-v2`)), so CLI-provisioned secrets
-//! decrypt here and login-provisioned secrets stay CLI-readable. Version-1
-//! blobs (AES-256-GCM under bare `SHA256(totp_key)`) still decrypt via a
-//! legacy fallback. The two implementations are
-//! intentionally small duplicates: `crypto` cannot depend on `cli`.
+//! The encrypted-secret blob layout mirrors `cli::secret`. Fresh writes use
+//! the v3 envelope (`version(3) || kid_len(1) || kid || wrap_nonce(12) ||
+//! wrapped_dek(32+16) || data_nonce(12) || ciphertext+tag`): a random 32-byte
+//! DEK per row, wrapped under HKDF-SHA256(`totp_key`, info `totp-kek-v1`).
+//! The wrap AAD binds the data nonce; the data AAD carries only the format
+//! tag plus version, never the kid, so `totp rewrap` can move a DEK to a new
+//! key without touching the data ciphertext. The writer is version-gated
+//! (`envelope = !pii_dual_write`) so old replicas keep reading v2 during the
+//! rolling upgrade. Version-2 blobs (HKDF `totp-gcm-v2`, empty AAD) and
+//! version-1 blobs (bare `SHA256(totp_key)`) still decrypt. The two
+//! implementations are intentionally small duplicates: `crypto` cannot depend
+//! on `cli`.
 //!
 //! No error variant carries a secret, code, or key: failures collapse to
 //! static messages.
@@ -30,6 +35,7 @@ use ring::{
 use secrecy::ExposeSecret as _;
 use sha2::{Digest as _, Sha256};
 use totp_rs::{Algorithm, Builder, Secret};
+use zeroize::Zeroizing;
 
 use crate::{crypto::ct::ct_eq, keys::KeyRing};
 
@@ -45,12 +51,23 @@ pub const USED_CODE_TTL: Duration = Duration::from_secs(180);
 pub const RECOVERY_CODE_COUNT: usize = 10;
 /// Current encrypted-secret blob format version (HKDF-SHA256 writes).
 const TOTP_BLOB_VERSION: u8 = 2;
+/// Envelope-encrypted blob version (per-row DEK): written when the caller
+/// passes `envelope = true`.
+const TOTP_BLOB_V3: u8 = 3;
 /// Legacy blob version (bare-`SHA256(totp_key)` writes): decrypt-only.
 const TOTP_BLOB_V1: u8 = 1;
 /// HKDF domain-separation label binding the derived key to TOTP AES-GCM use.
 const HKDF_INFO: &[u8] = b"totp-gcm-v2";
+/// HKDF domain-separation label for the key-encryption key that wraps v3 DEKs.
+const KEK_INFO: &[u8] = b"totp-kek-v1";
+/// AAD sealing the v3 data ciphertext: format tag plus version only. It must
+/// NOT name the wrapping key, so a DEK re-wrap changes the wrap without
+/// touching this ciphertext.
+const DATA_AAD: &[u8] = b"totp-v3\x03";
 /// AES-GCM nonce length.
 const NONCE_LEN: usize = 12;
+/// Wrapped-DEK length: a 32-byte DEK sealed under AES-256-GCM (16-byte tag).
+const WRAPPED_DEK_LEN: usize = 32 + 16;
 
 /// Failures from TOTP enrollment and verification.
 ///
@@ -82,10 +99,23 @@ pub enum TotpError {
 }
 
 impl From<TotpError> for crate::error::AppError {
-  /// Every TOTP failure is an internal, masked failure: the client sees
-  /// `server_error`, never secret material or store detail.
+  /// Fail-closed mapping: a stored ciphertext that fails to open is
+  /// [`AppError::PiiDecrypt`] (503 + `pii.decrypt_failure` at the route
+  /// layer); store and sealing failures are `temporarily_unavailable` (503),
+  /// never a 500 and never fail-open. Only QR rendering — a server-side
+  /// rendering defect, not a decrypt or dependency failure — stays
+  /// `server_error`. Every target is payload-free: no secret, code, key, or
+  /// store detail reaches the client.
   fn from(error: TotpError) -> Self {
-    Self::internal(error)
+    match error {
+      TotpError::Decrypt => Self::PiiDecrypt,
+      TotpError::Store(_)
+      | TotpError::UnexpectedReply
+      | TotpError::Encrypt
+      | TotpError::UnavailableRandomness
+      | TotpError::InvalidSecret => Self::temporarily_unavailable(),
+      TotpError::Qr => Self::server_error(),
+    }
   }
 }
 
@@ -288,14 +318,30 @@ pub async fn verify_and_claim(
 
 /// Encrypt a TOTP secret under the active TOTP-encryption key.
 ///
-/// Blob layout mirrors `cli::secret`: `version(2) || kid_len(1) || kid ||
-/// nonce(12) || ciphertext+tag`.
+/// The writer is version-gated for the rolling upgrade: `envelope = false`
+/// (while `pii_dual_write` is on) writes the legacy v2 blob so old replicas
+/// keep reading; `envelope = true` writes the v3 per-row-DEK envelope.
+/// Callers pass `!config.pii_dual_write`.
 ///
 /// # Errors
 ///
 /// Returns [`TotpError::Encrypt`] when no TOTP key is configured or the AEAD
 /// fails.
-pub fn encrypt_secret(keys: &KeyRing, plaintext: &str) -> Result<Vec<u8>, TotpError> {
+pub fn encrypt_secret(
+  keys: &KeyRing,
+  plaintext: &str,
+  envelope: bool,
+) -> Result<Vec<u8>, TotpError> {
+  if envelope {
+    encrypt_v3(keys, plaintext)
+  } else {
+    encrypt_v2(keys, plaintext)
+  }
+}
+
+/// Legacy v2 write: `version(2) || kid_len(1) || kid || nonce(12) ||
+/// ciphertext+tag`, AES-256-GCM under HKDF-SHA256 with empty AAD.
+fn encrypt_v2(keys: &KeyRing, plaintext: &str) -> Result<Vec<u8>, TotpError> {
   let (key_id, secret) = keys.active_totp_key().ok_or(TotpError::Encrypt)?;
   let kid = key_id.as_str().as_bytes();
   if kid.len() > usize::from(u8::MAX) {
@@ -325,19 +371,107 @@ pub fn encrypt_secret(keys: &KeyRing, plaintext: &str) -> Result<Vec<u8>, TotpEr
   Ok(blob)
 }
 
+/// Envelope write: `version(3) || kid_len(1) || kid || wrap_nonce(12) ||
+/// wrapped_dek(32+16) || data_nonce(12) || secret_ct+tag`.
+///
+/// A random 32-byte DEK is generated per write, wrapped under a KEK derived
+/// via HKDF-SHA256 (info `totp-kek-v1`) from the active TOTP key, and the
+/// secret is sealed under the DEK. The data nonce is generated FIRST because
+/// the wrap AAD binds it: a wrapped DEK lifted from another row names the
+/// wrong nonce and fails to unwrap.
+fn encrypt_v3(keys: &KeyRing, plaintext: &str) -> Result<Vec<u8>, TotpError> {
+  let (key_id, secret) = keys.active_totp_key().ok_or(TotpError::Encrypt)?;
+  let kid = key_id.as_str().as_bytes();
+  if kid.len() > usize::from(u8::MAX) {
+    return Err(TotpError::Encrypt);
+  }
+  let kek = Zeroizing::new(
+    derive_labeled(secret.expose_secret().as_bytes(), KEK_INFO).map_err(|_| TotpError::Encrypt)?,
+  );
+  let rng = SystemRandom::new();
+  let mut data_nonce = [0u8; NONCE_LEN];
+  rng
+    .fill(&mut data_nonce)
+    .map_err(|_| TotpError::UnavailableRandomness)?;
+  let mut wrap_nonce = [0u8; NONCE_LEN];
+  rng
+    .fill(&mut wrap_nonce)
+    .map_err(|_| TotpError::UnavailableRandomness)?;
+  let mut dek = Zeroizing::new([0u8; 32]);
+  rng
+    .fill(&mut dek[..])
+    .map_err(|_| TotpError::UnavailableRandomness)?;
+  let mut wrapped: Vec<u8> = dek.to_vec();
+  seal_with_aad(
+    &kek[..],
+    wrap_nonce,
+    &wrap_aad(kid, &data_nonce),
+    &mut wrapped,
+  )?;
+  let mut data_ct = plaintext.as_bytes().to_vec();
+  seal_with_aad(&dek[..], data_nonce, DATA_AAD, &mut data_ct)?;
+  let mut blob =
+    Vec::with_capacity(2 + kid.len() + NONCE_LEN + WRAPPED_DEK_LEN + NONCE_LEN + data_ct.len());
+  blob.push(TOTP_BLOB_V3);
+  blob.push(kid.len() as u8);
+  blob.extend_from_slice(kid);
+  blob.extend_from_slice(&wrap_nonce);
+  blob.extend_from_slice(&wrapped);
+  blob.extend_from_slice(&data_nonce);
+  blob.extend_from_slice(&data_ct);
+  Ok(blob)
+}
+
+/// Wrap AAD binding a wrapped DEK to its row: format tag, version, wrapping
+/// kid, and the data nonce the DEK was sealed for.
+fn wrap_aad(kid: &[u8], data_nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
+  let mut aad = Vec::with_capacity(DATA_AAD.len() + 1 + kid.len() + NONCE_LEN);
+  aad.extend_from_slice(DATA_AAD);
+  aad.push(kid.len() as u8);
+  aad.extend_from_slice(kid);
+  aad.extend_from_slice(data_nonce);
+  aad
+}
+
+/// Seal `in_out` in place under `key`, appending the GCM tag.
+///
+/// # Errors
+///
+/// Returns [`TotpError::Encrypt`] when the AEAD rejects the key.
+fn seal_with_aad(
+  key: &[u8],
+  nonce_bytes: [u8; NONCE_LEN],
+  aad: &[u8],
+  in_out: &mut Vec<u8>,
+) -> Result<(), TotpError> {
+  let sealing =
+    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| TotpError::Encrypt)?);
+  sealing
+    .seal_in_place_append_tag(
+      Nonce::assume_unique_for_key(nonce_bytes),
+      Aad::from(aad),
+      in_out,
+    )
+    .map_err(|_| TotpError::Encrypt)
+}
+
 /// Decrypt a secret previously produced by [`encrypt_secret`], trying the key
 /// named in the blob (retained keys keep decrypting after rotation).
 ///
-/// Version-2 blobs open under the HKDF-SHA256 key; legacy version-1 blobs
-/// first try the HKDF key, then fall back to the bare-`SHA256(totp_key)` key,
-/// so rows written before the HKDF migration keep decrypting.
+/// Version-3 envelopes unwrap the per-row DEK under the HKDF-SHA256 KEK, then
+/// open the data ciphertext; version-2 blobs open under the HKDF-SHA256 key;
+/// legacy version-1 blobs first try the HKDF key, then fall back to the
+/// bare-`SHA256(totp_key)` key, so rows written before the HKDF migration
+/// keep decrypting.
 ///
 /// # Errors
 ///
 /// Returns [`TotpError::Decrypt`] for a malformed blob, an unknown key id, or
 /// an authentication failure. The reason is never distinguished.
 pub fn decrypt_secret(keys: &KeyRing, blob: &[u8]) -> Result<String, TotpError> {
-  if blob.len() < 2 + NONCE_LEN || (blob[0] != TOTP_BLOB_VERSION && blob[0] != TOTP_BLOB_V1) {
+  if blob.len() < 2 + NONCE_LEN
+    || (blob[0] != TOTP_BLOB_V3 && blob[0] != TOTP_BLOB_VERSION && blob[0] != TOTP_BLOB_V1)
+  {
     return Err(TotpError::Decrypt);
   }
   let version = blob[0];
@@ -346,10 +480,13 @@ pub fn decrypt_secret(keys: &KeyRing, blob: &[u8]) -> Result<String, TotpError> 
   if blob.len() < header + NONCE_LEN {
     return Err(TotpError::Decrypt);
   }
-  let kid = core::str::from_utf8(blob.get(2..header).unwrap_or_default())
-    .map_err(|_| TotpError::Decrypt)?;
+  let kid_bytes = blob.get(2..header).ok_or(TotpError::Decrypt)?;
+  let kid = core::str::from_utf8(kid_bytes).map_err(|_| TotpError::Decrypt)?;
   let secret = keys.totp_key_by_id(kid).ok_or(TotpError::Decrypt)?;
   let ikm = secret.expose_secret().as_bytes();
+  if version == TOTP_BLOB_V3 {
+    return decrypt_v3(ikm, kid_bytes, &blob[header..]);
+  }
   let mut nonce_bytes = [0u8; NONCE_LEN];
   nonce_bytes.copy_from_slice(&blob[header..header + NONCE_LEN]);
   let ciphertext = &blob[header + NONCE_LEN..];
@@ -365,6 +502,45 @@ pub fn decrypt_secret(keys: &KeyRing, blob: &[u8]) -> Result<String, TotpError> 
   open_with_key(&derive_key_legacy(ikm), &nonce_bytes, ciphertext)
 }
 
+/// Open a v3 envelope body: `wrap_nonce(12) || wrapped_dek(32+16) ||
+/// data_nonce(12) || secret_ct+tag`.
+///
+/// The KEK is re-derived from the key named in the blob; the wrap AAD
+/// rebinds that kid plus the stored data nonce, so a wrapped DEK copied from
+/// another row fails closed.
+///
+/// # Errors
+///
+/// Returns [`TotpError::Decrypt`] for a malformed body, an unknown key, or
+/// an authentication failure. The reason is never distinguished.
+fn decrypt_v3(ikm: &[u8], kid: &[u8], body: &[u8]) -> Result<String, TotpError> {
+  if body.len() < NONCE_LEN + WRAPPED_DEK_LEN + NONCE_LEN + 16 {
+    return Err(TotpError::Decrypt);
+  }
+  let (wrap_nonce, rest) = body.split_at(NONCE_LEN);
+  let (wrapped_dek, rest) = rest.split_at(WRAPPED_DEK_LEN);
+  let (data_nonce, ciphertext) = rest.split_at(NONCE_LEN);
+  let mut wrap_nonce_bytes = [0u8; NONCE_LEN];
+  wrap_nonce_bytes.copy_from_slice(wrap_nonce);
+  let mut data_nonce_bytes = [0u8; NONCE_LEN];
+  data_nonce_bytes.copy_from_slice(data_nonce);
+  let kek = Zeroizing::new(derive_labeled(ikm, KEK_INFO).map_err(|_| TotpError::Decrypt)?);
+  let dek_bytes = open_with_aad(
+    &kek[..],
+    &wrap_nonce_bytes,
+    &wrap_aad(kid, &data_nonce_bytes),
+    wrapped_dek,
+  )?;
+  if dek_bytes.len() != 32 {
+    return Err(TotpError::Decrypt);
+  }
+  let mut dek_key = [0u8; 32];
+  dek_key.copy_from_slice(&dek_bytes);
+  let dek = Zeroizing::new(dek_key);
+  let plaintext = open_with_aad(&dek[..], &data_nonce_bytes, DATA_AAD, ciphertext)?;
+  String::from_utf8(plaintext).map_err(|_| TotpError::Decrypt)
+}
+
 /// Open `ciphertext` (with trailing GCM tag) under `key`, returning UTF-8.
 ///
 /// # Errors
@@ -376,17 +552,34 @@ fn open_with_key(
   nonce_bytes: &[u8; NONCE_LEN],
   ciphertext: &[u8],
 ) -> Result<String, TotpError> {
+  let plaintext = open_with_aad(key, nonce_bytes, &[], ciphertext)?;
+  String::from_utf8(plaintext).map_err(|_| TotpError::Decrypt)
+}
+
+/// Open `ciphertext` (with trailing GCM tag) under `key` and `aad`,
+/// returning the raw plaintext.
+///
+/// # Errors
+///
+/// Returns [`TotpError::Decrypt`] for an authentication failure. The reason
+/// is never distinguished.
+fn open_with_aad(
+  key: &[u8],
+  nonce_bytes: &[u8; NONCE_LEN],
+  aad: &[u8],
+  ciphertext: &[u8],
+) -> Result<Vec<u8>, TotpError> {
   let mut in_out = ciphertext.to_vec();
   let opening =
     LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| TotpError::Decrypt)?);
   let plaintext = opening
     .open_in_place(
       Nonce::assume_unique_for_key(*nonce_bytes),
-      Aad::empty(),
+      Aad::from(aad),
       &mut in_out,
     )
     .map_err(|_| TotpError::Decrypt)?;
-  String::from_utf8(plaintext.to_vec()).map_err(|_| TotpError::Decrypt)
+  Ok(plaintext.to_vec())
 }
 
 /// Build an `otpauth://` enrollment URI (same shape as `cli::secret`).
@@ -419,8 +612,15 @@ pub fn qr_svg(uri: &str) -> Result<String, TotpError> {
 /// Derive the AES-256 key from configured TOTP key material via HKDF-SHA256
 /// (RFC 5869, empty salt, info `totp-gcm-v2` domain-separating TOTP use).
 fn derive_key(totp_key: &[u8]) -> Result<[u8; 32], ring::error::Unspecified> {
+  derive_labeled(totp_key, HKDF_INFO)
+}
+
+/// HKDF-SHA256 (RFC 5869, empty salt) under an explicit domain-separation
+/// label: `totp-gcm-v2` seals data directly, `totp-kek-v1` wraps v3 DEKs.
+fn derive_labeled(totp_key: &[u8], info: &[u8]) -> Result<[u8; 32], ring::error::Unspecified> {
   let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(totp_key);
-  let okm = prk.expand(&[HKDF_INFO], HkdfAesKey)?;
+  let info_labels = [info];
+  let okm = prk.expand(&info_labels, HkdfAesKey)?;
   let mut key = [0u8; 32];
   okm.fill(&mut key)?;
   Ok(key)

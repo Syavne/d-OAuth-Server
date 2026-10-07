@@ -261,7 +261,9 @@ async fn subject_entitlements(
   if found.record.subject.trim().is_empty() {
     return Ok(subject_scope);
   }
-  let Some(user) = user_repo::find_by_email(&d.state.pool, &found.record.subject).await? else {
+  let Some(user) =
+    user_repo::find_by_email(&d.state.pool, &d.state.keys, &found.record.subject).await?
+  else {
     return Ok(ScopeSet::empty());
   };
   if user.disabled {

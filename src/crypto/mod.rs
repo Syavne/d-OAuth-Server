@@ -1,9 +1,10 @@
 //! Crypto core: token minting, keyed hash-at-rest, constant-time helpers.
 //!
-//! Re-exports `tokens`, `pkce`, `secret`, `totp`, and `ct`. All secret
+//! Re-exports `tokens`, `pkce`, `secret`, `totp`, `field`, and `ct`. All secret
 //! comparison goes through `ct`; intermediates are `zeroize`d.
 
 pub mod ct;
+pub mod field;
 pub mod pkce;
 pub mod secret;
 pub mod tokens;

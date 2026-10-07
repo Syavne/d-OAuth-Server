@@ -145,6 +145,7 @@ fn test_config(
     "rate_limit": {"enabled": rate_limit_enabled},
     "token_pepper": "resilience-test-pepper-0123456789abcdef",
     "totp_encryption_key": "resilience-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "resilience-test-pii-key-0123456789abcdef",
   });
   Config::from_source(::config::Config::try_from(&fixture)?)
 }

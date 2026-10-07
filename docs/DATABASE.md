@@ -26,30 +26,44 @@ One row per registered client (RFC 7591 / RFC 7592).
 | `client_secret_hash` | `text` | Argon2id hash, never a raw secret. |
 | `client_secret_expires_at` | `timestamptz` | Optional expiry. |
 | `client_id_issued_at` | `timestamptz` | Issue time. |
-| `client_name` | `text` | Display name. |
+| `client_name` | `text` | Display name. Nullable after the PII expansion migration; the backfill blanks it to NULL. |
+| `client_name_enc` | `bytea` | Sealed display name (versioned AES-256-GCM). |
 | `grant_types` | `text[]` | Registered grant types. |
 | `response_types` | `text[]` | Registered response types. |
 | `scope` | `text` | Registered scope string. |
 | `token_endpoint_auth_method` | `text` | One of the supported methods. |
-| `jwks` | `jsonb` | Optional inline JWKS. |
+| `jwks` | `jsonb` | Optional inline JWKS. Public by design; never sealed. |
 | `jwks_uri` | `text` | Optional JWKS URL (fetched with the SSRF guard). |
-| `tls_client_auth_subject_dn` | `text` | RFC 8705 subject DN binding. |
-| `tls_client_auth_cert_thumbprint` | `text` | RFC 8705 `x5t#S256` binding. |
+| `jwks_uri_enc` | `bytea` | Sealed JWKS URL. |
+| `tls_client_auth_subject_dn` | `text` | RFC 8705 subject DN binding. Nullable after the expansion migration. |
+| `tls_client_auth_subject_dn_enc` | `bytea` | Sealed subject DN. |
+| `tls_client_auth_subject_dn_index` | `text` | Keyed blind index over the subject DN. |
+| `tls_client_auth_cert_thumbprint` | `text` | RFC 8705 `x5t#S256` binding. Nullable after the expansion migration. |
+| `tls_client_auth_cert_thumbprint_enc` | `bytea` | Sealed certificate thumbprint. |
+| `tls_client_auth_cert_thumbprint_index` | `text` | Keyed blind index over the thumbprint. |
 | `request_uris` | `jsonb` | Pre-registered JAR request URIs. |
+| `request_uris_enc` | `bytea` | Sealed request URIs (JSON ciphertext). |
 | `contacts` | `jsonb` | Metadata only. |
+| `contacts_enc` | `bytea` | Sealed contacts (JSON ciphertext). |
 | `software_id` | `text` | Metadata only. |
+| `software_id_enc` | `bytea` | Sealed software id. |
 | `active` | `bool` | Soft disable, default true. |
 | `registration_access_token_hash` | `text` | Keyed hash of the RFC 7592 management token. |
 | `dpop_bound_access_tokens` | `bool` | Whether this client's tokens require DPoP proof (`migrations/1791244800_client_dpop_bound.sql`). |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
 
-Two partial unique indexes enforce that a client certificate authenticates at
-most one client:
+Four partial unique indexes enforce client-identity uniqueness. Two are on the
+legacy plaintext columns, kept inert once the backfill blanks them; two are on
+the new blind-index columns:
 
 - `ux_oauth_clients_tls_subject_dn` on `tls_client_auth_subject_dn` where it is
   not null.
 - `ux_oauth_clients_tls_cert_thumbprint` on `tls_client_auth_cert_thumbprint`
   where it is not null.
+- `ux_oauth_clients_tls_subject_dn_index` on `tls_client_auth_subject_dn_index`
+  where it is not null.
+- `ux_oauth_clients_tls_cert_thumbprint_index` on
+  `tls_client_auth_cert_thumbprint_index` where it is not null.
 
 The `UNIQUE (client_id)` is a table constraint, not merely an index, because
 Postgres accepts only a unique constraint as a foreign-key target.
@@ -61,7 +75,9 @@ One row per resource owner.
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | `uuid` | Primary key. |
-| `email` | `citext` | Case-insensitive email-as-username, unique. |
+| `email` | `citext` | Case-insensitive email-as-username, unique. Nullable after the PII expansion migration; the backfill blanks it to NULL. |
+| `email_enc` | `bytea` | Sealed email (versioned AES-256-GCM). |
+| `email_index` | `text` | Keyed blind index over the normalized email. |
 | `password_hash` | `text` | Argon2id PHC string. |
 | `totp_secret_enc` | `bytea` | AES-256-GCM encrypted TOTP secret, never plaintext. |
 | `totp_enabled` | `bool` | Default false. |
@@ -71,6 +87,10 @@ One row per resource owner.
 | `password_changed_at` | `timestamptz` | Stamped on password change. |
 | `disabled` | `bool` | Default false. |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
+
+`ux_users_email_index` is a partial unique index on `email_index` where it is
+not null; the legacy `ux_users_email UNIQUE (email)` constraint is kept and goes
+inert once every `email` is NULL.
 
 There are deliberately no failed-login or lockout columns. Those counters are
 security-ephemeral and live in Redis.
@@ -110,12 +130,19 @@ is unique per `(uri, kind)`.
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | `uuid` | Primary key. |
-| `uri` | `text` | Unique per `kind`. |
+| `uri` | `text` | Unique per `kind`. Nullable after the PII expansion migration; the backfill blanks it to NULL. |
+| `uri_enc` | `bytea` | Sealed URI (versioned AES-256-GCM). |
+| `uri_index` | `text` | Keyed blind index over the URI, per `kind`. |
 | `kind` | `text` | `authorize` (default) or `post_logout`. |
 | `enabled` | `bool` | Default true. |
 | `description` | `text` | Default empty. |
 | `created_by` | `uuid` | Optional creator. |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
+
+`ux_redirect_uris_uri_index_kind` is a partial unique index on
+`(uri_index, kind)` where `uri_index` is not null; the legacy
+`ux_redirect_uris_uri_kind UNIQUE (uri, kind)` constraint is kept and goes inert
+once every `uri` is NULL.
 
 `kind` separates the two browser landings: `authorize` URIs are valid
 authorization-response callbacks (they carry `code`/`state`); `post_logout` URIs
@@ -142,6 +169,36 @@ email comparison case-insensitive, so `A@x.com` and `a@x.com` collide and there
 is one account per email regardless of case. Installing `citext` requires
 superuser or trusted-extension privileges, so the migration role must have
 them, or an operator must install the extension out of band before migrating.
+
+## PII encryption at rest
+
+The plaintext identifier columns stay in the schema, but once the migration
+completes they are inert: NULL for every row, kept only so version N-1 replicas
+can still read them during the rollout. The live values move into two parallel
+columns per field:
+
+- **`_enc` (`bytea`)** holds a versioned AES-256-GCM blob. The blob carries the
+  key id (`kid`) of the PII key that wrote it, then a random 96-bit nonce, then
+  the ciphertext and tag. The key is derived from the master PII key with
+  HKDF-SHA256 (info `pii-field-gcm-v1`), so the ciphertext is not key-stable:
+  rotating the master key re-encrypts every blob.
+- **`_index` (`text`)** holds a keyed-HMAC blind index in the form
+  `{kid}:{hex}`. Encrypted bytes cannot be compared or made unique directly, so
+  the columns that are looked up or must stay unique (`email_index`, the two
+  mTLS indexes, `uri_index`) carry this deterministic tag under a separate HMAC
+  key (HKDF info `pii-blind-index-v1`). A read computes candidates across every
+  retained key id, newest first, so lookups work while an old key is retained.
+
+The TOTP secret uses a different envelope. `users.totp_secret_enc` blob version
+3 holds a random per-row data-encryption key (DEK), wrapped by a key-encryption
+key derived from the TOTP master key (HKDF info `totp-kek-v1`). The data AAD
+excludes the `kid`, so `totp rewrap` can re-wrap a DEK under a new TOTP key
+without re-encrypting the secret. Versions 1 and 2 still decrypt.
+
+The blind index is key-dependent, so uniqueness only holds within one key
+generation. Rotating the PII key requires a write freeze (app tier scaled to
+zero) while `pii rotate` re-encrypts and recomputes every index; see
+[OPERATIONS.md](OPERATIONS.md#pii-and-totp-key-rotation).
 
 ## Migration lifecycle
 
@@ -171,11 +228,39 @@ must be backward compatible:
 A migration that drops or renames a column in one step breaks the old replicas
 during the rollout. Do not do it.
 
+The PII encryption rollout follows this lifecycle exactly:
+
+1. **Expand.** Apply `migrations/1791417600_pii_encryption.sql` with the PII key
+   configured. It adds the `_enc`/`_index` columns and their partial unique
+   indexes and drops `NOT NULL` on the plaintext columns the backfill blanks.
+2. **Dual-write.** Set `pii_dual_write=true` and roll every replica. New writes
+   seal the value and also write the legacy plaintext, so old replicas keep
+   working.
+3. **Scale-to-zero backfill.** Set `pii_dual_write=false` and scale the app tier
+   to zero, so no write can interleave with the one-shot backfill.
+4. **Backfill.** Run `pii backfill` to seal every remaining plaintext value,
+   blank the plaintext columns, and upgrade TOTP blobs to v3.
+5. **Cutover.** Run `pii verify`, then scale the app tier back up. The startup
+   guard fails closed (readiness `503`) if `pii_dual_write=false` and any
+   blanked plaintext PII column still holds a value.
+6. **Contract (later release).** Dropping the now-inert plaintext columns and
+   legacy constraints is a deliberate follow-up release, not part of this
+   change. This release drops and renames nothing.
+
+**Maintenance window.** `ALTER TABLE ... DROP NOT NULL` takes `ACCESS EXCLUSIVE`
+on `users`, `redirect_uris`, and `oauth_clients`, blocking reads and writes for
+its duration; each non-concurrent `CREATE INDEX` takes `SHARE`, blocking writes.
+sqlx runs every migration inside one transaction, so a non-transactional
+`CREATE INDEX CONCURRENTLY` is not used (PostgreSQL rejects it in a
+transaction). Apply the expansion migration from the dedicated migration Job
+during a maintenance window with the app tier quiesced.
+
 ## Security properties
 
 - Only hashed or encrypted secrets are stored: client secrets in
-  `oauth_clients`, passwords in `users`, TOTP secrets encrypted in `users`.
-  Raw tokens are never rows here.
+  `oauth_clients`, passwords in `users`, TOTP secrets encrypted in `users`, and
+  the PII identifiers sealed in the `_enc` columns with their blind indexes in
+  `_index`. Raw tokens are never rows here.
 - The `registration_access_token_hash` column is the one token hash in
   Postgres, so RFC 7592 client management survives a Redis loss.
 - Foreign keys with `ON DELETE CASCADE` keep the join tables consistent, and a
@@ -243,8 +328,11 @@ the Postgres configuration and the operator's log pipeline.
 - Custody the backup key separately from the database, and never co-locate it
   with the master keys ([SECURITY.md](SECURITY.md#master-key-custody)).
 - Store backups off-site and test restores.
-- A backup is a full copy of the plaintext PII columns exactly as a live dump
-  is, so it carries the same disclosure risk and needs the same handling.
+- A backup is a point-in-time copy of the `_enc` ciphertext and the blind
+  indexes, plus the inert NULL plaintext columns. It still needs the same
+  handling as a live dump: after the PII key is rotated, an old backup is
+  readable only with the retained old PII key, so custody of the key store
+  still governs backup disclosure.
 
 ### Postgres-level encryption
 
@@ -257,10 +345,10 @@ Three layers, complementary rather than substitutes:
 | `pgcrypto` | Selected columns | A dump of those columns | An alternative, not the current implementation |
 
 The application already does its own crypto before a row is written: passwords
-and client secrets are Argon2id PHC, and TOTP secrets are AES-256-GCM under
-HKDF-SHA256 (`src/crypto/totp.rs`). `pgcrypto` is an alternative for the
-plaintext PII columns, but it moves key custody into the SQL path and is not
-used today.
+and client secrets are Argon2id PHC, TOTP secrets are AES-256-GCM under
+HKDF-SHA256 (`src/crypto/totp.rs`), and the PII identifiers are sealed with the
+field codec in `src/crypto/field.rs`. `pgcrypto` would move key custody into the
+SQL path and is not used today.
 
 ### See also
 
@@ -302,7 +390,11 @@ SELECT version, success FROM _sqlx_migrations ORDER BY version;
 - `migrations/1791158400_users.sql` for the other five tables and `citext`.
 - `migrations/1791244800_client_dpop_bound.sql` for `oauth_clients.dpop_bound_access_tokens`.
 - `migrations/1791331200_redirect_uri_kind.sql` for `redirect_uris.kind`.
+- `migrations/1791417600_pii_encryption.sql` for the `_enc`/`_index` PII
+  columns, their partial unique indexes, and the dropped `NOT NULL`s.
 - `src/db/` for the repositories.
+- `src/crypto/field.rs` for the field codec and blind index.
+- `src/cli/pii/` for `pii backfill|verify|rotate`.
 - `src/state.rs` for `MIGRATOR`.
 - `src/cli/ops.rs` for the `migrate` command.
 - `src/state/health.rs` for the readiness schema check.

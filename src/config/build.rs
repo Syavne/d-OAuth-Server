@@ -9,7 +9,7 @@ use std::{
   str::FromStr,
 };
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use super::{
   Config, ConfigError, TlsConfig,
@@ -21,7 +21,7 @@ use super::{
   scope::{ScopeDefinition, TokenExchangeRule},
   types::{Argon2Params, RateLimitConfig, TtlConfig},
 };
-use crate::keys::{KeyId, KeyRing};
+use crate::keys::{KeyId, KeyRing, KeyRingError};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_HEALTH_ADDR: &str = "0.0.0.0:8081";
@@ -76,6 +76,7 @@ impl Config {
       cookie_secure: raw.cookie_secure.unwrap_or(true),
       trusted_proxy,
       allow_open_registration: raw.allow_open_registration,
+      pii_dual_write: raw.pii_dual_write,
       dcr_redirect_policy: raw.dcr_redirect_policy,
       cors_allowed_origins: raw.cors_allowed_origins,
       scope_registry,
@@ -151,15 +152,73 @@ fn build_key_ring(raw: &RawConfig) -> Result<KeyRing, ConfigError> {
     raw.totp_encryption_key.as_deref(),
     raw.totp_encryption_key_file.as_deref(),
   )?;
+  let pii = non_blank(resolve_secret(
+    raw.pii_encryption_key.as_deref(),
+    raw.pii_encryption_key_file.as_deref(),
+  )?);
+  let totp_previous = non_blank(resolve_secret(
+    raw.totp_previous_key.as_deref(),
+    raw.totp_previous_key_file.as_deref(),
+  )?);
+  let pii_previous = non_blank(resolve_secret(
+    raw.pii_previous_key.as_deref(),
+    raw.pii_previous_key_file.as_deref(),
+  )?);
   let pepper_id = key_id_or_default(raw.token_pepper_id.as_deref());
   let totp_id = key_id_or_default(raw.totp_key_id.as_deref());
+  let pii_id = key_id_or_default(raw.pii_key_id.as_deref());
   let peppers = pepper
     .map(|secret| vec![(pepper_id, secret)])
     .unwrap_or_default();
-  let totp_keys = totp
-    .map(|secret| vec![(totp_id, secret)])
-    .unwrap_or_default();
-  KeyRing::from_parts(peppers, totp_keys).map_err(ConfigError::from)
+  let totp_keys = active_first_chain(
+    totp.map(|secret| (totp_id, secret)),
+    raw.totp_previous_key_id.as_deref(),
+    totp_previous,
+    KeyRingError::MissingTotpKey,
+  )?;
+  let pii_keys = active_first_chain(
+    pii.map(|secret| (pii_id, secret)),
+    raw.pii_previous_key_id.as_deref(),
+    pii_previous,
+    KeyRingError::MissingPiiKey,
+  )?;
+  KeyRing::from_parts(peppers, totp_keys, pii_keys).map_err(ConfigError::from)
+}
+
+/// Build an active-first chain from the active key plus its retained previous
+/// key. A missing active key with no previous key yields an empty chain (the
+/// caller maps it to `missing_active`); a previous key without its active key
+/// (R2) or without an explicit distinct id (R1) is rejected here so a retained
+/// key can never silently become active.
+fn active_first_chain(
+  active: Option<(KeyId, SecretString)>,
+  previous_id_raw: Option<&str>,
+  previous: Option<SecretString>,
+  missing_active: KeyRingError,
+) -> Result<Vec<(KeyId, SecretString)>, ConfigError> {
+  match (active, previous) {
+    (None, None) => Ok(Vec::new()),
+    (Some(pair), None) => Ok(vec![pair]),
+    (None, Some(_)) => Err(ConfigError::KeyRing(missing_active)),
+    (Some(active_pair), Some(previous_secret)) => {
+      let id_raw = previous_id_raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ConfigError::MissingPreviousKeyId)?;
+      let id = KeyId::new(id_raw);
+      if id == active_pair.0 {
+        return Err(ConfigError::MissingPreviousKeyId);
+      }
+      Ok(vec![active_pair, (id, previous_secret)])
+    }
+  }
+}
+
+/// Treat empty/whitespace-only resolved material as absent. The inline path in
+/// `resolve_secret` already drops blanks, but a mounted file can be zero-byte
+/// or whitespace-only; such a value must not become a chain element.
+fn non_blank(secret: Option<SecretString>) -> Option<SecretString> {
+  secret.filter(|value| !value.expose_secret().trim().is_empty())
 }
 
 fn resolve_secret(

@@ -21,8 +21,9 @@ the library.
 | Module | Owns |
 | --- | --- |
 | `src/config.rs`, `src/config/` | Layered configuration load from `D_OAUTH_*` env vars and an optional file, then fail-fast validation. See [CONFIGURATION.md](CONFIGURATION.md). |
-| `src/keys.rs` | The versioned `KeyRing`: token peppers and the TOTP encryption key, each under a key id. |
+| `src/keys.rs` | The versioned `KeyRing`: token peppers, the TOTP encryption key, and the PII field-encryption key, each under a key id with an optional retained previous key. |
 | `src/crypto/` | Constant-time comparison, PKCE, opaque token mint/hash, TOTP, and password/client-secret hashing. |
+| `src/crypto/field.rs` | Versioned AES-256-GCM field codec and keyed-HMAC blind index for the PII columns. |
 | `src/jose/` | DPoP proof verification, JAR request objects, `private_key_jwt` client assertions, and JWK parsing. |
 | `src/db/` | Postgres repositories for the six domain tables. See [DATABASE.md](DATABASE.md). |
 | `src/store/` | Redis ephemeral state and the durability barrier. See [REDIS.md](REDIS.md). |

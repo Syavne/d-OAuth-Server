@@ -12,6 +12,7 @@ use super::{
   context::{CliError, Context, audit},
   redirect, scope,
 };
+use crate::db::redirect_repo;
 
 /// Top-level declarative file.
 #[derive(Debug, Default, Deserialize)]
@@ -165,7 +166,7 @@ pub async fn apply(context: &Context, file: &SyncFile) -> Result<SyncReport, Cli
 
   for entry in &file.redirect_uris {
     match redirect::upsert(
-      context.pool(),
+      context,
       &entry.uri,
       &entry.kind,
       entry.description.as_deref(),
@@ -196,16 +197,8 @@ pub async fn apply(context: &Context, file: &SyncFile) -> Result<SyncReport, Cli
   for entry in &file.client_redirect_uris {
     redirect::ensure_client_exists(context, &entry.client_id).await?;
     let redirect_id = redirect::find_redirect_id(context, &entry.uri, &entry.kind).await?;
-    report.attachments_added += sqlx::query(
-      "INSERT INTO client_redirect_uris (client_id, redirect_uri_id, attached_at)
-       VALUES ($1, $2, now())
-       ON CONFLICT (client_id, redirect_uri_id) DO NOTHING",
-    )
-    .bind(&entry.client_id)
-    .bind(redirect_id)
-    .execute(context.pool())
-    .await?
-    .rows_affected();
+    report.attachments_added +=
+      u64::from(redirect_repo::attach(context.pool(), &entry.client_id, redirect_id, None).await?);
   }
 
   audit("config.sync", &report.to_string());

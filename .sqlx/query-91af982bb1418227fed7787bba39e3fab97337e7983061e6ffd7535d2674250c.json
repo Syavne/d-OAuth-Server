@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, uri, kind, enabled, description, created_by, created_at, updated_at FROM redirect_uris WHERE ($1 OR enabled = true) ORDER BY uri",
+  "query": "INSERT INTO redirect_uris (id, uri, kind, description, created_by, created_at, updated_at, uri_enc, uri_index) VALUES ($1, $2, $3, $4, $5, now(), now(), $6, $7) ON CONFLICT (uri_index, kind) WHERE uri_index IS NOT NULL DO UPDATE SET updated_at = now() RETURNING id, uri, kind, enabled, description, created_by, created_at, updated_at, uri_enc, (xmax = 0) AS \"inserted!\"",
   "describe": {
     "columns": [
       {
@@ -90,23 +90,48 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 8,
+        "name": "uri_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "redirect_uris",
+            "name": "uri_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "inserted!",
+        "type_info": "Bool",
+        "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
-        "Bool"
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Bytea",
+        "Text"
       ]
     },
     "nullable": [
       false,
-      false,
+      true,
       false,
       false,
       false,
       true,
       false,
-      false
+      false,
+      true,
+      null
     ]
   },
-  "hash": "5c4899738b7b454659330a8c2775c8641061a76368ad3b253f08d5d7536c81ab"
+  "hash": "91af982bb1418227fed7787bba39e3fab97337e7983061e6ffd7535d2674250c"
 }

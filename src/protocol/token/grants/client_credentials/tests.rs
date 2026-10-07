@@ -105,6 +105,7 @@ fn ring() -> Result<KeyRing, TestError> {
   KeyRing::from_parts(
     vec![(KeyId::new("v1"), SecretString::from("cc-test-pepper"))],
     vec![(KeyId::new("v1"), SecretString::from("totp-test-secret"))],
+    vec![(KeyId::new("v1"), SecretString::from("pii-test-secret"))],
   )
   .map_err(TestError::from)
 }

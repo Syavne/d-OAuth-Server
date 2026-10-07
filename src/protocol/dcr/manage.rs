@@ -234,10 +234,9 @@ pub async fn read_client(
     registration_access_token,
   )
   .await?;
-  let row = active_row(stores.pool, client_id).await?;
-  let effective = redirect_repo::effective_for_client(stores.pool, client_id)
-    .await
-    .map_err(AppError::from)?;
+  let row = active_row(stores.pool, &ctx.config.keys, client_id).await?;
+  let effective =
+    redirect_repo::effective_for_client(stores.pool, &ctx.config.keys, client_id).await?;
   Ok(respond(
     &row,
     effective.into_iter().map(|uri| uri.uri).collect(),
@@ -249,10 +248,12 @@ pub async fn read_client(
 
 /// Load an active client row; a client that vanished after authorization
 /// reads as `401` (fail closed, no oracle).
-async fn active_row(pool: &PgPool, client_id: &str) -> Result<Client, ManageError> {
-  let row = client_repo::find_active_by_client_id(pool, client_id)
-    .await
-    .map_err(AppError::from)?;
+async fn active_row(
+  pool: &PgPool,
+  keys: &crate::keys::KeyRing,
+  client_id: &str,
+) -> Result<Client, ManageError> {
+  let row = client_repo::find_active_by_client_id(pool, keys, client_id).await?;
   row.ok_or_else(|| AppError::invalid_client_bearer().into())
 }
 

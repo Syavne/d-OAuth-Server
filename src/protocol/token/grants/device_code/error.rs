@@ -48,6 +48,9 @@ impl DevicePollError {
       Self::ExpiredToken => "expired_token",
       Self::Protocol(error) => match error {
         AppError::OAuth { code, .. } => code.as_str(),
+        AppError::DuplicateEmail => "invalid_request",
+        AppError::DuplicateClientIdentity => "invalid_client_metadata",
+        AppError::PiiDecrypt => "temporarily_unavailable",
         AppError::Internal { .. } => "server_error",
       },
     }

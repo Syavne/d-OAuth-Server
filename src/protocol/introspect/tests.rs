@@ -98,6 +98,7 @@ async fn harness() -> TestResult<(ContainerGuard, Harness)> {
     "redis": {"url": redis_url, "durability": "waitaof"},
     "token_pepper": "introspect-test-pepper-0123456789abcdef",
     "totp_encryption_key": "introspect-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "introspect-test-pii-key-0123456789abcdef",
   });
   let source = ::config::Config::try_from(&fixture)?;
   let config = Config::from_source(source)?;
@@ -115,6 +116,7 @@ async fn harness() -> TestResult<(ContainerGuard, Harness)> {
 
 async fn insert_client(
   pool: &PgPool,
+  keys: &crate::keys::KeyRing,
   client_id: &str,
   method: TokenEndpointAuthMethod,
   secret: Option<&str>,
@@ -143,7 +145,7 @@ async fn insert_client(
     dpop_bound_access_tokens: false,
     registration_access_token_hash: None,
   };
-  client_repo::insert(pool, &new).await?;
+  client_repo::insert(pool, keys, false, &new).await?;
   Ok(())
 }
 
@@ -190,6 +192,7 @@ async fn run_core(
   let service = token_service(h)?;
   let mut stores = IntrospectStores {
     pool: &h.pool,
+    keys: &h.config.keys,
     conn: &mut h.conn,
     store: &h.store,
   };
@@ -217,6 +220,7 @@ fn app_state(h: &Harness) -> AppState {
     redis: h.conn.clone(),
     config: Arc::clone(&h.config),
     keys: Arc::new(h.config.keys.clone()),
+    transition_unsafe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     clock: Clock::system(),
   }
 }
@@ -253,6 +257,7 @@ async fn test_introspect_active_access_token_reports_shape() -> TestResult {
   let client_id = unique("owner");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &client_id,
     TokenEndpointAuthMethod::ClientSecretPost,
     Some("secret-a"),
@@ -304,6 +309,7 @@ async fn test_introspect_unknown_token_is_inactive_200() -> TestResult {
   let client_id = unique("unknown");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &client_id,
     TokenEndpointAuthMethod::ClientSecretBasic,
     Some("secret-u"),
@@ -342,6 +348,7 @@ async fn test_introspect_foreign_client_token_is_inactive_200() -> TestResult {
   let owner = unique("owner");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &owner,
     TokenEndpointAuthMethod::ClientSecretBasic,
     Some("owner-secret"),
@@ -350,6 +357,7 @@ async fn test_introspect_foreign_client_token_is_inactive_200() -> TestResult {
   let foreign = unique("foreign");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &foreign,
     TokenEndpointAuthMethod::ClientSecretBasic,
     Some("foreign-secret"),
@@ -377,6 +385,7 @@ async fn test_introspect_revoked_token_is_inactive() -> TestResult {
   let client_id = unique("revoked");
   insert_client(
     &h.pool,
+    &h.config.keys,
     &client_id,
     TokenEndpointAuthMethod::ClientSecretPost,
     Some("secret-r"),

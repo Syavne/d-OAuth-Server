@@ -17,7 +17,7 @@
 
 use askama::Template;
 use axum::{
-  Form,
+  Extension, Form,
   body::Body,
   extract::State,
   http::{StatusCode, header},
@@ -32,7 +32,8 @@ use crate::{
   config::GrantKind,
   db::{client_repo, scope_repo, user_repo, user_scope_repo},
   error::AppError,
-  middleware::audit::AuditEvent,
+  keys::KeyRing,
+  middleware::{audit::AuditEvent, request_id::RequestId},
   protocol::{
     code,
     scope::{self, ScopeSet},
@@ -134,6 +135,8 @@ pub struct ConsentDeps<'a> {
   pub conn: &'a mut RedisConn,
   /// Redis store handle (session/pending/code key layout).
   pub store: &'a Store,
+  /// Versioned PII keys for the encrypted user-email lookup.
+  pub keys: &'a KeyRing,
 }
 
 /// Whether `live` is a full authenticated session (never a pre-session or a
@@ -271,10 +274,10 @@ async fn client_and_user(
   pending: &PendingAuth,
   subject: &str,
 ) -> Result<(client_repo::Client, user_repo::UserRecord), AppError> {
-  let client = client_repo::find_active_by_client_id(deps.pool, &pending.client_id)
+  let client = client_repo::find_active_by_client_id(deps.pool, deps.keys, &pending.client_id)
     .await?
     .ok_or_else(|| AppError::invalid_request("the client is no longer active"))?;
-  let user = user_repo::find_by_email(deps.pool, subject)
+  let user = user_repo::find_by_email(deps.pool, deps.keys, subject)
     .await?
     .filter(|user| !user.disabled)
     .ok_or_else(|| AppError::invalid_request("the authenticated account is no longer active"))?;
@@ -359,6 +362,21 @@ fn audit(request_id: &str, client_id: &str, subject: &str, granted: bool) {
   .emit();
 }
 
+/// Emit `pii.decrypt_failure` for a stored-value open failure.
+///
+/// Matches [`AppError::PiiDecrypt`] specifically; any other error passes
+/// through silently. The event carries only the request id — never the value
+/// that failed to open and never any plaintext — and the error itself still
+/// renders 503 via [`AppError`].
+fn emit_pii_decrypt(request_id: &RequestId, error: &AppError) {
+  if matches!(error, AppError::PiiDecrypt) {
+    AuditEvent::PiiDecryptFailure {
+      request_id: Some(request_id.as_str()),
+    }
+    .emit();
+  }
+}
+
 /// Append `text` percent-encoded (unreserved characters pass through).
 fn push_percent_encoded(out: &mut String, text: &str) {
   const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -407,7 +425,11 @@ struct ConsentTemplate {
 
 /// `GET /consent`: render the screen for the bound request; anonymous or
 /// restricted callers are sent to login.
-pub async fn get_consent(State(state): State<AppState>, jar: CookieJar) -> Response {
+pub async fn get_consent(
+  State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
+  jar: CookieJar,
+) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let session_id = session_id_of(&jar);
@@ -415,6 +437,7 @@ pub async fn get_consent(State(state): State<AppState>, jar: CookieJar) -> Respo
     pool: &state.pool,
     conn: &mut conn,
     store: &store,
+    keys: &state.keys,
   };
   match load_consent_view(&mut deps, &session_id).await {
     Ok(Some(view)) => render(ConsentTemplate {
@@ -425,7 +448,10 @@ pub async fn get_consent(State(state): State<AppState>, jar: CookieJar) -> Respo
       csrf: view.csrf,
     }),
     Ok(None) => Redirect::to(login::LOGIN_PATH).into_response(),
-    Err(error) => error.into_response(),
+    Err(error) => {
+      emit_pii_decrypt(&request_id, &error);
+      error.into_response()
+    }
   }
 }
 
@@ -435,6 +461,7 @@ pub async fn get_consent(State(state): State<AppState>, jar: CookieJar) -> Respo
 /// closed before any decision is recorded.
 pub async fn post_consent(
   State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
   jar: CookieJar,
   Form(form): Form<ConsentForm>,
 ) -> Response {
@@ -453,6 +480,7 @@ pub async fn post_consent(
     pool: &state.pool,
     conn: &mut conn,
     store: &store,
+    keys: &state.keys,
   };
   let submission = ConsentSubmission {
     session_id: &session_id,
@@ -464,7 +492,10 @@ pub async fn post_consent(
     Ok(ConsentOutcome::Approved { issued }) => redirect(&issued.location),
     Ok(ConsentOutcome::Denied { redirect_to }) => redirect(&redirect_to),
     Ok(ConsentOutcome::NeedsLogin) => Redirect::to(login::LOGIN_PATH).into_response(),
-    Err(error) => error.into_response(),
+    Err(error) => {
+      emit_pii_decrypt(&request_id, &error);
+      error.into_response()
+    }
   }
 }
 

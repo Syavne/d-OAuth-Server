@@ -21,7 +21,7 @@ use std::{
 };
 
 use sqlx::{
-  Executor as _, PgPool,
+  Executor as _, PgPool, Row as _,
   migrate::{MigrateError, Migrator},
   postgres::PgPoolOptions,
 };
@@ -201,6 +201,98 @@ fn assert_unique_violation(
   }
 }
 
+/// A table's columns as `(name, udt_name, is_nullable)`.
+async fn columns_of(
+  pool: &PgPool,
+  table: &str,
+) -> Result<Vec<(String, String, String)>, TestError> {
+  let rows = sqlx::query(
+    "SELECT column_name, udt_name, is_nullable FROM information_schema.columns \
+     WHERE table_schema = 'public' AND table_name = $1",
+  )
+  .bind(table)
+  .fetch_all(pool)
+  .await?;
+  let mut columns = Vec::with_capacity(rows.len());
+  for row in &rows {
+    columns.push((
+      row.try_get::<String, _>("column_name")?,
+      row.try_get::<String, _>("udt_name")?,
+      row.try_get::<String, _>("is_nullable")?,
+    ));
+  }
+  Ok(columns)
+}
+
+/// Assert a table has `column` of the given Postgres `udt_name`.
+fn assert_udt(columns: &[(String, String, String)], column: &str, udt: &str) -> TestResult {
+  let found = columns
+    .iter()
+    .find(|(name, _, _)| name == column)
+    .ok_or_else(|| io::Error::other(format!("column {column} missing")))?;
+  assert_eq!(found.1, udt, "{column} is {udt}");
+  Ok(())
+}
+
+/// Assert a table has `column` and it accepts NULL.
+fn assert_nullable(columns: &[(String, String, String)], column: &str) -> TestResult {
+  let found = columns
+    .iter()
+    .find(|(name, _, _)| name == column)
+    .ok_or_else(|| io::Error::other(format!("column {column} missing")))?;
+  assert_eq!(found.2, "YES", "{column} is nullable");
+  Ok(())
+}
+
+/// Assert a unique partial index on `table` is keyed by `column` with an
+/// `IS NOT NULL` predicate (so NULL rows stay unconstrained).
+async fn assert_partial_unique_index(
+  pool: &PgPool,
+  index: &str,
+  table: &str,
+  column: &str,
+) -> TestResult {
+  let def = index_def(pool, table, index).await?;
+  assert!(def.contains("UNIQUE INDEX"), "{index} is unique: {def}");
+  assert!(def.contains(column), "{index} keys on {column}: {def}");
+  assert!(def.contains("IS NOT NULL"), "{index} is partial: {def}");
+  Ok(())
+}
+
+/// Assert an index exists on `table`.
+async fn assert_index_exists(pool: &PgPool, table: &str, index: &str) -> TestResult {
+  index_def(pool, table, index).await.map(|_| ())
+}
+
+/// The `pg_indexes.indexdef` for `table`'s `index`, or an error naming it.
+async fn index_def(pool: &PgPool, table: &str, index: &str) -> Result<String, TestError> {
+  sqlx::query_scalar(
+    "SELECT indexdef FROM pg_indexes \
+     WHERE schemaname = 'public' AND tablename = $1 AND indexname = $2",
+  )
+  .bind(table)
+  .bind(index)
+  .fetch_optional(pool)
+  .await?
+  .ok_or_else(|| io::Error::other(format!("index {index} missing on {table}")).into())
+}
+
+/// Assert a table constraint (unique/check) still exists after the expansion.
+async fn assert_constraint_kept(pool: &PgPool, table: &str, constraint: &str) -> TestResult {
+  let exists: bool = sqlx::query_scalar(
+    "SELECT EXISTS (SELECT 1 FROM pg_constraint c \
+       JOIN pg_class t ON t.oid = c.conrelid \
+       JOIN pg_namespace n ON n.oid = t.relnamespace \
+      WHERE n.nspname = 'public' AND t.relname = $1 AND c.conname = $2)",
+  )
+  .bind(table)
+  .bind(constraint)
+  .fetch_one(pool)
+  .await?;
+  assert!(exists, "legacy constraint {constraint} is kept");
+  Ok(())
+}
+
 /// Run all migrations on an empty DB: full schema, empty scope catalog, and a
 /// second run is a clean no-op.
 #[tokio::test]
@@ -282,6 +374,8 @@ async fn migration_users_totp_is_ciphertext_and_no_lockout_columns() -> TestResu
     "created_at",
     "disabled",
     "email",
+    "email_enc",
+    "email_index",
     "id",
     "is_admin",
     "must_change_password",
@@ -322,6 +416,9 @@ async fn migration_users_totp_is_ciphertext_and_no_lockout_columns() -> TestResu
     .ok_or_else(|| io::Error::other("email column missing"))?;
   assert_eq!(email_type, "citext", "email is case-insensitive citext");
 
+  // The blind index is unique and partial: NULL email_index rows are unconstrained.
+  assert_partial_unique_index(&pool, "ux_users_email_index", "users", "email_index").await?;
+
   for name in &names {
     assert!(!name.contains("lock"), "no lockout column: {name}");
     assert!(!name.contains("failed"), "no failed-login column: {name}");
@@ -330,6 +427,131 @@ async fn migration_users_totp_is_ciphertext_and_no_lockout_columns() -> TestResu
       "no failed-attempt column: {name}"
     );
   }
+  Ok(())
+}
+
+/// Todo 8 expansion: the encrypted PII columns and blind indexes exist, the
+/// plaintext columns the backfill blanks accept NULL, and the legacy unique
+/// constraints survive (inert on NULL), so an encrypt-only row inserts.
+#[tokio::test]
+async fn expand_migration_adds_pii_columns() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+
+  // The expansion version is compiled into the embedded set readiness reads.
+  assert!(
+    MIGRATOR.iter().any(|m| m.version == 1_791_417_600),
+    "the PII expansion migration is embedded in MIGRATOR"
+  );
+
+  // users: email stays citext but becomes nullable; ciphertext + blind index add.
+  let users = columns_of(&pool, "users").await?;
+  assert_nullable(&users, "email")?;
+  assert_udt(&users, "email_enc", "bytea")?;
+  assert_udt(&users, "email_index", "text")?;
+  assert_partial_unique_index(&pool, "ux_users_email_index", "users", "email_index").await?;
+  assert_constraint_kept(&pool, "users", "ux_users_email").await?;
+
+  // oauth_clients: every PII metadata column gains a ciphertext twin, the two
+  // mTLS identities gain blind indexes, and client_name becomes nullable.
+  let clients = columns_of(&pool, "oauth_clients").await?;
+  assert_nullable(&clients, "client_name")?;
+  for column in [
+    "client_name_enc",
+    "contacts_enc",
+    "request_uris_enc",
+    "jwks_uri_enc",
+    "software_id_enc",
+    "tls_client_auth_subject_dn_enc",
+    "tls_client_auth_cert_thumbprint_enc",
+  ] {
+    assert_udt(&clients, column, "bytea")?;
+  }
+  assert_udt(&clients, "tls_client_auth_subject_dn_index", "text")?;
+  assert_udt(&clients, "tls_client_auth_cert_thumbprint_index", "text")?;
+  assert_partial_unique_index(
+    &pool,
+    "ux_oauth_clients_tls_subject_dn_index",
+    "oauth_clients",
+    "tls_client_auth_subject_dn_index",
+  )
+  .await?;
+  assert_partial_unique_index(
+    &pool,
+    "ux_oauth_clients_tls_cert_thumbprint_index",
+    "oauth_clients",
+    "tls_client_auth_cert_thumbprint_index",
+  )
+  .await?;
+  assert_index_exists(&pool, "oauth_clients", "ux_oauth_clients_tls_subject_dn").await?;
+  assert_index_exists(
+    &pool,
+    "oauth_clients",
+    "ux_oauth_clients_tls_cert_thumbprint",
+  )
+  .await?;
+
+  // redirect_uris: uri becomes nullable; ciphertext + per-kind blind index add.
+  let uris = columns_of(&pool, "redirect_uris").await?;
+  assert_nullable(&uris, "uri")?;
+  assert_udt(&uris, "uri_enc", "bytea")?;
+  assert_udt(&uris, "uri_index", "text")?;
+  assert_partial_unique_index(
+    &pool,
+    "ux_redirect_uris_uri_index_kind",
+    "redirect_uris",
+    "uri_index",
+  )
+  .await?;
+  assert_constraint_kept(&pool, "redirect_uris", "ux_redirect_uris_uri_kind").await?;
+
+  // Encrypt-only rows (plaintext NULL, ciphertext populated) insert cleanly.
+  sqlx::query(
+    "INSERT INTO users (id, email, email_enc, email_index, password_hash, created_at, updated_at) \
+     VALUES ($1, NULL, $2, $3, $4, now(), now())",
+  )
+  .bind(uuid::Uuid::new_v4())
+  .bind(b"sealed-email".to_vec())
+  .bind("blind-email-index")
+  .bind("$argon2id$v=19$m=19456,t=2,p=1$placeholder")
+  .execute(&pool)
+  .await?;
+
+  sqlx::query(
+    "INSERT INTO redirect_uris (id, uri, uri_enc, uri_index, created_at, updated_at) \
+     VALUES ($1, NULL, $2, $3, now(), now())",
+  )
+  .bind(uuid::Uuid::new_v4())
+  .bind(b"sealed-uri".to_vec())
+  .bind("blind-uri-index")
+  .execute(&pool)
+  .await?;
+
+  sqlx::query(
+    "INSERT INTO oauth_clients \
+       (id, client_id, client_id_issued_at, client_name, client_name_enc, \
+        grant_types, response_types, scope, token_endpoint_auth_method, \
+        created_at, updated_at) \
+     VALUES ($1, $2, now(), NULL, $3, $4, $5, $6, $7, now(), now())",
+  )
+  .bind(uuid::Uuid::new_v4())
+  .bind("pii-expansion-client")
+  .bind(b"sealed-name".to_vec())
+  .bind(vec!["client_credentials".to_owned()])
+  .bind(vec!["token".to_owned()])
+  .bind("")
+  .bind("client_secret_basic")
+  .execute(&pool)
+  .await?;
+
+  // Re-running the migrator applies nothing new (a no-op).
+  let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+    .fetch_one(&pool)
+    .await?;
+  MIGRATOR.run(&pool).await?;
+  let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+    .fetch_one(&pool)
+    .await?;
+  assert_eq!(before, after, "re-running the migrator is a no-op");
   Ok(())
 }
 

@@ -15,6 +15,7 @@ async fn test_grant_device_fast_poll_is_slow_down() -> TestResult {
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -111,6 +112,7 @@ async fn test_grant_device_denied_is_access_denied() -> TestResult {
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,

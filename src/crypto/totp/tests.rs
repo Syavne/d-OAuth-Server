@@ -8,7 +8,10 @@ use super::{
   derive_key, derive_key_legacy, encrypt_secret, generate_recovery_codes, generate_secret,
   normalize_recovery_code, otpauth_uri, qr_svg, replay_fingerprint, verify_window,
 };
-use crate::keys::{KeyId, KeyRing};
+use crate::{
+  error::{AppError, OAuthErrorCode},
+  keys::{KeyId, KeyRing},
+};
 
 /// Test KeyRing with one pepper generation and one TOTP-encryption key.
 fn test_ring() -> Result<KeyRing, TotpError> {
@@ -20,6 +23,10 @@ fn test_ring() -> Result<KeyRing, TotpError> {
     vec![(
       KeyId::new("v1"),
       SecretString::from("test-totp-key-0123456789abcdef"),
+    )],
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("test-pii-key-0123456789abcdef"),
     )],
   )
   .map_err(|_| TotpError::Encrypt)
@@ -100,7 +107,7 @@ fn login_totp_secret_round_trip() -> Result<(), TotpError> {
   if secret.len() != 32 {
     return Err(TotpError::InvalidSecret);
   }
-  let blob = encrypt_secret(&ring, &secret)?;
+  let blob = encrypt_secret(&ring, &secret, true)?;
   let back = decrypt_secret(&ring, &blob)?;
   if back != secret {
     return Err(TotpError::Decrypt);
@@ -115,7 +122,7 @@ fn login_totp_secret_round_trip() -> Result<(), TotpError> {
 #[test]
 fn login_totp_decrypt_rejects_tampered_and_foreign_blobs() -> Result<(), TotpError> {
   let ring = test_ring()?;
-  let mut blob = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ")?;
+  let mut blob = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ", true)?;
   let last = blob.len() - 1;
   blob[last] ^= 0x01;
   if decrypt_secret(&ring, &blob).is_ok() {
@@ -127,9 +134,10 @@ fn login_totp_decrypt_rejects_tampered_and_foreign_blobs() -> Result<(), TotpErr
   let foreign = KeyRing::from_parts(
     vec![(KeyId::new("v1"), SecretString::from("other-pepper"))],
     vec![(KeyId::new("v1"), SecretString::from("other-totp-key"))],
+    vec![(KeyId::new("v1"), SecretString::from("other-pii-key"))],
   )
   .map_err(|_| TotpError::Encrypt)?;
-  let blob = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ")?;
+  let blob = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ", true)?;
   if decrypt_secret(&foreign, &blob).is_ok() {
     return Err(TotpError::Decrypt);
   }
@@ -248,14 +256,109 @@ fn login_totp_hkdf_differs_from_legacy_sha256() -> Result<(), TotpError> {
   Ok(())
 }
 
+/// The writer is version-gated for the rolling upgrade: `envelope = false`
+/// (while `pii_dual_write` is on and old replicas still read) writes the
+/// legacy v2 blob; `envelope = true` writes the v3 per-row-DEK envelope.
+/// `decrypt_secret` opens both.
 #[test]
 fn login_totp_new_blobs_use_version_two() -> Result<(), TotpError> {
   let ring = test_ring()?;
-  let blob = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ")?;
-  if TOTP_BLOB_VERSION != 2 || blob.first().copied() != Some(2) {
+  let legacy = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ", false)?;
+  if TOTP_BLOB_VERSION != 2 || legacy.first().copied() != Some(2) {
     return Err(TotpError::Encrypt);
   }
-  if decrypt_secret(&ring, &blob)? != "GEZDGNBVGY3TQOJQ" {
+  if decrypt_secret(&ring, &legacy)? != "GEZDGNBVGY3TQOJQ" {
+    return Err(TotpError::Decrypt);
+  }
+  let enveloped = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ", true)?;
+  if enveloped.first().copied() != Some(3) {
+    return Err(TotpError::Encrypt);
+  }
+  if decrypt_secret(&ring, &enveloped)? != "GEZDGNBVGY3TQOJQ" {
+    return Err(TotpError::Decrypt);
+  }
+  Ok(())
+}
+
+#[test]
+fn totp_v3_envelope_round_trip() -> Result<(), TotpError> {
+  let ring = test_ring()?;
+  let secret = "GEZDGNBVGY3TQOJQ";
+  let blob = encrypt_secret(&ring, secret, true)?;
+  if blob.first().copied() != Some(3) {
+    return Err(TotpError::Encrypt);
+  }
+  if decrypt_secret(&ring, &blob)? != secret {
+    return Err(TotpError::Decrypt);
+  }
+  // The envelope carries no plaintext.
+  if String::from_utf8_lossy(&blob).contains(secret) {
+    return Err(TotpError::Encrypt);
+  }
+  Ok(())
+}
+
+#[test]
+fn totp_v3_two_rows_use_distinct_deks() -> Result<(), TotpError> {
+  let ring = test_ring()?;
+  let first = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ", true)?;
+  let second = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ", true)?;
+  // Fresh DEK + nonces per write: identical plaintext never repeats a blob.
+  if first == second {
+    return Err(TotpError::Encrypt);
+  }
+  if decrypt_secret(&ring, &first)? != "GEZDGNBVGY3TQOJQ" {
+    return Err(TotpError::Decrypt);
+  }
+  if decrypt_secret(&ring, &second)? != "GEZDGNBVGY3TQOJQ" {
+    return Err(TotpError::Decrypt);
+  }
+  Ok(())
+}
+
+/// V3 layout: `version(1)=3 || kid_len(1) || kid || wrap_nonce(12) ||
+/// wrapped_dek(32+16) || data_nonce(12) || secret_ct+tag`.
+fn v3_wrap_range(blob: &[u8]) -> Result<(usize, usize), TotpError> {
+  if blob.first().copied() != Some(3) || blob.len() < 2 {
+    return Err(TotpError::Decrypt);
+  }
+  let header = 2 + usize::from(blob[1]);
+  let start = header + 12;
+  let end = start + 48;
+  if blob.len() < end + 12 + 16 {
+    return Err(TotpError::Decrypt);
+  }
+  Ok((start, end))
+}
+
+#[test]
+fn totp_v3_rejects_swapped_wrapped_dek() -> Result<(), TotpError> {
+  let ring = test_ring()?;
+  let first = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ", true)?;
+  let second = encrypt_secret(&ring, "GEZDGNBVGY3TQOJQ", true)?;
+  let (from_start, from_end) = v3_wrap_range(&second)?;
+  let (to_start, to_end) = v3_wrap_range(&first)?;
+  // A wrapped DEK moved from another row binds that row's data nonce in its
+  // wrap AAD, so it must fail to unwrap here.
+  let mut swapped = first.clone();
+  swapped[to_start..to_end].copy_from_slice(&second[from_start..from_end]);
+  if decrypt_secret(&ring, &swapped).is_ok() {
+    return Err(TotpError::Decrypt);
+  }
+  // A tampered wrapped DEK fails closed.
+  let mut tampered = first.clone();
+  tampered[to_start] ^= 0x01;
+  if decrypt_secret(&ring, &tampered).is_ok() {
+    return Err(TotpError::Decrypt);
+  }
+  // A tampered data nonce breaks the wrap AAD binding too.
+  let mut nonce_tampered = first.clone();
+  nonce_tampered[to_end] ^= 0x01;
+  if decrypt_secret(&ring, &nonce_tampered).is_ok() {
+    return Err(TotpError::Decrypt);
+  }
+  // The untouched blob still opens.
+  if decrypt_secret(&ring, &first)? != "GEZDGNBVGY3TQOJQ" {
     return Err(TotpError::Decrypt);
   }
   Ok(())
@@ -308,4 +411,38 @@ fn login_totp_decrypts_legacy_v1_sha256_blob() -> Result<(), TotpError> {
     return Err(TotpError::Decrypt);
   }
   Ok(())
+}
+
+#[test]
+fn totp_error_maps_fail_closed() {
+  use axum::http::StatusCode;
+  // A stored ciphertext that fails to open is PII-decrypt (503), so the
+  // route layer emits `pii.decrypt_failure` with the request id.
+  let decrypt = AppError::from(TotpError::Decrypt);
+  assert!(matches!(decrypt, AppError::PiiDecrypt));
+  assert_eq!(decrypt.code(), OAuthErrorCode::TemporarilyUnavailable);
+  assert_eq!(decrypt.status(), StatusCode::SERVICE_UNAVAILABLE);
+  // Stored-value and dependency failures are 503, never fail-open 500, and
+  // carry no secret, key, or store detail.
+  let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "store down");
+  let failures = [
+    AppError::from(TotpError::Encrypt),
+    AppError::from(TotpError::UnavailableRandomness),
+    AppError::from(TotpError::InvalidSecret),
+    AppError::from(TotpError::UnexpectedReply),
+    AppError::from(TotpError::from(redis::RedisError::from(io))),
+  ];
+  for error in failures {
+    assert_eq!(error.code(), OAuthErrorCode::TemporarilyUnavailable);
+    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+      !format!("{error:?}").contains("store down"),
+      "a mapped error must stay payload-free"
+    );
+  }
+  // QR rendering is a server-side rendering defect, not a decrypt or
+  // dependency failure, so it stays `server_error`.
+  let qr = AppError::from(TotpError::Qr);
+  assert_eq!(qr.code(), OAuthErrorCode::ServerError);
+  assert_eq!(qr.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }

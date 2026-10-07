@@ -10,9 +10,9 @@
 #
 # Hardened like the Deployment: non-root 65532,
 # read-only rootfs, ALL capabilities dropped, `automountServiceAccountToken:
-# false`, and every secret (token pepper, TOTP key, DB/Redis passwords) mounted
-# as 0400 tmpfs files under `/run/secrets` (read through the `*_FILE`
-# variables) instead of env vars. The image carries the same placeholder
+# false`, and every secret (token pepper, TOTP key, mandatory PII key, DB/Redis
+# passwords) mounted as 0400 tmpfs files under `/run/secrets` (read through the
+# `*_FILE` variables) instead of env vars. The image carries the same placeholder
 # digest; `pin-digest` rewrites the real digest in `kustomization.yaml` for
 # every workload.
 apiVersion: batch/v1
@@ -66,6 +66,8 @@ spec:
               value: /run/secrets/token-pepper
             - name: D_OAUTH_TOTP_ENCRYPTION_KEY_FILE
               value: /run/secrets/totp-encryption-key
+            - name: D_OAUTH_PII_ENCRYPTION_KEY_FILE
+              value: /run/secrets/pii-encryption-key
           resources:
             requests:
               cpu: 50m
@@ -104,3 +106,5 @@ spec:
                 path: token-pepper
               - key: totp-encryption-key
                 path: totp-encryption-key
+              - key: pii-encryption-key
+                path: pii-encryption-key

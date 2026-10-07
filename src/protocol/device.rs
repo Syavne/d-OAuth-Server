@@ -245,7 +245,7 @@ pub async fn authorize_device(
       AppError::invalid_client_non_basic()
     }
   };
-  let client = client_repo::find_active_by_client_id(stores.pool, inputs.client_id)
+  let client = client_repo::find_active_by_client_id(stores.pool, stores.keys, inputs.client_id)
     .await?
     .ok_or_else(unknown_client)?;
   let method = client.auth_method().map_err(|_| unknown_client())?;
@@ -292,7 +292,7 @@ pub async fn authorize_device(
     }
     TokenEndpointAuthMethod::TlsClientAuth | TokenEndpointAuthMethod::SelfSignedTlsClientAuth => {
       let leaf = inputs.peer_certs.and_then(|chain| chain.chain().first());
-      let cnf = mtls::authenticate(stores.pool, &client, leaf)
+      let cnf = mtls::authenticate(stores.pool, stores.keys, &client, leaf)
         .await
         .map_err(mtls::MtlsError::into_app_error)?;
       DeviceBinding {
@@ -377,6 +377,7 @@ async fn authenticate_confidential(
   };
   let mut auth = AuthStores {
     pool: stores.pool,
+    keys: stores.keys,
     conn: &mut *stores.conn,
     store: stores.store,
   };

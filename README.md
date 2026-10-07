@@ -60,6 +60,7 @@ export D_OAUTH_REDIS__URL=redis://127.0.0.1:6379
 export D_OAUTH_REDIS__DURABILITY=waitaof
 export D_OAUTH_TOKEN_PEPPER='replace-with-32-bytes-of-random'
 export D_OAUTH_TOTP_ENCRYPTION_KEY='replace-with-32-bytes-of-random'
+export D_OAUTH_PII_ENCRYPTION_KEY='replace-with-32-bytes-of-random'
 ```
 
 Development relaxes the database TLS requirement. Production requires
@@ -232,8 +233,9 @@ certificate.
   against that draft are listed in [docs/OAUTH.md](docs/OAUTH.md).
 - There is no default credential and no HTTP admin API. Provision through the
   CLI.
-- The token pepper and TOTP encryption key are required; losing the pepper
-  invalidates every live opaque token.
+- The token pepper, TOTP encryption key, and PII field-encryption key are
+  required; losing the pepper invalidates every live opaque token, and losing
+  the PII key makes the sealed directory unreadable.
 - Production requires `issuer` on `https` and a database URL with
   `sslmode=verify-full`.
 - Redis must run with `noeviction` and persistence. The server asserts this at
@@ -255,6 +257,8 @@ certificate.
 - Users and entitlements: `user create|enroll-totp|disable|grant-scope|revoke-scope|scopes`.
 - Admin: `admin bootstrap` (see [RUNBOOK.md](RUNBOOK.md)).
 - Declarative apply: `config sync --file` and `config check`.
+- PII migration and rotation: `pii backfill`, `pii verify`, and `pii rotate`,
+  plus `totp rewrap` for the TOTP key. See [docs/OPERATIONS.md](docs/OPERATIONS.md).
 - DCR initial access: `initial-access-token issue`.
 - Utilities: `keygen` and `healthcheck`.
 
@@ -262,4 +266,4 @@ Full flags are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## License
 
-MIT OR Apache-2.0. See [LICENSE.md](LICENSE.md).
+ISC. See [LICENSE.md](LICENSE.md).

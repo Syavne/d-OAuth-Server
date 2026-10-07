@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT password_hash, disabled\n         FROM users\n        WHERE email = $1::text::citext",
+  "query": "SELECT password_hash, disabled, email_enc\n         FROM users\n        WHERE email_index = ANY($1)\n           OR (email_enc IS NULL AND email = $2::text::citext)",
   "describe": {
     "columns": [
       {
@@ -24,17 +24,30 @@
             "name": "disabled"
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "email_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "email_enc"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
+        "TextArray",
         "Text"
       ]
     },
     "nullable": [
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "0ed2b9b91b8c1630e806e6eaf9d49aa0fc33a8e90932bdc8f0eb5d5d1fc0b44d"
+  "hash": "8d3f5427e689a18faa311d2f0ac9f095982c4088868329f4259ebdd876fdf55c"
 }

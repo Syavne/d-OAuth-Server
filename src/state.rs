@@ -16,6 +16,8 @@ mod sentinel;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
+mod tests_guard;
+#[cfg(test)]
 mod tests_resilience;
 #[cfg(test)]
 mod tests_topology;
@@ -25,7 +27,14 @@ pub(crate) use pg::connect_options;
 pub use redis::RedisConn;
 pub use sentinel::SentinelConn;
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+  fmt,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
+  time::Duration,
+};
 
 use time::OffsetDateTime;
 
@@ -108,6 +117,12 @@ pub struct AppState {
   pub config: Arc<Config>,
   /// Versioned token-pepper and TOTP-encryption keys.
   pub keys: Arc<KeyRing>,
+  /// Cached PII-transition state, computed once in [`AppState::connect`].
+  /// When true, encrypt-only mode would serve over un-backfilled plaintext
+  /// PII, so `/health/ready` is 503 until the backfill blanks the columns
+  /// and the process restarts. Never a global or thread-local: it rides the
+  /// state every handler already receives.
+  pub transition_unsafe: Arc<AtomicBool>,
   /// Injectable clock.
   pub clock: Clock,
 }
@@ -120,14 +135,81 @@ impl AppState {
     let pool = pg::connect_postgres(&config.database, config.environment).await?;
     let redis = redis::connect_redis(&config.redis).await?;
     let keys = Arc::new(config.keys.clone());
+    // Fail-closed PII transition guard, computed once here and never per
+    // probe: encrypt-only over un-backfilled plaintext must not serve.
+    let transition_unsafe = probe_transition_unsafe(&pool, config.pii_dual_write).await?;
     Ok(Self {
       pool,
       redis,
       config,
       keys,
+      transition_unsafe: Arc::new(AtomicBool::new(transition_unsafe)),
       clock: Clock::system(),
     })
   }
+}
+
+/// Whether encrypt-only mode would serve over un-backfilled plaintext PII.
+///
+/// Returns `!pii_dual_write && any blanked plaintext PII column is still
+/// non-NULL`, covering exactly the columns `pii backfill` blanks:
+/// `users.email`, seven `oauth_clients` metadata columns, and
+/// `redirect_uris.uri`. A runtime `sqlx::query` on purpose: no `.sqlx` cache
+/// entry is needed. A fresh install (no rows) reports safe.
+///
+/// Pre-migration databases have neither the table nor the `_enc` columns, so
+/// the probe gates on both (`to_regclass` for the table, which cannot test a
+/// column, plus an `information_schema` probe for `email_enc`) and skips as
+/// safe there; readiness already gates on migrations. A guard query that
+/// fails only because the columns do not exist yet (`42703`/`42P01`) is the
+/// same skip; any other failure is [`StateError::Database`] (fail closed,
+/// never a silent cached "unsafe").
+pub(crate) async fn probe_transition_unsafe(
+  pool: &sqlx::PgPool,
+  pii_dual_write: bool,
+) -> Result<bool, StateError> {
+  if pii_dual_write {
+    return Ok(false);
+  }
+  let table_present: bool = sqlx::query_scalar("SELECT to_regclass('public.users') IS NOT NULL")
+    .fetch_one(pool)
+    .await
+    .map_err(StateError::Database)?;
+  if !table_present {
+    return Ok(false);
+  }
+  let migrated: bool = sqlx::query_scalar(
+    "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+     WHERE table_schema = 'public' AND table_name = 'users' \
+     AND column_name = 'email_enc')",
+  )
+  .fetch_one(pool)
+  .await
+  .map_err(StateError::Database)?;
+  if !migrated {
+    return Ok(false);
+  }
+  let legacy: bool = match sqlx::query_scalar::<_, bool>(
+    "SELECT EXISTS(SELECT 1 FROM users WHERE email IS NOT NULL) \
+     OR EXISTS(SELECT 1 FROM oauth_clients WHERE client_name IS NOT NULL) \
+     OR EXISTS(SELECT 1 FROM oauth_clients WHERE contacts IS NOT NULL) \
+     OR EXISTS(SELECT 1 FROM oauth_clients WHERE request_uris IS NOT NULL) \
+     OR EXISTS(SELECT 1 FROM oauth_clients WHERE jwks_uri IS NOT NULL) \
+     OR EXISTS(SELECT 1 FROM oauth_clients WHERE software_id IS NOT NULL) \
+     OR EXISTS(SELECT 1 FROM oauth_clients WHERE tls_client_auth_subject_dn IS NOT NULL) \
+     OR EXISTS(SELECT 1 FROM oauth_clients WHERE tls_client_auth_cert_thumbprint IS NOT NULL) \
+     OR EXISTS(SELECT 1 FROM redirect_uris WHERE uri IS NOT NULL)",
+  )
+  .fetch_one(pool)
+  .await
+  {
+    Ok(legacy) => legacy,
+    Err(sqlx::Error::Database(db)) if matches!(db.code().as_deref(), Some("42703" | "42P01")) => {
+      return Ok(false);
+    }
+    Err(other) => return Err(StateError::Database(other)),
+  };
+  Ok(legacy)
 }
 
 impl fmt::Debug for AppState {
@@ -137,6 +219,10 @@ impl fmt::Debug for AppState {
       .field("redis", &self.redis.topology_name())
       .field("config", &self.config)
       .field("keys", &self.keys)
+      .field(
+        "transition_unsafe",
+        &self.transition_unsafe.load(Ordering::Relaxed),
+      )
       .field("clock", &self.clock)
       .finish()
   }

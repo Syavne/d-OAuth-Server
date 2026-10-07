@@ -24,7 +24,7 @@ use crate::error::{AppError, OAuthErrorCode};
 
 /// mTLS client-authentication failures.
 ///
-/// Every variant except [`MtlsError::Database`] and
+/// Every variant except [`MtlsError::Database`], [`MtlsError::App`], and
 /// [`MtlsError::TrustBundle`] maps to `invalid_client`
 /// (see [`MtlsError::into_app_error`]); no certificate bytes, subject
 /// details, or database text are exposed to the client.
@@ -54,6 +54,9 @@ pub enum MtlsError {
   /// A client lookup failed.
   #[error("database error: {0}")]
   Database(#[from] sqlx::Error),
+  /// An encrypted client lookup failed (fail-closed PII or store error).
+  #[error("client lookup failed")]
+  App(#[from] AppError),
 }
 
 impl MtlsError {
@@ -62,6 +65,7 @@ impl MtlsError {
   pub fn into_app_error(self) -> AppError {
     match self {
       Self::Database(source) => AppError::from(source),
+      Self::App(error) => error,
       Self::TrustBundle(_) => AppError::from_code(OAuthErrorCode::ServerError),
       Self::MissingCertificate
       | Self::UnknownCertificate

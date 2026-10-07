@@ -124,6 +124,7 @@ fn test_config(
     "redis": {"url": redis_url, "durability": "waitaof"},
     "token_pepper": "dcr-test-pepper-0123456789abcdef",
     "totp_encryption_key": "dcr-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "dcr-test-pii-key-0123456789abcdef",
     "argon2": {"memory_kib": 8192, "iterations": 1, "parallelism": 1},
     "allow_open_registration": open,
     "dcr_redirect_policy": policy,
@@ -150,14 +151,18 @@ fn parts_of(harness: &mut Harness) -> (RegisterStores<'_>, RegisterContext<'_>) 
 }
 
 /// Seed one enabled catalog redirect URI.
-async fn seed_redirect(pool: &PgPool, uri: &str) -> TestResult {
+async fn seed_redirect(pool: &PgPool, keys: &crate::keys::KeyRing, uri: &str) -> TestResult {
   redirect_repo::upsert(
     pool,
-    Uuid::new_v4(),
-    uri,
-    redirect_repo::RedirectKind::Authorize,
-    "dcr test",
-    None,
+    keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: Uuid::new_v4(),
+      uri,
+      kind: redirect_repo::RedirectKind::Authorize,
+      description: "dcr test",
+      created_by: None,
+    },
   )
   .await?;
   Ok(())
@@ -204,6 +209,7 @@ fn dpop_request(redirect_uri: &str, scope: Option<&str>) -> RegisterRequest {
     tls_client_auth_subject_dn: None,
     dpop_bound_access_tokens: Some(true),
     contacts: None,
+    request_uris: None,
     software_id: None,
   }
 }
@@ -228,7 +234,12 @@ fn expect_error(error: AppError, code: OAuthErrorCode, status: u16) -> TestResul
 #[tokio::test]
 async fn dcr_register_valid_201() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
-  seed_redirect(&harness.pool, "https://app.example.test/cb").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
   seed_scope(&harness.pool, "read").await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = dpop_request("https://app.example.test/cb", Some("read"));
@@ -311,6 +322,168 @@ async fn dcr_register_valid_201() -> TestResult {
 }
 
 #[tokio::test]
+async fn dcr_register_round_trip() -> TestResult {
+  let (_guard, mut harness) = harness(false, "catalog").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
+  let iat = issue_iat(&mut harness, 3).await?;
+  let contacts = serde_json::json!(["admin@example.test"]);
+  let request_uris = serde_json::json!(["https://app.example.test/request.jwt"]);
+  let mut request = dpop_request("https://app.example.test/cb", None);
+  request.client_name = Some("round trip client".to_owned());
+  request.contacts = Some(contacts.clone());
+  request.request_uris = Some(request_uris.clone());
+
+  let response = {
+    let (mut stores, ctx) = parts_of(&mut harness);
+    register_client(&mut stores, &ctx, Some(&iat), &request)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("register failed: {error}")))?
+  };
+
+  let row =
+    client_repo::find_active_by_client_id(&harness.pool, &harness.config.keys, &response.client_id)
+      .await?
+      .ok_or_else(|| TestError::Unexpected("registered row missing".to_owned()))?;
+  if row.client_name != "round trip client" {
+    return Err(TestError::Unexpected(format!(
+      "client_name not round-tripped: {}",
+      row.client_name
+    )));
+  }
+  if row.contacts.as_ref() != Some(&contacts) {
+    return Err(TestError::Unexpected(format!(
+      "contacts not round-tripped: {:?}",
+      row.contacts
+    )));
+  }
+  if row.request_uris.as_ref() != Some(&request_uris) {
+    return Err(TestError::Unexpected(format!(
+      "request_uris not round-tripped: {:?}",
+      row.request_uris
+    )));
+  }
+  if response.client_name != "round trip client" {
+    return Err(TestError::Unexpected(format!(
+      "response lost the name: {}",
+      response.client_name
+    )));
+  }
+
+  let name_enc_present: bool = sqlx::query_scalar(
+    "SELECT client_name_enc IS NOT NULL FROM oauth_clients WHERE client_id = $1",
+  )
+  .bind(&response.client_id)
+  .fetch_one(&harness.pool)
+  .await?;
+  let name_plain_present: bool =
+    sqlx::query_scalar("SELECT client_name IS NOT NULL FROM oauth_clients WHERE client_id = $1")
+      .bind(&response.client_id)
+      .fetch_one(&harness.pool)
+      .await?;
+  let uris_enc_present: bool = sqlx::query_scalar(
+    "SELECT request_uris_enc IS NOT NULL FROM oauth_clients WHERE client_id = $1",
+  )
+  .bind(&response.client_id)
+  .fetch_one(&harness.pool)
+  .await?;
+  let uris_plain_present: bool =
+    sqlx::query_scalar("SELECT request_uris IS NOT NULL FROM oauth_clients WHERE client_id = $1")
+      .bind(&response.client_id)
+      .fetch_one(&harness.pool)
+      .await?;
+  if !name_enc_present || name_plain_present {
+    return Err(TestError::Unexpected(
+      "client_name was not sealed with encrypt-only mode".to_owned(),
+    ));
+  }
+  if !uris_enc_present || uris_plain_present {
+    return Err(TestError::Unexpected(
+      "request_uris was not sealed with encrypt-only mode".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn dcr_register_duplicate_mtls_identity_is_400() -> TestResult {
+  let (_guard, mut harness) = harness(false, "catalog").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
+  let iat = issue_iat(&mut harness, 5).await?;
+  let mut request = dpop_request("https://app.example.test/cb", None);
+  request.token_endpoint_auth_method = Some("tls_client_auth".to_owned());
+  request.dpop_bound_access_tokens = None;
+  request.tls_client_auth_subject_dn = Some("CN=duplicate-client, O=Example".to_owned());
+
+  {
+    let (mut stores, ctx) = parts_of(&mut harness);
+    register_client(&mut stores, &ctx, Some(&iat), &request)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("first register failed: {error}")))?;
+  }
+
+  let error = {
+    let (mut stores, ctx) = parts_of(&mut harness);
+    match register_client(&mut stores, &ctx, Some(&iat), &request).await {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "duplicate mTLS identity accepted".to_owned(),
+        ));
+      }
+      Err(error) => error,
+    }
+  };
+
+  if error.code() != OAuthErrorCode::InvalidClientMetadata {
+    return Err(TestError::Unexpected(format!(
+      "wrong duplicate code: {}",
+      error.code()
+    )));
+  }
+  if error.status().as_u16() != 400 {
+    return Err(TestError::Unexpected(format!(
+      "wrong duplicate status: {}",
+      error.status()
+    )));
+  }
+  let description = error.description().to_owned();
+  if description.contains("CN=") || description.contains("duplicate-client") {
+    return Err(TestError::Unexpected(format!(
+      "duplicate description leaks the identity: {description}"
+    )));
+  }
+  if description != OAuthErrorCode::InvalidClientMetadata.default_description() {
+    return Err(TestError::Unexpected(format!(
+      "duplicate description is not the static default: {description}"
+    )));
+  }
+
+  use axum::response::IntoResponse as _;
+  use http_body_util::BodyExt as _;
+  let rendered = error.into_response();
+  let body = match rendered.into_body().collect().await {
+    Ok(collected) => collected.to_bytes(),
+    Err(_) => axum::body::Bytes::new(),
+  };
+  let body = String::from_utf8_lossy(&body);
+  if body.contains("CN=") || body.contains("duplicate-client") || body.contains("Example") {
+    return Err(TestError::Unexpected(format!(
+      "400 body leaks the identity: {body}"
+    )));
+  }
+  Ok(())
+}
+
+#[tokio::test]
 async fn dcr_register_missing_iat_401() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
   let request = dpop_request("https://app.example.test/cb", None);
@@ -353,7 +526,12 @@ async fn dcr_register_bad_redirect_rejected() -> TestResult {
 #[tokio::test]
 async fn dcr_register_bad_auth_method_rejected() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
-  seed_redirect(&harness.pool, "https://app.example.test/cb").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let mut request = dpop_request("https://app.example.test/cb", None);
   request.token_endpoint_auth_method = Some("magic_auth".to_owned());
@@ -369,7 +547,12 @@ async fn dcr_register_bad_auth_method_rejected() -> TestResult {
 #[tokio::test]
 async fn dcr_register_bad_grant_rejected() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
-  seed_redirect(&harness.pool, "https://app.example.test/cb").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let mut request = dpop_request("https://app.example.test/cb", None);
   request.grant_types = Some(vec!["client_credentials".to_owned()]);
@@ -385,7 +568,12 @@ async fn dcr_register_bad_grant_rejected() -> TestResult {
 #[tokio::test]
 async fn dcr_register_bad_scope_rejected() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
-  seed_redirect(&harness.pool, "https://app.example.test/cb").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
   seed_scope(&harness.pool, "read").await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = dpop_request("https://app.example.test/cb", Some("admin"));
@@ -399,7 +587,12 @@ async fn dcr_register_bad_scope_rejected() -> TestResult {
 #[tokio::test]
 async fn dcr_register_confidential_without_binding_rejected() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
-  seed_redirect(&harness.pool, "https://app.example.test/cb").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
   let iat = issue_iat(&mut harness, 5).await?;
 
   let mut bare_secret = dpop_request("https://app.example.test/cb", None);
@@ -446,6 +639,7 @@ async fn dcr_register_open_anonymous_201() -> TestResult {
     tls_client_auth_subject_dn: None,
     dpop_bound_access_tokens: None,
     contacts: None,
+    request_uris: None,
     software_id: None,
   };
   let response = {
@@ -460,7 +654,9 @@ async fn dcr_register_open_anonymous_201() -> TestResult {
       "public client was issued a secret".to_owned(),
     ));
   }
-  let effective = redirect_repo::effective_for_client(&harness.pool, &response.client_id).await?;
+  let effective =
+    redirect_repo::effective_for_client(&harness.pool, &harness.config.keys, &response.client_id)
+      .await?;
   if effective.len() != 1 || effective[0].uri != "http://127.0.0.1:6420/cb" {
     return Err(TestError::Unexpected(format!(
       "loopback URI not attached: {:?}",
@@ -473,7 +669,12 @@ async fn dcr_register_open_anonymous_201() -> TestResult {
 #[tokio::test]
 async fn dcr_register_mtls_client_201() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
-  seed_redirect(&harness.pool, "https://app.example.test/cb").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = RegisterRequest {
     redirect_uris: Some(vec!["https://app.example.test/cb".to_owned()]),
@@ -487,6 +688,7 @@ async fn dcr_register_mtls_client_201() -> TestResult {
     tls_client_auth_subject_dn: Some("CN=mtls-client, O=Example".to_owned()),
     dpop_bound_access_tokens: None,
     contacts: None,
+    request_uris: None,
     software_id: None,
   };
   let response = {
@@ -501,9 +703,10 @@ async fn dcr_register_mtls_client_201() -> TestResult {
       "mTLS client was issued a secret".to_owned(),
     ));
   }
-  let row = client_repo::find_active_by_client_id(&harness.pool, &response.client_id)
-    .await?
-    .ok_or_else(|| TestError::Unexpected("mtls client row missing".to_owned()))?;
+  let row =
+    client_repo::find_active_by_client_id(&harness.pool, &harness.config.keys, &response.client_id)
+      .await?
+      .ok_or_else(|| TestError::Unexpected("mtls client row missing".to_owned()))?;
   if row.tls_client_auth_subject_dn.as_deref() != Some("CN=mtls-client, O=Example") {
     return Err(TestError::Unexpected(format!(
       "subject DN not persisted: {:?}",
@@ -516,7 +719,12 @@ async fn dcr_register_mtls_client_201() -> TestResult {
 #[tokio::test]
 async fn dcr_register_jwks_xor_rejected() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
-  seed_redirect(&harness.pool, "https://app.example.test/cb").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let mut request = dpop_request("https://app.example.test/cb", None);
   request.jwks = Some(serde_json::json!({"keys": []}));

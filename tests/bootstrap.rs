@@ -52,8 +52,9 @@ use sqlx::{Executor as _, postgres::PgPoolOptions};
 const CLIENT_ID: &str = "bootstrap-tls-client";
 /// Subject DN of the CA-signed fixture, in [`mtls::subject_dn`] rendering.
 const PKI_DN: &str = "CN=mtls-pki-client, O=Example";
-/// `x5t#S256` of the CA-signed fixture (locked by `test(mtls)` too).
-const PKI_THUMBPRINT: &str = "PC8ir71uIdRIdw1XFkMmoFvGC8Ud4CANxkk4x3BWqAc";
+/// `x5t#S256` of the CA-signed fixture (locked by `test(mtls)` too;
+/// re-minted 2026-10-06, valid to 2036-10-03).
+const PKI_THUMBPRINT: &str = "VSFBS4-7neqMcHVsx-dcc28rEEemzFvmeqtZSE3xbK8";
 
 /// Test-body error.
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +68,9 @@ enum TestError {
   /// An mTLS operation failed.
   #[error("mtls error: {0}")]
   Mtls(#[from] mtls::MtlsError),
+  /// A test key ring was rejected.
+  #[error("key error: {0}")]
+  Keys(#[from] d_oauth::keys::KeyRingError),
   /// A fixture did not decode.
   #[error("fixture error: {0}")]
   Fixture(#[from] certs::FixtureError),
@@ -199,6 +203,12 @@ async fn build_world() -> Result<World, TestError> {
     },
     "token_pepper": "bootstrap-test-pepper-0123456789abcdef",
     "totp_encryption_key": "bootstrap-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "bootstrap-test-pii-key-0123456789abcdef",
+    // Dual-write window: the mTLS fixture seeds a legacy-plaintext client
+    // row via raw SQL, which the encrypt-only startup guard would (correctly)
+    // refuse to serve over. Dual-write keeps the seed legal without touching
+    // the guard or the handshake assertions.
+    "pii_dual_write": true,
   });
   let config_file = dir.join("d-oauth.json");
   std::fs::write(
@@ -404,6 +414,23 @@ async fn tls_request_rejected(
   Ok(!matches!(attempt, Ok((200, _))))
 }
 
+/// Test PII key ring matching the world's `pii_encryption_key`.
+fn test_keys() -> Result<d_oauth::keys::KeyRing, TestError> {
+  use d_oauth::keys::{KeyId, KeyRing};
+  use secrecy::SecretString;
+  Ok(KeyRing::from_parts(
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("bootstrap-test-pepper"),
+    )],
+    vec![(KeyId::new("v1"), SecretString::from("bootstrap-test-totp"))],
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("bootstrap-test-pii-key-0123456789abcdef"),
+    )],
+  )?)
+}
+
 /// Register one `tls_client_auth` client row (runtime query: no `.sqlx` cache).
 async fn insert_tls_client(pool: &sqlx::PgPool) -> Result<(), TestError> {
   sqlx::query(
@@ -480,7 +507,7 @@ async fn bootstrap_serve_tls_mtls_registered_completes_unregistered_rejected() -
   }
 
   let leaf = certs::cert_der(certs::CLIENT_PKI_CERT_PEM)?;
-  let cnf = mtls::authenticate_by_id(&pool, CLIENT_ID, Some(&leaf)).await?;
+  let cnf = mtls::authenticate_by_id(&pool, &test_keys()?, CLIENT_ID, Some(&leaf)).await?;
   if cnf.x5t_s256 != PKI_THUMBPRINT {
     return Err(TestError::Failed(format!(
       "unexpected cnf: {}",
@@ -500,7 +527,7 @@ async fn bootstrap_serve_tls_mtls_registered_completes_unregistered_rejected() -
     ));
   }
   let foreign = certs::cert_der(certs::CLIENT_ROGUE_CERT_PEM)?;
-  if mtls::authenticate_by_id(&pool, CLIENT_ID, Some(&foreign))
+  if mtls::authenticate_by_id(&pool, &test_keys()?, CLIENT_ID, Some(&foreign))
     .await
     .is_ok()
   {

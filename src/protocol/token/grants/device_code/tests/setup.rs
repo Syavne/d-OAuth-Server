@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use super::{TestError, TestResult, unique};
 use crate::{
+  config::Config,
   crypto::secret::{Argon2Params, hash_secret},
   db::{NewClient, TokenEndpointAuthMethod, client_repo, scope_repo, user_repo},
   protocol::device::DEVICE_GRANT,
@@ -12,17 +13,19 @@ use crate::{
 
 pub(super) async fn insert_client(
   pool: &PgPool,
+  config: &Config,
   client_id: &str,
   method: TokenEndpointAuthMethod,
   secret: Option<&str>,
   scope: &str,
 ) -> TestResult {
-  insert_client_bound(pool, client_id, method, secret, scope, false).await
+  insert_client_bound(pool, config, client_id, method, secret, scope, false).await
 }
 
 /// Insert a client with an explicit `dpop_bound_access_tokens` registration.
 pub(super) async fn insert_client_bound(
   pool: &PgPool,
+  config: &Config,
   client_id: &str,
   method: TokenEndpointAuthMethod,
   secret: Option<&str>,
@@ -55,7 +58,7 @@ pub(super) async fn insert_client_bound(
     dpop_bound_access_tokens: dpop_bound,
     registration_access_token_hash: None,
   };
-  client_repo::insert(pool, &new).await?;
+  client_repo::insert(pool, &config.keys, config.pii_dual_write, &new).await?;
   Ok(())
 }
 
@@ -68,10 +71,16 @@ pub(super) async fn enable_scopes(pool: &PgPool, names: &[&str]) -> TestResult {
 }
 
 /// Provision a user and entitle it to the given scopes.
-pub(super) async fn entitled_user(pool: &PgPool, scopes: &[&str]) -> Result<Uuid, TestError> {
+pub(super) async fn entitled_user(
+  pool: &PgPool,
+  config: &Config,
+  scopes: &[&str],
+) -> Result<Uuid, TestError> {
   let email = format!("{}@example.test", unique("user"));
   let record = user_repo::create_user(
     pool,
+    &config.keys,
+    config.pii_dual_write,
     &user_repo::NewUser {
       email,
       password_hash: "grant-device-dummy-hash".to_owned(),

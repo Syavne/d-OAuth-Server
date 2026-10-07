@@ -187,6 +187,25 @@ pub enum AppError {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
+  /// A unique email collided (pre-check or `ux_users_email[_index]` 23505).
+  ///
+  /// Payload-free by construction (unit variant): no email ever reaches a
+  /// log, a metric label, or an HTTP body through this variant.
+  #[error("duplicate email")]
+  DuplicateEmail,
+  /// A stored PII ciphertext failed to open (tampered or corrupt).
+  ///
+  /// Fail-closed `temporarily_unavailable` (503), distinguishable from a
+  /// database-outage 503 by the variant. Payload-free by construction.
+  #[error("PII field cannot be decrypted")]
+  PiiDecrypt,
+  /// A client mTLS identity collided (pre-check or `ux_oauth_clients_tls_*`
+  /// 23505).
+  ///
+  /// Payload-free by construction (unit variant): no DN or thumbprint value
+  /// ever reaches a log, a metric label, or an HTTP body through this variant.
+  #[error("duplicate client identity")]
+  DuplicateClientIdentity,
 }
 
 impl AppError {
@@ -339,11 +358,16 @@ impl AppError {
   }
 
   /// The RFC error code this error renders as. Internal failures map to
-  /// `server_error`.
+  /// `server_error`; a duplicate email maps to `invalid_request`, a duplicate
+  /// client mTLS identity maps to `invalid_client_metadata`, and a PII
+  /// decrypt failure maps to `temporarily_unavailable`.
   #[must_use]
   pub fn code(&self) -> OAuthErrorCode {
     match self {
       Self::OAuth { code, .. } => *code,
+      Self::DuplicateEmail => OAuthErrorCode::InvalidRequest,
+      Self::DuplicateClientIdentity => OAuthErrorCode::InvalidClientMetadata,
+      Self::PiiDecrypt => OAuthErrorCode::TemporarilyUnavailable,
       Self::Internal { .. } => OAuthErrorCode::ServerError,
     }
   }
@@ -355,6 +379,17 @@ impl AppError {
       Self::OAuth {
         code, client_auth, ..
       } => status_for(*code, *client_auth),
+      Self::DuplicateEmail => {
+        status_for(OAuthErrorCode::InvalidRequest, ClientAuthMethod::NonBasic)
+      }
+      Self::DuplicateClientIdentity => status_for(
+        OAuthErrorCode::InvalidClientMetadata,
+        ClientAuthMethod::NonBasic,
+      ),
+      Self::PiiDecrypt => status_for(
+        OAuthErrorCode::TemporarilyUnavailable,
+        ClientAuthMethod::NonBasic,
+      ),
       Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }
   }
@@ -364,6 +399,9 @@ impl AppError {
   pub fn description(&self) -> &str {
     match self {
       Self::OAuth { description, .. } => description,
+      Self::DuplicateEmail => "The email address is already in use.",
+      Self::DuplicateClientIdentity => OAuthErrorCode::InvalidClientMetadata.default_description(),
+      Self::PiiDecrypt => OAuthErrorCode::TemporarilyUnavailable.default_description(),
       Self::Internal { .. } => OAuthErrorCode::ServerError.default_description(),
     }
   }
@@ -396,6 +434,22 @@ impl IntoResponse for AppError {
         description,
         client_auth,
       } => (code, description, client_auth),
+      // Payload-free typed errors render fixed codes and descriptions.
+      Self::DuplicateEmail => (
+        OAuthErrorCode::InvalidRequest,
+        Cow::Borrowed("The email address is already in use."),
+        ClientAuthMethod::NonBasic,
+      ),
+      Self::DuplicateClientIdentity => (
+        OAuthErrorCode::InvalidClientMetadata,
+        Cow::Borrowed(OAuthErrorCode::InvalidClientMetadata.default_description()),
+        ClientAuthMethod::NonBasic,
+      ),
+      Self::PiiDecrypt => (
+        OAuthErrorCode::TemporarilyUnavailable,
+        Cow::Borrowed(OAuthErrorCode::TemporarilyUnavailable.default_description()),
+        ClientAuthMethod::NonBasic,
+      ),
       // Mask every internal failure: generic code + generic description.
       Self::Internal { .. } => (
         OAuthErrorCode::ServerError,
@@ -442,14 +496,53 @@ impl IntoResponse for AppError {
 impl From<sqlx::Error> for AppError {
   /// Map a database error to a client-safe error: connectivity failures
   /// (pool timeout/close, transport I/O) render `503 temporarily_unavailable`
-  /// (fail closed, matching the Redis mapping); every genuine query or logic
-  /// failure stays a masked `server_error` that never leaks database text.
+  /// (fail closed, matching the Redis mapping); a unique violation on the
+  /// user-email constraints renders the payload-free [`AppError::DuplicateEmail`];
+  /// a unique violation on any client mTLS identity constraint (legacy
+  /// plaintext or blind-index) renders the payload-free
+  /// [`AppError::DuplicateClientIdentity`]; every other genuine query or
+  /// logic failure stays a masked `server_error` that never leaks database text.
   fn from(source: sqlx::Error) -> Self {
     match source {
       sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => {
         Self::temporarily_unavailable()
       }
+      sqlx::Error::Database(db)
+        if db.code().as_deref() == Some("23505")
+          && matches!(
+            db.constraint(),
+            Some("ux_users_email") | Some("ux_users_email_index")
+          ) =>
+      {
+        Self::DuplicateEmail
+      }
+      sqlx::Error::Database(db)
+        if db.code().as_deref() == Some("23505")
+          && matches!(
+            db.constraint(),
+            Some("ux_oauth_clients_tls_subject_dn")
+              | Some("ux_oauth_clients_tls_cert_thumbprint")
+              | Some("ux_oauth_clients_tls_subject_dn_index")
+              | Some("ux_oauth_clients_tls_cert_thumbprint_index")
+          ) =>
+      {
+        Self::DuplicateClientIdentity
+      }
       other => Self::internal(other),
+    }
+  }
+}
+
+impl From<crate::crypto::field::FieldError> for AppError {
+  /// Map a PII field failure fail-closed: a blob that fails to open becomes
+  /// the distinguishable [`AppError::PiiDecrypt`] (503); a seal or RNG
+  /// failure becomes generic `temporarily_unavailable` (503). Neither carries
+  /// plaintext or key material.
+  fn from(error: crate::crypto::field::FieldError) -> Self {
+    match error {
+      crate::crypto::field::FieldError::Decrypt => Self::PiiDecrypt,
+      crate::crypto::field::FieldError::Encrypt
+      | crate::crypto::field::FieldError::UnavailableRandomness => Self::temporarily_unavailable(),
     }
   }
 }

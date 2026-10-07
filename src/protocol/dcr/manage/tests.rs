@@ -77,6 +77,55 @@ async fn dcr_manage_read_returns_metadata() -> TestResult {
 }
 
 #[tokio::test]
+async fn dcr_manage_get() -> TestResult {
+  let (_guard, mut harness) = harness("catalog").await?;
+  let registered = register(&mut harness, "https://app.example.test/cb", Some("read")).await?;
+
+  let response = {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    read_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+    )
+    .await
+    .map_err(|error| super::support::TestError::Unexpected(format!("get failed: {error:?}")))?
+  };
+
+  if response.client_id != registered.client_id {
+    return Err(super::support::TestError::Unexpected(format!(
+      "wrong client_id: {}",
+      response.client_id
+    )));
+  }
+  if response.client_name != "dcr manage client" {
+    return Err(super::support::TestError::Unexpected(format!(
+      "wrong name: {}",
+      response.client_name
+    )));
+  }
+  if response.redirect_uris != vec!["https://app.example.test/cb".to_owned()] {
+    return Err(super::support::TestError::Unexpected(format!(
+      "wrong redirects: {:?}",
+      response.redirect_uris
+    )));
+  }
+  if response.scope != "read" {
+    return Err(super::support::TestError::Unexpected(format!(
+      "wrong scope: {}",
+      response.scope
+    )));
+  }
+  if response.client_secret.is_some() || response.registration_access_token.is_some() {
+    return Err(super::support::TestError::Unexpected(
+      "GET must not return credentials".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
 async fn dcr_manage_read_missing_token_401() -> TestResult {
   let (_guard, mut harness) = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
@@ -176,6 +225,7 @@ async fn dcr_manage_update_bad_redirect_rejected() -> TestResult {
     tls_client_auth_subject_dn: None,
     dpop_bound_access_tokens: Some(true),
     contacts: None,
+    request_uris: None,
     software_id: None,
   };
   let (mut stores, ctx) = manage_parts(&mut harness);

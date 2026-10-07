@@ -1,6 +1,7 @@
-//! Versioned [`KeyRing`] for token peppers and TOTP-encryption keys.
+//! Versioned [`KeyRing`] for token peppers, TOTP-encryption keys, and PII keys.
 //!
-//! Holds versioned key ids for the token pepper and the TOTP-encryption key
+//! Holds versioned key ids for the token pepper, the TOTP-encryption key, and
+//! the PII field-encryption key
 //! (newest first, bounded retry across retained ids). Opaque tokens are stored
 //! under `v<N>` key ids and verification retries across retained key ids,
 //! ordered newest-first. Sessions are opaque Redis ids, so there is no session
@@ -121,6 +122,9 @@ pub enum KeyRingError {
   /// No TOTP-encryption key material was supplied.
   #[error("TOTP encryption key material is required")]
   MissingTotpKey,
+  /// No PII field-encryption key material was supplied.
+  #[error("PII encryption key material is required")]
+  MissingPiiKey,
   /// A key id was empty.
   #[error("key id must not be empty")]
   EmptyKeyId,
@@ -132,27 +136,30 @@ pub enum KeyRingError {
   },
 }
 
-/// Versioned key ring for token peppers and TOTP-encryption keys.
+/// Versioned key ring for token peppers, TOTP-encryption keys, and PII keys.
 ///
-/// Both chains are ordered newest-first; the first element is the active key.
+/// Every chain is ordered newest-first; the first element is the active key.
 /// The `Debug` impl never prints key material.
 #[derive(Clone)]
 pub struct KeyRing {
   peppers: Vec<VersionedSecret>,
   totp_keys: Vec<VersionedSecret>,
+  pii_keys: Vec<VersionedSecret>,
 }
 
 impl KeyRing {
-  /// Build a key ring from newest-first pepper and TOTP-encryption chains.
+  /// Build a key ring from newest-first pepper, TOTP-encryption, and PII chains.
   ///
   /// Each chain must be non-empty and free of duplicate ids.
   pub fn from_parts(
     peppers: Vec<(KeyId, SecretString)>,
     totp_keys: Vec<(KeyId, SecretString)>,
+    pii_keys: Vec<(KeyId, SecretString)>,
   ) -> Result<Self, KeyRingError> {
     Ok(Self {
       peppers: build_chain(peppers, KeyRingError::MissingTokenPepper)?,
       totp_keys: build_chain(totp_keys, KeyRingError::MissingTotpKey)?,
+      pii_keys: build_chain(pii_keys, KeyRingError::MissingPiiKey)?,
     })
   }
 
@@ -189,15 +196,34 @@ impl KeyRing {
   pub fn totp_keys_newest_first(&self) -> impl Iterator<Item = (&KeyId, &SecretString)> {
     self.totp_keys.iter().map(|k| (k.id(), k.secret()))
   }
+
+  /// The active PII-encryption key (newest key id), if any.
+  #[must_use]
+  pub fn active_pii_key(&self) -> Option<(&KeyId, &SecretString)> {
+    self.pii_keys.first().map(|k| (k.id(), k.secret()))
+  }
+
+  /// Look up a retained PII-encryption key by key id.
+  #[must_use]
+  pub fn pii_key_by_id(&self, id: &str) -> Option<&SecretString> {
+    find(&self.pii_keys, id)
+  }
+
+  /// Iterate PII-encryption keys ordered newest-first.
+  pub fn pii_keys_newest_first(&self) -> impl Iterator<Item = (&KeyId, &SecretString)> {
+    self.pii_keys.iter().map(|k| (k.id(), k.secret()))
+  }
 }
 
 impl fmt::Debug for KeyRing {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let pepper_ids: Vec<&str> = self.peppers.iter().map(|k| k.id().as_str()).collect();
     let totp_ids: Vec<&str> = self.totp_keys.iter().map(|k| k.id().as_str()).collect();
+    let pii_ids: Vec<&str> = self.pii_keys.iter().map(|k| k.id().as_str()).collect();
     f.debug_struct("KeyRing")
       .field("token_pepper_ids", &pepper_ids)
       .field("totp_key_ids", &totp_ids)
+      .field("pii_key_ids", &pii_ids)
       .finish()
   }
 }
@@ -243,25 +269,58 @@ mod tests {
 
   #[test]
   fn keyring_requires_a_token_pepper() -> Result<(), KeyRingError> {
-    let result = KeyRing::from_parts(Vec::new(), vec![pepper("v1", "totp-secret")]);
+    let result = KeyRing::from_parts(
+      Vec::new(),
+      vec![pepper("v1", "totp-secret")],
+      vec![pepper("v1", "pii-secret")],
+    );
     assert!(matches!(result, Err(KeyRingError::MissingTokenPepper)));
     Ok(())
   }
 
   #[test]
   fn keyring_requires_a_totp_key() -> Result<(), KeyRingError> {
-    let result = KeyRing::from_parts(vec![pepper("v1", "pepper-secret")], Vec::new());
+    let result = KeyRing::from_parts(
+      vec![pepper("v1", "pepper-secret")],
+      Vec::new(),
+      vec![pepper("v1", "pii-secret")],
+    );
     assert!(matches!(result, Err(KeyRingError::MissingTotpKey)));
     Ok(())
   }
 
   #[test]
-  fn keyring_rejects_duplicate_ids() {
+  fn keyring_requires_a_pii_key() -> Result<(), KeyRingError> {
     let result = KeyRing::from_parts(
+      vec![pepper("v1", "pepper-secret")],
+      vec![pepper("v1", "totp-secret")],
+      Vec::new(),
+    );
+    assert!(matches!(result, Err(KeyRingError::MissingPiiKey)));
+    Ok(())
+  }
+
+  #[test]
+  fn keyring_rejects_duplicate_ids() {
+    let duplicate_pepper = KeyRing::from_parts(
       vec![pepper("v1", "a"), pepper("v1", "b")],
       vec![pepper("v1", "c")],
+      vec![pepper("v1", "d")],
     );
-    assert!(matches!(result, Err(KeyRingError::DuplicateKeyId { .. })));
+    assert!(matches!(
+      duplicate_pepper,
+      Err(KeyRingError::DuplicateKeyId { .. })
+    ));
+    // A duplicate inside the PII chain is rejected the same way.
+    let duplicate_pii = KeyRing::from_parts(
+      vec![pepper("v1", "a")],
+      vec![pepper("v1", "b")],
+      vec![pepper("v2", "c"), pepper("v2", "d")],
+    );
+    assert!(matches!(
+      duplicate_pii,
+      Err(KeyRingError::DuplicateKeyId { .. })
+    ));
   }
 
   #[test]
@@ -269,12 +328,41 @@ mod tests {
     let ring = KeyRing::from_parts(
       vec![pepper("v2", "new"), pepper("v1", "old")],
       vec![pepper("v1", "totp")],
+      vec![pepper("v1", "pii")],
     )?;
     let active = ring.active_pepper();
     assert!(matches!(active, Some((id, _)) if id.as_str() == "v2"));
     let retained = ring.pepper_by_id("v1");
     assert!(matches!(retained, Some(secret) if secret.expose_secret() == "old"));
     assert!(ring.pepper_by_id("v9").is_none());
+    Ok(())
+  }
+
+  #[test]
+  fn keyring_resolves_retained_pii_id() -> Result<(), KeyRingError> {
+    let ring = KeyRing::from_parts(
+      vec![pepper("v1", "pepper-secret")],
+      vec![pepper("v1", "totp-secret")],
+      vec![
+        pepper("v2", "new-pii-secret"),
+        pepper("v1", "old-pii-secret"),
+      ],
+    )?;
+    let active = ring.active_pii_key();
+    assert!(matches!(active, Some((id, _)) if id.as_str() == "v2"));
+    let retained = ring.pii_key_by_id("v1");
+    assert!(matches!(retained, Some(secret) if secret.expose_secret() == "old-pii-secret"));
+    assert!(ring.pii_key_by_id("v9").is_none());
+    let ids: Vec<&str> = ring
+      .pii_keys_newest_first()
+      .map(|(id, _)| id.as_str())
+      .collect();
+    assert_eq!(ids, vec!["v2", "v1"]);
+    // `Debug` exposes ids only, never material from any chain.
+    let debug = format!("{ring:?}");
+    assert!(debug.contains("v2"), "debug must include the pii key id");
+    assert!(!debug.contains("new-pii-secret") && !debug.contains("old-pii-secret"));
+    assert!(!debug.contains("pepper-secret") && !debug.contains("totp-secret"));
     Ok(())
   }
 

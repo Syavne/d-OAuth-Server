@@ -159,6 +159,7 @@ impl Dispatch<'_> {
     };
     let mut stores = AuthStores {
       pool: &self.state.pool,
+      keys: &self.state.keys,
       conn: &mut *self.conn,
       store: self.store,
     };
@@ -196,7 +197,7 @@ impl Dispatch<'_> {
       ) => {
         let leaf = self.peer_certs.and_then(|certs| certs.chain().first());
         Some(
-          mtls::authenticate(&self.state.pool, client, leaf)
+          mtls::authenticate(&self.state.pool, &self.state.keys, client, leaf)
             .await
             .map_err(mtls::MtlsError::into_app_error)?
             .x5t_s256,

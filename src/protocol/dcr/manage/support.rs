@@ -129,6 +129,7 @@ fn test_config(pg_url: &str, redis_url: &str, policy: &str) -> Result<Config, Te
     "redis": {"url": redis_url, "durability": "waitaof"},
     "token_pepper": "dcr-test-pepper-0123456789abcdef",
     "totp_encryption_key": "dcr-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "dcr-test-pii-key-0123456789abcdef",
     "argon2": {"memory_kib": 8192, "iterations": 1, "parallelism": 1},
     "allow_open_registration": false,
     "dcr_redirect_policy": policy,
@@ -166,14 +167,22 @@ pub(super) fn manage_parts(harness: &mut Harness) -> (ManageStores<'_>, ManageCo
 }
 
 /// Seed one enabled catalog redirect URI.
-pub(super) async fn seed_redirect(pool: &PgPool, uri: &str) -> TestResult {
+pub(super) async fn seed_redirect(
+  pool: &PgPool,
+  keys: &crate::keys::KeyRing,
+  uri: &str,
+) -> TestResult {
   redirect_repo::upsert(
     pool,
-    Uuid::new_v4(),
-    uri,
-    redirect_repo::RedirectKind::Authorize,
-    "dcr manage test",
-    None,
+    keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: Uuid::new_v4(),
+      uri,
+      kind: redirect_repo::RedirectKind::Authorize,
+      description: "dcr manage test",
+      created_by: None,
+    },
   )
   .await?;
   Ok(())
@@ -219,6 +228,7 @@ fn dpop_request(redirect_uri: &str, scope: Option<&str>) -> RegisterRequest {
     tls_client_auth_subject_dn: None,
     dpop_bound_access_tokens: Some(true),
     contacts: None,
+    request_uris: None,
     software_id: None,
   }
 }
@@ -229,7 +239,7 @@ pub(super) async fn register(
   redirect_uri: &str,
   scope: Option<&str>,
 ) -> Result<Registered, TestError> {
-  seed_redirect(&harness.pool, redirect_uri).await?;
+  seed_redirect(&harness.pool, &harness.config.keys, redirect_uri).await?;
   if let Some(name) = scope {
     seed_scope(&harness.pool, name).await?;
   }
@@ -240,6 +250,42 @@ pub(super) async fn register(
     register_client(&mut stores, &ctx, Some(&iat), &request)
       .await
       .map_err(|error| TestError::Unexpected(format!("register failed: {error}")))?
+  };
+  Ok(Registered {
+    client_id: response.client_id,
+    secret: response.client_secret,
+    reg_token: response.registration_access_token,
+  })
+}
+
+/// Register one mTLS client through the production path.
+pub(super) async fn register_mtls(
+  harness: &mut Harness,
+  redirect_uri: &str,
+  subject_dn: &str,
+) -> Result<Registered, TestError> {
+  seed_redirect(&harness.pool, &harness.config.keys, redirect_uri).await?;
+  let iat = issue_iat(harness, 3).await?;
+  let request = RegisterRequest {
+    redirect_uris: Some(vec![redirect_uri.to_owned()]),
+    client_name: Some("dcr manage mtls client".to_owned()),
+    token_endpoint_auth_method: Some("tls_client_auth".to_owned()),
+    grant_types: Some(vec!["authorization_code".to_owned()]),
+    response_types: Some(vec!["code".to_owned()]),
+    scope: None,
+    jwks: None,
+    jwks_uri: None,
+    tls_client_auth_subject_dn: Some(subject_dn.to_owned()),
+    dpop_bound_access_tokens: None,
+    contacts: None,
+    request_uris: None,
+    software_id: None,
+  };
+  let response = {
+    let (mut stores, ctx) = register_parts(harness);
+    register_client(&mut stores, &ctx, Some(&iat), &request)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("mtls register failed: {error}")))?
   };
   Ok(Registered {
     client_id: response.client_id,

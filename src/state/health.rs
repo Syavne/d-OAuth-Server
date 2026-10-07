@@ -22,6 +22,7 @@ use tokio::time::timeout;
 use tower::{Layer, Service};
 
 use super::{AppState, MIGRATOR, READINESS_TIMEOUT};
+use std::sync::atomic::Ordering;
 
 /// Liveness body.
 #[derive(Serialize)]
@@ -62,9 +63,20 @@ async fn schema_ready(pool: &sqlx::PgPool) -> bool {
     .all(|migration| applied.contains(&migration.version))
 }
 
-/// Readiness: Postgres ping + Redis ping + schema version, all bounded by
-/// [`READINESS_TIMEOUT`]. Dependency outage is 503, never a panic or hang.
+/// Readiness: the cached PII-transition guard first (computed once at
+/// startup, never per probe), then Postgres ping + Redis ping + schema
+/// version, all bounded by [`READINESS_TIMEOUT`]. Dependency outage is 503,
+/// never a panic or hang.
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+  if state.transition_unsafe.load(Ordering::Relaxed) {
+    return (
+      StatusCode::SERVICE_UNAVAILABLE,
+      Json(ReadyBody {
+        status: "not_ready",
+      }),
+    )
+      .into_response();
+  }
   let healthy = timeout(READINESS_TIMEOUT, async {
     if sqlx::query("SELECT 1").execute(&state.pool).await.is_err() {
       return false;

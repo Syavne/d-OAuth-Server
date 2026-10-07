@@ -28,6 +28,10 @@ use crate::{
   db::redirect_repo,
   error::AppError,
   jose::jar::PAR_REQUEST_URI_PREFIX,
+  middleware::{
+    audit::AuditEvent,
+    request_id::{REQUEST_ID_HEADER, RequestId},
+  },
   state::{AppState, RedisConn},
   store::{Store, par},
 };
@@ -39,6 +43,8 @@ const CREDENTIAL_PARAMS: [&str; 3] = ["client_secret", "client_assertion", "clie
 pub struct ParStores<'a> {
   /// Postgres pool for client lookup and redirect-URI matching.
   pub pool: &'a PgPool,
+  /// Versioned PII keys for the encrypted client lookup.
+  pub keys: &'a crate::keys::KeyRing,
   /// Redis connection for the PAR record store.
   pub conn: &'a mut RedisConn,
   /// Key layout plus retry/durability knobs for the PAR store.
@@ -87,6 +93,7 @@ pub async fn push_authorization_request(
 ) -> Result<ParResponse, AppError> {
   let mut auth_stores = AuthStores {
     pool: stores.pool,
+    keys: stores.keys,
     conn: stores.conn,
     store: stores.store,
   };
@@ -95,7 +102,13 @@ pub async fn push_authorization_request(
     now: ctx.now,
   };
   let authenticated = authenticate_client(&mut auth_stores, &auth_ctx, auth).await?;
-  validate_request_rules(stores.pool, &authenticated.client.client_id, params).await?;
+  validate_request_rules(
+    stores.pool,
+    stores.keys,
+    &authenticated.client.client_id,
+    params,
+  )
+  .await?;
 
   let mut stored = params.clone();
   for member in CREDENTIAL_PARAMS {
@@ -118,6 +131,7 @@ pub async fn push_authorization_request(
 /// Enforce the pushed-request rules (RFC 9126 §2).
 async fn validate_request_rules(
   pool: &PgPool,
+  keys: &crate::keys::KeyRing,
   client_id: &str,
   params: &HashMap<String, String>,
 ) -> Result<(), AppError> {
@@ -155,7 +169,7 @@ async fn validate_request_rules(
       "pushed request redirect_uri is required",
     ));
   };
-  let effective = redirect_repo::effective_for_client(pool, client_id).await?;
+  let effective = redirect_repo::effective_for_client(pool, keys, client_id).await?;
   let registered: Vec<&str> = effective.iter().map(|entry| entry.uri.as_str()).collect();
   if match_redirect_uri(&registered, redirect_uri) == RedirectDecision::Reject {
     return Err(AppError::invalid_request(
@@ -198,6 +212,7 @@ pub async fn par_handler(
   let mut redis = state.redis.clone();
   let mut stores = ParStores {
     pool: &state.pool,
+    keys: &state.keys,
     conn: &mut redis,
     store: &Store::from_config(&state.config.redis),
   };
@@ -206,8 +221,27 @@ pub async fn par_handler(
     now: state.clock.now(),
     par_ttl: state.config.ttl.par,
   };
-  let response = push_authorization_request(&mut stores, &ctx, &auth, &form).await?;
+  let response = match push_authorization_request(&mut stores, &ctx, &auth, &form).await {
+    Ok(response) => response,
+    Err(error) => {
+      emit_pii_decrypt(&headers, &error);
+      return Err(error);
+    }
+  };
   Ok((StatusCode::CREATED, axum::Json(response)))
+}
+
+fn emit_pii_decrypt(headers: &HeaderMap, error: &AppError) {
+  if matches!(error, AppError::PiiDecrypt) {
+    let request_id = headers
+      .get(REQUEST_ID_HEADER)
+      .and_then(|value| value.to_str().ok())
+      .and_then(RequestId::parse);
+    AuditEvent::PiiDecryptFailure {
+      request_id: request_id.as_ref().map(RequestId::as_str),
+    }
+    .emit();
+  }
 }
 
 #[cfg(test)]

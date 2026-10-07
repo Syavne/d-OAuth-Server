@@ -10,10 +10,12 @@ use crate::{
   config::DurabilityMode,
   crypto::pkce::challenge_from_verifier,
   db::{client_repo::NewClient, redirect_repo, scope_repo, test_support::migrated_pool},
-  error::OAuthErrorCode,
+  error::{AppError, OAuthErrorCode},
+  keys::{KeyId, KeyRing},
   state::RedisConn,
   store::Store,
 };
+use secrecy::SecretString;
 
 /// Boxed test error (no `unwrap`/`expect` under the crate deny lints).
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -59,18 +61,38 @@ fn fixture(client_id: &str, public: bool) -> NewClient {
 }
 
 /// Register a client, one redirect URI, and the `api:read` catalog scope.
-async fn provision(pool: &sqlx::PgPool, client_id: &str, public: bool) -> TestResult {
-  crate::db::client_repo::insert(pool, &fixture(client_id, public)).await?;
-  let uri = redirect_repo::upsert(
+async fn provision(
+  pool: &sqlx::PgPool,
+  keys: &KeyRing,
+  client_id: &str,
+  public: bool,
+) -> TestResult {
+  provision_at(pool, keys, client_id, public, REDIRECT).await
+}
+
+/// Register a client with an explicit redirect URI (encrypt-only at rest).
+async fn provision_at(
+  pool: &sqlx::PgPool,
+  keys: &KeyRing,
+  client_id: &str,
+  public: bool,
+  uri: &str,
+) -> TestResult {
+  crate::db::client_repo::insert(pool, keys, false, &fixture(client_id, public)).await?;
+  let (row, _) = redirect_repo::upsert(
     pool,
-    Uuid::new_v4(),
-    REDIRECT,
-    redirect_repo::RedirectKind::Authorize,
-    "authorize test",
-    None,
+    keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: Uuid::new_v4(),
+      uri,
+      kind: redirect_repo::RedirectKind::Authorize,
+      description: "authorize test",
+      created_by: None,
+    },
   )
   .await?;
-  redirect_repo::attach(pool, client_id, uri.id, None).await?;
+  redirect_repo::attach(pool, client_id, row.id, None).await?;
   scope_repo::upsert(pool, "api:read", "read api").await?;
   Ok(())
 }
@@ -97,6 +119,18 @@ fn test_store() -> Store {
   )
 }
 
+/// Test PII key ring for the encrypted client projection.
+fn test_keys() -> TestResult<KeyRing> {
+  Ok(KeyRing::from_parts(
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("authorize-test-pepper"),
+    )],
+    vec![(KeyId::new("v1"), SecretString::from("authorize-test-totp"))],
+    vec![(KeyId::new("v1"), SecretString::from("authorize-test-pii"))],
+  )?)
+}
+
 /// A valid plain-query authorize map for the provisioned client.
 fn valid_query(client_id: &str, challenge: &str) -> HashMap<String, String> {
   query(&[
@@ -114,7 +148,8 @@ fn valid_query(client_id: &str, challenge: &str) -> HashMap<String, String> {
 #[tokio::test]
 async fn authorize_validate_public_client_plain_query_proceeds() -> TestResult {
   let (_db, pool) = migrated_pool().await?;
-  provision(&pool, "authz-public", true).await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-public", true).await?;
   let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
   let params = valid_query("authz-public", &challenge);
   let mut conn = offline_redis()?;
@@ -122,6 +157,7 @@ async fn authorize_validate_public_client_plain_query_proceeds() -> TestResult {
 
   let validated = validate(AuthorizeInput {
     pool: &pool,
+    keys: &keys,
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
@@ -142,6 +178,7 @@ async fn authorize_validate_public_client_plain_query_proceeds() -> TestResult {
 #[tokio::test]
 async fn authorize_validate_unknown_client_shows_page() -> TestResult {
   let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
   let mut params = valid_query("authz-ghost", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
   params.remove("scope");
   let mut conn = offline_redis()?;
@@ -149,6 +186,7 @@ async fn authorize_validate_unknown_client_shows_page() -> TestResult {
 
   match validate(AuthorizeInput {
     pool: &pool,
+    keys: &keys,
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
@@ -170,7 +208,8 @@ async fn authorize_validate_unknown_client_shows_page() -> TestResult {
 #[tokio::test]
 async fn authorize_validate_unregistered_redirect_shows_page() -> TestResult {
   let (_db, pool) = migrated_pool().await?;
-  provision(&pool, "authz-redirect", true).await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-redirect", true).await?;
   let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
   let mut params = valid_query("authz-redirect", &challenge);
   params.insert(
@@ -182,6 +221,7 @@ async fn authorize_validate_unregistered_redirect_shows_page() -> TestResult {
 
   match validate(AuthorizeInput {
     pool: &pool,
+    keys: &keys,
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
@@ -204,7 +244,8 @@ async fn authorize_validate_unregistered_redirect_shows_page() -> TestResult {
 #[tokio::test]
 async fn authorize_validate_token_response_type_redirects() -> TestResult {
   let (_db, pool) = migrated_pool().await?;
-  provision(&pool, "authz-rt", true).await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-rt", true).await?;
   let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
   let mut params = valid_query("authz-rt", &challenge);
   params.insert("response_type".to_owned(), "token".to_owned());
@@ -213,6 +254,7 @@ async fn authorize_validate_token_response_type_redirects() -> TestResult {
 
   match validate(AuthorizeInput {
     pool: &pool,
+    keys: &keys,
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
@@ -254,7 +296,8 @@ async fn authorize_validate_token_response_type_redirects() -> TestResult {
 #[tokio::test]
 async fn authorize_validate_unknown_scope_redirects() -> TestResult {
   let (_db, pool) = migrated_pool().await?;
-  provision(&pool, "authz-scope", true).await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-scope", true).await?;
   let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
   let mut params = valid_query("authz-scope", &challenge);
   params.insert("scope".to_owned(), "admin:all".to_owned());
@@ -263,6 +306,7 @@ async fn authorize_validate_unknown_scope_redirects() -> TestResult {
 
   match validate(AuthorizeInput {
     pool: &pool,
+    keys: &keys,
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
@@ -305,7 +349,8 @@ async fn authorize_validate_unknown_scope_redirects() -> TestResult {
 #[tokio::test]
 async fn authorize_validate_confidential_plain_query_rejected() -> TestResult {
   let (_db, pool) = migrated_pool().await?;
-  provision(&pool, "authz-conf", false).await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-conf", false).await?;
   let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
   let params = valid_query("authz-conf", &challenge);
   let mut conn = offline_redis()?;
@@ -313,6 +358,7 @@ async fn authorize_validate_confidential_plain_query_rejected() -> TestResult {
 
   match validate(AuthorizeInput {
     pool: &pool,
+    keys: &keys,
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
@@ -331,11 +377,140 @@ async fn authorize_validate_confidential_plain_query_rejected() -> TestResult {
   }
 }
 
+/// An exact registered redirect matches after decryption; a prefix/evil
+/// URI still fails closed; a corrupt `uri_enc` fails as 503 `PiiDecrypt`.
+#[tokio::test]
+async fn authorize_redirect_exact_match() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-exact", true).await?;
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let mut conn = offline_redis()?;
+  let store = test_store();
+
+  let params = valid_query("authz-exact", &challenge);
+  let validated = validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    query: &params,
+  })
+  .await
+  .map_err(|failure| format!("exact redirect rejected: {}", failure.code()))?;
+  assert_eq!(validated.redirect_uri, REDIRECT);
+
+  for hostile in [
+    "https://evil.example.test/cb",
+    "https://app.example.test/cb/extra",
+  ] {
+    let mut params = valid_query("authz-exact", &challenge);
+    params.insert("redirect_uri".to_owned(), hostile.to_owned());
+    match validate(AuthorizeInput {
+      pool: &pool,
+      keys: &keys,
+      conn: &mut conn,
+      store: &store,
+      issuer: ISSUER,
+      query: &params,
+    })
+    .await
+    {
+      Ok(_) => return Err(format!("hostile redirect accepted: {hostile}").into()),
+      Err(failure) => {
+        assert_eq!(failure.code(), OAuthErrorCode::InvalidRequest);
+        let response = failure.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(header::LOCATION).is_none());
+      }
+    }
+  }
+
+  let corrupt: &[u8] = b"corrupt-blob";
+  sqlx::query("UPDATE redirect_uris SET uri_enc = $1")
+    .bind(corrupt)
+    .execute(&pool)
+    .await
+    .map_err(|error| format!("corrupt fixture failed: {error}"))?;
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    query: &params,
+  })
+  .await
+  {
+    Ok(_) => Err("corrupt uri_enc accepted".into()),
+    Err(AuthorizeFailure::Page(error)) => {
+      assert!(matches!(error, AppError::PiiDecrypt));
+      assert_eq!(error.code(), OAuthErrorCode::TemporarilyUnavailable);
+      assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+      Ok(())
+    }
+    Err(other) => Err(format!("expected a PiiDecrypt page, got {}", other.code()).into()),
+  }
+}
+
+/// A loopback registration matches a request with a random port (RFC 8252
+/// §7.3) after decryption; a different path still fails closed.
+#[tokio::test]
+async fn authorize_loopback_allows_port() -> TestResult {
+  const LOOPBACK: &str = "http://127.0.0.1:8080/cb";
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  provision_at(&pool, &keys, "authz-loop", true, LOOPBACK).await?;
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let mut conn = offline_redis()?;
+  let store = test_store();
+
+  let mut params = valid_query("authz-loop", &challenge);
+  params.insert(
+    "redirect_uri".to_owned(),
+    "http://127.0.0.1:59231/cb".to_owned(),
+  );
+  let validated = validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    query: &params,
+  })
+  .await
+  .map_err(|failure| format!("loopback port rejected: {}", failure.code()))?;
+  assert_eq!(validated.redirect_uri, "http://127.0.0.1:59231/cb");
+
+  params.insert(
+    "redirect_uri".to_owned(),
+    "http://127.0.0.1:59231/other".to_owned(),
+  );
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    query: &params,
+  })
+  .await
+  {
+    Ok(_) => Err("loopback wrong-path accepted".into()),
+    Err(failure) => {
+      assert_eq!(failure.code(), OAuthErrorCode::InvalidRequest);
+      Ok(())
+    }
+  }
+}
+
 /// A missing PKCE challenge redirects with `invalid_request` (+ `state`).
 #[tokio::test]
 async fn authorize_validate_missing_challenge_redirects() -> TestResult {
   let (_db, pool) = migrated_pool().await?;
-  provision(&pool, "authz-pkce", true).await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-pkce", true).await?;
   let mut params = valid_query("authz-pkce", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
   params.remove("code_challenge");
   params.remove("code_challenge_method");
@@ -344,6 +519,7 @@ async fn authorize_validate_missing_challenge_redirects() -> TestResult {
 
   match validate(AuthorizeInput {
     pool: &pool,
+    keys: &keys,
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,

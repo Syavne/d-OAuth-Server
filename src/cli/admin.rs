@@ -27,11 +27,12 @@ use std::{fmt, path::Path};
 
 use base64::Engine as _;
 use ring::rand::{SecureRandom as _, SystemRandom};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::context::{CliError, audit, require_nonempty};
 use super::secret;
+use super::user::map_user_repo_error;
 use crate::{config::Config, db::user_repo};
 
 /// Bytes of entropy in a generated bootstrap password (256-bit).
@@ -119,12 +120,13 @@ pub fn generate_password() -> Result<String, CliError> {
   Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// Create the first admin: advisory-locked check-and-insert in one transaction.
+/// Create the first admin: advisory-locked existence gate plus a repository
+/// insert.
 ///
-/// The password is hashed before the transaction opens so the lock is held
-/// only for the check and the insert. On success the admin has
-/// `is_admin = true`, `must_change_password = true`, `totp_enabled = false`,
-/// and a `NULL` `password_changed_at`.
+/// The password is hashed before the lock is taken so the lock is held only
+/// for the check and the insert. On success the admin has `is_admin = true`,
+/// `must_change_password = true`, `totp_enabled = false`, and a `NULL`
+/// `password_changed_at`.
 ///
 /// # Errors
 /// Returns [`CliError::Input`] for an empty email/password,
@@ -147,23 +149,57 @@ pub async fn bootstrap(
     }
     BootstrapPassword::Generate => (generate_password()?, true),
   };
-  // Hash before opening the transaction so the advisory lock is held only
-  // for the check and the insert. The plaintext below is never logged and
-  // never stored; only the Argon2id hash reaches the database.
+  // Hash before taking the lock so the lock is held only for the check and the
+  // insert. The plaintext below is never logged and never stored; only the
+  // Argon2id hash reaches the database.
   let password_hash = secret::hash_password(config, &plaintext)?;
 
-  let mut tx = pool.begin().await?;
-  sqlx::query("SELECT pg_advisory_xact_lock(hashtext('d_oauth_admin_bootstrap'))")
-    .execute(&mut *tx)
+  // Serialize within the process so a single process never parks multiple
+  // pooled connections on the database lock while the winner still needs a
+  // second connection for the repository insert.
+  let _serialized = BOOTSTRAP_MUTEX.lock().await;
+  let mut conn = pool.acquire().await?;
+  sqlx::query("SELECT pg_advisory_lock(hashtext('d_oauth_admin_bootstrap'))")
+    .execute(&mut *conn)
     .await?;
+  let outcome = bootstrap_locked(
+    config,
+    pool,
+    &mut conn,
+    &email,
+    &password_hash,
+    force,
+    was_generated.then_some(plaintext),
+  )
+  .await;
+  sqlx::query("SELECT pg_advisory_unlock(hashtext('d_oauth_admin_bootstrap'))")
+    .execute(&mut *conn)
+    .await?;
+  outcome
+}
+
+/// Process-wide serialization for [`bootstrap`]; the session advisory lock
+/// still serializes across processes.
+static BOOTSTRAP_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Run the admin-count gate and the user-repository insert while the advisory
+/// lock is held by `conn`.
+async fn bootstrap_locked(
+  config: &Config,
+  pool: &PgPool,
+  conn: &mut PgConnection,
+  email: &str,
+  password_hash: &str,
+  force: bool,
+  generated_password: Option<String>,
+) -> Result<BootstrapOutcome, CliError> {
   let existing: i64 =
     sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin AND NOT disabled")
-      .fetch_one(&mut *tx)
+      .fetch_one(&mut *conn)
       .await?;
 
   if existing > 0 && !force {
-    drop(tx);
-    audit("admin.bootstrap.refused", &email);
+    audit("admin.bootstrap.refused", email);
     return Err(CliError::AlreadyExists(format!(
       "an administrator already exists ({existing}); use `user create --admin` for more admins"
     )));
@@ -174,48 +210,32 @@ pub async fn bootstrap(
        creating one more. This override is audited. \
        Prefer `user create --admin` for routine provisioning."
     );
-    audit("admin.bootstrap.force", &email);
+    audit("admin.bootstrap.force", email);
   }
 
-  let id = Uuid::new_v4();
-  let inserted: Option<Uuid> = sqlx::query_scalar(
-    "INSERT INTO users (
-       id, email, password_hash, is_admin, must_change_password,
-       password_changed_at, created_at, updated_at
-     ) VALUES ($1, $2::citext, $3, true, true, NULL, now(), now())
-     RETURNING id",
+  let record = user_repo::create_user(
+    pool,
+    &config.keys,
+    config.pii_dual_write,
+    &user_repo::NewUser {
+      email: email.to_owned(),
+      password_hash: password_hash.to_owned(),
+      is_admin: true,
+      must_change_password: true,
+    },
   )
-  .bind(id)
-  .bind(&email)
-  .bind(&password_hash)
-  .fetch_optional(&mut *tx)
   .await
-  .map_err(map_insert_error)?;
-  let Some(id) = inserted else {
-    drop(tx);
-    return Err(CliError::AlreadyExists(format!("user {email}")));
-  };
-  tx.commit().await?;
+  .map_err(map_user_repo_error)?;
 
   let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin AND NOT disabled")
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
-  audit("admin.bootstrap.created", &email);
+  audit("admin.bootstrap.created", email);
   audit("admin.count.changed", &total.to_string());
 
   Ok(BootstrapOutcome {
-    id,
-    email,
-    generated_password: if was_generated { Some(plaintext) } else { None },
+    id: record.id,
+    email: email.to_owned(),
+    generated_password,
   })
-}
-
-/// Map an insert failure: unique violations become `AlreadyExists`.
-fn map_insert_error(error: sqlx::Error) -> CliError {
-  match &error {
-    sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
-      CliError::AlreadyExists("user email already exists".to_owned())
-    }
-    _ => CliError::Database(error),
-  }
 }

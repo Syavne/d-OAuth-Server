@@ -33,6 +33,7 @@ async fn setup() -> Result<World, TestError> {
   let world = World::start(open_rate_limit()).await?;
   seed_client(
     &world.pool,
+    &world.state.keys,
     CLIENT_ID,
     Some(CLIENT_SECRET),
     &[
@@ -47,9 +48,10 @@ async fn setup() -> Result<World, TestError> {
   .await?;
   seed_scope(&world.pool, "read").await?;
   seed_scope(&world.pool, "write").await?;
-  attach_redirect(&world.pool, CLIENT_ID, REDIRECT_URI).await?;
+  attach_redirect(&world.pool, &world.state.keys, CLIENT_ID, REDIRECT_URI).await?;
   seed_client(
     &world.pool,
+    &world.state.keys,
     PUBLIC_ID,
     None,
     &["authorization_code", "refresh_token"],
@@ -57,7 +59,7 @@ async fn setup() -> Result<World, TestError> {
     TokenEndpointAuthMethod::None,
   )
   .await?;
-  attach_redirect(&world.pool, PUBLIC_ID, REDIRECT_URI).await?;
+  attach_redirect(&world.pool, &world.state.keys, PUBLIC_ID, REDIRECT_URI).await?;
   Ok(world)
 }
 

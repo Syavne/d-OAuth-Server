@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE redirect_uris SET enabled = $2, updated_at = now() WHERE id = $1 RETURNING id, uri, kind, enabled, description, created_by, created_at, updated_at",
+  "query": "SELECT ru.id, ru.uri, ru.kind, ru.enabled, ru.description, ru.created_by, ru.created_at, ru.updated_at, ru.uri_enc FROM client_redirect_uris AS cru JOIN redirect_uris AS ru ON ru.id = cru.redirect_uri_id WHERE cru.client_id = $1 AND ru.enabled = true AND ru.kind = 'authorize'",
   "describe": {
     "columns": [
       {
@@ -90,24 +90,35 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 8,
+        "name": "uri_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "redirect_uris",
+            "name": "uri_enc"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Bool"
+        "Text"
       ]
     },
     "nullable": [
       false,
-      false,
+      true,
       false,
       false,
       false,
       true,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "69308568afaa5e9fab1dd59db7b40ca7323832855f4ac20607293134cfb3202e"
+  "hash": "79e3601aefbfd67768897e2869f5c6eb0a9bbe8878a3b48c2e4d02c7afe262e8"
 }

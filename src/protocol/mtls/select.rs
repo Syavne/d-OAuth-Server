@@ -14,6 +14,7 @@ use super::{
   cert::{subject_dn, thumbprint_b64url},
 };
 use crate::db::client_repo::{self, Client, TokenEndpointAuthMethod};
+use crate::keys::KeyRing;
 
 /// Select the unique client enrolled with this certificate thumbprint.
 pub fn select_by_thumbprint<'a>(
@@ -49,6 +50,7 @@ pub fn select_by_subject_dn<'a>(clients: &'a [Client], dn: &str) -> Result<&'a C
 /// subject-DN matching for `tls_client_auth`. Returns the `cnf` to bind.
 pub async fn authenticate(
   pool: &PgPool,
+  keys: &KeyRing,
   client: &Client,
   leaf: Option<&CertificateDer<'_>>,
 ) -> Result<MtlsCnf, MtlsError> {
@@ -79,7 +81,7 @@ pub async fn authenticate(
       if registered != dn {
         return Err(MtlsError::UnknownCertificate);
       }
-      let clients = client_repo::list(pool, false).await?;
+      let clients = client_repo::list(pool, keys, false).await?;
       select_by_subject_dn(&clients, &dn)?;
       Ok(MtlsCnf {
         x5t_s256: thumbprint_b64url(der.as_ref()),
@@ -95,11 +97,12 @@ pub async fn authenticate(
 /// Load the client by `client_id`, then [`authenticate`] it with the leaf.
 pub async fn authenticate_by_id(
   pool: &PgPool,
+  keys: &KeyRing,
   client_id: &str,
   leaf: Option<&CertificateDer<'_>>,
 ) -> Result<MtlsCnf, MtlsError> {
-  let client = client_repo::find_active_by_client_id(pool, client_id)
+  let client = client_repo::find_active_by_client_id(pool, keys, client_id)
     .await?
     .ok_or(MtlsError::UnknownClient)?;
-  authenticate(pool, &client, leaf).await
+  authenticate(pool, keys, &client, leaf).await
 }

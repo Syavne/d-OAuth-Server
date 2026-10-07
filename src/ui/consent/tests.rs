@@ -9,8 +9,9 @@
 
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use secrecy::SecretString;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row as _};
 use testcontainers::{
   GenericImage, ImageExt,
   core::{IntoContainerPort, WaitFor},
@@ -35,7 +36,7 @@ use crate::{
     user_repo::{self, NewUser},
     user_scope_repo,
   },
-  error::OAuthErrorCode,
+  error::{AppError, OAuthErrorCode},
   keys::{KeyId, KeyRing},
   protocol::code,
   state::RedisConn,
@@ -63,6 +64,8 @@ struct Harness {
   conn: RedisConn,
   /// Store handle over the test keyspaces.
   store: Store,
+  /// PII key ring for the encrypted user-email lookup (strict encrypt-only).
+  keys: KeyRing,
   /// Redis container guard (synchronous removal on drop).
   _redis: ContainerGuard,
 }
@@ -94,6 +97,7 @@ async fn harness() -> Result<Harness, TestError> {
     pool,
     conn: RedisConn::Single(manager),
     store,
+    keys: test_ring()?,
     _redis: guarded,
   })
 }
@@ -104,6 +108,7 @@ fn deps_of(h: &mut Harness) -> ConsentDeps<'_> {
     pool: &h.pool,
     conn: &mut h.conn,
     store: &h.store,
+    keys: &h.keys,
   }
 }
 
@@ -112,6 +117,7 @@ fn test_ring() -> Result<KeyRing, TestError> {
   Ok(KeyRing::from_parts(
     vec![(KeyId::new("v1"), SecretString::from("consent-test-pepper"))],
     vec![(KeyId::new("v1"), SecretString::from("consent-test-totp"))],
+    vec![(KeyId::new("v1"), SecretString::from("consent-test-pii"))],
   )?)
 }
 
@@ -137,6 +143,8 @@ struct Fixture {
 async fn provision(h: &mut Harness) -> Result<Fixture, TestError> {
   let client = client_repo::insert(
     &h.pool,
+    &h.keys,
+    false,
     &NewClient {
       id: Uuid::new_v4(),
       client_id: "consent-client".to_owned(),
@@ -165,6 +173,8 @@ async fn provision(h: &mut Harness) -> Result<Fixture, TestError> {
   let params = Argon2Params::new(8192, 1, 1, 32)?;
   let user = user_repo::create_user(
     &h.pool,
+    &h.keys,
+    false,
     &NewUser {
       email: "consent-user@example.test".to_owned(),
       password_hash: hash_secret("consent-password-01", &params)?,
@@ -473,6 +483,65 @@ async fn consent_requires_authenticated_session() -> TestResult {
   }
   if code_key_count(&mut h).await? != 0 {
     return Err("no code may be issued without a session".into());
+  }
+  Ok(())
+}
+
+/// The consent screen renders the DECRYPTED client name: the stored row is
+/// encrypt-only (plaintext blanked), and a corrupt ciphertext fails closed
+/// as `PiiDecrypt` (503) with no plaintext in the error.
+#[tokio::test]
+async fn consent_renders_client_name() -> TestResult {
+  let mut h = harness().await?;
+  let fx = provision(&mut h).await?;
+  let at_rest = sqlx::query(
+    "SELECT client_name, client_name_enc FROM oauth_clients WHERE client_id = 'consent-client'",
+  )
+  .fetch_one(&h.pool)
+  .await?;
+  let plain: Option<String> = at_rest.try_get("client_name")?;
+  let sealed: Option<Vec<u8>> = at_rest.try_get("client_name_enc")?;
+  if plain.is_some() {
+    return Err("encrypt-only must blank the client name".into());
+  }
+  if sealed.is_none() {
+    return Err("the sealed client name must be stored".into());
+  }
+  let view = {
+    let mut deps = deps_of(&mut h);
+    load_consent_view(&mut deps, &fx.session_id).await?
+  };
+  let Some(view) = view else {
+    return Err("a bound full session must render consent".into());
+  };
+  if view.client_name != "Consent Test App" {
+    return Err(
+      format!(
+        "consent must render the decrypted client name, got: {}",
+        view.client_name
+      )
+      .into(),
+    );
+  }
+  let corrupt: &[u8] = b"corrupt-blob";
+  sqlx::query("UPDATE oauth_clients SET client_name_enc = $1 WHERE client_id = 'consent-client'")
+    .bind(corrupt)
+    .execute(&h.pool)
+    .await?;
+  let mut deps = deps_of(&mut h);
+  match load_consent_view(&mut deps, &fx.session_id).await {
+    Err(error) => {
+      if !matches!(error, AppError::PiiDecrypt) {
+        return Err("a corrupt client_name_enc must be PiiDecrypt".into());
+      }
+      if error.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return Err("a decrypt failure must be 503, never 500".into());
+      }
+      if format!("{error:?}").contains("Consent Test App") {
+        return Err("a decrypt error must not leak plaintext".into());
+      }
+    }
+    Ok(_) => return Err("a corrupt client row must never render".into()),
   }
   Ok(())
 }

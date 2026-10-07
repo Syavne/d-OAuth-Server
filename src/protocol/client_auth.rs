@@ -26,6 +26,7 @@ use crate::{
   db::client_repo::ClientRepoError,
   db::{Client, TokenEndpointAuthMethod, client_repo},
   error::AppError,
+  keys::KeyRing,
   protocol::mtls,
   state::RedisConn,
   store::Store,
@@ -128,6 +129,8 @@ pub struct AuthenticatedClient {
 pub struct AuthStores<'a> {
   /// Postgres pool for client lookup and secret verification.
   pub pool: &'a PgPool,
+  /// Versioned PII keys for the encrypted client lookup.
+  pub keys: &'a KeyRing,
   /// Redis connection for the assertion `jti` replay store.
   pub conn: &'a mut RedisConn,
   /// Key layout plus retry/durability knobs for the replay store.
@@ -183,7 +186,7 @@ pub async fn authenticate_client(
     {
       return Err(invalid_client_for(true));
     }
-    let client = lookup_client(stores.pool, &creds.client_id, true).await?;
+    let client = lookup_client(stores.pool, stores.keys, &creds.client_id, true).await?;
     require_method(&client, TokenEndpointAuthMethod::ClientSecretBasic, true)?;
     authenticate_secret(
       stores.pool,
@@ -197,7 +200,7 @@ pub async fn authenticate_client(
     let Some(client_id) = req.client_id else {
       return Err(invalid_client_for(false));
     };
-    let client = lookup_client(stores.pool, client_id, false).await?;
+    let client = lookup_client(stores.pool, stores.keys, client_id, false).await?;
     require_method(&client, TokenEndpointAuthMethod::ClientSecretPost, false)?;
     authenticate_secret(stores.pool, &client, secret.expose_secret(), ctx.now, false).await
   } else if let Some(assertion_str) = req.assertion {
@@ -210,11 +213,11 @@ pub async fn authenticate_client(
       (None, Some(iss)) => iss,
       (None, None) => return Err(invalid_client_for(false)),
     };
-    let client = lookup_client(stores.pool, &client_id, false).await?;
+    let client = lookup_client(stores.pool, stores.keys, &client_id, false).await?;
     require_method(&client, TokenEndpointAuthMethod::PrivateKeyJwt, false)?;
     assertion::authenticate(stores, &client, assertion_str, ctx).await
   } else if let Some(client_id) = req.client_id {
-    let client = lookup_client(stores.pool, client_id, false).await?;
+    let client = lookup_client(stores.pool, stores.keys, client_id, false).await?;
     match client.auth_method() {
       Ok(TokenEndpointAuthMethod::None) => Ok(AuthenticatedClient {
         client,
@@ -222,7 +225,7 @@ pub async fn authenticate_client(
       }),
       Ok(
         TokenEndpointAuthMethod::TlsClientAuth | TokenEndpointAuthMethod::SelfSignedTlsClientAuth,
-      ) => authenticate_tls(stores.pool, &client, req.peer_certs).await,
+      ) => authenticate_tls(stores.pool, stores.keys, &client, req.peer_certs).await,
       Ok(_) | Err(_) => Err(invalid_client_for(false)),
     }
   } else {
@@ -243,13 +246,14 @@ fn invalid_client_for(used_basic: bool) -> AppError {
 /// whether the id exists).
 async fn lookup_client(
   pool: &PgPool,
+  keys: &KeyRing,
   client_id: &str,
   used_basic: bool,
 ) -> Result<Client, AppError> {
-  match client_repo::find_active_by_client_id(pool, client_id).await {
+  match client_repo::find_active_by_client_id(pool, keys, client_id).await {
     Ok(Some(client)) => Ok(client),
     Ok(None) => Err(invalid_client_for(used_basic)),
-    Err(error) => Err(AppError::from(error)),
+    Err(error) => Err(error),
   }
 }
 
@@ -304,6 +308,7 @@ async fn authenticate_secret(
 /// or unregistered certificate fails closed as `invalid_client`.
 async fn authenticate_tls(
   pool: &PgPool,
+  keys: &KeyRing,
   client: &Client,
   peer_certs: Option<&PeerCertificates>,
 ) -> Result<AuthenticatedClient, AppError> {
@@ -311,7 +316,7 @@ async fn authenticate_tls(
     .auth_method()
     .map_err(|_| AppError::invalid_client_non_basic())?;
   let leaf = peer_certs.and_then(|certs| certs.chain().first());
-  mtls::authenticate(pool, client, leaf)
+  mtls::authenticate(pool, keys, client, leaf)
     .await
     .map_err(mtls::MtlsError::into_app_error)?;
   Ok(AuthenticatedClient {

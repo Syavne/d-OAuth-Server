@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use askama::Template;
 use axum::{
-  Form,
+  Extension, Form,
   extract::{Query, State},
   http::{StatusCode, header},
   response::{IntoResponse, Redirect, Response},
@@ -55,7 +55,7 @@ use crate::{
   },
   error::AppError,
   keys::KeyRing,
-  middleware::audit::AuditEvent,
+  middleware::{audit::AuditEvent, request_id::RequestId},
   protocol::redirect_repo as redirect_match,
   state::{AppState, RedisConn},
   store::{self, Store, StoreError},
@@ -392,7 +392,7 @@ pub async fn attempt_login(
       ),
       None => return Err(AppError::invalid_request("the login session has expired")),
     };
-  match user_repo::verify_password(deps.pool, &email, &attempt.password).await? {
+  match user_repo::verify_password(deps.pool, deps.keys, &email, &attempt.password).await? {
     user_repo::PasswordVerdict::Unknown => {
       burn_timing(deps.config, &attempt.password)?;
       user_repo::register_login_failure(deps.conn, deps.store, policy, &email).await?;
@@ -411,7 +411,7 @@ pub async fn attempt_login(
     }
     user_repo::PasswordVerdict::Matched => {}
   }
-  let Some(user) = user_repo::find_by_email(deps.pool, &email).await? else {
+  let Some(user) = user_repo::find_by_email(deps.pool, deps.keys, &email).await? else {
     audit_failure(pending_id.as_deref(), None, "bad_credentials");
     return Ok(LoginOutcome::Rejected);
   };
@@ -532,7 +532,8 @@ pub async fn change_password(
       "the password does not meet the length requirement",
     ));
   }
-  let Some(user) = user_repo::find_by_email(deps.pool, &live.record.subject).await? else {
+  let Some(user) = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject).await?
+  else {
     return Err(AppError::invalid_request("the login session has expired"));
   };
   let params = secret_params(deps.config)?;
@@ -540,7 +541,7 @@ pub async fn change_password(
   if !user_repo::set_password(deps.pool, user.id, &hash).await? {
     return Err(AppError::server_error());
   }
-  let enrolled = user_repo::find_by_email(deps.pool, &live.record.subject)
+  let enrolled = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject)
     .await?
     .is_some_and(|user| user.totp_enabled);
   if !enrolled {
@@ -582,11 +583,12 @@ pub async fn provision_totp(
   if live.record.subject.is_empty() {
     return Err(AppError::invalid_request("the login session has expired"));
   }
-  let Some(user) = user_repo::find_by_email(deps.pool, &live.record.subject).await? else {
+  let Some(user) = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject).await?
+  else {
     return Err(AppError::invalid_request("the login session has expired"));
   };
   let secret = totp::generate_secret()?;
-  let blob = totp::encrypt_secret(deps.keys, &secret)?;
+  let blob = totp::encrypt_secret(deps.keys, &secret, !deps.config.pii_dual_write)?;
   if !user_repo::set_totp_secret(deps.pool, user.id, &blob).await? {
     return Err(AppError::server_error());
   }
@@ -639,7 +641,8 @@ pub async fn confirm_totp(
   if live.record.subject.is_empty() {
     return Err(AppError::invalid_request("the login session has expired"));
   }
-  let Some(user) = user_repo::find_by_email(deps.pool, &live.record.subject).await? else {
+  let Some(user) = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject).await?
+  else {
     return Err(AppError::invalid_request("the login session has expired"));
   };
   let Some(blob) = user_repo::totp_secret_blob(deps.pool, user.id).await? else {
@@ -671,7 +674,7 @@ pub async fn confirm_totp(
     );
     return Ok(ConfirmOutcome::Rejected);
   }
-  let fresh = user_repo::find_by_email(deps.pool, &live.record.subject).await?;
+  let fresh = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject).await?;
   if fresh.is_some_and(|user| !user.must_change_password) {
     let promoted = promote_to_full(deps, session_id, &live).await?;
     match promoted {
@@ -855,6 +858,21 @@ fn audit_failure(request_id: Option<&str>, subject: Option<&str>, reason: &str) 
     reason,
   }
   .emit();
+}
+
+/// Audit a stored-value open failure as `pii.decrypt_failure` (fail-closed).
+///
+/// Matches [`AppError::PiiDecrypt`] specifically; any other error passes
+/// through silently. The event carries only the request id — never the value
+/// that failed to open and never any plaintext — and the error itself still
+/// renders 503 via [`AppError`].
+fn emit_pii_decrypt(request_id: &RequestId, error: &AppError) {
+  if matches!(error, AppError::PiiDecrypt) {
+    AuditEvent::PiiDecryptFailure {
+      request_id: Some(request_id.as_str()),
+    }
+    .emit();
+  }
 }
 
 /// Sidecar key for a session id (same `{state}` slot as the record).
@@ -1235,6 +1253,7 @@ pub async fn get_login(
 /// `POST /login`: verify credentials, rotate the session, redirect strictly.
 pub async fn post_login(
   State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
   jar: CookieJar,
   Form(form): Form<LoginForm>,
 ) -> Response {
@@ -1271,7 +1290,10 @@ pub async fn post_login(
       login_rejected_page(&form.email),
     )
       .into_response(),
-    Err(error) => error.into_response(),
+    Err(error) => {
+      emit_pii_decrypt(&request_id, &error);
+      error.into_response()
+    }
   }
 }
 
@@ -1289,6 +1311,7 @@ pub async fn get_change_password(State(state): State<AppState>, jar: CookieJar) 
 /// `POST /login/change-password`: set the password, promote when enrolled.
 pub async fn post_change_password(
   State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
   jar: CookieJar,
   Form(form): Form<PasswordForm>,
 ) -> Response {
@@ -1317,12 +1340,19 @@ pub async fn post_change_password(
     )
       .into_response(),
     Ok(PasswordOutcome::StillRestricted { .. }) => Redirect::to(TOTP_SETUP_PATH).into_response(),
-    Err(error) => error.into_response(),
+    Err(error) => {
+      emit_pii_decrypt(&request_id, &error);
+      error.into_response()
+    }
   }
 }
 
 /// `GET /login/totp/setup`: provision and display enrollment material once.
-pub async fn get_totp_setup(State(state): State<AppState>, jar: CookieJar) -> Response {
+pub async fn get_totp_setup(
+  State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
+  jar: CookieJar,
+) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let session_id = jar
@@ -1354,7 +1384,10 @@ pub async fn get_totp_setup(State(state): State<AppState>, jar: CookieJar) -> Re
         has_error: false,
       })
     }
-    Err(error) => error.into_response(),
+    Err(error) => {
+      emit_pii_decrypt(&request_id, &error);
+      error.into_response()
+    }
   }
 }
 
@@ -1366,6 +1399,7 @@ pub async fn get_totp_confirm(State(state): State<AppState>, jar: CookieJar) -> 
 /// `POST /login/totp/confirm`: verify the authenticator code, promote or stay.
 pub async fn post_totp_confirm(
   State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
   jar: CookieJar,
   Form(form): Form<ConfirmForm>,
 ) -> Response {
@@ -1399,7 +1433,10 @@ pub async fn post_totp_confirm(
       error: "That code was not accepted. Check your authenticator and try again.".to_owned(),
       has_error: true,
     }),
-    Err(error) => error.into_response(),
+    Err(error) => {
+      emit_pii_decrypt(&request_id, &error);
+      error.into_response()
+    }
   }
 }
 
@@ -1427,7 +1464,11 @@ pub async fn post_logout(State(state): State<AppState>, jar: CookieJar) -> Respo
 /// the client/URI is no longer valid, the neutral page is rendered and no
 /// redirect is issued. The server session is destroyed idempotently; a missing
 /// session is a no-op.
-pub async fn get_logout(State(state): State<AppState>, jar: CookieJar) -> Response {
+pub async fn get_logout(
+  State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
+  jar: CookieJar,
+) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let session_id = jar
@@ -1438,7 +1479,16 @@ pub async fn get_logout(State(state): State<AppState>, jar: CookieJar) -> Respon
     .await
     .unwrap_or(None)
   {
-    Some(live) => resolve_post_logout_target(&state, &live).await,
+    Some(live) => match resolve_post_logout_target(&state, &live).await {
+      Ok(target) => target,
+      Err(error) => {
+        emit_pii_decrypt(&request_id, &error);
+        if logout(&mut conn, &store, &session_id).await.is_err() {
+          return AppError::server_error().into_response();
+        }
+        return (jar.add(expired_session_cookie()), error.into_response()).into_response();
+      }
+    },
     None => None,
   };
   if logout(&mut conn, &store, &session_id).await.is_err() {
@@ -1456,22 +1506,45 @@ pub async fn get_logout(State(state): State<AppState>, jar: CookieJar) -> Respon
 /// Returns the frozen URI only when the flow recorded both a client and a URI,
 /// the client is still active, and that exact URI is still in the client's
 /// effective post-logout set (exact-match or RFC 8252 loopback). Any miss or
-/// database failure yields `None` (no redirect), never a guessed target.
-async fn resolve_post_logout_target(state: &AppState, live: &LiveSession) -> Option<String> {
-  let client_id = live.meta.post_logout_client_id.as_deref()?;
-  let bound = live.meta.post_logout_uri.as_deref()?;
-  client_repo::find_active_by_client_id(&state.pool, client_id)
-    .await
-    .ok()??;
-  let effective = redirect_repo::effective_post_logout_for_client(&state.pool, client_id)
-    .await
-    .ok()?;
+/// database failure yields `Ok(None)` (no redirect), never a guessed target.
+/// A stored-value open failure is fail-closed as `Err(AppError::PiiDecrypt)`
+/// (503), never downgraded to the neutral page.
+async fn resolve_post_logout_target(
+  state: &AppState,
+  live: &LiveSession,
+) -> Result<Option<String>, AppError> {
+  let (Some(client_id), Some(bound)) = (
+    live.meta.post_logout_client_id.as_deref(),
+    live.meta.post_logout_uri.as_deref(),
+  ) else {
+    return Ok(None);
+  };
+  let client =
+    match client_repo::find_active_by_client_id(&state.pool, &state.keys, client_id).await {
+      Ok(client) => client,
+      Err(AppError::PiiDecrypt) => return Err(AppError::PiiDecrypt),
+      Err(_) => return Ok(None),
+    };
+  if client.is_none() {
+    return Ok(None);
+  }
+  let effective = match redirect_repo::effective_post_logout_for_client(
+    &state.pool,
+    &state.keys,
+    client_id,
+  )
+  .await
+  {
+    Ok(effective) => effective,
+    Err(AppError::PiiDecrypt) => return Err(AppError::PiiDecrypt),
+    Err(_) => return Ok(None),
+  };
   let registered: Vec<&str> = effective.iter().map(String::as_str).collect();
   match redirect_match::match_redirect_uri(&registered, bound) {
     redirect_match::RedirectDecision::Exact | redirect_match::RedirectDecision::Loopback => {
-      Some(bound.to_owned())
+      Ok(Some(bound.to_owned()))
     }
-    redirect_match::RedirectDecision::Reject => None,
+    redirect_match::RedirectDecision::Reject => Ok(None),
   }
 }
 

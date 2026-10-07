@@ -19,7 +19,9 @@ https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1).
 - Opaque access and refresh tokens, and the authorization codes and device codes
   that yield them.
 - Client secrets, user passwords, TOTP secrets, and DCR initial-access tokens.
-- The token pepper and TOTP encryption keys.
+- The token pepper, the TOTP encryption key, and the PII field-encryption key.
+- The directory itself: emails, client names, contacts, redirect URIs, JAR
+  request URIs, JWKS URLs, software ids, and mTLS identities.
 - The integrity of the authorization decision: which client may act for which
   user with which scopes.
 
@@ -56,7 +58,7 @@ class, or runtime setting).
 | Application-level RCE in a parser (form bodies, DPoP/JAR/`private_key_jwt` JWTs, DCR JSON, `jwks_uri`/`request_uri` fetches) | `#![forbid(unsafe_code)]`, no `unwrap`/`panic` in request paths, rustls/ring (no OpenSSL), fuzz targets for token-form/DCR-JSON/JAR-claims | Fuzzing is not exhaustive. |
 | Dependency / supply-chain compromise | Committed `Cargo.lock`, `cargo deny`/`cargo audit` in CI, SBOM + provenance + keyless cosign, digest-pinned bases | A zero-day in a trusted crate. |
 | Container escape via kernel or runtime bug | Non-root UID 65532, read-only root filesystem, all capabilities dropped, `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault` | A kernel LPE or runc bug, mitigated but not eliminated. |
-| Secret exfiltration from the process environment | Secrets are injected at runtime, not baked into image layers; the pepper/TOTP key live outside the database; the Deployment mounts every secret — pepper, TOTP key, and the database/Redis passwords — as `0400` tmpfs files under `/run/secrets` (read through their `*_FILE` variables), and the passwordless DSNs come from the ConfigMap, so no secret enters the environment | An attacker with code execution can still read the mounted secret files under `/run/secrets`; that is the same capability the server has. |
+| Secret exfiltration from the process environment | Secrets are injected at runtime, not baked into image layers; the pepper/TOTP/PII keys live outside the database; the Deployment mounts every secret — pepper, TOTP key, PII key, and the database/Redis passwords — as `0400` tmpfs files under `/run/secrets` (read through their `*_FILE` variables), and the passwordless DSNs come from the ConfigMap, so no secret enters the environment | An attacker with code execution can still read the mounted secret files under `/run/secrets`; that is the same capability the server has. |
 | Exposed management surface | The plaintext health listener (8081) is unauthenticated but not published in the Service (only 8080 is) | A misconfigured Service/Ingress could expose it; it must never be internet-facing. |
 | Host access via mounted volumes | `/certs` is mounted read-only at mode `0400`; no Docker socket is mounted | Operator misconfiguration. |
 | Unrestricted pod egress (SSRF to metadata, exfiltration) | `networkpolicy.yaml` default-denies egress except DNS (53 to `kube-system`) and Postgres/Redis (5432/6379) scoped to the namespace hosting them — no internet-wide `0.0.0.0/0` peer; any `ipBlock` peer excludes `169.254.0.0/16`; ingress is limited to pod ports 8080/8081 | Enforcement depends on a NetworkPolicy-capable CNI; a cluster that ignores NetworkPolicy gets no benefit. A managed database outside the cluster needs a specific CIDR or a CNI FQDN policy. The default-deny also blocks the JAR `request_uri` HTTPS fetch — remote request objects are unsupported unless the deployment adds a scoped allowance (see `docs/DEPLOYMENT.md`). |
@@ -66,8 +68,7 @@ class, or runtime setting).
 
 Last reviewed: 2026-10-05. File-mounted DB/Redis passwords, digest pinning,
 NetworkPolicy, `automountServiceAccountToken: false`, and scheduled fuzzing are
-implemented in the shipped manifests and workflows; the remaining mitigations
-are tracked in `docs/TODO.md`.
+implemented in the shipped manifests and workflows.
 
 ## Toplevel rules
 
@@ -162,37 +163,81 @@ Reference: RFC 9126, RFC 9101.
 
 ## Key ring and rotation
 
-- One versioned `KeyRing` holds the token-pepper chain and the TOTP-encryption
-  chain, newest first.
-- Opaque token hashes carry the pepper key id; the TOTP blob carries its key id.
+- One versioned `KeyRing` holds three independent chains, newest first: the
+  token-pepper chain, the TOTP-encryption chain, and the PII field-encryption
+  chain. Each purpose also has an optional retained previous key.
+- Opaque token hashes carry the pepper key id; the TOTP blob and every `_enc`
+  PII blob carry their own key id, and the blind index carries its key id.
 - Rotating the pepper requires retaining the old key for at least the refresh
   lifetime so live tokens still verify.
+- Rotating the PII key re-encrypts every `_enc` value and recomputes every blind
+  index (`pii rotate`); rotating the TOTP key re-wraps the per-row DEKs
+  (`totp rewrap`). See
+  [OPERATIONS.md](OPERATIONS.md#pii-and-totp-key-rotation).
 - `Debug` prints key ids only, never key material.
 - There is no authorization-server JWT-signing key and no `jwks_uri`. The
   `keygen` command emits keys for test fixtures and client-side DPoP only.
 
+## PII field encryption
+
+Reference: AES-256-GCM (`ring`), HKDF-SHA256, HMAC-SHA256.
+
+- The directory columns listed under [Assets](#assets) are sealed in the
+  application with a versioned AES-256-GCM field codec
+  (`src/crypto/field.rs`). The key is derived from the PII master key with
+  HKDF-SHA256 (info `pii-field-gcm-v1`), never from the TOTP key.
+- A keyed-HMAC blind index (`{kid}:{hex}`, info `pii-blind-index-v1`) is stored
+  for the columns that are looked up or must stay unique: `email_index`, the
+  two mTLS indexes, and `uri_index`. Encrypted bytes cannot be compared or made
+  unique directly, so the index is what enforces uniqueness and equality.
+- A read accepts candidates across every retained key id, newest first, so a
+  lookup keeps working while an old key is retained. A create or register path
+  runs an explicit dual-predicate uniqueness pre-check because a partial unique
+  index cannot span a sealed row and a not-yet-backfilled plaintext row.
+- TOTP secrets use a per-row envelope (blob version 3): a random DEK wrapped by
+  a key derived from the TOTP key (info `totp-kek-v1`). The data AAD excludes
+  the key id, so a DEK can be re-wrapped under a new key without re-encrypting
+  the secret. Versions 1 and 2 still decrypt.
+- Decryption of a stored ciphertext is fail-closed: a tampered, truncated,
+  unknown-key, or undecodable blob maps to `AppError::PiiDecrypt`
+  (`temporarily_unavailable`, `503`) and emits the `pii.decrypt_failure` audit
+  event with the request id. No value or plaintext is written to the event.
+- **Out of scope.** An attacker who already has database write access can move
+  an entire encrypted body between rows (full-blob substitution) or replay a
+  sealed value. Field encryption binds ciphertext to a key, not to a row
+  identity, and defending against a write-capable adversary would require row
+  binding or a MAC over the row that this release does not add. This is a
+  documented threat-model boundary, not a defect.
+
 ## Master key custody
 
-- The token pepper and the TOTP-encryption key are the server's master keys.
-  They live in the versioned `KeyRing` (`src/keys.rs`), loaded once at startup
-  from configuration. Nothing re-reads or fetches them later.
+- The token pepper, the TOTP-encryption key, and the PII field-encryption key
+  are the server's master keys. They live in the versioned `KeyRing`
+  (`src/keys.rs`), loaded once at startup from configuration. Nothing re-reads
+  or fetches them later.
 - **Hard requirement.** A master key must never be stored in Postgres, captured
   in the same backup or restore as Postgres, baked into an image layer, placed
   in a ConfigMap, or injected into the process environment by the shipped
-  manifests. A database dump plus its backup must not yield either key.
+  manifests. A database dump plus its backup must not yield any of the three
+  keys.
 - Losing the token pepper invalidates every live opaque access and refresh
   token, because only keyed HMAC hashes are persisted and the pepper is the
-  HMAC key.
-- The real config surface is small: inline `token_pepper` /
-  `totp_encryption_key`, or the mounted-file forms `token_pepper_file` /
-  `totp_encryption_key_file`. When both are set the inline value wins
-  (`resolve_secret` in `src/config/build.rs`). The key ids default to `v1`
-  through `token_pepper_id` / `totp_key_id` (`src/config/raw.rs`).
+  HMAC key. Losing the PII key makes every sealed directory value unreadable.
+- The real config surface is small: inline `token_pepper`, `totp_encryption_key`,
+  and `pii_encryption_key`, or the mounted-file forms `token_pepper_file`,
+  `totp_encryption_key_file`, and `pii_encryption_key_file`. When both are set
+  the inline value wins (`resolve_secret` in `src/config/build.rs`). The key ids
+  default to `v1` through `token_pepper_id` / `totp_key_id` / `pii_key_id`
+  (`src/config/raw.rs`). Each purpose may retain one previous key
+  (`*_previous_key` / `*_previous_key_file`) with an explicit, distinct
+  `*_previous_key_id`; a previous key without its active key is a config error.
 - The shipped cluster manifests never use the inline or environment forms: the
   Secret file-mounts the keys `0400` on a tmpfs volume at `/run/secrets`, and
-  the loader reads them through `D_OAUTH_TOKEN_PEPPER_FILE` /
-  `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` (`deploy/k8s/secret.yaml`,
-  `deploy/k8s/configmap.yaml`). The ConfigMap carries only non-secret settings.
+  the loader reads them through `D_OAUTH_TOKEN_PEPPER_FILE`,
+  `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, and `D_OAUTH_PII_ENCRYPTION_KEY_FILE`
+  (`deploy/k8s/secret.yaml`, `deploy/k8s/configmap.yaml`). The ConfigMap carries
+  only non-secret settings; the previous keys stay optional and are never
+  required in a workload.
 - **The server does not talk to a KMS or an HSM.** It has no cloud SDK and no
   key-fetch code path. Sourcing a key from a KMS/HSM or a secret manager is the
   deployment's responsibility; this section is a documented contract, not an
@@ -211,9 +256,10 @@ Custody, in order of preference:
 
 Custody and rotation interact. Retain the old pepper key id for at least the
 refresh lifetime, or live tokens stop verifying; retain the old TOTP key id
-only long enough to re-enroll users, then drop it. The full order is above; a
-rotation that removes an id early is a deliberate invalidation of what that key
-protects.
+only long enough to re-enroll users or re-wrap blobs, then drop it; retain the
+old PII key id until `pii rotate` has re-encrypted every value and recomputed
+every blind index, then drop it. A rotation that removes an id early is a
+deliberate invalidation of what that key protects.
 
 The operator procedure for custody and KMS/HSM sourcing lives in
 [DEPLOYMENT.md](DEPLOYMENT.md#master-key-custody-and-kmshsm).
@@ -311,6 +357,9 @@ security rationale and checklist.
   Treat the grant family as compromised.
 - Repeated `login.failure` for one subject means a credential-stuffing attempt.
 - `admin.bootstrap.force` means an admin was created despite an existing one.
+- `pii.decrypt_failure` means a stored PII or TOTP ciphertext failed to open
+  (tamper, truncation, or a missing key id). Treat it as possible data
+  corruption or key-store drift; it carries only the request id, never a value.
 - A spike in `503` on security endpoints means a dependency is down; the server
   is failing closed, not open.
 
@@ -338,19 +387,19 @@ store can be shown untouched.
 | --- | --- | --- |
 | User passwords | Argon2id PHC, salted | Offline cracking only. |
 | Client secrets | Argon2id PHC | Offline cracking only. |
-| TOTP secrets | AES-256-GCM under HKDF-SHA256 (info `totp-gcm-v2`; pre-migration v1 blobs under bare `SHA256(totp_key)` still decrypt) | Readable only if the TOTP key also leaks. |
+| TOTP secrets | Per-row DEK wrapped by AES-256-GCM under HKDF-SHA256 (info `totp-kek-v1`; a re-wrap keeps the data ciphertext unchanged); v1/v2 blobs still decrypt | Readable only if the TOTP key also leaks. |
 | TOTP recovery codes | Argon2id PHC | Offline cracking only. |
 | DCR registration access tokens | Keyed HMAC (`registration_access_token_hash`) | Opaque while the pepper stays outside the dump. |
-| Emails, client names, contacts, redirect URIs, JAR `request_uris`, `jwks_uri`, scopes, entitlements | Plaintext | Full disclosure. |
+| Emails, client names, contacts, redirect URIs, JAR `request_uris`, `jwks_uri`, software ids, mTLS subject DNs and certificate thumbprints | Sealed AES-256-GCM under HKDF-SHA256 (info `pii-field-gcm-v1`), with keyed-HMAC blind indexes in `_index` | Opaque without the PII key. The blind indexes are deterministic tags, not plaintext, but they do reveal equality within one key generation. |
+| Scopes, entitlements, timestamps, actor ids | Plaintext | Metadata disclosure. |
 | Client public keys (`jwks`) | Plaintext | Public by design. |
-| `tls_client_auth_subject_dn` and certificate thumbprints | Plaintext | Identifier disclosure. |
 | `is_admin`, `disabled`, `must_change_password`, `totp_enabled`, timestamps | Plaintext | Metadata disclosure. |
 | Client registration metadata (`grant_types`, `response_types`, `token_endpoint_auth_method`, `software_id`, `active`, `dpop_bound_access_tokens`, `client_id_issued_at`, `client_secret_expires_at`) and catalog metadata (scope/redirect `description`, `enabled`, `kind`, actor ids `granted_by`/`created_by`/`attached_by`) | Plaintext | Metadata disclosure. |
 
-If the key store leaked too, the dump is a full compromise: TOTP secrets
-decrypt, the Argon2id hashes are the only barrier left on passwords and client
-secrets, and registration-access-token hashes can be recomputed. Respond in the
-order below.
+If the key store leaked too, the dump is a full compromise: TOTP secrets and
+the sealed directory decrypt, the Argon2id hashes are the only barrier left on
+passwords and client secrets, and registration-access-token hashes can be
+recomputed. Respond in the order below.
 
 ### Full-database-disclosure rotation order
 
@@ -363,14 +412,25 @@ exposed; do not skip ahead because a later step looks cheaper.
    that retires tokens the dump cannot reconstruct. Retain the old id only to
    keep live tokens verifying, which is the opposite of what a breach response
    wants; a full disclosure drops it.
-2. **TOTP encryption key second.** Make a new key active. Existing TOTP blobs
-   stay readable only while the old key is retained; once it is removed every
-   user must re-enroll. Re-enroll with `user enroll-totp` before the old key is
-   dropped, or the user cannot complete TOTP.
-3. **Client secrets third.** Rotate every confidential client secret through
+2. **TOTP encryption key second.** Make a new key active with the old key
+   retained. Existing TOTP blobs stay readable while the old key is retained;
+   run `totp rewrap` to re-wrap every v3 per-row DEK under the new key (the data
+   ciphertext is untouched), or re-enroll with `user enroll-totp` before the old
+   key is dropped. Once the old key is removed, a blob still naming it cannot
+   decrypt.
+3. **PII field-encryption key third.** Make a new PII key active with the old
+   key retained, then run `pii rotate` under a write freeze (the app tier scaled
+   to zero). Rotation re-encrypts every `_enc` value and recomputes every blind
+   index under the new key, in bounded transactions under an advisory lock. The
+   blind index is key-dependent, so uniqueness is only enforced within one key
+   generation during the window; the freeze is what keeps a duplicate from
+   slipping between generations. Run `pii verify` and only then retire the old
+   key. See
+   [OPERATIONS.md](OPERATIONS.md#pii-and-totp-key-rotation).
+4. **Client secrets fourth.** Rotate every confidential client secret through
    RFC 7592 `PUT /register/{client_id}`, which mints a fresh secret when the
    method is secret-based and returns it once.
-4. **DCR registration tokens last.** The same `PUT /register/{client_id}` call
+5. **DCR registration tokens last.** The same `PUT /register/{client_id}` call
    rotates the registration access token on every update, and the response
    carries the only copy. Do not re-issue DCR tokens by replaying an
    initial-access token; it is single-use and consumed at registration.
@@ -396,6 +456,7 @@ service up mid-rotation. The operator checklist with concrete commands is in
 ## File and directory references
 
 - `src/crypto/` for token minting, hashing, TOTP, and constant-time compare.
+- `src/crypto/field.rs` for the PII field codec and keyed blind index.
 - `src/keys.rs` for the key ring.
 - `src/protocol/token/types.rs` for the sender-constraint matrix.
 - `src/jose/dpop.rs`, `src/jose/jar.rs`,

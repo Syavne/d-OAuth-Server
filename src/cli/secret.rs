@@ -1,13 +1,17 @@
 //! Secret handling for the CLI: password hashing, token hashing, TOTP-secret
 //! encryption, and ES256 keygen.
 //!
-//! Nothing here ever logs or prints a secret. TOTP secrets are encrypted with
-//! AES-256-GCM under a key derived from the active [`crate::keys::KeyRing`]
-//! TOTP key via HKDF-SHA256 (info `totp-gcm-v2`); the stored blob carries the
-//! key id so retained keys keep decrypting after rotation. Version-1 blobs
-//! (bare `SHA256(totp_key)`) still decrypt via a legacy fallback. `keygen`
-//! emits an ES256 keypair for test fixtures
-//! and client-side DPoP keys only — never an AS signing key.
+//! Nothing here ever logs or prints a secret. TOTP secrets use the same blob
+//! format as [`crate::crypto::totp`]: the writer is version-gated, emitting the
+//! v3 per-row-DEK envelope when `envelope = true` and the legacy v2
+//! HKDF-SHA256 blob (info `totp-gcm-v2`) otherwise. Version-3 blobs wrap a
+//! random DEK under HKDF-SHA256 (`totp-kek-v1`) and seal the data with a fixed
+//! AAD that never names the kid, so `totp rewrap` can move a DEK to a new key
+//! without touching the ciphertext. Version-2 and legacy version-1
+//! (bare `SHA256(totp_key)`) blobs still decrypt. The two implementations are
+//! intentionally small duplicates: `crypto` cannot depend on `cli`. `keygen`
+//! emits an ES256 keypair for test fixtures and client-side DPoP keys only —
+//! never an AS signing key.
 
 use base64::{
   Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
@@ -21,21 +25,32 @@ use ring::{
 use secrecy::ExposeSecret as _;
 #[cfg(test)]
 use sha2::{Digest as _, Sha256};
+use zeroize::Zeroizing;
 
 use super::context::CliError;
 use crate::config::Config;
 
-/// Current TOTP-blob format version (HKDF-SHA256 writes).
+/// Legacy v2 blob version (HKDF-SHA256 writes while `pii_dual_write` is on).
 const TOTP_BLOB_VERSION: u8 = 2;
+/// Envelope blob version (per-row DEK): written when `envelope = true`.
+const TOTP_BLOB_V3: u8 = 3;
 /// Legacy blob version (bare-`SHA256(totp_key)` writes): decrypt-only.
 #[cfg(test)]
 const TOTP_BLOB_V1: u8 = 1;
 /// HKDF domain-separation label binding the derived key to TOTP AES-GCM use.
 const HKDF_INFO: &[u8] = b"totp-gcm-v2";
+/// HKDF domain-separation label for the key-encryption key that wraps v3 DEKs.
+const KEK_INFO: &[u8] = b"totp-kek-v1";
+/// AAD sealing the v3 data ciphertext: format tag plus version only. It must
+/// NOT name the wrapping key, so a DEK re-wrap changes the wrap without
+/// touching this ciphertext.
+const DATA_AAD: &[u8] = b"totp-v3\x03";
 /// AES-GCM nonce length.
 const NONCE_LEN: usize = 12;
 /// AES-256 key length.
 const KEY_LEN: usize = 32;
+/// Wrapped-DEK length: a 32-byte DEK sealed under AES-256-GCM (16-byte tag).
+const WRAPPED_DEK_LEN: usize = 32 + 16;
 
 /// A generated ES256 keypair, serialized for test fixtures / DPoP clients.
 pub struct KeypairPem {
@@ -84,13 +99,25 @@ pub fn token_hash(config: &Config, token: &str) -> Result<String, CliError> {
 
 /// Encrypt a TOTP secret with the active TOTP-encryption key.
 ///
-/// Blob layout: `version(2) || kid_len(1) || kid || nonce(12) || ciphertext+tag`.
-/// The key id travels with the blob so retained keys decrypt after rotation.
+/// The writer is version-gated: `envelope = false` (while `pii_dual_write` is
+/// on) writes the legacy v2 blob so old replicas keep reading; `envelope =
+/// true` writes the v3 per-row-DEK envelope. Callers pass
+/// `!config.pii_dual_write`.
 ///
 /// # Errors
 /// Returns [`CliError::Crypto`] when no TOTP key is configured or the AEAD
 /// fails.
-pub fn encrypt_totp(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliError> {
+pub fn encrypt_totp(config: &Config, plaintext: &str, envelope: bool) -> Result<Vec<u8>, CliError> {
+  if envelope {
+    encrypt_v3(config, plaintext)
+  } else {
+    encrypt_v2(config, plaintext)
+  }
+}
+
+/// Legacy v2 write: `version(2) || kid_len(1) || kid || nonce(12) ||
+/// ciphertext+tag`, AES-256-GCM under HKDF-SHA256 with empty AAD.
+fn encrypt_v2(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliError> {
   let (key_id, secret) = config
     .keys
     .active_totp_key()
@@ -127,11 +154,99 @@ pub fn encrypt_totp(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliErro
   Ok(blob)
 }
 
+/// Envelope write: `version(3) || kid_len(1) || kid || wrap_nonce(12) ||
+/// wrapped_dek(32+16) || data_nonce(12) || secret_ct+tag`.
+///
+/// A random 32-byte DEK is generated per write, wrapped under a KEK derived
+/// via HKDF-SHA256 (info `totp-kek-v1`) from the active TOTP key, and the
+/// secret is sealed under the DEK. The data nonce is generated FIRST because
+/// the wrap AAD binds it: a wrapped DEK lifted from another row names the
+/// wrong nonce and fails to unwrap.
+fn encrypt_v3(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliError> {
+  let (key_id, secret) = config
+    .keys
+    .active_totp_key()
+    .ok_or_else(|| CliError::Crypto("no TOTP encryption key configured".to_owned()))?;
+  let kid = key_id.as_str().as_bytes();
+  if kid.len() > u8::MAX as usize {
+    return Err(CliError::Crypto("TOTP key id is too long".to_owned()));
+  }
+  let kek = Zeroizing::new(
+    derive_labeled(secret.expose_secret().as_bytes(), KEK_INFO)
+      .map_err(|_| CliError::Crypto("TOTP key derivation failed".to_owned()))?,
+  );
+  let rng = SystemRandom::new();
+  let mut data_nonce = [0u8; NONCE_LEN];
+  rng
+    .fill(&mut data_nonce)
+    .map_err(|_| CliError::Crypto("operating-system randomness unavailable".to_owned()))?;
+  let mut wrap_nonce = [0u8; NONCE_LEN];
+  rng
+    .fill(&mut wrap_nonce)
+    .map_err(|_| CliError::Crypto("operating-system randomness unavailable".to_owned()))?;
+  let mut dek = Zeroizing::new([0u8; KEY_LEN]);
+  rng
+    .fill(&mut dek[..])
+    .map_err(|_| CliError::Crypto("operating-system randomness unavailable".to_owned()))?;
+  let mut wrapped: Vec<u8> = dek.to_vec();
+  seal_with_aad(
+    &kek[..],
+    wrap_nonce,
+    &wrap_aad(kid, &data_nonce),
+    &mut wrapped,
+  )?;
+  let mut data_ct = plaintext.as_bytes().to_vec();
+  seal_with_aad(&dek[..], data_nonce, DATA_AAD, &mut data_ct)?;
+  let mut blob =
+    Vec::with_capacity(2 + kid.len() + NONCE_LEN + WRAPPED_DEK_LEN + NONCE_LEN + data_ct.len());
+  blob.push(TOTP_BLOB_V3);
+  blob.push(kid.len() as u8);
+  blob.extend_from_slice(kid);
+  blob.extend_from_slice(&wrap_nonce);
+  blob.extend_from_slice(&wrapped);
+  blob.extend_from_slice(&data_nonce);
+  blob.extend_from_slice(&data_ct);
+  Ok(blob)
+}
+
+/// Wrap AAD binding a wrapped DEK to its row: format tag, version, wrapping
+/// kid, and the data nonce the DEK was sealed for.
+fn wrap_aad(kid: &[u8], data_nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
+  let mut aad = Vec::with_capacity(DATA_AAD.len() + 1 + kid.len() + NONCE_LEN);
+  aad.extend_from_slice(DATA_AAD);
+  aad.push(kid.len() as u8);
+  aad.extend_from_slice(kid);
+  aad.extend_from_slice(data_nonce);
+  aad
+}
+
+/// Seal `in_out` in place under `key` and `aad`, appending the GCM tag.
+fn seal_with_aad(
+  key: &[u8],
+  nonce_bytes: [u8; NONCE_LEN],
+  aad: &[u8],
+  in_out: &mut Vec<u8>,
+) -> Result<(), CliError> {
+  let sealing = LessSafeKey::new(
+    UnboundKey::new(&AES_256_GCM, key)
+      .map_err(|_| CliError::Crypto("TOTP key rejected by AEAD".to_owned()))?,
+  );
+  sealing
+    .seal_in_place_append_tag(
+      Nonce::assume_unique_for_key(nonce_bytes),
+      Aad::from(aad),
+      in_out,
+    )
+    .map_err(|_| CliError::Crypto("TOTP secret encryption failed".to_owned()))
+}
+
 /// Decrypt a TOTP secret previously produced by [`encrypt_totp`].
 ///
-/// Version-2 blobs open under the HKDF-SHA256 key; legacy version-1 blobs
-/// first try the HKDF key, then fall back to the bare-`SHA256(totp_key)` key,
-/// so rows written before the HKDF migration keep decrypting.
+/// Version-3 envelopes unwrap the per-row DEK under the HKDF-SHA256 KEK, then
+/// open the data ciphertext; version-2 blobs open under the HKDF-SHA256 key;
+/// legacy version-1 blobs first try the HKDF key, then fall back to the
+/// bare-`SHA256(totp_key)` key, so rows written before the HKDF migration keep
+/// decrypting.
 ///
 /// Currently exercised only by tests; the login/verification path (a later
 /// task) is the production consumer.
@@ -141,7 +256,9 @@ pub fn encrypt_totp(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliErro
 /// authentication failure.
 #[cfg(test)]
 pub fn decrypt_totp(config: &Config, blob: &[u8]) -> Result<String, CliError> {
-  if blob.len() < 2 + NONCE_LEN || (blob[0] != TOTP_BLOB_VERSION && blob[0] != TOTP_BLOB_V1) {
+  if blob.len() < 2 + NONCE_LEN
+    || (blob[0] != TOTP_BLOB_V3 && blob[0] != TOTP_BLOB_VERSION && blob[0] != TOTP_BLOB_V1)
+  {
     return Err(CliError::Crypto("malformed TOTP blob".to_owned()));
   }
   let version = blob[0];
@@ -150,13 +267,19 @@ pub fn decrypt_totp(config: &Config, blob: &[u8]) -> Result<String, CliError> {
   if blob.len() < header + NONCE_LEN {
     return Err(CliError::Crypto("malformed TOTP blob".to_owned()));
   }
-  let kid = std::str::from_utf8(&blob[2..header])
+  let kid_bytes = blob
+    .get(2..header)
+    .ok_or_else(|| CliError::Crypto("malformed TOTP blob".to_owned()))?;
+  let kid = std::str::from_utf8(kid_bytes)
     .map_err(|_| CliError::Crypto("malformed TOTP key id".to_owned()))?;
   let secret = config
     .keys
     .totp_key_by_id(kid)
     .ok_or_else(|| CliError::Crypto(format!("unknown TOTP key id: {kid}")))?;
   let ikm = secret.expose_secret().as_bytes();
+  if version == TOTP_BLOB_V3 {
+    return decrypt_v3(ikm, kid_bytes, &blob[header..]);
+  }
 
   let mut nonce_bytes = [0u8; NONCE_LEN];
   nonce_bytes.copy_from_slice(&blob[header..header + NONCE_LEN]);
@@ -175,12 +298,67 @@ pub fn decrypt_totp(config: &Config, blob: &[u8]) -> Result<String, CliError> {
   open_with_key(&derive_key_legacy(ikm), &nonce_bytes, ciphertext)
 }
 
+/// Open a v3 envelope body: `wrap_nonce(12) || wrapped_dek(32+16) ||
+/// data_nonce(12) || secret_ct+tag`.
+///
+/// The KEK is re-derived from the key named in the blob; the wrap AAD rebinds
+/// that kid plus the stored data nonce, so a wrapped DEK copied from another
+/// row fails closed.
+#[cfg(test)]
+fn decrypt_v3(ikm: &[u8], kid: &[u8], body: &[u8]) -> Result<String, CliError> {
+  if body.len() < NONCE_LEN + WRAPPED_DEK_LEN + NONCE_LEN + 16 {
+    return Err(CliError::Crypto("malformed TOTP blob".to_owned()));
+  }
+  let (wrap_nonce, rest) = body.split_at(NONCE_LEN);
+  let (wrapped_dek, rest) = rest.split_at(WRAPPED_DEK_LEN);
+  let (data_nonce, ciphertext) = rest.split_at(NONCE_LEN);
+  let mut wrap_nonce_bytes = [0u8; NONCE_LEN];
+  wrap_nonce_bytes.copy_from_slice(wrap_nonce);
+  let mut data_nonce_bytes = [0u8; NONCE_LEN];
+  data_nonce_bytes.copy_from_slice(data_nonce);
+  let kek = Zeroizing::new(
+    derive_labeled(ikm, KEK_INFO)
+      .map_err(|_| CliError::Crypto("TOTP key derivation failed".to_owned()))?,
+  );
+  let dek_bytes = open_with_aad(
+    &kek[..],
+    &wrap_nonce_bytes,
+    &wrap_aad(kid, &data_nonce_bytes),
+    wrapped_dek,
+  )?;
+  if dek_bytes.len() != KEY_LEN {
+    return Err(CliError::Crypto("TOTP secret decryption failed".to_owned()));
+  }
+  let mut dek_key = [0u8; KEY_LEN];
+  dek_key.copy_from_slice(&dek_bytes);
+  let dek = Zeroizing::new(dek_key);
+  let plaintext = open_with_aad(&dek[..], &data_nonce_bytes, DATA_AAD, ciphertext)?;
+  String::from_utf8(plaintext)
+    .map_err(|_| CliError::Crypto("decrypted TOTP secret is not UTF-8".to_owned()))
+}
+
+/// Open `ciphertext` (with trailing GCM tag) under `key` with empty AAD,
+/// returning UTF-8.
 #[cfg(test)]
 fn open_with_key(
   key: &[u8; KEY_LEN],
   nonce_bytes: &[u8; NONCE_LEN],
   ciphertext: &[u8],
 ) -> Result<String, CliError> {
+  let plaintext = open_with_aad(key, nonce_bytes, &[], ciphertext)?;
+  String::from_utf8(plaintext)
+    .map_err(|_| CliError::Crypto("decrypted TOTP secret is not UTF-8".to_owned()))
+}
+
+/// Open `ciphertext` (with trailing GCM tag) under `key` and `aad`, returning
+/// the raw plaintext.
+#[cfg(test)]
+fn open_with_aad(
+  key: &[u8],
+  nonce_bytes: &[u8; NONCE_LEN],
+  aad: &[u8],
+  ciphertext: &[u8],
+) -> Result<Vec<u8>, CliError> {
   let mut in_out = ciphertext.to_vec();
   let unbound = UnboundKey::new(&AES_256_GCM, key)
     .map_err(|_| CliError::Crypto("TOTP key rejected by AEAD".to_owned()))?;
@@ -188,12 +366,11 @@ fn open_with_key(
   let plaintext = opening
     .open_in_place(
       Nonce::assume_unique_for_key(*nonce_bytes),
-      Aad::empty(),
+      Aad::from(aad),
       &mut in_out,
     )
     .map_err(|_| CliError::Crypto("TOTP secret decryption failed".to_owned()))?;
-  String::from_utf8(plaintext.to_vec())
-    .map_err(|_| CliError::Crypto("decrypted TOTP secret is not UTF-8".to_owned()))
+  Ok(plaintext.to_vec())
 }
 
 /// Generate a fresh 160-bit TOTP secret, base32 (RFC 4648, no padding).
@@ -259,8 +436,15 @@ pub fn generate_es256() -> Result<KeypairPem, CliError> {
 }
 
 fn derive_key(totp_key: &[u8]) -> Result<[u8; KEY_LEN], ring::error::Unspecified> {
+  derive_labeled(totp_key, HKDF_INFO)
+}
+
+/// HKDF-SHA256 (RFC 5869, empty salt) under an explicit domain-separation
+/// label: `totp-gcm-v2` seals data directly, `totp-kek-v1` wraps v3 DEKs.
+fn derive_labeled(totp_key: &[u8], info: &[u8]) -> Result<[u8; KEY_LEN], ring::error::Unspecified> {
   let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(totp_key);
-  let okm = prk.expand(&[HKDF_INFO], HkdfAesKey)?;
+  let info_labels = [info];
+  let okm = prk.expand(&info_labels, HkdfAesKey)?;
   let mut key = [0u8; KEY_LEN];
   okm.fill(&mut key)?;
   Ok(key)

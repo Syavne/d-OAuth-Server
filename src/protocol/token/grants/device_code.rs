@@ -136,10 +136,10 @@ pub async fn poll_device(
       AppError::invalid_client_non_basic()
     }
   };
-  let client = client_repo::find_active_by_client_id(state.pool, inputs.client_id.trim())
-    .await
-    .map_err(AppError::from)?
-    .ok_or_else(unknown_client)?;
+  let client =
+    client_repo::find_active_by_client_id(state.pool, state.keys, inputs.client_id.trim())
+      .await?
+      .ok_or_else(unknown_client)?;
   let method = client.auth_method().map_err(|_| unknown_client())?;
   if !client.grant_types.iter().any(|grant| grant == DEVICE_GRANT) {
     return Err(AppError::unauthorized_client("client may not use the device grant").into());

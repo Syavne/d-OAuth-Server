@@ -13,13 +13,18 @@ contract WITHOUT a live cluster:
 - PDB: `minAvailable: 2`.
 - Service: never exposes the health port (8081).
 - Hardening: `automountServiceAccountToken: false` and `fsGroup: 65532`; every
-  secret (token pepper, TOTP key, database and Redis passwords) must be
-  file-mounted from `d-oauth-secrets` at `/run/secrets` (`defaultMode: 0400`)
-  and referenced with its `*_FILE` variable; the inline
-  `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` envs FAIL, and any
-  workload env that injects a secret FAILS (`secretKeyRef`, `envFrom.secretRef`,
-  a literal value embedding a DSN password, or a workload redefinition of
-  `D_OAUTH_DATABASE__URL` / `D_OAUTH_REDIS__URL`).
+  secret (token pepper, TOTP key, mandatory PII key, database and Redis
+  passwords) must be file-mounted from `d-oauth-secrets` at `/run/secrets`
+  (`defaultMode: 0400`) and referenced with its `*_FILE` variable; the inline
+  `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` /
+  `D_OAUTH_PII_ENCRYPTION_KEY` / `D_OAUTH_PII_PREVIOUS_KEY` /
+  `D_OAUTH_TOTP_PREVIOUS_KEY` envs FAIL, and any workload env that injects a
+  secret FAILS (`secretKeyRef`, `envFrom.secretRef`, a literal value embedding a
+  DSN password, or a workload redefinition of `D_OAUTH_DATABASE__URL` /
+  `D_OAUTH_REDIS__URL`). The PII key is mandatory in every workload; the
+  previous PII/TOTP keys are OPTIONAL, but any `*_PREVIOUS_KEY_FILE` reference
+  must point at `/run/secrets/<basename>` with `<basename>` actually projected
+  by the secret volume's `items`.
 - ConfigMap: the ConfigMap referenced by a workload `envFrom` must provide the
   passwordless `D_OAUTH_DATABASE__URL` / `D_OAUTH_REDIS__URL` DSNs, and neither
   may embed a password (it belongs in the Secret, read through the
@@ -59,7 +64,15 @@ import yaml
 HEALTH_PORT = 8081
 PUBLIC_PORT = 8080
 TERMINATION_GRACE_MIN = 45
-SECRET_NAME_RE = re.compile(r"(?i)(pepper|password|secret|private[_-]?key|totp)")
+SECRET_NAME_RE = re.compile(
+  r"(?i)("
+  r"pepper|password|secret|private[_-]?key"
+  r"|pii[_-]?encryption[_-]?key(?!_id)"
+  r"|pii[_-]?previous[_-]?key(?!_id)"
+  r"|totp[_-]?previous[_-]?key(?!_id)"
+  r"|totp[_-]?(encryption[_-]?)?key(?!_id)"
+  r")"
+)
 PEM_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|-----BEGIN CERTIFICATE-----")
 DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
 HIGH_ENTROPY_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=_-]{32,}$")
@@ -80,10 +93,27 @@ SECRET_VOLUME_MODE = 0o400
 FILE_SECRET_ENV_KEYS = {
   "D_OAUTH_TOKEN_PEPPER_FILE": "token-pepper",
   "D_OAUTH_TOTP_ENCRYPTION_KEY_FILE": "totp-encryption-key",
+  "D_OAUTH_PII_ENCRYPTION_KEY_FILE": "pii-encryption-key",
   "D_OAUTH_DATABASE__PASSWORD_FILE": "database-password",
   "D_OAUTH_REDIS__PASSWORD_FILE": "redis-password",
 }
-INLINE_SECRET_ENVS = ("D_OAUTH_TOKEN_PEPPER", "D_OAUTH_TOTP_ENCRYPTION_KEY")
+INLINE_SECRET_ENVS = (
+  "D_OAUTH_TOKEN_PEPPER",
+  "D_OAUTH_TOTP_ENCRYPTION_KEY",
+  "D_OAUTH_PII_ENCRYPTION_KEY",
+  "D_OAUTH_PII_PREVIOUS_KEY",
+  "D_OAUTH_TOTP_PREVIOUS_KEY",
+)
+# The previous keys are OPTIONAL, so their `_FILE` forms are not in
+# FILE_SECRET_ENV_KEYS (that set is mandatory in every workload). They are
+# still secret-shaped, so a workload that references them must file-mount them.
+OPTIONAL_FILE_SECRET_ENVS = (
+  "D_OAUTH_PII_PREVIOUS_KEY_FILE",
+  "D_OAUTH_TOTP_PREVIOUS_KEY_FILE",
+)
+OPTIONAL_FILE_SECRET_RE = re.compile(
+  rf"^{re.escape(SECRETS_MOUNT_PATH)}/(?P<basename>[^/]+)$"
+)
 PASSWORDLESS_DSN_KEYS = ("D_OAUTH_DATABASE__URL", "D_OAUTH_REDIS__URL")
 REQUIRED_EGRESS_PORTS = (53, 5432, 6379)
 METADATA_CIDR = "169.254.0.0/16"
@@ -276,6 +306,24 @@ def check_file_mounted_secrets(
     entry = envs.get(env_name) or {}
     if (entry.get("value") or "").strip() != expected:
       fails.add(f"{workload}/{cname}: {env_name} must point at {expected}")
+  for env_name in OPTIONAL_FILE_SECRET_ENVS:
+    entry = envs.get(env_name)
+    if entry is None:
+      continue
+    value = (entry.get("value") or "").strip()
+    match = OPTIONAL_FILE_SECRET_RE.fullmatch(value)
+    if match is None:
+      fails.add(
+        f"{workload}/{cname}: {env_name} must point at "
+        f"{SECRETS_MOUNT_PATH}/<basename>, not a literal value"
+      )
+      continue
+    basename = match.group("basename")
+    if basename not in set(items.values()):
+      fails.add(
+        f"{workload}/{cname}: {env_name} points at {value} but the "
+        f"{SECRET_NAME} volume does not project {basename!r}"
+      )
 
 
 def policy_ports(rule: dict) -> set[int]:

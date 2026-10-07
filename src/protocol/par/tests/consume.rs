@@ -50,8 +50,15 @@ async fn par_push_stores_one_time_record() -> Result<(), TestError> {
   let (_guard, mut h) = harness().await?;
   let client_id = "par-public-client";
   let redirect_uri = "https://client.example.test/cb";
-  insert_client(&h.pool, client_id, TokenEndpointAuthMethod::None, None).await?;
-  attach_redirect(&h.pool, client_id, redirect_uri).await?;
+  insert_client(
+    &h.pool,
+    &h.keys,
+    client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+  )
+  .await?;
+  attach_redirect(&h.pool, &h.keys, client_id, redirect_uri).await?;
 
   let endpoint = h.endpoint.clone();
   let request_uri = push_public(&mut h, &endpoint, client_id, redirect_uri).await?;
@@ -94,16 +101,30 @@ async fn par_authorize_binds_client_and_rejects_replay() -> Result<(), TestError
   let client_a = "par-client-a";
   let client_b = "par-client-b";
   let redirect_uri = "https://client.example.test/cb";
-  insert_client(&h.pool, client_a, TokenEndpointAuthMethod::None, None).await?;
-  insert_client(&h.pool, client_b, TokenEndpointAuthMethod::None, None).await?;
-  attach_redirect(&h.pool, client_a, redirect_uri).await?;
-  attach_redirect(&h.pool, client_b, redirect_uri).await?;
+  insert_client(
+    &h.pool,
+    &h.keys,
+    client_a,
+    TokenEndpointAuthMethod::None,
+    None,
+  )
+  .await?;
+  insert_client(
+    &h.pool,
+    &h.keys,
+    client_b,
+    TokenEndpointAuthMethod::None,
+    None,
+  )
+  .await?;
+  attach_redirect(&h.pool, &h.keys, client_a, redirect_uri).await?;
+  attach_redirect(&h.pool, &h.keys, client_b, redirect_uri).await?;
 
   let endpoint = h.endpoint.clone();
   let request_uri = push_public(&mut h, &endpoint, client_a, redirect_uri).await?;
 
   let issuer = "https://auth.example.test";
-  let client_row_b = client_repo::find_active_by_client_id(&h.pool, client_b)
+  let client_row_b = client_repo::find_active_by_client_id(&h.pool, &h.keys, client_b)
     .await?
     .ok_or_else(|| TestError::Unexpected("client B missing".to_owned()))?;
   let query_b = HashMap::from([
@@ -129,7 +150,7 @@ async fn par_authorize_binds_client_and_rejects_replay() -> Result<(), TestError
   // The failed foreign attempt consumed the record (single-use Lua): a fresh
   // push is required for the legitimate first use.
   let request_uri = push_public(&mut h, &endpoint, client_a, redirect_uri).await?;
-  let client_row_a = client_repo::find_active_by_client_id(&h.pool, client_a)
+  let client_row_a = client_repo::find_active_by_client_id(&h.pool, &h.keys, client_a)
     .await?
     .ok_or_else(|| TestError::Unexpected("client A missing".to_owned()))?;
   let query_a = HashMap::from([

@@ -1,8 +1,10 @@
 //! `test(login)` authentication suite: cookies, uniform rejects, replay, binding.
 
-use axum::extract::{Query, State};
+use axum::Extension;
+use axum::extract::{Form, Query, State};
 use axum::http::{StatusCode, header};
 use axum_extra::extract::CookieJar;
+use sqlx::Row as _;
 
 use super::{
   Harness, LoginAttempt, TestError, TestResult, TestUser, app_state, attempt, cookie_header,
@@ -14,12 +16,13 @@ use crate::{
     redirect_repo::{self, RedirectKind},
     user_repo,
   },
-  error::OAuthErrorCode,
+  error::{AppError, OAuthErrorCode},
+  middleware::request_id::RequestId,
   store::{pending, sessions},
   ui::login::{
-    CONSENT_PATH, LOCKOUT_THRESHOLD, LOCKOUT_WINDOW, LOGIN_SUCCESS_PATH, LoginOutcome,
+    CONSENT_PATH, LOCKOUT_THRESHOLD, LOCKOUT_WINDOW, LOGIN_SUCCESS_PATH, LoginForm, LoginOutcome,
     LoginPageQuery, attempt_login, bind_pending_request, get_login, get_logout, load_session,
-    session_cookie,
+    post_login, session_cookie,
   },
 };
 
@@ -127,7 +130,7 @@ async fn get_logout_destroys_session_and_clears_cookie() -> TestResult {
   };
 
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), jar).await;
+  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
 
   if response.status() != StatusCode::OK {
     return Err(unexpected(
@@ -161,7 +164,12 @@ async fn get_logout_destroys_session_and_clears_cookie() -> TestResult {
 #[tokio::test]
 async fn get_logout_without_session_is_idempotent() -> TestResult {
   let h = harness().await?;
-  let response = get_logout(State(app_state(&h)), CookieJar::new()).await;
+  let response = get_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    CookieJar::new(),
+  )
+  .await;
   if response.status() != StatusCode::OK {
     return Err(unexpected(
       "GET /logout without a session must still succeed",
@@ -186,6 +194,8 @@ async fn bind_logout_flow(
 ) -> Result<String, TestError> {
   let client = client_repo::insert(
     &h.pool,
+    &h.config.keys,
+    false,
     &NewClient {
       id: uuid::Uuid::new_v4(),
       client_id: client_id.to_owned(),
@@ -208,18 +218,22 @@ async fn bind_logout_flow(
     },
   )
   .await?;
-  let row = redirect_repo::upsert(
+  let (row, _) = redirect_repo::upsert(
     &h.pool,
-    uuid::Uuid::new_v4(),
-    post_logout_uri,
-    RedirectKind::PostLogout,
-    "logout test",
-    None,
+    &h.config.keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: uuid::Uuid::new_v4(),
+      uri: post_logout_uri,
+      kind: RedirectKind::PostLogout,
+      description: "logout test",
+      created_by: None,
+    },
   )
   .await?;
   redirect_repo::attach(&h.pool, &client.client_id, row.id, None).await?;
   if !enabled {
-    redirect_repo::disable(&h.pool, row.id).await?;
+    redirect_repo::disable(&h.pool, &h.config.keys, row.id).await?;
   }
   let request_id =
     pending::new_request_id().map_err(|_| TestError::Unexpected("rng".to_owned()))?;
@@ -275,7 +289,7 @@ async fn get_logout_redirects_to_bound_post_logout_uri() -> TestResult {
   .await?;
 
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), jar).await;
+  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
 
   if response.status() != StatusCode::SEE_OTHER {
     return Err(unexpected("a bound logout must redirect"));
@@ -313,7 +327,7 @@ async fn get_logout_ignores_disabled_post_logout_uri() -> TestResult {
   .await?;
 
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), jar).await;
+  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
 
   if response.status() != StatusCode::OK {
     return Err(unexpected("a disabled post-logout URI must not redirect"));
@@ -339,7 +353,7 @@ async fn get_logout_ignores_deactivated_client() -> TestResult {
   client_repo::deactivate(&h.pool, "logout-inactive").await?;
 
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), jar).await;
+  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
 
   if response.status() != StatusCode::OK {
     return Err(unexpected(
@@ -697,6 +711,257 @@ async fn login_authenticated_session_rebinds_fresh_request() -> TestResult {
     return Err(unexpected(
       "GET /login must rebind the session to the fresh request",
     ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn login_attempt_success() -> TestResult {
+  let mut h = harness().await?;
+  // Mixed case on purpose: the session subject must be the normalized
+  // plaintext email, while the stored row stays encrypt-only.
+  let user = create_user(
+    &mut h,
+    "Login-Ok@Example.Test",
+    "correct-horse-20",
+    false,
+    true,
+  )
+  .await?;
+  let at_rest = sqlx::query("SELECT email, email_enc FROM users WHERE id = $1")
+    .bind(user.id)
+    .fetch_one(&h.pool)
+    .await?;
+  let plain: Option<String> = at_rest.try_get("email")?;
+  let sealed: Option<Vec<u8>> = at_rest.try_get("email_enc")?;
+  if plain.is_some() {
+    return Err(unexpected("encrypt-only must blank the email plaintext"));
+  }
+  if sealed.is_none() {
+    return Err(unexpected("the sealed email must be stored"));
+  }
+  let request_id = pending_request(&mut h).await?;
+  let (pre, csrf) = presession(&mut h).await?;
+  {
+    let mut deps = deps_of(&mut h);
+    bind_pending_request(&mut deps, &pre, &request_id, "login-test-client", None).await?;
+  }
+  let code = current_code(&user, &h)?;
+  let session_id = match try_login(&mut h, attempt(&pre, &csrf, &user, &code)).await? {
+    LoginOutcome::Authenticated {
+      session_id,
+      redirect_to,
+    } => {
+      if redirect_to != CONSENT_PATH {
+        return Err(unexpected("a bound login must reach consent"));
+      }
+      session_id
+    }
+    _ => return Err(unexpected("correct credentials must authenticate")),
+  };
+  let live = load_session(&mut h.conn, &h.store, &session_id)
+    .await?
+    .ok_or_else(|| unexpected("the new session must be stored"))?;
+  if live.record.subject != "login-ok@example.test" {
+    return Err(unexpected(
+      "the session subject must be the normalized plaintext email",
+    ));
+  }
+  if !live.record.mfa_verified || live.record.restricted {
+    return Err(unexpected("the session must be full and owned"));
+  }
+  // A disabled user is rejected exactly as before.
+  let off = create_user(
+    &mut h,
+    "login-off@example.test",
+    "correct-horse-21",
+    false,
+    true,
+  )
+  .await?;
+  if !user_repo::disable_user(&h.pool, off.id).await? {
+    return Err(unexpected("disable must update a row"));
+  }
+  let (pre, csrf) = presession(&mut h).await?;
+  let off_code = current_code(&off, &h)?;
+  match try_login(&mut h, attempt(&pre, &csrf, &off, &off_code)).await? {
+    LoginOutcome::Rejected => {}
+    _ => return Err(unexpected("a disabled account must be rejected")),
+  }
+  // A wrong TOTP code is rejected exactly as before.
+  let bad_code = wrong_code(&user, &h)?;
+  let (pre, csrf) = presession(&mut h).await?;
+  match try_login(&mut h, attempt(&pre, &csrf, &user, &bad_code)).await? {
+    LoginOutcome::Rejected => {}
+    _ => return Err(unexpected("a wrong TOTP code must be rejected")),
+  }
+  // A corrupt stored ciphertext fails closed as `PiiDecrypt` (503): never a
+  // 500, never an authentication, and the error carries no plaintext.
+  let corrupt: &[u8] = b"corrupt-blob";
+  sqlx::query("UPDATE users SET email_enc = $1 WHERE id = $2")
+    .bind(corrupt)
+    .bind(user.id)
+    .execute(&h.pool)
+    .await?;
+  let (pre, csrf) = presession(&mut h).await?;
+  match try_login(&mut h, attempt(&pre, &csrf, &user, &code)).await {
+    Err(TestError::App(error)) => {
+      if !matches!(error, AppError::PiiDecrypt) {
+        return Err(unexpected("a corrupt email_enc must be PiiDecrypt"));
+      }
+      if error.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return Err(unexpected("a decrypt failure must be 503, never 500"));
+      }
+      if format!("{error:?}").contains("login-ok") {
+        return Err(unexpected("a decrypt error must not leak plaintext"));
+      }
+    }
+    Err(_) => return Err(unexpected("a corrupt email_enc must surface PiiDecrypt")),
+    Ok(_) => return Err(unexpected("a corrupt row must never authenticate")),
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn logout_redirects_to_registered_uri() -> TestResult {
+  let mut h = harness().await?;
+  let uri = "https://client.example.test/signed-out";
+  let session_id = bind_logout_flow(
+    &mut h,
+    "logout-registered",
+    "logout-registered@example.test",
+    uri,
+    true,
+  )
+  .await?;
+  // The logout path reads the DECRYPTED client row: plaintext is blanked.
+  let at_rest = sqlx::query(
+    "SELECT client_name, client_name_enc FROM oauth_clients WHERE client_id = 'logout-registered'",
+  )
+  .fetch_one(&h.pool)
+  .await?;
+  let plain: Option<String> = at_rest.try_get("client_name")?;
+  let sealed: Option<Vec<u8>> = at_rest.try_get("client_name_enc")?;
+  if plain.is_some() {
+    return Err(unexpected("encrypt-only must blank the client name"));
+  }
+  if sealed.is_none() {
+    return Err(unexpected("the sealed client name must be stored"));
+  }
+  let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
+  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
+  if response.status() != StatusCode::SEE_OTHER {
+    return Err(unexpected("a bound logout must redirect"));
+  }
+  let location = response
+    .headers()
+    .get(header::LOCATION)
+    .and_then(|value| value.to_str().ok())
+    .unwrap_or_default();
+  if location != uri {
+    return Err(unexpected(
+      "the redirect must be exactly the registered post-logout URI",
+    ));
+  }
+  if sessions::get(&mut h.conn, &h.store, &session_id)
+    .await?
+    .is_some()
+  {
+    return Err(unexpected("the session must still be destroyed"));
+  }
+  // A corrupt stored client name fails closed with 503: no redirect to the
+  // bound URI and no neutral page.
+  let other_uri = "https://client.example.test/other-out";
+  let other = bind_logout_flow(
+    &mut h,
+    "logout-corrupt",
+    "logout-corrupt@example.test",
+    other_uri,
+    true,
+  )
+  .await?;
+  let corrupt: &[u8] = b"corrupt-blob";
+  sqlx::query("UPDATE oauth_clients SET client_name_enc = $1 WHERE client_id = 'logout-corrupt'")
+    .bind(corrupt)
+    .execute(&h.pool)
+    .await?;
+  let jar = CookieJar::new().add(session_cookie(&h.config, &other));
+  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
+  if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+    return Err(unexpected("a corrupt client row must fail closed with 503"));
+  }
+  if response.headers().get(header::LOCATION).is_some() {
+    return Err(unexpected("a decrypt failure must never redirect"));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn login_corrupt_totp_ciphertext_fails_closed_with_503() -> TestResult {
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "auth-corrupt-totp@example.test",
+    "correct-horse-09",
+    false,
+    true,
+  )
+  .await?;
+  let code = current_code(&user, &h)?;
+  // Sanity: correct credentials authenticate before corruption.
+  let (pre, csrf) = presession(&mut h).await?;
+  match try_login(&mut h, attempt(&pre, &csrf, &user, &code)).await? {
+    LoginOutcome::Authenticated { .. } => {}
+    _ => return Err(unexpected("correct credentials must authenticate")),
+  }
+  // Corrupt the stored TOTP blob at rest.
+  let corrupt: &[u8] = b"corrupt-blob";
+  sqlx::query("UPDATE users SET totp_secret_enc = $1 WHERE id = $2")
+    .bind(corrupt)
+    .bind(user.id)
+    .execute(&h.pool)
+    .await?;
+  // The core path surfaces `PiiDecrypt` (503): never a 500, never an
+  // authentication, and the error carries no plaintext.
+  let (pre, csrf) = presession(&mut h).await?;
+  match try_login(&mut h, attempt(&pre, &csrf, &user, &code)).await {
+    Err(TestError::App(error)) => {
+      if !matches!(error, AppError::PiiDecrypt) {
+        return Err(unexpected("a corrupt totp_secret_enc must be PiiDecrypt"));
+      }
+      if error.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return Err(unexpected("a TOTP decrypt failure must be 503, never 500"));
+      }
+      if format!("{error:?}").contains(&user.email) {
+        return Err(unexpected("a decrypt error must not leak plaintext"));
+      }
+    }
+    Err(_) => {
+      return Err(unexpected(
+        "a corrupt totp_secret_enc must surface PiiDecrypt",
+      ));
+    }
+    Ok(_) => return Err(unexpected("a corrupt row must never authenticate")),
+  }
+  // The HTTP layer renders 503 through the same `Err` arm that routes
+  // `PiiDecrypt` into `emit_pii_decrypt` (`pii.decrypt_failure`).
+  let (pre, csrf) = presession(&mut h).await?;
+  let jar = CookieJar::new().add(session_cookie(&h.config, &pre));
+  let form = LoginForm {
+    email: user.email.clone(),
+    password: user.password.clone(),
+    code,
+    csrf,
+  };
+  let response = post_login(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(form),
+  )
+  .await;
+  if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+    return Err(unexpected("a corrupt TOTP row must render 503"));
   }
   Ok(())
 }

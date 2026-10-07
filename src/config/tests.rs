@@ -32,6 +32,8 @@ fn base() -> Map<String, Value> {
     "token_pepper_id": "v1",
     "totp_encryption_key": "SUPER_SECRET_TOTP_KEY",
     "totp_key_id": "v1",
+    "pii_encryption_key": "SUPER_SECRET_PII_KEY",
+    "pii_key_id": "v1",
     "cookie_secure": true,
     "allow_open_registration": false,
     "dcr_redirect_policy": "catalog",
@@ -249,6 +251,7 @@ fn config_debug_redacts_secret_values() -> Result<(), Box<dyn Error>> {
   let rendered = format!("{cfg:?}");
   assert!(!rendered.contains("SUPER_SECRET_PEPPER_VALUE"));
   assert!(!rendered.contains("SUPER_SECRET_TOTP_KEY"));
+  assert!(!rendered.contains("SUPER_SECRET_PII_KEY"));
   assert!(!rendered.contains("DB_PASSWORD_XYZ"));
   assert!(rendered.contains("REDACTED"));
   Ok(())
@@ -285,6 +288,188 @@ fn config_env_double_underscore_maps_to_nested_snake_keys() -> Result<(), Box<dy
     raw.token_pepper.as_deref(),
     Some("dev-only-pepper-ROTATE-IN-PROD-000000")
   );
+  Ok(())
+}
+
+#[test]
+fn config_rejects_missing_pii_key() {
+  let result = try_load(&without("pii_encryption_key"));
+  assert!(matches!(
+    result,
+    Err(ConfigError::KeyRing(KeyRingError::MissingPiiKey))
+  ));
+}
+
+#[test]
+fn config_rejects_empty_active_pii_key() {
+  let mut map = base();
+  map.insert(
+    "pii_encryption_key".to_owned(),
+    Value::String("   ".to_owned()),
+  );
+  let result = try_load(&map);
+  assert!(matches!(
+    result,
+    Err(ConfigError::KeyRing(KeyRingError::MissingPiiKey))
+  ));
+
+  let path = std::env::temp_dir().join(format!("d-oauth-empty-pii-key-{}.txt", std::process::id()));
+  if std::fs::write(&path, "").is_ok() {
+    let mut file_map = base();
+    file_map.remove("pii_encryption_key");
+    file_map.insert(
+      "pii_encryption_key_file".to_owned(),
+      Value::String(path.to_string_lossy().into_owned()),
+    );
+    let result = try_load(&file_map);
+    let _ = std::fs::remove_file(&path);
+    assert!(matches!(
+      result,
+      Err(ConfigError::KeyRing(KeyRingError::MissingPiiKey))
+    ));
+  }
+}
+
+#[test]
+fn config_builds_pii_chain() -> Result<(), Box<dyn Error>> {
+  let mut map = base();
+  map.insert(
+    "pii_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PII_PREVIOUS".to_owned()),
+  );
+  map.insert(
+    "pii_previous_key_id".to_owned(),
+    Value::String("v0".to_owned()),
+  );
+  map.insert("pii_dual_write".to_owned(), Value::Bool(true));
+  let cfg = try_load(&map)?;
+  let active = cfg.keys.active_pii_key().ok_or("missing active pii key")?;
+  assert_eq!(active.0.as_str(), "v1");
+  let retained = cfg
+    .keys
+    .pii_key_by_id("v0")
+    .ok_or("missing retained pii key")?;
+  assert!(!cfg.keys.pii_key_by_id("v9").is_some());
+  let _ = retained;
+  let ids: Vec<&str> = cfg
+    .keys
+    .pii_keys_newest_first()
+    .map(|(id, _)| id.as_str())
+    .collect();
+  assert_eq!(ids, vec!["v1", "v0"]);
+  assert!(cfg.pii_dual_write);
+
+  let dual_default = try_load(&base())?;
+  assert!(!dual_default.pii_dual_write);
+  Ok(())
+}
+
+#[test]
+fn config_rejects_previous_key_without_id() {
+  let mut map = base();
+  map.insert(
+    "pii_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PII_PREVIOUS".to_owned()),
+  );
+  let result = try_load(&map);
+  assert!(matches!(result, Err(ConfigError::MissingPreviousKeyId)));
+
+  let mut same_id = base();
+  same_id.insert(
+    "pii_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PII_PREVIOUS".to_owned()),
+  );
+  same_id.insert(
+    "pii_previous_key_id".to_owned(),
+    Value::String("v1".to_owned()),
+  );
+  let result = try_load(&same_id);
+  assert!(matches!(result, Err(ConfigError::MissingPreviousKeyId)));
+
+  let mut totp = base();
+  totp.insert(
+    "totp_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_TOTP_PREVIOUS".to_owned()),
+  );
+  let result = try_load(&totp);
+  assert!(matches!(result, Err(ConfigError::MissingPreviousKeyId)));
+}
+
+#[test]
+fn config_rejects_previous_key_without_active() {
+  let mut pii = without("pii_encryption_key");
+  pii.insert(
+    "pii_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PII_PREVIOUS".to_owned()),
+  );
+  pii.insert(
+    "pii_previous_key_id".to_owned(),
+    Value::String("v0".to_owned()),
+  );
+  let result = try_load(&pii);
+  assert!(matches!(
+    result,
+    Err(ConfigError::KeyRing(KeyRingError::MissingPiiKey))
+  ));
+
+  let mut totp = without("totp_encryption_key");
+  totp.insert(
+    "totp_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_TOTP_PREVIOUS".to_owned()),
+  );
+  totp.insert(
+    "totp_previous_key_id".to_owned(),
+    Value::String("v0".to_owned()),
+  );
+  let result = try_load(&totp);
+  assert!(matches!(
+    result,
+    Err(ConfigError::KeyRing(KeyRingError::MissingTotpKey))
+  ));
+}
+
+#[test]
+fn config_treats_empty_previous_key_as_absent() -> Result<(), Box<dyn Error>> {
+  let mut map = base();
+  map.insert(
+    "pii_previous_key".to_owned(),
+    Value::String("   ".to_owned()),
+  );
+  map.insert(
+    "pii_previous_key_id".to_owned(),
+    Value::String("v0".to_owned()),
+  );
+  let cfg = try_load(&map)?;
+  let ids: Vec<&str> = cfg
+    .keys
+    .pii_keys_newest_first()
+    .map(|(id, _)| id.as_str())
+    .collect();
+  assert_eq!(ids, vec!["v1"]);
+
+  let path = std::env::temp_dir().join(format!(
+    "d-oauth-empty-pii-previous-{}.txt",
+    std::process::id()
+  ));
+  if std::fs::write(&path, "").is_ok() {
+    let mut file_map = base();
+    file_map.insert(
+      "pii_previous_key_file".to_owned(),
+      Value::String(path.to_string_lossy().into_owned()),
+    );
+    file_map.insert(
+      "pii_previous_key_id".to_owned(),
+      Value::String("v0".to_owned()),
+    );
+    let cfg = try_load(&file_map)?;
+    let _ = std::fs::remove_file(&path);
+    let ids: Vec<&str> = cfg
+      .keys
+      .pii_keys_newest_first()
+      .map(|(id, _)| id.as_str())
+      .collect();
+    assert_eq!(ids, vec!["v1"]);
+  }
   Ok(())
 }
 

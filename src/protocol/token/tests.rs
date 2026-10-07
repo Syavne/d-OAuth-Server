@@ -105,6 +105,7 @@ fn ring(pairs: &[(&str, &str)]) -> Result<KeyRing, TestError> {
   KeyRing::from_parts(
     peppers,
     vec![(KeyId::new("v1"), SecretString::from("totp-test-secret"))],
+    vec![(KeyId::new("v1"), SecretString::from("pii-test-secret"))],
   )
   .map_err(TestError::from)
 }

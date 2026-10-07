@@ -73,7 +73,7 @@ pub(super) async fn fresh_proofs(
     TokenEndpointAuthMethod::TlsClientAuth | TokenEndpointAuthMethod::SelfSignedTlsClientAuth => {
       let leaf = inputs.peer_certs.and_then(|chain| chain.chain().first());
       Some(
-        mtls::authenticate(state.pool, client, leaf)
+        mtls::authenticate(state.pool, state.keys, client, leaf)
           .await
           .map_err(mtls::MtlsError::into_app_error)?
           .x5t_s256,
@@ -114,6 +114,7 @@ async fn authenticate_confidential(
   };
   let mut auth = AuthStores {
     pool: state.pool,
+    keys: state.keys,
     conn: &mut *state.conn,
     store: state.store,
   };

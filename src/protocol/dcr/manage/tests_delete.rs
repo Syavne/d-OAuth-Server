@@ -29,6 +29,7 @@ async fn dcr_manage_cross_client_forbidden() -> TestResult {
     tls_client_auth_subject_dn: None,
     dpop_bound_access_tokens: Some(true),
     contacts: None,
+    request_uris: None,
     software_id: None,
   };
 
@@ -70,7 +71,9 @@ async fn dcr_manage_cross_client_forbidden() -> TestResult {
     Err(error) => expect_forbidden(error)?,
   }
 
-  let row = client_repo::find_active_by_client_id(&harness.pool, &second.client_id).await?;
+  let row =
+    client_repo::find_active_by_client_id(&harness.pool, &harness.config.keys, &second.client_id)
+      .await?;
   if row.is_none() {
     return Err(TestError::Unexpected(
       "victim client changed by cross-client calls".to_owned(),
@@ -96,15 +99,19 @@ async fn dcr_manage_delete_deactivates() -> TestResult {
     .map_err(|error| TestError::Unexpected(format!("delete failed: {error:?}")))?;
   }
 
-  if client_repo::find_active_by_client_id(&harness.pool, &registered.client_id)
-    .await?
-    .is_some()
+  if client_repo::find_active_by_client_id(
+    &harness.pool,
+    &harness.config.keys,
+    &registered.client_id,
+  )
+  .await?
+  .is_some()
   {
     return Err(TestError::Unexpected(
       "deleted client still active".to_owned(),
     ));
   }
-  let listed = client_repo::list(&harness.pool, true).await?;
+  let listed = client_repo::list(&harness.pool, &harness.config.keys, true).await?;
   let kept = listed
     .iter()
     .find(|row| row.client_id == registered.client_id)

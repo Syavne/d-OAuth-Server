@@ -86,6 +86,7 @@ pub fn test_config(pg_url: &str, redis: Value) -> Result<Config, ConfigError> {
     "redis": redis,
     "token_pepper": "health-test-pepper-0123456789abcdef",
     "totp_encryption_key": "health-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "health-test-pii-key-0123456789abcdef",
   });
   let source = ::config::Config::try_from(&fixture)?;
   Config::from_source(source)

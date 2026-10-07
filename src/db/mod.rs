@@ -11,7 +11,7 @@ pub mod user_repo;
 pub mod user_scope_repo;
 
 pub use client_repo::{Client, ClientMetadata, NewClient, TokenEndpointAuthMethod};
-pub use redirect_repo::{RedirectKind, RedirectUri};
+pub use redirect_repo::{NewRedirectUri, RedirectKind, RedirectUri, UpsertOutcome};
 
 /// Test-only scaffolding shared by the repository suites.
 ///

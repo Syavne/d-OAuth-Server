@@ -57,8 +57,9 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::error::AppError;
 use crate::jose::dpop::{DpopRequest, verify_dpop};
+use crate::middleware::audit::AuditEvent;
 use crate::middleware::ratelimit::RateLimitLayer;
-use crate::middleware::request_id::RequestIdLayer;
+use crate::middleware::request_id::{REQUEST_ID_HEADER, RequestId, RequestIdLayer};
 use crate::middleware::security_headers::{
   SecurityHeadersLayer, StripProxyHeadersLayer, cors_layer,
 };
@@ -219,6 +220,7 @@ async fn authorize_entry(
   let store = Store::from_config(&state.config.redis);
   let input = authorize::AuthorizeInput {
     pool: &state.pool,
+    keys: &state.keys,
     conn: &mut conn,
     store: &store,
     issuer: &state.config.issuer,
@@ -226,7 +228,19 @@ async fn authorize_entry(
   };
   let validated = match authorize::validate(input).await {
     Ok(validated) => validated,
-    Err(failure) => return failure.into_response(),
+    Err(failure) => {
+      if failure.is_pii_decrypt() {
+        let request_id = headers
+          .get(REQUEST_ID_HEADER)
+          .and_then(|value| value.to_str().ok())
+          .and_then(RequestId::parse);
+        AuditEvent::PiiDecryptFailure {
+          request_id: request_id.as_ref().map(RequestId::as_str),
+        }
+        .emit();
+      }
+      return failure.into_response();
+    }
   };
   let dpop_jkt = match headers.get("dpop").and_then(|value| value.to_str().ok()) {
     Some(proof) => {
@@ -359,6 +373,7 @@ mod router_tests {
       "redis": {"url": redis_url, "durability": "waitaof"},
       "token_pepper": "router-test-pepper-0123456789abcdef",
       "totp_encryption_key": "router-test-totp-key-0123456789abcdef",
+      "pii_encryption_key": "router-test-pii-key-0123456789abcdef",
       "rate_limit": rate_limit,
       "cors_allowed_origins": cors_origins,
     });
@@ -387,6 +402,7 @@ mod router_tests {
       redis: RedisConn::Single(manager),
       config: Arc::new(config),
       keys,
+      transition_unsafe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
       clock: Clock::system(),
     })
   }

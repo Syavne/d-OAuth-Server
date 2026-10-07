@@ -2,7 +2,7 @@
 
 use super::read_client;
 use super::support::{
-  TestError, TestResult, harness, manage_parts, register, seed_redirect, seed_scope,
+  TestError, TestResult, harness, manage_parts, register, register_mtls, seed_redirect, seed_scope,
 };
 use super::update::update_client;
 use crate::db::{client_repo, redirect_repo};
@@ -25,6 +25,7 @@ fn put_request(
     tls_client_auth_subject_dn: None,
     dpop_bound_access_tokens: Some(true),
     contacts: None,
+    request_uris: None,
     software_id: None,
   }
 }
@@ -33,13 +34,22 @@ fn put_request(
 async fn dcr_manage_update_full_replace_rotates() -> TestResult {
   let (_guard, mut harness) = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", Some("read")).await?;
-  seed_redirect(&harness.pool, "https://app.example.test/other").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/other",
+  )
+  .await?;
   seed_scope(&harness.pool, "write").await?;
-  let issued_before = client_repo::find_active_by_client_id(&harness.pool, &registered.client_id)
-    .await?
-    .ok_or_else(|| TestError::Unexpected("client row missing".to_owned()))?
-    .client_id_issued_at
-    .unix_timestamp();
+  let issued_before = client_repo::find_active_by_client_id(
+    &harness.pool,
+    &harness.config.keys,
+    &registered.client_id,
+  )
+  .await?
+  .ok_or_else(|| TestError::Unexpected("client row missing".to_owned()))?
+  .client_id_issued_at
+  .unix_timestamp();
 
   let request = put_request(
     vec!["https://app.example.test/other".to_owned()],
@@ -147,8 +157,18 @@ async fn dcr_manage_update_full_replace_rotates() -> TestResult {
 async fn dcr_manage_update_replaces_redirect_attachments() -> TestResult {
   let (_guard, mut harness) = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/a", None).await?;
-  seed_redirect(&harness.pool, "https://app.example.test/b").await?;
-  seed_redirect(&harness.pool, "https://app.example.test/c").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/b",
+  )
+  .await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/c",
+  )
+  .await?;
 
   let request = put_request(
     vec![
@@ -174,7 +194,9 @@ async fn dcr_manage_update_replaces_redirect_attachments() -> TestResult {
       .ok_or_else(|| TestError::Unexpected("missing rotated token".to_owned()))?
   };
 
-  let effective = redirect_repo::effective_for_client(&harness.pool, &registered.client_id).await?;
+  let effective =
+    redirect_repo::effective_for_client(&harness.pool, &harness.config.keys, &registered.client_id)
+      .await?;
   let uris: Vec<String> = effective.into_iter().map(|row| row.uri).collect();
   if uris
     != vec![
@@ -188,6 +210,7 @@ async fn dcr_manage_update_replaces_redirect_attachments() -> TestResult {
   }
   if client_repo::redirect_uri_allowed(
     &harness.pool,
+    &harness.config.keys,
     &registered.client_id,
     "https://app.example.test/a",
   )
@@ -237,6 +260,107 @@ async fn dcr_manage_update_omitted_fields_clear() -> TestResult {
     return Err(TestError::Unexpected(format!(
       "omitted scope not cleared: {}",
       reread.scope
+    )));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn dcr_manage_update_rename() -> TestResult {
+  let (_guard, mut harness) = harness("catalog").await?;
+  let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
+
+  let request = put_request(
+    vec!["https://app.example.test/cb".to_owned()],
+    Some("renamed via manage"),
+    None,
+  );
+  let token = {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    let response = update_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+      &request,
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("update failed: {error:?}")))?;
+    if response.client_name != "renamed via manage" {
+      return Err(TestError::Unexpected(format!(
+        "PUT did not rename: {}",
+        response.client_name
+      )));
+    }
+    response
+      .registration_access_token
+      .ok_or_else(|| TestError::Unexpected("missing rotated token".to_owned()))?
+  };
+
+  let (mut stores, ctx) = manage_parts(&mut harness);
+  let reread = read_client(&mut stores, &ctx, &registered.client_id, Some(&token))
+    .await
+    .map_err(|error| TestError::Unexpected(format!("reread failed: {error:?}")))?;
+  if reread.client_name != "renamed via manage" {
+    return Err(TestError::Unexpected(format!(
+      "GET did not return the renamed value: {}",
+      reread.client_name
+    )));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn dcr_manage_update_same_mtls_identity_ok() -> TestResult {
+  let (_guard, mut harness) = harness("catalog").await?;
+  let subject_dn = "CN=manage-mtls, O=Example";
+  let registered = register_mtls(&mut harness, "https://app.example.test/cb", subject_dn).await?;
+
+  let request = crate::protocol::dcr::RegisterRequest {
+    redirect_uris: Some(vec!["https://app.example.test/cb".to_owned()]),
+    client_name: Some("dcr manage mtls client".to_owned()),
+    token_endpoint_auth_method: Some("tls_client_auth".to_owned()),
+    grant_types: Some(vec!["authorization_code".to_owned()]),
+    response_types: Some(vec!["code".to_owned()]),
+    scope: None,
+    jwks: None,
+    jwks_uri: None,
+    tls_client_auth_subject_dn: Some(subject_dn.to_owned()),
+    dpop_bound_access_tokens: None,
+    contacts: None,
+    request_uris: None,
+    software_id: None,
+  };
+  let token = {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    let response = update_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+      &request,
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("unchanged identity rejected: {error:?}")))?;
+    if response.tls_client_auth_subject_dn.as_deref() != Some(subject_dn) {
+      return Err(TestError::Unexpected(format!(
+        "subject DN changed: {:?}",
+        response.tls_client_auth_subject_dn
+      )));
+    }
+    response
+      .registration_access_token
+      .ok_or_else(|| TestError::Unexpected("missing rotated token".to_owned()))?
+  };
+
+  let (mut stores, ctx) = manage_parts(&mut harness);
+  let reread = read_client(&mut stores, &ctx, &registered.client_id, Some(&token))
+    .await
+    .map_err(|error| TestError::Unexpected(format!("reread failed: {error:?}")))?;
+  if reread.tls_client_auth_subject_dn.as_deref() != Some(subject_dn) {
+    return Err(TestError::Unexpected(format!(
+      "GET returned a different DN: {:?}",
+      reread.tls_client_auth_subject_dn
     )));
   }
   Ok(())

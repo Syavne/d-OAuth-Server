@@ -19,6 +19,7 @@ async fn test_grant_device_pending_then_approved_issues_bound_tokens() -> TestRe
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -26,7 +27,7 @@ async fn test_grant_device_pending_then_approved_issues_bound_tokens() -> TestRe
   )
   .await?;
   setup::enable_scopes(&h.pool, &["orders:read"]).await?;
-  let user_id = setup::entitled_user(&h.pool, &["orders:read"]).await?;
+  let user_id = setup::entitled_user(&h.pool, &h.config, &["orders:read"]).await?;
   let t0 = now_unix();
   let key = keys::fresh_key()?;
   let authorize_htu = keys::device_htu(&h.config);

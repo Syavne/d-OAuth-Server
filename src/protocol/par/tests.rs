@@ -21,11 +21,13 @@ use crate::{
   crypto::secret::{Argon2Params, hash_secret},
   db::{NewClient, TokenEndpointAuthMethod, client_repo, redirect_repo, test_support::Db},
   error::{AppError, OAuthErrorCode},
+  keys::{KeyId, KeyRing},
   protocol::client_auth::ClientAuthRequest,
   state::RedisConn,
   store::Store,
   test_guard::{ContainerGuard, Lease},
 };
+use secrecy::SecretString;
 
 /// Test scaffolding failures (no `unwrap`/`expect` under the deny lints).
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +41,9 @@ enum TestError {
   /// A database operation failed.
   #[error("database error: {0}")]
   Database(#[from] sqlx::Error),
+  /// An application error from a repository helper.
+  #[error("app error: {0}")]
+  App(#[from] AppError),
   /// A crypto operation failed.
   #[error("test crypto error: {0}")]
   Crypto(String),
@@ -54,6 +59,7 @@ struct Harness {
   conn: RedisConn,
   store: Store,
   endpoint: String,
+  keys: KeyRing,
 }
 
 /// Fresh Postgres database plus a throwaway Redis for one test.
@@ -82,6 +88,12 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
     conn: RedisConn::Single(manager),
     store,
     endpoint: "https://auth.example.test/token".to_owned(),
+    keys: KeyRing::from_parts(
+      vec![(KeyId::new("v1"), SecretString::from("par-test-pepper"))],
+      vec![(KeyId::new("v1"), SecretString::from("par-test-totp"))],
+      vec![(KeyId::new("v1"), SecretString::from("par-test-pii"))],
+    )
+    .map_err(|error| TestError::Crypto(format!("{error:?}")))?,
   };
   Ok((guarded, h))
 }
@@ -90,6 +102,7 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
 fn stores_of(h: &mut Harness) -> ParStores<'_> {
   ParStores {
     pool: &h.pool,
+    keys: &h.keys,
     conn: &mut h.conn,
     store: &h.store,
   }
@@ -107,6 +120,7 @@ fn ctx_of(endpoint: &str) -> ParContext<'_> {
 /// Register a client row for PAR tests.
 async fn insert_client(
   pool: &PgPool,
+  keys: &KeyRing,
   client_id: &str,
   method: TokenEndpointAuthMethod,
   secret: Option<&str>,
@@ -137,19 +151,28 @@ async fn insert_client(
     dpop_bound_access_tokens: false,
     registration_access_token_hash: None,
   };
-  client_repo::insert(pool, &new).await?;
+  client_repo::insert(pool, keys, false, &new).await?;
   Ok(())
 }
 
 /// Register a redirect URI in the catalog and attach it to the client.
-async fn attach_redirect(pool: &PgPool, client_id: &str, uri: &str) -> Result<(), TestError> {
-  let row = redirect_repo::upsert(
+async fn attach_redirect(
+  pool: &PgPool,
+  keys: &KeyRing,
+  client_id: &str,
+  uri: &str,
+) -> Result<(), TestError> {
+  let (row, _) = redirect_repo::upsert(
     pool,
-    Uuid::new_v4(),
-    uri,
-    redirect_repo::RedirectKind::Authorize,
-    "par test",
-    None,
+    keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: Uuid::new_v4(),
+      uri,
+      kind: redirect_repo::RedirectKind::Authorize,
+      description: "par test",
+      created_by: None,
+    },
   )
   .await?;
   redirect_repo::attach(pool, client_id, row.id, None).await?;

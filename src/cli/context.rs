@@ -51,6 +51,11 @@ pub enum CliError {
   /// A unique record already exists.
   #[error("already exists: {0}")]
   AlreadyExists(String),
+  /// A repository operation failed (typed `AppError`; payload-free variants
+  /// such as `DuplicateEmail` are matched explicitly by callers, never
+  /// through this catch-all).
+  #[error("application error: {0}")]
+  App(#[from] crate::error::AppError),
   /// A cryptographic operation failed (non-secret detail only).
   #[error("crypto failure: {0}")]
   Crypto(String),

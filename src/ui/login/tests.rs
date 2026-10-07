@@ -119,6 +119,7 @@ pub(super) async fn harness() -> Result<Harness, TestError> {
     "redis": {"url": redis_url, "durability": "waitaof"},
     "token_pepper": "login-test-pepper-0123456789abcdef",
     "totp_encryption_key": "login-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "login-test-pii-key-0123456789abcdef",
     "argon2": {"memory_kib": 8192, "iterations": 1, "parallelism": 1},
   });
   let source = ::config::Config::try_from(&fixture)
@@ -154,6 +155,7 @@ pub(super) fn app_state(harness: &Harness) -> crate::state::AppState {
     redis: harness.conn.clone(),
     config: harness.config.clone(),
     keys: std::sync::Arc::new(harness.config.keys.clone()),
+    transition_unsafe: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     clock: crate::state::Clock::fixed(harness.now),
   }
 }
@@ -206,6 +208,8 @@ pub(super) async fn create_user(
   let params = test_params(harness)?;
   let record = user_repo::create_user(
     &harness.pool,
+    &harness.config.keys,
+    harness.config.pii_dual_write,
     &NewUser {
       email: email.to_owned(),
       password_hash: hash_secret(password, &params)?,
@@ -223,7 +227,11 @@ pub(super) async fn create_user(
   };
   if with_totp {
     let secret = totp::generate_secret()?;
-    let blob = totp::encrypt_secret(&harness.config.keys, &secret)?;
+    let blob = totp::encrypt_secret(
+      &harness.config.keys,
+      &secret,
+      !harness.config.pii_dual_write,
+    )?;
     if !user_repo::set_totp_secret(&harness.pool, user.id, &blob).await? {
       return Err(TestError::Unexpected("totp enroll failed".to_owned()));
     }

@@ -104,8 +104,9 @@ Every module has a single responsibility:
 | Area | Path | Owns |
 | --- | --- | --- |
 | Configuration | `src/config.rs`, `src/config/` | Layered env/file load and fail-fast validation. |
-| Keys | `src/keys.rs` | Versioned `KeyRing` for the token pepper and TOTP encryption key. |
+| Keys | `src/keys.rs` | Versioned `KeyRing` for the token pepper, TOTP encryption key, and PII field-encryption key. |
 | Crypto primitives | `src/crypto/` | Constant-time compare, PKCE, token mint/hash, TOTP, secret hashing. |
+| Field encryption | `src/crypto/field.rs` | AES-256-GCM PII field codec and keyed-HMAC blind index. |
 | JOSE | `src/jose/` | DPoP, JAR, `private_key_jwt` verification, JWK parsing. |
 | Postgres repositories | `src/db/` | The six domain tables. |
 | Redis store | `src/store/` | Ephemeral state: codes, tokens, grants, sessions, PAR, device, DCR, rate limits. |

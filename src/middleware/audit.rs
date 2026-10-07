@@ -70,6 +70,14 @@ pub enum AuditEvent<'a> {
     /// Newly registered client identifier.
     client_id: &'a str,
   },
+  /// A stored PII ciphertext failed to open (fail-closed decrypt failure).
+  ///
+  /// Payload-free by construction: only the request id is carried, never
+  /// the value that failed to open and never any plaintext.
+  PiiDecryptFailure {
+    /// Correlating request id, when one is in scope.
+    request_id: Option<&'a str>,
+  },
 }
 
 impl AuditEvent<'_> {
@@ -84,6 +92,7 @@ impl AuditEvent<'_> {
       Self::TokenRevoke { .. } => "token.revoke",
       Self::RefreshReuseDetected { .. } => "token.refresh_reuse_detected",
       Self::DynamicClientRegistered { .. } => "dcr.register",
+      Self::PiiDecryptFailure { .. } => "pii.decrypt_failure",
     }
   }
 
@@ -170,6 +179,13 @@ impl AuditEvent<'_> {
         client_id = %client_id,
         "dynamic client registered"
       ),
+      Self::PiiDecryptFailure { request_id } => info!(
+        target: "audit",
+        event = self.name(),
+        request_id = ?request_id,
+        outcome = "failure",
+        "pii decryption failed"
+      ),
     }
   }
 }
@@ -239,6 +255,10 @@ mod audit_tests {
       }
       .name(),
       "dcr.register"
+    );
+    assert_eq!(
+      AuditEvent::PiiDecryptFailure { request_id: None }.name(),
+      "pii.decrypt_failure"
     );
   }
 }

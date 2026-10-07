@@ -16,6 +16,7 @@ async fn test_grant_device_public_without_dpop_rejected() -> TestResult {
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -67,6 +68,7 @@ async fn test_grant_device_confidential_secret_redeems_bearer() -> TestResult {
   let client_id = unique("conf");
   setup::insert_client(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::ClientSecretPost,
     Some("poll-secret"),
@@ -74,7 +76,7 @@ async fn test_grant_device_confidential_secret_redeems_bearer() -> TestResult {
   )
   .await?;
   setup::enable_scopes(&h.pool, &["orders:read"]).await?;
-  let user_id = setup::entitled_user(&h.pool, &["orders:read"]).await?;
+  let user_id = setup::entitled_user(&h.pool, &h.config, &["orders:read"]).await?;
   let t0 = now_unix();
 
   let authorize_inputs = DeviceHttpInputs {
@@ -134,6 +136,7 @@ async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> Tes
   let client_id = unique("bound-conf");
   setup::insert_client_bound(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::ClientSecretPost,
     Some("bound-secret"),
@@ -142,7 +145,7 @@ async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> Tes
   )
   .await?;
   setup::enable_scopes(&h.pool, &["orders:read"]).await?;
-  let user_id = setup::entitled_user(&h.pool, &["orders:read"]).await?;
+  let user_id = setup::entitled_user(&h.pool, &h.config, &["orders:read"]).await?;
   let t0 = now_unix();
 
   let authorize_inputs = DeviceHttpInputs {

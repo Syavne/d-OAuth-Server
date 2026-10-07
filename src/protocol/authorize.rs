@@ -37,6 +37,8 @@ use crate::{
 pub struct AuthorizeInput<'a> {
   /// Postgres pool for the client, redirect, and scope catalog reads.
   pub pool: &'a PgPool,
+  /// Versioned PII keys for the encrypted client lookup.
+  pub keys: &'a crate::keys::KeyRing,
   /// Redis connection for PAR `request_uri` consumption.
   pub conn: &'a mut RedisConn,
   /// Redis store handle backing the PAR lookup.
@@ -100,6 +102,20 @@ impl AuthorizeFailure {
     }
   }
 
+  /// Whether this failure carries a stored-value decrypt failure: the
+  /// handler audits it as `pii.decrypt_failure` (the repository never emits).
+  #[must_use]
+  pub fn is_pii_decrypt(&self) -> bool {
+    matches!(
+      self,
+      Self::Page(AppError::PiiDecrypt)
+        | Self::Redirect {
+          error: AppError::PiiDecrypt,
+          ..
+        }
+    )
+  }
+
   /// Render the failure as an HTTP response (page or redirect).
   #[must_use]
   pub fn into_response(self) -> Response {
@@ -126,9 +142,8 @@ impl AuthorizeFailure {
 pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, AuthorizeFailure> {
   let client_id = present(input.query.get("client_id"))
     .ok_or_else(|| page(AppError::invalid_request("client_id is required")))?;
-  let client = client_repo::find_active_by_client_id(input.pool, client_id)
+  let client = client_repo::find_active_by_client_id(input.pool, input.keys, client_id)
     .await
-    .map_err(AppError::from)
     .map_err(AuthorizeFailure::Page)?
     .ok_or_else(|| page(AppError::invalid_client_non_basic()))?;
 
@@ -154,9 +169,8 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
 
   let redirect_uri = present(merged.get("redirect_uri"))
     .ok_or_else(|| page(AppError::invalid_request("redirect_uri is required")))?;
-  let effective = redirect_repo::effective_for_client(input.pool, &client.client_id)
+  let effective = redirect_repo::effective_for_client(input.pool, input.keys, &client.client_id)
     .await
-    .map_err(AppError::from)
     .map_err(AuthorizeFailure::Page)?;
   let registered: Vec<&str> = effective.iter().map(|entry| entry.uri.as_str()).collect();
   match redirect_match::match_redirect_uri(&registered, redirect_uri) {
@@ -223,10 +237,10 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
   verify_method(S256_METHOD).map_err(|_| redirect_err(AppError::server_error()))?;
   check_challenge_shape(challenge).map_err(redirect_err)?;
 
-  let post_logout_uri = redirect_repo::post_logout_for_client(input.pool, &client.client_id)
-    .await
-    .map_err(AppError::from)
-    .map_err(AuthorizeFailure::Page)?;
+  let post_logout_uri =
+    redirect_repo::post_logout_for_client(input.pool, input.keys, &client.client_id)
+      .await
+      .map_err(AuthorizeFailure::Page)?;
 
   Ok(ValidatedRequest {
     client_id: client.client_id,

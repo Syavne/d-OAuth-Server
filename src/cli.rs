@@ -27,10 +27,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod admin;
 mod context;
 mod ops;
+mod pii;
 mod redirect;
 mod scope;
 mod secret;
 mod sync;
+mod totp;
 mod user;
 
 #[cfg(test)]
@@ -103,6 +105,18 @@ pub enum Command {
     /// Admin subcommand.
     #[command(subcommand)]
     command: AdminCommand,
+  },
+  /// Re-wrap v3 TOTP secret DEKs under the active TOTP-encryption key.
+  Totp {
+    /// TOTP subcommand.
+    #[command(subcommand)]
+    command: TotpCommand,
+  },
+  /// Backfill and verify sealed PII (migration-role DSN; counts only).
+  Pii {
+    /// PII subcommand.
+    #[command(subcommand)]
+    command: PiiCommand,
   },
   /// Issue a one-time DCR initial-access token.
   InitialAccessToken {
@@ -324,6 +338,26 @@ pub enum AdminCommand {
   },
 }
 
+/// `totp` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum TotpCommand {
+  /// Re-wrap every v3 DEK under the active TOTP-encryption key.
+  Rewrap,
+}
+
+/// `pii` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum PiiCommand {
+  /// Seal remaining plaintext PII and upgrade TOTP blobs to v3. Refuses while
+  /// `pii_dual_write=true`; run only with the app tier scaled to zero.
+  Backfill,
+  /// Report the four cutover checks; exits non-zero when any is dirty.
+  Verify,
+  /// Re-encrypt sealed PII under the active key and recompute blind indexes.
+  /// Run under a write freeze with the previous key retained; idempotent.
+  Rotate,
+}
+
 /// `initial-access-token` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum InitialAccessTokenCommand {
@@ -418,6 +452,16 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
       run_admin(command).await?;
       Ok(0)
     }
+    Command::Totp { command } => {
+      let context = context::Context::from_env().await?;
+      run_totp(&context, command).await?;
+      Ok(0)
+    }
+    Command::Pii { command } => {
+      let context = context::Context::from_env().await?;
+      run_pii(&context, command).await?;
+      Ok(0)
+    }
     Command::InitialAccessToken { command } => {
       run_initial_access_token(command).await?;
       Ok(0)
@@ -471,6 +515,33 @@ async fn run_admin(command: AdminCommand) -> Result<(), CliError> {
       password_file,
       force,
     } => ops::admin_bootstrap(&email, password_file.as_deref(), force).await,
+  }
+}
+
+async fn run_totp(context: &context::Context, command: TotpCommand) -> Result<(), CliError> {
+  match command {
+    TotpCommand::Rewrap => {
+      let report = totp::rewrap(context).await?;
+      println!("{report}");
+      Ok(())
+    }
+  }
+}
+
+async fn run_pii(context: &context::Context, command: PiiCommand) -> Result<(), CliError> {
+  match command {
+    PiiCommand::Backfill => {
+      pii::backfill(context).await?;
+      Ok(())
+    }
+    PiiCommand::Verify => {
+      pii::verify(context).await?;
+      Ok(())
+    }
+    PiiCommand::Rotate => {
+      pii::rotate(context).await?;
+      Ok(())
+    }
   }
 }
 

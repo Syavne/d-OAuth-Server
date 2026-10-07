@@ -115,6 +115,7 @@ pub(super) async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
     "redis": {"url": redis_url, "durability": "waitaof"},
     "token_pepper": "grant-device-test-pepper-0123456789abcdef",
     "totp_encryption_key": "grant-device-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "grant-device-test-pii-key-0123456789abcdef",
     "rate_limit": {"enabled": true, "window_secs": 60, "per_ip": 120,
       "per_client": 300, "login_per_ip": 20, "token_per_client": 60},
   });

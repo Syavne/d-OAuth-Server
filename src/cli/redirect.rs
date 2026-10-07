@@ -1,12 +1,16 @@
 //! `redirect-uri` and `client` subcommands plus the shared URI upsert.
 
-use sqlx::{PgPool, Row as _};
+use sqlx::Row as _;
 use uuid::Uuid;
 
 use super::{
   ClientCommand, RedirectUriCommand,
   context::{CliError, Context, audit},
   scope::Upsert,
+};
+use crate::{
+  crypto::field::blind_index_candidates,
+  db::{NewRedirectUri, RedirectKind, UpsertOutcome, redirect_repo},
 };
 
 /// Run a `redirect-uri` subcommand.
@@ -20,7 +24,7 @@ pub async fn run_uri(context: &Context, command: RedirectUriCommand) -> Result<(
       kind,
       description,
     } => {
-      match upsert(context.pool(), &uri, &kind, description.as_deref(), true).await? {
+      match upsert(context, &uri, &kind, description.as_deref(), true).await? {
         Upsert::Created => println!("created redirect uri {uri}"),
         Upsert::Updated => println!("updated redirect uri {uri}"),
         Upsert::Unchanged => println!("redirect uri {uri} unchanged"),
@@ -56,21 +60,17 @@ pub async fn run_client(context: &Context, command: ClientCommand) -> Result<(),
 }
 
 async fn list(context: &Context) -> Result<(), CliError> {
-  let rows =
-    sqlx::query("SELECT uri, kind, description, enabled FROM redirect_uris ORDER BY uri, kind")
-      .fetch_all(context.pool())
-      .await?;
-  if rows.is_empty() {
+  let uris = redirect_repo::list(context.pool(), &context.config().keys, true).await?;
+  if uris.is_empty() {
     println!("redirect uri catalog is empty");
     return Ok(());
   }
-  for row in rows {
-    let uri: String = row.try_get("uri")?;
-    let kind: String = row.try_get("kind")?;
-    let description: String = row.try_get("description")?;
-    let enabled: bool = row.try_get("enabled")?;
-    let state = if enabled { "enabled" } else { "disabled" };
-    println!("{uri}\t{kind}\t{state}\t{description}");
+  for entry in uris {
+    let state = if entry.enabled { "enabled" } else { "disabled" };
+    println!(
+      "{}\t{}\t{}\t{}",
+      entry.uri, entry.kind, state, entry.description
+    );
   }
   Ok(())
 }
@@ -81,16 +81,11 @@ async fn set_enabled(
   kind: &str,
   enabled: bool,
 ) -> Result<(), CliError> {
-  let affected = sqlx::query(
-    "UPDATE redirect_uris SET enabled = $3, updated_at = now() WHERE uri = $1 AND kind = $2",
-  )
-  .bind(uri)
-  .bind(kind)
-  .bind(enabled)
-  .execute(context.pool())
-  .await?
-  .rows_affected();
-  if affected == 0 {
+  let id = find_redirect_id(context, uri, kind).await?;
+  if redirect_repo::set_enabled(context.pool(), &context.config().keys, id, enabled)
+    .await?
+    .is_none()
+  {
     return Err(CliError::NotFound(format!("redirect uri {uri} ({kind})")));
   }
   let operation = if enabled {
@@ -107,59 +102,27 @@ async fn set_enabled(
 }
 
 async fn delete(context: &Context, uri: &str, kind: &str) -> Result<(), CliError> {
-  let referenced: bool = sqlx::query_scalar(
-    "SELECT EXISTS(
-       SELECT 1 FROM client_redirect_uris c
-       JOIN redirect_uris r ON r.id = c.redirect_uri_id
-       WHERE r.uri = $1 AND r.kind = $2)",
-  )
-  .bind(uri)
-  .bind(kind)
-  .fetch_one(context.pool())
-  .await?;
-  if referenced {
-    let affected = sqlx::query(
-      "UPDATE redirect_uris SET enabled = false, updated_at = now() \
-       WHERE uri = $1 AND kind = $2",
-    )
-    .bind(uri)
-    .bind(kind)
-    .execute(context.pool())
-    .await?
-    .rows_affected();
-    if affected == 0 {
-      return Err(CliError::NotFound(format!("redirect uri {uri} ({kind})")));
-    }
-    audit("redirect_uri.disable", uri);
-    println!("redirect uri {uri} ({kind}) is attached; disabled instead of deleted");
+  let id = find_redirect_id(context, uri, kind).await?;
+  if redirect_repo::delete_if_unattached(context.pool(), id).await? {
+    audit("redirect_uri.delete", uri);
+    println!("deleted redirect uri {uri} ({kind})");
     return Ok(());
   }
-  let affected = sqlx::query("DELETE FROM redirect_uris WHERE uri = $1 AND kind = $2")
-    .bind(uri)
-    .bind(kind)
-    .execute(context.pool())
+  if redirect_repo::set_enabled(context.pool(), &context.config().keys, id, false)
     .await?
-    .rows_affected();
-  if affected == 0 {
+    .is_none()
+  {
     return Err(CliError::NotFound(format!("redirect uri {uri} ({kind})")));
   }
-  audit("redirect_uri.delete", uri);
-  println!("deleted redirect uri {uri} ({kind})");
+  audit("redirect_uri.disable", uri);
+  println!("redirect uri {uri} ({kind}) is attached; disabled instead of deleted");
   Ok(())
 }
 
 async fn attach(context: &Context, client_id: &str, uri: &str, kind: &str) -> Result<(), CliError> {
   ensure_client_exists(context, client_id).await?;
   let redirect_id = find_redirect_id(context, uri, kind).await?;
-  sqlx::query(
-    "INSERT INTO client_redirect_uris (client_id, redirect_uri_id, attached_at)
-     VALUES ($1, $2, now())
-     ON CONFLICT (client_id, redirect_uri_id) DO NOTHING",
-  )
-  .bind(client_id)
-  .bind(redirect_id)
-  .execute(context.pool())
-  .await?;
+  redirect_repo::attach(context.pool(), client_id, redirect_id, None).await?;
   audit("client.attach_redirect_uri", &format!("{client_id}:{uri}"));
   println!("attached {uri} ({kind}) to {client_id}");
   Ok(())
@@ -167,11 +130,7 @@ async fn attach(context: &Context, client_id: &str, uri: &str, kind: &str) -> Re
 
 async fn detach(context: &Context, client_id: &str, uri: &str, kind: &str) -> Result<(), CliError> {
   let redirect_id = find_redirect_id(context, uri, kind).await?;
-  sqlx::query("DELETE FROM client_redirect_uris WHERE client_id = $1 AND redirect_uri_id = $2")
-    .bind(client_id)
-    .bind(redirect_id)
-    .execute(context.pool())
-    .await?;
+  redirect_repo::detach(context.pool(), client_id, redirect_id).await?;
   audit("client.detach_redirect_uri", &format!("{client_id}:{uri}"));
   println!("detached {uri} ({kind}) from {client_id}");
   Ok(())
@@ -179,75 +138,100 @@ async fn detach(context: &Context, client_id: &str, uri: &str, kind: &str) -> Re
 
 async fn list_for_client(context: &Context, client_id: &str) -> Result<(), CliError> {
   ensure_client_exists(context, client_id).await?;
-  let uris: Vec<(String, String)> = sqlx::query_as(
-    "SELECT r.uri, r.kind FROM client_redirect_uris c
-       JOIN redirect_uris r ON r.id = c.redirect_uri_id
-      WHERE c.client_id = $1
-      ORDER BY r.uri, r.kind",
-  )
-  .bind(client_id)
-  .fetch_all(context.pool())
-  .await?;
+  let uris =
+    redirect_repo::list_for_client(context.pool(), &context.config().keys, client_id).await?;
   if uris.is_empty() {
     println!("{client_id} has no attached redirect URIs");
   } else {
-    for (uri, kind) in uris {
-      println!("{uri}\t{kind}");
+    for entry in uris {
+      println!("{}\t{}", entry.uri, entry.kind);
     }
   }
   Ok(())
 }
 
-/// Idempotently create or update a redirect URI.
+/// Idempotently create a catalog redirect URI, or adopt a legacy plaintext row.
+///
+/// The write routes through [`redirect_repo::upsert`] with the PII key ring and
+/// the dual-write flag, so the URI is sealed into `uri_enc` and blind-indexed
+/// into `uri_index`. An already-sealed row is left untouched (`Unchanged`),
+/// which preserves its `description`/`enabled` and keeps `config sync`
+/// idempotent; a declared `enabled` applies only to a freshly created row.
 ///
 /// # Errors
-/// Returns [`CliError::Database`] on failure.
+/// Returns [`CliError`] on a repository or database failure.
 pub async fn upsert(
-  pool: &PgPool,
+  context: &Context,
   uri: &str,
   kind: &str,
   description: Option<&str>,
   enabled: bool,
 ) -> Result<Upsert, CliError> {
-  let description = description.unwrap_or_default();
-  let id = Uuid::new_v4();
-  let row = sqlx::query(
-    "INSERT INTO redirect_uris (id, uri, kind, description, enabled, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, now(), now())
-     ON CONFLICT (uri, kind) DO UPDATE
-       SET description = EXCLUDED.description,
-           enabled = EXCLUDED.enabled,
-           updated_at = now()
-       WHERE redirect_uris.description IS DISTINCT FROM EXCLUDED.description
-          OR redirect_uris.enabled IS DISTINCT FROM EXCLUDED.enabled
-     RETURNING (xmax = 0) AS inserted",
-  )
-  .bind(id)
-  .bind(uri)
-  .bind(kind)
-  .bind(description)
-  .bind(enabled)
-  .fetch_optional(pool)
-  .await?;
-  Ok(match row {
-    Some(row) if row.try_get::<bool, _>("inserted").unwrap_or(false) => Upsert::Created,
-    Some(_) => Upsert::Updated,
-    None => Upsert::Unchanged,
+  let keys = &context.config().keys;
+  if find_existing(context, uri, kind)
+    .await?
+    .is_some_and(|(_, encrypted)| encrypted)
+  {
+    return Ok(Upsert::Unchanged);
+  }
+  let new = NewRedirectUri {
+    id: Uuid::new_v4(),
+    uri,
+    kind: RedirectKind::parse(kind),
+    description: description.unwrap_or_default(),
+    created_by: None,
+  };
+  let (row, outcome) =
+    redirect_repo::upsert(context.pool(), keys, context.config().pii_dual_write, &new).await?;
+  if outcome == UpsertOutcome::Created && !enabled {
+    redirect_repo::set_enabled(context.pool(), keys, row.id, false).await?;
+  }
+  Ok(match outcome {
+    UpsertOutcome::Created => Upsert::Created,
+    UpsertOutcome::Updated => Upsert::Updated,
   })
 }
 
 /// Resolve a catalog redirect-URI id by its exact URI and kind.
 ///
+/// The lookup matches through the keyed blind index (ciphertext rows) with a
+/// plaintext fallback for legacy rows whose `uri_index` is still NULL, so a
+/// sealed catalog stays resolvable.
+///
 /// # Errors
 /// Returns [`CliError::NotFound`] when the URI is not in the catalog.
 pub async fn find_redirect_id(context: &Context, uri: &str, kind: &str) -> Result<Uuid, CliError> {
-  let id: Option<Uuid> =
-    sqlx::query_scalar("SELECT id FROM redirect_uris WHERE uri = $1 AND kind = $2")
-      .bind(uri)
-      .bind(kind)
-      .fetch_optional(context.pool())
-      .await?;
-  id.ok_or_else(|| CliError::NotFound(format!("redirect uri {uri} ({kind})")))
+  find_existing(context, uri, kind)
+    .await?
+    .map(|(id, _)| id)
+    .ok_or_else(|| CliError::NotFound(format!("redirect uri {uri} ({kind})")))
+}
+
+/// Resolve a catalog row's id and whether it already carries ciphertext,
+/// through the blind-index candidates plus the legacy plaintext fallback.
+async fn find_existing(
+  context: &Context,
+  uri: &str,
+  kind: &str,
+) -> Result<Option<(Uuid, bool)>, CliError> {
+  let candidates = blind_index_candidates(&context.config().keys, uri);
+  let row = sqlx::query(
+    "SELECT id, (uri_enc IS NOT NULL) AS encrypted FROM redirect_uris \
+     WHERE kind = $1 AND (uri_index = ANY($2) OR (uri_enc IS NULL AND uri = $3))",
+  )
+  .bind(kind)
+  .bind(&candidates)
+  .bind(uri)
+  .fetch_optional(context.pool())
+  .await?;
+  match row {
+    Some(row) => {
+      let id: Uuid = row.try_get("id")?;
+      let encrypted: bool = row.try_get("encrypted")?;
+      Ok(Some((id, encrypted)))
+    }
+    None => Ok(None),
+  }
 }
 
 /// Ensure an OAuth client exists.

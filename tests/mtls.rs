@@ -20,12 +20,14 @@ use std::{
 
 use certs::FixtureError;
 use d_oauth::{
-  db::client_repo::{self, Client},
+  db::client_repo::{self, Client, NewClient},
   error::{AppError, OAuthErrorCode},
+  keys::{KeyId, KeyRing},
   protocol::mtls::{
     self, MtlsCnf, MtlsError, PROXY_CERT_HEADER, PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS,
   },
 };
+use secrecy::SecretString;
 mod common;
 
 /// The `oauth_clients` migration, embedded byte-for-byte from the repo.
@@ -47,14 +49,44 @@ async fn mtls_postgres() -> Result<sqlx::PgPool, TestError> {
 async fn mtls_migrate(pool: &sqlx::PgPool) -> Result<(), TestError> {
   sqlx::raw_sql(OAUTH_CLIENTS_SQL).execute(pool).await?;
   sqlx::raw_sql(CLIENT_DPOP_BOUND_SQL).execute(pool).await?;
+  sqlx::raw_sql(
+    "ALTER TABLE oauth_clients ALTER COLUMN client_name DROP NOT NULL;
+     ALTER TABLE oauth_clients
+       ADD COLUMN client_name_enc bytea NULL,
+       ADD COLUMN contacts_enc bytea NULL,
+       ADD COLUMN request_uris_enc bytea NULL,
+       ADD COLUMN jwks_uri_enc bytea NULL,
+       ADD COLUMN software_id_enc bytea NULL,
+       ADD COLUMN tls_client_auth_subject_dn_enc bytea NULL,
+       ADD COLUMN tls_client_auth_cert_thumbprint_enc bytea NULL,
+       ADD COLUMN tls_client_auth_subject_dn_index text NULL,
+       ADD COLUMN tls_client_auth_cert_thumbprint_index text NULL;
+     CREATE UNIQUE INDEX ux_oauth_clients_tls_subject_dn_index
+       ON oauth_clients (tls_client_auth_subject_dn_index)
+       WHERE tls_client_auth_subject_dn_index IS NOT NULL;
+     CREATE UNIQUE INDEX ux_oauth_clients_tls_cert_thumbprint_index
+       ON oauth_clients (tls_client_auth_cert_thumbprint_index)
+       WHERE tls_client_auth_cert_thumbprint_index IS NOT NULL;",
+  )
+  .execute(pool)
+  .await?;
   Ok(())
 }
 
-/// `x5t#S256` of the self-signed fixture (minted 2026-10-04; see
-/// `tests/mtls/certs.rs` if fixtures are re-minted).
-const SELF_THUMBPRINT: &str = "9qdr8V8zS6_ay9l9KkxIDqDtLK_JpWmWVeDLEm89VX0";
-/// `x5t#S256` of the CA-signed fixture.
-const PKI_THUMBPRINT: &str = "PC8ir71uIdRIdw1XFkMmoFvGC8Ud4CANxkk4x3BWqAc";
+/// Test PII key ring for the encrypted client projection.
+fn test_keys() -> Result<KeyRing, TestError> {
+  Ok(KeyRing::from_parts(
+    vec![(KeyId::new("v1"), SecretString::from("mtls-test-pepper"))],
+    vec![(KeyId::new("v1"), SecretString::from("mtls-test-totp"))],
+    vec![(KeyId::new("v1"), SecretString::from("mtls-test-pii"))],
+  )?)
+}
+
+/// `x5t#S256` of the self-signed fixture (re-minted 2026-10-06, valid to
+/// 2036-10-03; see `tests/mtls/certs.rs` if fixtures are re-minted).
+const SELF_THUMBPRINT: &str = "UoFOLf7P9QP8478uT1qx-2pZyBJQDdNlbbLyopxl8cA";
+/// `x5t#S256` of the CA-signed fixture (re-minted 2026-10-06).
+const PKI_THUMBPRINT: &str = "VSFBS4-7neqMcHVsx-dcc28rEEemzFvmeqtZSE3xbK8";
 /// Subject of the self-signed fixture in [`mtls::subject_dn`] rendering.
 const SELF_DN: &str = "CN=mtls-test-client, O=Example";
 /// Subject of the CA-signed fixture in [`mtls::subject_dn`] rendering.
@@ -72,6 +104,12 @@ enum TestError {
   /// An mTLS operation failed.
   #[error("mtls error: {0}")]
   Mtls(#[from] MtlsError),
+  /// An application error escaped where success was required.
+  #[error("app error: {0}")]
+  App(#[from] AppError),
+  /// A test key ring was rejected.
+  #[error("key error: {0}")]
+  Keys(#[from] d_oauth::keys::KeyRingError),
   /// A fixture did not decode.
   #[error("fixture error: {0}")]
   Fixture(#[from] FixtureError),
@@ -197,11 +235,11 @@ async fn mtls_registered_thumbprint_binds_cnf() -> TestResult {
     Some(SELF_THUMBPRINT),
   )
   .await?;
-  let client = client_repo::find_active_by_client_id(&pool, "mtls-self")
+  let client = client_repo::find_active_by_client_id(&pool, &test_keys()?, "mtls-self")
     .await?
     .ok_or(MtlsError::UnknownClient)?;
   let leaf = certs::cert_der(certs::CLIENT_SELF_CERT_PEM)?;
-  let cnf = mtls::authenticate(&pool, &client, Some(&leaf)).await?;
+  let cnf = mtls::authenticate(&pool, &test_keys()?, &client, Some(&leaf)).await?;
   assert_eq!(cnf.x5t_s256, SELF_THUMBPRINT);
   assert_eq!(cnf.claim()["x5t#S256"], SELF_THUMBPRINT);
   Ok(())
@@ -213,11 +251,11 @@ async fn mtls_pki_subject_dn_binds_cnf() -> TestResult {
   let pool = mtls_postgres().await?;
   mtls_migrate(&pool).await?;
   insert_mtls_client(&pool, "mtls-pki", "tls_client_auth", Some(PKI_DN), None).await?;
-  let client = client_repo::find_active_by_client_id(&pool, "mtls-pki")
+  let client = client_repo::find_active_by_client_id(&pool, &test_keys()?, "mtls-pki")
     .await?
     .ok_or(MtlsError::UnknownClient)?;
   let leaf = certs::cert_der(certs::CLIENT_PKI_CERT_PEM)?;
-  let cnf = mtls::authenticate(&pool, &client, Some(&leaf)).await?;
+  let cnf = mtls::authenticate(&pool, &test_keys()?, &client, Some(&leaf)).await?;
   assert_eq!(cnf.x5t_s256, PKI_THUMBPRINT);
   Ok(())
 }
@@ -235,11 +273,11 @@ async fn mtls_unregistered_thumbprint_rejected_as_invalid_client() -> TestResult
     Some(SELF_THUMBPRINT),
   )
   .await?;
-  let client = client_repo::find_active_by_client_id(&pool, "mtls-self")
+  let client = client_repo::find_active_by_client_id(&pool, &test_keys()?, "mtls-self")
     .await?
     .ok_or(MtlsError::UnknownClient)?;
   let rogue = certs::cert_der(certs::CLIENT_ROGUE_CERT_PEM)?;
-  let result = mtls::authenticate(&pool, &client, Some(&rogue)).await;
+  let result = mtls::authenticate(&pool, &test_keys()?, &client, Some(&rogue)).await;
   assert!(matches!(result, Err(MtlsError::UnknownCertificate)));
   assert!(is_invalid_client(result));
   Ok(())
@@ -251,13 +289,86 @@ async fn mtls_missing_cert_rejects_mtls_clients() -> TestResult {
   let pool = mtls_postgres().await?;
   mtls_migrate(&pool).await?;
   let pinned = fixture_client("self_signed_tls_client_auth", None, Some(SELF_THUMBPRINT));
-  let result = mtls::authenticate(&pool, &pinned, None).await;
+  let result = mtls::authenticate(&pool, &test_keys()?, &pinned, None).await;
   assert!(matches!(result, Err(MtlsError::MissingCertificate)));
   assert!(is_invalid_client(result));
   let pki = fixture_client("tls_client_auth", Some(PKI_DN), None);
-  let result = mtls::authenticate(&pool, &pki, None).await;
+  let result = mtls::authenticate(&pool, &test_keys()?, &pki, None).await;
   assert!(matches!(result, Err(MtlsError::MissingCertificate)));
   assert!(is_invalid_client(result));
+  Ok(())
+}
+
+/// An encrypted subject-DN row matches after decryption; an unknown DN
+/// fails closed; a corrupt `tls_client_auth_subject_dn_enc` surfaces as
+/// 503 `temporarily_unavailable`, never a flattened `invalid_client`.
+#[tokio::test]
+async fn mtls_subject_dn_select() -> TestResult {
+  let pool = mtls_postgres().await?;
+  mtls_migrate(&pool).await?;
+  let keys = test_keys()?;
+  client_repo::insert(
+    &pool,
+    &keys,
+    false,
+    &NewClient {
+      id: uuid::Uuid::new_v4(),
+      client_id: "mtls-enc-dn".to_owned(),
+      client_secret_hash: None,
+      client_secret_expires_at: None,
+      client_name: "mTLS Encrypted DN".to_owned(),
+      grant_types: vec!["client_credentials".to_owned()],
+      response_types: vec!["token".to_owned()],
+      scope: "api:read".to_owned(),
+      token_endpoint_auth_method: "tls_client_auth".to_owned(),
+      jwks: None,
+      jwks_uri: None,
+      tls_client_auth_subject_dn: Some(PKI_DN.to_owned()),
+      tls_client_auth_cert_thumbprint: None,
+      request_uris: None,
+      contacts: None,
+      software_id: None,
+      dpop_bound_access_tokens: false,
+      registration_access_token_hash: None,
+    },
+  )
+  .await?;
+  let client = client_repo::find_active_by_client_id(&pool, &keys, "mtls-enc-dn")
+    .await?
+    .ok_or(MtlsError::UnknownClient)?;
+  assert_eq!(client.tls_client_auth_subject_dn.as_deref(), Some(PKI_DN));
+  let clients = [client.clone()];
+  assert_eq!(
+    mtls::select_by_subject_dn(&clients, PKI_DN)?.client_id,
+    "mtls-enc-dn"
+  );
+  assert!(matches!(
+    mtls::select_by_subject_dn(&clients, "CN=nobody, O=Example"),
+    Err(MtlsError::UnknownCertificate)
+  ));
+  let leaf = certs::cert_der(certs::CLIENT_PKI_CERT_PEM)?;
+  let cnf = mtls::authenticate(&pool, &keys, &client, Some(&leaf)).await?;
+  assert_eq!(cnf.x5t_s256, PKI_THUMBPRINT);
+
+  let corrupt: &[u8] = b"corrupt-blob";
+  sqlx::query("UPDATE oauth_clients SET tls_client_auth_subject_dn_enc = $1 WHERE client_id = $2")
+    .bind(corrupt)
+    .bind("mtls-enc-dn")
+    .execute(&pool)
+    .await?;
+  match client_repo::find_active_by_client_id(&pool, &keys, "mtls-enc-dn").await {
+    Ok(_) => {
+      return Err(TestError::Setup(
+        "corrupt subject_dn_enc decrypted".to_owned(),
+      ));
+    }
+    Err(error) => {
+      assert!(matches!(error, AppError::PiiDecrypt));
+      let app = MtlsError::from(error).into_app_error();
+      assert_eq!(app.code(), OAuthErrorCode::TemporarilyUnavailable);
+      assert_eq!(app.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+  }
   Ok(())
 }
 

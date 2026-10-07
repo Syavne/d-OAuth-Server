@@ -133,9 +133,8 @@ pub async fn redeem_code(
   };
 
   let candidate_id = candidate_client_id(inputs).ok_or_else(unknown_client)?;
-  let client = client_repo::find_active_by_client_id(state.pool, candidate_id.as_str())
-    .await
-    .map_err(AppError::from)?
+  let client = client_repo::find_active_by_client_id(state.pool, state.keys, candidate_id.as_str())
+    .await?
     .ok_or_else(unknown_client)?;
   if !client
     .grant_types
@@ -346,7 +345,7 @@ async fn fresh_proofs(
     TokenEndpointAuthMethod::TlsClientAuth | TokenEndpointAuthMethod::SelfSignedTlsClientAuth => {
       let leaf = inputs.peer_certs.and_then(|chain| chain.chain().first());
       Some(
-        mtls::authenticate(state.pool, client, leaf)
+        mtls::authenticate(state.pool, state.keys, client, leaf)
           .await
           .map_err(mtls::MtlsError::into_app_error)?
           .x5t_s256,
@@ -387,6 +386,7 @@ async fn authenticate_confidential(
   };
   let mut auth = AuthStores {
     pool: state.pool,
+    keys: state.keys,
     conn: &mut *state.conn,
     store: state.store,
   };
@@ -537,6 +537,7 @@ mod tests {
         SecretString::from("grant-code-test-pepper"),
       )],
       vec![(KeyId::new("v1"), SecretString::from("grant-code-test-totp"))],
+      vec![(KeyId::new("v1"), SecretString::from("grant-code-test-pii"))],
     )?;
     Ok((
       guarded,
@@ -589,7 +590,7 @@ mod tests {
       dpop_bound_access_tokens: false,
       registration_access_token_hash: None,
     };
-    client_repo::insert(&h.pool, &new).await?;
+    client_repo::insert(&h.pool, &h.ring, false, &new).await?;
     Ok(())
   }
 

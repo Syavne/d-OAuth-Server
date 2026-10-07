@@ -144,6 +144,8 @@ pub struct IntrospectHttpInputs<'a> {
 pub struct IntrospectStores<'a> {
   /// Postgres pool for client lookup and secret verification.
   pub pool: &'a PgPool,
+  /// Versioned PII keys for the encrypted client lookup.
+  pub keys: &'a crate::keys::KeyRing,
   /// Redis connection for token records and sidecars.
   pub conn: &'a mut RedisConn,
   /// Key layout plus retry/durability knobs.
@@ -247,6 +249,7 @@ async fn authenticate(
   };
   let mut auth_stores = AuthStores {
     pool: stores.pool,
+    keys: stores.keys,
     conn: &mut *stores.conn,
     store: stores.store,
   };
@@ -461,6 +464,7 @@ pub async fn handler(
   let mut conn = state.redis.clone();
   let mut stores = IntrospectStores {
     pool: &state.pool,
+    keys: &state.keys,
     conn: &mut conn,
     store: &store,
   };

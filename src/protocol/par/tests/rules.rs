@@ -8,7 +8,9 @@ use super::{
   insert_client, push_params, stores_of,
 };
 use crate::{
-  db::TokenEndpointAuthMethod, error::OAuthErrorCode, protocol::client_auth::ClientAuthRequest,
+  db::TokenEndpointAuthMethod,
+  error::{AppError, OAuthErrorCode},
+  protocol::client_auth::ClientAuthRequest,
 };
 
 use super::TestError;
@@ -20,12 +22,13 @@ async fn par_rejects_unauthenticated_client() -> Result<(), TestError> {
   let redirect_uri = "https://client.example.test/cb";
   insert_client(
     &h.pool,
+    &h.keys,
     client_id,
     TokenEndpointAuthMethod::ClientSecretBasic,
     Some("correct-secret"),
   )
   .await?;
-  attach_redirect(&h.pool, client_id, redirect_uri).await?;
+  attach_redirect(&h.pool, &h.keys, client_id, redirect_uri).await?;
 
   // Unknown client: no authentication possible.
   let params = push_params("par-ghost", redirect_uri);
@@ -82,8 +85,15 @@ async fn par_rejects_invalid_request_rules() -> Result<(), TestError> {
   let (_guard, mut h) = harness().await?;
   let client_id = "par-rules-client";
   let redirect_uri = "https://client.example.test/cb";
-  insert_client(&h.pool, client_id, TokenEndpointAuthMethod::None, None).await?;
-  attach_redirect(&h.pool, client_id, redirect_uri).await?;
+  insert_client(
+    &h.pool,
+    &h.keys,
+    client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+  )
+  .await?;
+  attach_redirect(&h.pool, &h.keys, client_id, redirect_uri).await?;
 
   // Missing response_type.
   let mut params = push_params(client_id, redirect_uri);
@@ -134,6 +144,68 @@ async fn par_rejects_invalid_request_rules() -> Result<(), TestError> {
       ));
     }
     Err(error) => expect_code(&error, OAuthErrorCode::InvalidRequest)?,
+  }
+  Ok(())
+}
+
+/// A pushed redirect that was never registered is rejected, and a corrupt
+/// `uri_enc` fails as 503 `PiiDecrypt` (never a flattened client error).
+#[tokio::test]
+async fn par_redirect_mismatch_rejected() -> Result<(), TestError> {
+  let (_guard, mut h) = harness().await?;
+  let client_id = "par-mismatch-client";
+  let redirect_uri = "https://client.example.test/cb";
+  insert_client(
+    &h.pool,
+    &h.keys,
+    client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+  )
+  .await?;
+  attach_redirect(&h.pool, &h.keys, client_id, redirect_uri).await?;
+
+  let params = push_params(client_id, "https://evil.example.test/cb");
+  let auth = bare_auth(client_id);
+  let endpoint = h.endpoint.clone();
+  let ctx = ctx_of(&endpoint);
+  let mut stores = stores_of(&mut h);
+  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+    Ok(_) => {
+      return Err(TestError::Unexpected("evil redirect accepted".to_owned()));
+    }
+    Err(error) => expect_code(&error, OAuthErrorCode::InvalidRequest)?,
+  }
+
+  let corrupt: &[u8] = b"corrupt-blob";
+  sqlx::query("UPDATE redirect_uris SET uri_enc = $1")
+    .bind(corrupt)
+    .execute(&h.pool)
+    .await?;
+  let params = push_params(client_id, redirect_uri);
+  let auth = bare_auth(client_id);
+  let endpoint = h.endpoint.clone();
+  let ctx = ctx_of(&endpoint);
+  let mut stores = stores_of(&mut h);
+  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+    Ok(_) => {
+      return Err(TestError::Unexpected("corrupt uri_enc accepted".to_owned()));
+    }
+    Err(error) => {
+      if !matches!(error, AppError::PiiDecrypt) {
+        return Err(TestError::Unexpected(format!(
+          "corrupt uri_enc must be PiiDecrypt, got {}",
+          error.code()
+        )));
+      }
+      expect_code(&error, OAuthErrorCode::TemporarilyUnavailable)?;
+      if error.status().as_u16() != 503 {
+        return Err(TestError::Unexpected(format!(
+          "PiiDecrypt must be 503, got {}",
+          error.status()
+        )));
+      }
+    }
   }
   Ok(())
 }

@@ -38,6 +38,7 @@ async fn setup_with_rate_limit(rate_limit: serde_json::Value) -> Result<World, T
   let world = World::start(rate_limit).await?;
   seed_client(
     &world.pool,
+    &world.state.keys,
     CLIENT_ID,
     Some(CLIENT_SECRET),
     &["authorization_code", "refresh_token", "client_credentials"],
@@ -47,9 +48,10 @@ async fn setup_with_rate_limit(rate_limit: serde_json::Value) -> Result<World, T
   .await?;
   seed_scope(&world.pool, "read").await?;
   seed_scope(&world.pool, "write").await?;
-  attach_redirect(&world.pool, CLIENT_ID, REDIRECT_URI).await?;
+  attach_redirect(&world.pool, &world.state.keys, CLIENT_ID, REDIRECT_URI).await?;
   seed_client(
     &world.pool,
+    &world.state.keys,
     PUBLIC_ID,
     None,
     &["authorization_code", "refresh_token"],
@@ -57,7 +59,7 @@ async fn setup_with_rate_limit(rate_limit: serde_json::Value) -> Result<World, T
     TokenEndpointAuthMethod::None,
   )
   .await?;
-  attach_redirect(&world.pool, PUBLIC_ID, REDIRECT_URI).await?;
+  attach_redirect(&world.pool, &world.state.keys, PUBLIC_ID, REDIRECT_URI).await?;
   Ok(world)
 }
 

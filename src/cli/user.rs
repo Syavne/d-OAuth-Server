@@ -6,6 +6,7 @@ use super::{
   context::{CliError, Context, audit, require_nonempty},
   secret,
 };
+use crate::{db::user_repo, error::AppError};
 
 /// The one-time TOTP enrollment material printed to the operator.
 pub struct Enrollment {
@@ -32,31 +33,24 @@ pub async fn create(
   let email = normalized_email(email)?;
   require_nonempty(password, "password")?;
   let password_hash = secret::hash_password(context.config(), password)?;
-  let id = Uuid::new_v4();
 
-  let result = sqlx::query(
-    "INSERT INTO users (
-       id, email, password_hash, is_admin, must_change_password, created_at, updated_at
-     ) VALUES ($1, $2::citext, $3, $4, true, now(), now())",
+  let record = user_repo::create_user(
+    context.pool(),
+    &context.config().keys,
+    context.config().pii_dual_write,
+    &user_repo::NewUser {
+      email: email.clone(),
+      password_hash,
+      is_admin: admin,
+      must_change_password: true,
+    },
   )
-  .bind(id)
-  .bind(&email)
-  .bind(&password_hash)
-  .bind(admin)
-  .execute(context.pool())
-  .await;
+  .await
+  .map_err(map_user_repo_error)?;
 
-  match result {
-    Ok(_) => {
-      audit("user.create", &email);
-      println!("created user {email} (id {id})");
-      Ok(())
-    }
-    Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
-      Err(CliError::AlreadyExists(format!("user {email}")))
-    }
-    Err(error) => Err(error.into()),
-  }
+  audit("user.create", &email);
+  println!("created user {email} (id {})", record.id);
+  Ok(())
 }
 
 /// Enroll TOTP for a user, returning the one-time secret to print.
@@ -67,17 +61,18 @@ pub async fn enroll_totp(context: &Context, email: &str) -> Result<Enrollment, C
   let email = normalized_email(email)?;
   let id = find_user_id(context, &email).await?;
   let totp_secret = secret::generate_totp_secret()?;
-  let blob = secret::encrypt_totp(context.config(), &totp_secret)?;
+  let blob = secret::encrypt_totp(
+    context.config(),
+    &totp_secret,
+    !context.config().pii_dual_write,
+  )?;
 
-  sqlx::query(
-    "UPDATE users
-        SET totp_secret_enc = $2, totp_enabled = true, updated_at = now()
-      WHERE id = $1",
-  )
-  .bind(id)
-  .bind(&blob)
-  .execute(context.pool())
-  .await?;
+  let updated = user_repo::set_totp_secret(context.pool(), id, &blob)
+    .await
+    .map_err(map_user_repo_error)?;
+  if !updated {
+    return Err(CliError::NotFound("user not found".to_owned()));
+  }
 
   audit("user.enroll_totp", &email);
   Ok(Enrollment {
@@ -93,10 +88,12 @@ pub async fn enroll_totp(context: &Context, email: &str) -> Result<Enrollment, C
 pub async fn disable(context: &Context, email: &str) -> Result<(), CliError> {
   let email = normalized_email(email)?;
   let id = find_user_id(context, &email).await?;
-  sqlx::query("UPDATE users SET disabled = true, updated_at = now() WHERE id = $1")
-    .bind(id)
-    .execute(context.pool())
-    .await?;
+  let updated = user_repo::disable_user(context.pool(), id)
+    .await
+    .map_err(map_user_repo_error)?;
+  if !updated {
+    return Err(CliError::NotFound("user not found".to_owned()));
+  }
   audit("user.disable", &email);
   println!("disabled user {email}");
   Ok(())
@@ -161,16 +158,27 @@ pub async fn list_scopes(context: &Context, email: &str) -> Result<Vec<String>, 
   Ok(scopes)
 }
 
-/// Resolve a user id by case-insensitive email.
+/// Resolve a user id by email through the repository's encrypted lookup
+/// (blind index with a legacy plaintext fallback for rows with no ciphertext).
 ///
 /// # Errors
-/// Returns [`CliError::NotFound`] when no such user exists.
+/// Returns [`CliError::NotFound`] when no such user exists. The message is
+/// payload-free: it never echoes the submitted email.
 pub async fn find_user_id(context: &Context, email: &str) -> Result<Uuid, CliError> {
-  let id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1::citext")
-    .bind(email)
-    .fetch_optional(context.pool())
-    .await?;
-  id.ok_or_else(|| CliError::NotFound(format!("user {email}")))
+  user_repo::find_by_email(context.pool(), &context.config().keys, email)
+    .await
+    .map_err(map_user_repo_error)?
+    .map(|record| record.id)
+    .ok_or_else(|| CliError::NotFound("user not found".to_owned()))
+}
+
+/// Map a repository failure: the typed payload-free duplicate becomes
+/// `AlreadyExists`; anything else converts without carrying PII.
+pub(super) fn map_user_repo_error(error: AppError) -> CliError {
+  match error {
+    AppError::DuplicateEmail => CliError::AlreadyExists("user email already exists".to_owned()),
+    other => CliError::App(other),
+  }
 }
 
 async fn ensure_scope_exists(context: &Context, scope: &str) -> Result<(), CliError> {

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO oauth_clients (id, client_id, client_secret_hash, client_secret_expires_at, client_id_issued_at, client_name, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, tls_client_auth_subject_dn, tls_client_auth_cert_thumbprint, request_uris, contacts, software_id, registration_access_token_hash, dpop_bound_access_tokens, created_at, updated_at) VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, now(), now()) RETURNING id, client_id, client_secret_expires_at, client_id_issued_at, client_name, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, tls_client_auth_subject_dn, tls_client_auth_cert_thumbprint, request_uris, contacts, software_id, dpop_bound_access_tokens, active, created_at, updated_at",
+  "query": "UPDATE oauth_clients SET client_name = $2, client_name_enc = $3, grant_types = $4, response_types = $5, scope = $6, token_endpoint_auth_method = $7, jwks = $8, jwks_uri = $9, jwks_uri_enc = $10, tls_client_auth_subject_dn = $11, tls_client_auth_subject_dn_enc = $12, tls_client_auth_subject_dn_index = $13, tls_client_auth_cert_thumbprint = $14, tls_client_auth_cert_thumbprint_enc = $15, tls_client_auth_cert_thumbprint_index = $16, request_uris = $17, request_uris_enc = $18, contacts = $19, contacts_enc = $20, software_id = $21, software_id_enc = $22, dpop_bound_access_tokens = $23, updated_at = now() WHERE id = $1 RETURNING id, client_id, client_secret_expires_at, client_id_issued_at, client_name, client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, dpop_bound_access_tokens, active, created_at, updated_at",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,17 @@
       },
       {
         "ordinal": 5,
+        "name": "client_name_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "client_name_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "grant_types",
         "type_info": "TextArray",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "response_types",
         "type_info": "TextArray",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "scope",
         "type_info": "Text",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "token_endpoint_auth_method",
         "type_info": "Text",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "jwks",
         "type_info": "Jsonb",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "jwks_uri",
         "type_info": "Text",
         "origin": {
@@ -125,7 +136,18 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
+        "name": "jwks_uri_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "jwks_uri_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
         "name": "tls_client_auth_subject_dn",
         "type_info": "Text",
         "origin": {
@@ -136,7 +158,18 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
+        "name": "tls_client_auth_subject_dn_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "tls_client_auth_subject_dn_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
         "name": "tls_client_auth_cert_thumbprint",
         "type_info": "Text",
         "origin": {
@@ -147,7 +180,18 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 16,
+        "name": "tls_client_auth_cert_thumbprint_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "tls_client_auth_cert_thumbprint_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
         "name": "request_uris",
         "type_info": "Jsonb",
         "origin": {
@@ -158,7 +202,18 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 18,
+        "name": "request_uris_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "request_uris_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
         "name": "contacts",
         "type_info": "Jsonb",
         "origin": {
@@ -169,7 +224,18 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 20,
+        "name": "contacts_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "contacts_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
         "name": "software_id",
         "type_info": "Text",
         "origin": {
@@ -180,7 +246,18 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 22,
+        "name": "software_id_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "software_id_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
         "name": "dpop_bound_access_tokens",
         "type_info": "Bool",
         "origin": {
@@ -191,7 +268,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 24,
         "name": "active",
         "type_info": "Bool",
         "origin": {
@@ -202,7 +279,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 25,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -213,7 +290,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -228,21 +305,26 @@
       "Left": [
         "Uuid",
         "Text",
-        "Text",
-        "Timestamptz",
-        "Text",
+        "Bytea",
         "TextArray",
         "TextArray",
         "Text",
         "Text",
         "Jsonb",
         "Text",
+        "Bytea",
         "Text",
+        "Bytea",
+        "Text",
+        "Text",
+        "Bytea",
         "Text",
         "Jsonb",
+        "Bytea",
         "Jsonb",
+        "Bytea",
         "Text",
-        "Text",
+        "Bytea",
         "Bool"
       ]
     },
@@ -251,11 +333,18 @@
       false,
       true,
       false,
+      true,
+      true,
       false,
       false,
       false,
       false,
-      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
       true,
       true,
       true,
@@ -269,5 +358,5 @@
       false
     ]
   },
-  "hash": "6bc0248569d7b6b4d3fd1f7f57fb21cba3b74bfded63c3287b06db8160a07b24"
+  "hash": "1cf0676f9a41ce8b8e07e77673d31d225ec331c2fbfc7d6e6ac9fe9598570a21"
 }

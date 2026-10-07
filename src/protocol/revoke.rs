@@ -58,6 +58,8 @@ const UNSUPPORTED_TOKEN_TYPE: &str =
 pub struct RevokeStores<'a> {
   /// Postgres pool for client authentication.
   pub pool: &'a PgPool,
+  /// Versioned PII keys for the encrypted client lookup.
+  pub keys: &'a crate::keys::KeyRing,
   /// Redis connection for the token and grant stores.
   pub conn: &'a mut RedisConn,
   /// Key layout plus retry/durability knobs.
@@ -132,6 +134,7 @@ pub async fn revoke_tokens(
   let authenticated = {
     let mut auth_stores = AuthStores {
       pool: stores.pool,
+      keys: stores.keys,
       conn: stores.conn,
       store: stores.store,
     };
@@ -263,6 +266,7 @@ pub async fn revoke_handler(
   let store = Store::from_config(&state.config.redis);
   let mut stores = RevokeStores {
     pool: &state.pool,
+    keys: &state.keys,
     conn: &mut redis,
     store: &store,
     service: &service,

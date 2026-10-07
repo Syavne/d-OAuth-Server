@@ -92,3 +92,49 @@ async fn resolve_par(
   };
   merge_claims(query, object, &client.client_id)
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn fixture(request_uris: Option<Value>) -> Client {
+    Client {
+      id: uuid::Uuid::nil(),
+      client_id: "jar-fixture".to_owned(),
+      client_secret_expires_at: None,
+      client_id_issued_at: time::OffsetDateTime::UNIX_EPOCH,
+      client_name: "JAR Fixture".to_owned(),
+      grant_types: Vec::new(),
+      response_types: Vec::new(),
+      scope: String::new(),
+      token_endpoint_auth_method: "none".to_owned(),
+      jwks: None,
+      jwks_uri: None,
+      tls_client_auth_subject_dn: None,
+      tls_client_auth_cert_thumbprint: None,
+      request_uris,
+      contacts: None,
+      software_id: None,
+      dpop_bound_access_tokens: false,
+      active: true,
+      created_at: time::OffsetDateTime::UNIX_EPOCH,
+      updated_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+  }
+
+  #[test]
+  fn jar_preregistered_request_uri_matches_decrypted_set() {
+    let uri = "https://client.example.test/req.jwt";
+    let client = fixture(Some(serde_json::json!([uri])));
+    assert!(is_registered_request_uri(&client, uri));
+    assert!(!is_registered_request_uri(
+      &client,
+      "https://evil.example.test/req.jwt"
+    ));
+    assert!(!is_registered_request_uri(
+      &client,
+      "https://client.example.test/req.jwt/extra"
+    ));
+    assert!(!is_registered_request_uri(&fixture(None), uri));
+  }
+}

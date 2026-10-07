@@ -54,15 +54,20 @@ pub async fn update_client(
     jwks_uri: validated.jwks_uri.clone(),
     tls_client_auth_subject_dn: validated.subject_dn.clone(),
     tls_client_auth_cert_thumbprint: None,
-    request_uris: None,
+    request_uris: validated.request_uris.clone(),
     contacts: validated.contacts.clone(),
     software_id: validated.software_id.clone(),
     dpop_bound_access_tokens: validated.dpop_bound,
   };
-  client_repo::update_metadata(stores.pool, client_id, &meta)
-    .await
-    .map_err(AppError::from)?
-    .ok_or_else(AppError::invalid_client_bearer)?;
+  client_repo::update_metadata(
+    stores.pool,
+    &ctx.config.keys,
+    ctx.config.pii_dual_write,
+    client_id,
+    &meta,
+  )
+  .await?
+  .ok_or_else(AppError::invalid_client_bearer)?;
 
   redirect_repo::detach_all(stores.pool, client_id)
     .await
@@ -77,10 +82,9 @@ pub async fn update_client(
   let rotated_secret =
     rotate_secret_if_configured(stores, ctx, client_id, validated.method).await?;
 
-  let row = super::active_row(stores.pool, client_id).await?;
-  let effective = redirect_repo::effective_for_client(stores.pool, client_id)
-    .await
-    .map_err(AppError::from)?;
+  let row = super::active_row(stores.pool, &ctx.config.keys, client_id).await?;
+  let effective =
+    redirect_repo::effective_for_client(stores.pool, &ctx.config.keys, client_id).await?;
   Ok(respond(
     &row,
     effective.into_iter().map(|uri| uri.uri).collect(),

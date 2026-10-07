@@ -100,6 +100,8 @@ pub struct RegisterRequest {
   pub dpop_bound_access_tokens: Option<bool>,
   /// Contact addresses, stored verbatim.
   pub contacts: Option<serde_json::Value>,
+  /// Pre-registered JAR `request_uri` values (RFC 9101), stored verbatim.
+  pub request_uris: Option<serde_json::Value>,
   /// Software identifier, stored verbatim.
   pub software_id: Option<String>,
 }
@@ -161,6 +163,7 @@ struct ValidatedRegistration {
   subject_dn: Option<String>,
   dpop_bound: bool,
   contacts: Option<serde_json::Value>,
+  request_uris: Option<serde_json::Value>,
   software_id: Option<String>,
   redirect_uris: Vec<String>,
 }
@@ -243,13 +246,19 @@ pub async fn register_client(
     jwks_uri: validated.jwks_uri.clone(),
     tls_client_auth_subject_dn: validated.subject_dn.clone(),
     tls_client_auth_cert_thumbprint: None,
-    request_uris: None,
+    request_uris: validated.request_uris.clone(),
     contacts: validated.contacts.clone(),
     software_id: validated.software_id.clone(),
     dpop_bound_access_tokens: validated.dpop_bound,
     registration_access_token_hash: Some(registration_hash),
   };
-  let row = client_repo::insert(stores.pool, &new).await?;
+  let row = client_repo::insert(
+    stores.pool,
+    &ctx.config.keys,
+    ctx.config.pii_dual_write,
+    &new,
+  )
+  .await?;
 
   for id in &redirect_ids {
     redirect_repo::attach(stores.pool, &client_id, *id, None).await?;
@@ -445,6 +454,7 @@ async fn validate_metadata(
     subject_dn,
     dpop_bound,
     contacts: request.contacts.clone(),
+    request_uris: request.request_uris.clone(),
     software_id: request.software_id.clone(),
     redirect_uris,
   })
@@ -479,7 +489,7 @@ async fn resolve_redirects(
   config: &Config,
   redirect_uris: &[String],
 ) -> Result<Vec<Uuid>, AppError> {
-  let catalog = redirect_repo::list(pool, false).await?;
+  let catalog = redirect_repo::list(pool, &config.keys, false).await?;
   let mut ids = Vec::with_capacity(redirect_uris.len());
   for uri in redirect_uris {
     if let Some(hit) = catalog.iter().find(|row| row.uri == *uri) {
@@ -507,13 +517,17 @@ async fn resolve_redirects(
         }
       }
     }
-    let row = redirect_repo::upsert(
+    let (row, _) = redirect_repo::upsert(
       pool,
-      Uuid::new_v4(),
-      uri,
-      redirect_repo::RedirectKind::Authorize,
-      DYNAMIC_REDIRECT_DESCRIPTION,
-      None,
+      &config.keys,
+      config.pii_dual_write,
+      &redirect_repo::NewRedirectUri {
+        id: Uuid::new_v4(),
+        uri,
+        kind: redirect_repo::RedirectKind::Authorize,
+        description: DYNAMIC_REDIRECT_DESCRIPTION,
+        created_by: None,
+      },
     )
     .await?;
     if !row.enabled {

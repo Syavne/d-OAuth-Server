@@ -143,8 +143,21 @@ fn service() -> Result<TokenService, TestError> {
       SecretString::from("revoke-test-pepper-one"),
     )],
     vec![(KeyId::new("v1"), SecretString::from("revoke-test-totp"))],
+    vec![(KeyId::new("v1"), SecretString::from("revoke-test-pii"))],
   )?;
   TokenService::new(&TtlConfig::default(), &ring).map_err(TestError::from)
+}
+
+/// A PII key ring for the encrypted client lookup.
+fn test_keys() -> Result<KeyRing, TestError> {
+  Ok(KeyRing::from_parts(
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("revoke-test-pepper-one"),
+    )],
+    vec![(KeyId::new("v1"), SecretString::from("revoke-test-totp"))],
+    vec![(KeyId::new("v1"), SecretString::from("revoke-test-pii"))],
+  )?)
 }
 
 /// A confidential-client mint request with fixed subject/scope.

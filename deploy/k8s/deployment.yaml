@@ -16,8 +16,8 @@
 #   Kubernetes API). `networkpolicy.yaml` default-denies pod egress except DNS
 #   + Postgres + Redis.
 # - Secret material is file-mounted, never env-injected: the token pepper,
-#   TOTP key, and the Postgres/Redis passwords are projected from
-#   `d-oauth-secrets` into a tmpfs volume at `/run/secrets` (`defaultMode:
+#   TOTP key, mandatory PII key, and the Postgres/Redis passwords are projected
+#   from `d-oauth-secrets` into a tmpfs volume at `/run/secrets` (`defaultMode:
 #   0400`, group 65532 via `fsGroup`) and read through their `*_FILE`
 #   variables. The passwordless DSNs come from the ConfigMap. The inline
 #   `D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOTP_ENCRYPTION_KEY` forms remain
@@ -103,6 +103,8 @@ spec:
               value: /run/secrets/token-pepper
             - name: D_OAUTH_TOTP_ENCRYPTION_KEY_FILE
               value: /run/secrets/totp-encryption-key
+            - name: D_OAUTH_PII_ENCRYPTION_KEY_FILE
+              value: /run/secrets/pii-encryption-key
           # Liveness is dependency-free by construction (`/health/live`
           # touches no Postgres/Redis), so a dependency outage never
           # triggers a restart storm — readiness absorbs it instead.
@@ -172,6 +174,8 @@ spec:
                 path: token-pepper
               - key: totp-encryption-key
                 path: totp-encryption-key
+              - key: pii-encryption-key
+                path: pii-encryption-key
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone

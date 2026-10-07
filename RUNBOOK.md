@@ -14,6 +14,25 @@ CLI/Job only.
   `d-oauth-server migrate`
 - Zero enabled admins exist (a migrated database seeds zero users).
 
+## Migrations and the maintenance window
+
+Apply the PII envelope-encryption expansion
+(`migrations/1791417600_pii_encryption.sql`) during a maintenance window with
+the app tier quiesced, from the dedicated migration Job:
+
+```sh
+d-oauth-server migrate
+```
+
+`ALTER TABLE ... DROP NOT NULL` takes `ACCESS EXCLUSIVE` on `users`,
+`redirect_uris`, and `oauth_clients`, blocking reads and writes on each table for
+the duration. Each non-concurrent `CREATE INDEX` in the file takes `SHARE` on its
+table, blocking writes. A non-transactional `CREATE INDEX CONCURRENTLY` is not
+used because sqlx applies every migration inside one transaction, and
+PostgreSQL rejects `CONCURRENTLY` in a transaction. The migration is additive:
+no column is dropped or renamed and the legacy unique constraints are kept, so
+version N-1 replicas keep working through the rollout.
+
 ## 1. Bootstrap the first admin
 
 Interactive (password read from stdin, never argv, never logged):

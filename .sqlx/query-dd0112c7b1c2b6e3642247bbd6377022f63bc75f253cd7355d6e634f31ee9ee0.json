@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO redirect_uris (id, uri, kind, description, created_by, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, now(), now()) ON CONFLICT (uri, kind) DO UPDATE SET updated_at = now() RETURNING id, uri, kind, enabled, description, created_by, created_at, updated_at",
+  "query": "SELECT ru.id, ru.uri, ru.kind, ru.enabled, ru.description, ru.created_by, ru.created_at, ru.updated_at, ru.uri_enc FROM client_redirect_uris AS cru JOIN redirect_uris AS ru ON ru.id = cru.redirect_uri_id WHERE cru.client_id = $1",
   "describe": {
     "columns": [
       {
@@ -90,27 +90,35 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 8,
+        "name": "uri_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "redirect_uris",
+            "name": "uri_enc"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Text",
-        "Text",
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
       false,
-      false,
+      true,
       false,
       false,
       false,
       true,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "56a179c3ef725c5ffe95f7c71f2e5f195072bcbc139737eab10b83a50e6c72a1"
+  "hash": "dd0112c7b1c2b6e3642247bbd6377022f63bc75f253cd7355d6e634f31ee9ee0"
 }

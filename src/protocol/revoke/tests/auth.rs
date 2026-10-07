@@ -5,7 +5,9 @@ use axum::{
   response::IntoResponse,
 };
 
-use super::{TestError, TestResult, lazy_pool, lazy_redis, no_credentials, service, store};
+use super::{
+  TestError, TestResult, lazy_pool, lazy_redis, no_credentials, service, store, test_keys,
+};
 use crate::{
   error::OAuthErrorCode,
   protocol::revoke::{RevokeContext, RevokeRequest, RevokeStores, revoke_tokens},
@@ -19,8 +21,10 @@ async fn revoke_unauthenticated_request_is_401() -> TestResult {
   let store = store();
   let service = service()?;
   let auth = no_credentials();
+  let ring = test_keys()?;
   let mut stores = RevokeStores {
     pool: &pool,
+    keys: &ring,
     conn: &mut conn,
     store: &store,
     service: &service,
@@ -74,8 +78,10 @@ async fn revoke_missing_token_is_invalid_request() -> TestResult {
   let store = store();
   let service = service()?;
   let auth = no_credentials();
+  let ring = test_keys()?;
   let mut stores = RevokeStores {
     pool: &pool,
+    keys: &ring,
     conn: &mut conn,
     store: &store,
     service: &service,

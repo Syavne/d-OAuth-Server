@@ -139,6 +139,58 @@ is never an authorization-server signing key; the server publishes no
 `jwks_uri`. `healthcheck` probes the health listener over raw HTTP and exits 0
 or 1; it is the container `HEALTHCHECK`.
 
+### PII and TOTP migration commands
+
+```bash
+d-oauth-server pii backfill
+d-oauth-server pii verify
+d-oauth-server pii rotate
+d-oauth-server totp rewrap
+```
+
+All four take no options and read the key ring from configuration. `pii
+backfill`, `pii verify`, and `pii rotate` require a migration-role DSN
+(`D_OAUTH_DATABASE__URL`); they scan every row and print counts only, never a
+value.
+
+- `pii backfill` seals every remaining plaintext PII value, blanks the plaintext
+  columns, and upgrades every TOTP blob to v3. It refuses while
+  `pii_dual_write=true`, and must run with the app tier scaled to zero.
+- `pii verify` reports the four cutover checks: no plaintext remains, every
+  `_enc` opens under a retained key, every TOTP blob is v3, and every stored
+  blind index matches. It exits non-zero when any check is dirty.
+- `pii rotate` re-encrypts every `_enc` value and recomputes every blind index
+  under the active PII key. Run it under a write freeze with the previous key
+  retained. It is idempotent: a re-run re-encrypts only stale blobs.
+- `totp rewrap` re-wraps every v3 per-row DEK under the active TOTP key without
+  touching the data ciphertext. It is idempotent.
+
+### PII encryption rollout and cutover
+
+The expansion is additive. The backfill blanks the plaintext columns but this
+release does **not** drop them; dropping the now-inert columns is a later
+release. Follow this order exactly:
+
+0. Apply the expansion migration with the PII key configured:
+   `d-oauth-server migrate`. The migration drops `NOT NULL` on the plaintext
+   columns and builds the new indexes, so run it in a maintenance window. See
+   [DATABASE.md](DATABASE.md#expand-and-contract).
+1. Set `pii_dual_write=true` (`D_OAUTH_PII_DUAL_WRITE=true`).
+2. Roll every replica so all of them dual-write and emit v2 TOTP blobs.
+3. Set `pii_dual_write=false` and scale the app tier to zero, so no writer runs
+   during the backfill.
+4. Run `d-oauth-server pii backfill`.
+5. Run `d-oauth-server pii verify`; it must exit 0.
+6. Scale the app tier back up. Startup readiness is fail-closed: if
+   `pii_dual_write=false` and any blanked plaintext column still holds a value,
+   `GET /health/ready` returns `503` and the replica stays out of service.
+
+While the rollout window is open, CLI `d-oauth-server user enroll-totp` and
+login-driven TOTP enrollment MUST run with `D_OAUTH_PII_DUAL_WRITE=true`. With
+it `false` they write v3 TOTP blobs, which a version N-1 replica cannot read, so
+the user's next TOTP check fails on an old replica. Keep dual-write on for the
+whole window; turn it off only at the scale-to-zero step above.
+
 ## config sync file format
 
 The file is JSON. Every section is optional and defaults to empty.
@@ -184,8 +236,9 @@ CLI mutations go to the `audit` target with `event = "cli.mutation"`, an
 `user.revoke_scope`, `scope.create`, `scope.enable`, `scope.disable`,
 `scope.delete`, `redirect_uri.create`, `redirect_uri.enable`,
 `redirect_uri.disable`, `redirect_uri.delete`, `client.attach_redirect_uri`,
-`client.detach_redirect_uri`, `initial_access_token.issue`, and the
-`admin.bootstrap.*` family.
+`client.detach_redirect_uri`, `initial_access_token.issue`,
+`pii.backfill`, `pii.rotate`, `totp.rewrap`, and the `admin.bootstrap.*`
+family. `pii verify` is read-only and emits no mutation event.
 
 HTTP events on the same target include `login.success`, `login.failure`,
 `consent`, `token.issue`, `token.revoke`, `token.refresh_reuse_detected`, and
@@ -206,17 +259,51 @@ live tokens, retain the previous key id for at least the refresh lifetime
 (`ttl.refresh_secs`, default 30 days) before removing it. New tokens are always
 minted under the active pepper.
 
-### TOTP encryption key
-
-The encrypted TOTP blob carries its key id, and the ring can resolve a retained
-TOTP key by id. Rotate by making the new key active and retaining the old key
-until every user has re-enrolled or until existing secrets are re-encrypted.
-
 ### TLS certificate
 
 `serve` loads the certificate chain and key once at startup. Rotate by
 replacing the mounted material and performing a rolling restart; there is no
 hot reload, by design.
+
+## PII and TOTP key rotation
+
+Both the PII field-encryption key and the TOTP encryption key are versioned in
+the ring, and each has an optional retained previous key. Keep the previous key
+id configured until every value has been migrated, then retire it. A previous
+key without a distinct `*_previous_key_id`, or without its active key, is a
+load-time error.
+
+### TOTP encryption key
+
+The TOTP blob carries its key id, and the ring resolves a retained TOTP key by
+id. To rotate:
+
+1. Put the old key in `totp_previous_key` / `totp_previous_key_file` with a
+   distinct `totp_previous_key_id`, and set the new `totp_encryption_key` /
+   `totp_encryption_key_file` as active.
+2. Roll the replicas so the ring loads both keys.
+3. Run `d-oauth-server totp rewrap`. Every v3 blob is re-wrapped under the new
+   key. Version 1 and 2 blobs have no DEK and still decrypt through the legacy
+   path, so re-enroll those users with `d-oauth-server user enroll-totp` before
+   the old key is dropped.
+4. Remove the previous key once no blob names it.
+
+### PII field-encryption key
+
+The blind index is key-dependent, so equality and uniqueness only hold within
+one key generation. Rotate under a write freeze:
+
+1. Put the old key in `pii_previous_key` / `pii_previous_key_file` with a
+   distinct `pii_previous_key_id`, and set the new `pii_encryption_key` /
+   `pii_encryption_key_file` as active.
+2. Roll the replicas, then scale the app tier to zero (the write freeze). No
+   writer may run while the indexes are recomputed.
+3. Run `d-oauth-server pii rotate`. It re-encrypts every `_enc` value and
+   recomputes every blind index under the new key in bounded transactions; a
+   duplicate across key generations aborts that batch instead of overwriting a
+   row. It is idempotent and resumable because the previous key is retained.
+4. Run `d-oauth-server pii verify`; it must exit 0.
+5. Remove the previous key and scale the app tier back up.
 
 ## Backup and restore
 
@@ -268,7 +355,10 @@ survives a Redis loss.
   `RUNBOOK.md`.
 - Routine provisioning: `config sync` for scopes, redirect URIs, and
   entitlements; `user create` for users.
-- Key rotation: overlap the pepper for at least the refresh lifetime.
+- Key rotation: overlap the pepper for at least the refresh lifetime. Rotate the
+  TOTP key with `totp rewrap`, and the PII key with a write freeze plus
+  `pii rotate` then `pii verify`; see
+  [PII and TOTP key rotation](#pii-and-totp-key-rotation).
 - Backup: `pg_dump` Postgres; Redis is not backed up.
 - Access: prefer running admin commands as a one-shot Job (or the local CLI
   against the database) over `exec` into a running replica. If `exec` is
@@ -282,5 +372,8 @@ survives a Redis loss.
 - `src/cli/ops.rs`, `src/cli/user.rs`, `src/cli/scope.rs`,
   `src/cli/redirect.rs`, `src/cli/sync.rs`, `src/cli/admin.rs`,
   `src/cli/secret.rs` for implementations.
+- `src/cli/pii/` for `pii backfill|verify|rotate` and `src/cli/totp.rs` for
+  `totp rewrap`.
+- `src/crypto/field.rs` for the PII field codec and blind index.
 - `src/middleware/audit.rs` for the HTTP audit events.
 - `RUNBOOK.md` for the bootstrap and replacement procedure.

@@ -207,6 +207,7 @@ fn test_config(pg_url: &str, redis_url: &str) -> Result<Config, TestError> {
     "redis": {"url": redis_url, "durability": "waitaof"},
     "token_pepper": "cli-test-pepper-0123456789abcdef",
     "totp_encryption_key": "cli-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "cli-test-pii-key-0123456789abcdef",
   });
   let source = ::config::Config::try_from(&fixture)?;
   Ok(Config::from_source(source)?)

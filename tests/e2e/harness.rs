@@ -83,6 +83,9 @@ pub enum TestError {
   /// Application state failed to connect.
   #[error("state error: {0}")]
   State(#[from] StateError),
+  /// An application error escaped where success was required.
+  #[error("app error: {0}")]
+  App(#[from] d_oauth::error::AppError),
   /// A test step observed an unexpected value.
   #[error("failed: {0}")]
   Failed(String),
@@ -167,6 +170,7 @@ impl World {
       },
       "token_pepper": "e2e-test-pepper-0123456789abcdef",
       "totp_encryption_key": "e2e-test-totp-key-0123456789abcdef",
+      "pii_encryption_key": "e2e-test-pii-key-0123456789abcdef",
       "rate_limit": rate_limit,
       "cors_allowed_origins": [],
     });
@@ -321,24 +325,47 @@ pub fn open_rate_limit() -> serde_json::Value {
 /// Seed one client row (secret hashed with the REAL Argon2id verifier path).
 pub async fn seed_client(
   pool: &sqlx::PgPool,
+  keys: &d_oauth::keys::KeyRing,
   client_id: &str,
   secret: Option<&str>,
   grants: &[&str],
   scope: &str,
   method: TokenEndpointAuthMethod,
 ) -> Result<(), TestError> {
-  seed_client_bound(pool, client_id, secret, grants, scope, method, false).await
+  seed_client_bound(
+    pool,
+    keys,
+    client_id,
+    secret,
+    &SeedClientOpts {
+      grants,
+      scope,
+      method,
+      dpop_bound: false,
+    },
+  )
+  .await
+}
+
+/// Registration options for one seeded client row.
+pub struct SeedClientOpts<'a> {
+  /// Registered grant types.
+  pub grants: &'a [&'a str],
+  /// Space-delimited default scope string.
+  pub scope: &'a str,
+  /// Registered token-endpoint authentication method.
+  pub method: TokenEndpointAuthMethod,
+  /// Whether the client registers DPoP-bound access tokens.
+  pub dpop_bound: bool,
 }
 
 /// Seed one client row with an explicit DPoP-bound-access-tokens flag.
 pub async fn seed_client_bound(
   pool: &sqlx::PgPool,
+  keys: &d_oauth::keys::KeyRing,
   client_id: &str,
   secret: Option<&str>,
-  grants: &[&str],
-  scope: &str,
-  method: TokenEndpointAuthMethod,
-  dpop_bound: bool,
+  opts: &SeedClientOpts<'_>,
 ) -> Result<(), TestError> {
   let params =
     Argon2Params::new(SEED_MEM_KIB, 1, 1, 32).map_err(|error| fail(format!("argon2: {error}")))?;
@@ -352,10 +379,10 @@ pub async fn seed_client_bound(
     client_secret_hash: secret_hash,
     client_secret_expires_at: None,
     client_name: format!("{client_id} e2e"),
-    grant_types: grants.iter().map(ToString::to_string).collect(),
+    grant_types: opts.grants.iter().map(ToString::to_string).collect(),
     response_types: vec!["code".to_owned()],
-    scope: scope.to_owned(),
-    token_endpoint_auth_method: method.as_str().to_owned(),
+    scope: opts.scope.to_owned(),
+    token_endpoint_auth_method: opts.method.as_str().to_owned(),
     jwks: None,
     jwks_uri: None,
     tls_client_auth_subject_dn: None,
@@ -363,10 +390,10 @@ pub async fn seed_client_bound(
     request_uris: None,
     contacts: None,
     software_id: None,
-    dpop_bound_access_tokens: dpop_bound,
+    dpop_bound_access_tokens: opts.dpop_bound,
     registration_access_token_hash: None,
   };
-  client_repo::insert(pool, &new).await?;
+  client_repo::insert(pool, keys, false, &new).await?;
   Ok(())
 }
 
@@ -381,16 +408,21 @@ pub async fn seed_scope(pool: &sqlx::PgPool, name: &str) -> Result<(), TestError
 /// Register a redirect URI in the catalog and attach it to a client.
 pub async fn attach_redirect(
   pool: &sqlx::PgPool,
+  keys: &d_oauth::keys::KeyRing,
   client_id: &str,
   uri: &str,
 ) -> Result<(), TestError> {
-  let row = redirect_repo::upsert(
+  let (row, _) = redirect_repo::upsert(
     pool,
-    uuid::Uuid::new_v4(),
-    uri,
-    redirect_repo::RedirectKind::Authorize,
-    "e2e",
-    None,
+    keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: uuid::Uuid::new_v4(),
+      uri,
+      kind: redirect_repo::RedirectKind::Authorize,
+      description: "e2e",
+      created_by: None,
+    },
   )
   .await?;
   redirect_repo::attach(pool, client_id, row.id, None).await?;

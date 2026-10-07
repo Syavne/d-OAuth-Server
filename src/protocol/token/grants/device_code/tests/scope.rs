@@ -14,6 +14,7 @@ async fn test_grant_device_unentitled_scope_rejected() -> TestResult {
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -21,7 +22,7 @@ async fn test_grant_device_unentitled_scope_rejected() -> TestResult {
   )
   .await?;
   setup::enable_scopes(&h.pool, &["orders:admin", "orders:read"]).await?;
-  let user_id = setup::entitled_user(&h.pool, &["orders:read"]).await?;
+  let user_id = setup::entitled_user(&h.pool, &h.config, &["orders:read"]).await?;
   let t0 = now_unix();
   let key = keys::fresh_key()?;
   let authorize_htu = keys::device_htu(&h.config);
@@ -70,6 +71,7 @@ async fn test_grant_device_scope_reduced_to_user_entitlement() -> TestResult {
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
+    &h.config,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
@@ -77,7 +79,7 @@ async fn test_grant_device_scope_reduced_to_user_entitlement() -> TestResult {
   )
   .await?;
   setup::enable_scopes(&h.pool, &["orders:admin", "orders:read"]).await?;
-  let user_id = setup::entitled_user(&h.pool, &["orders:read"]).await?;
+  let user_id = setup::entitled_user(&h.pool, &h.config, &["orders:read"]).await?;
   let t0 = now_unix();
   let key = keys::fresh_key()?;
   let authorize_htu = keys::device_htu(&h.config);

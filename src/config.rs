@@ -78,6 +78,9 @@ pub struct Config {
   pub redis: RedisConfig,
   /// Versioned token-pepper and TOTP-encryption keys.
   pub keys: KeyRing,
+  /// Write PII plaintext alongside ciphertext during the rotation window
+  /// (default false: encrypt-only).
+  pub pii_dual_write: bool,
   /// Per-endpoint failure policy.
   pub failure_policy: FailurePolicy,
   /// Token/request lifetimes.
@@ -118,6 +121,7 @@ impl fmt::Debug for Config {
       .field("database", &self.database)
       .field("redis", &self.redis)
       .field("keys", &self.keys)
+      .field("pii_dual_write", &self.pii_dual_write)
       .field("failure_policy", &self.failure_policy)
       .field("ttl", &self.ttl)
       .field("argon2", &self.argon2)
@@ -315,6 +319,10 @@ pub enum ConfigError {
   /// The key ring could not be constructed.
   #[error("key ring error: {0}")]
   KeyRing(#[from] crate::keys::KeyRingError),
+  /// A retained (`*_previous_key`) key was provided without an explicit
+  /// distinct previous key id.
+  #[error("previous key requires an explicit distinct previous key id")]
+  MissingPreviousKeyId,
 }
 
 /// Read an optional secret from a mounted file, trimming trailing newlines.

@@ -61,6 +61,7 @@ fn test_ring() -> Result<KeyRing, TestError> {
   Ok(KeyRing::from_parts(
     vec![(KeyId::new("v1"), SecretString::from("code-issue-pepper"))],
     vec![(KeyId::new("v1"), SecretString::from("code-issue-totp"))],
+    vec![(KeyId::new("v1"), SecretString::from("code-issue-pii"))],
   )?)
 }
 
