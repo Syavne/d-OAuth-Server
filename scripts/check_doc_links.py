@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local documentation link checker for d-OAuth.
+"""Local documentation link checker for d-OAuth-Server.
 
 This is the "markdown-link-check" equivalent named by task 48. It validates
 every relative Markdown link in the root README.md, root AGENTS.md, and the

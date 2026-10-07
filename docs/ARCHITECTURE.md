@@ -1,6 +1,6 @@
 # Architecture
 
-The d-OAuth authorization server is a single Rust process with two listeners:
+The d-OAuth-Server authorization server is a single Rust process with two listeners:
 a TLS public listener for OAuth traffic and a plaintext health-only listener
 for probes. All durable domain state lives in PostgreSQL and all ephemeral
 state lives in Redis. There is no in-process state that a second replica would

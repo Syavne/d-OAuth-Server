@@ -3,7 +3,7 @@ name = "d-oauth"
 version = "0.1.0"
 edition = "2024"
 description = "OAuth 2.1-only authorization server"
-license = "MIT OR Apache-2.0"
+license = "ISC"
 
 [lib]
 name = "d_oauth"

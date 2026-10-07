@@ -1,6 +1,6 @@
 # Operator Runbook
 
-How to create the first administrator of a fresh `d-oauth` install, how to
+How to create the first administrator of a fresh `d-oauth-server` install, how to
 replace that bootstrap account immediately, and how to respond to a full
 database disclosure. There is no HTTP bootstrap endpoint: provisioning is
 CLI/Job only.

@@ -1,6 +1,6 @@
 # Contributing
 
-How to build, test, and change the d-OAuth authorization server. The rules here
+How to build, test, and change the d-OAuth-Server authorization server. The rules here
 are enforced by CI, so a change that skips them will not merge.
 
 ## Purpose

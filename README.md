@@ -1,4 +1,4 @@
-# d-OAuth
+# d-OAuth-Server
 
 An OAuth 2.1-only authorization server written in Rust. It is deliberately not
 backwards compatible with OAuth 2.0: PKCE is mandatory, the implicit and
