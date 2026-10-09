@@ -73,6 +73,15 @@ fn without_redis_durability() -> Map<String, Value> {
   map
 }
 
+fn with_ttl(access_secs: u64, refresh_secs: u64) -> Map<String, Value> {
+  let mut map = base();
+  map.insert(
+    "ttl".to_owned(),
+    json!({ "access_secs": access_secs, "refresh_secs": refresh_secs }),
+  );
+  map
+}
+
 #[test]
 fn config_loads_with_empty_scope_registry() -> Result<(), Box<dyn Error>> {
   let cfg = try_load(&base())?;
@@ -194,6 +203,20 @@ fn config_rejects_invalid_timeout_ladder() {
   let map = with_database_field("lock_timeout_secs", json!(5));
   let result = try_load(&map);
   assert!(matches!(result, Err(ConfigError::InvalidTimeoutLadder)));
+}
+
+#[test]
+fn config_rejects_access_ttl_longer_than_refresh() {
+  let map = with_ttl(2_592_001, 2_592_000);
+  let result = try_load(&map);
+  assert!(matches!(result, Err(ConfigError::InvalidTtlLadder)));
+}
+
+#[test]
+fn config_accepts_access_ttl_equal_to_refresh() -> Result<(), Box<dyn Error>> {
+  let cfg = try_load(&with_ttl(3_600, 3_600))?;
+  assert_eq!(cfg.ttl.access, Duration::from_secs(3_600));
+  Ok(())
 }
 
 #[test]

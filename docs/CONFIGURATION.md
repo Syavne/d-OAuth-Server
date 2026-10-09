@@ -221,8 +221,9 @@ The security endpoints are `authorize`, `token`, `introspect`, `revoke`, `par`,
 | `argon2.iterations` | `2` |
 | `argon2.parallelism` | `1` |
 
-Every TTL must be non-zero. Argon2 memory must be at least 8192 KiB, with a
-non-zero iteration count and parallelism.
+Every TTL must be non-zero, and the access-token TTL must not exceed the
+refresh-token TTL. Argon2 memory must be at least 8192 KiB, with a non-zero
+iteration count and parallelism.
 
 ## Rate-limit keys
 

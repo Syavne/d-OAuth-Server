@@ -307,6 +307,9 @@ pub enum ConfigError {
   /// A TTL was zero.
   #[error("invalid token TTL: every lifetime must be non-zero")]
   InvalidTtl,
+  /// The access-token lifetime exceeded the refresh-token lifetime.
+  #[error("invalid token TTL: access lifetime must not exceed the refresh lifetime")]
+  InvalidTtlLadder,
   /// A mounted secret file could not be read.
   #[error("failed to read secret file {path}: {source}")]
   SecretFile {

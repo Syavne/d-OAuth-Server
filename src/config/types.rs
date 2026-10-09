@@ -100,6 +100,9 @@ impl TtlConfig {
     {
       return Err(ConfigError::InvalidTtl);
     }
+    if ttl.access > ttl.refresh {
+      return Err(ConfigError::InvalidTtlLadder);
+    }
     Ok(ttl)
   }
 }
