@@ -18,10 +18,12 @@ mod dpop;
 #[path = "e2e/clients.rs"]
 mod clients;
 
-use d_oauth::db::TokenEndpointAuthMethod;
+use d_oauth::db::{TokenEndpointAuthMethod, user_repo, user_scope_repo};
 use d_oauth::protocol::code::{CodeClientKind, CodeIssueRequest, CodeIssuer, IssuedCode};
+use d_oauth::protocol::device::hash_token;
 use d_oauth::protocol::scope::ScopeSet;
 use d_oauth::protocol::token::ClientKind;
+use d_oauth::store::device::{DeviceStatus, decide};
 use dpop::DpopKey;
 use harness::{
   SeedClientOpts, TestError, World, attach_redirect, ensure, fail, json_body, open_rate_limit,
@@ -397,6 +399,405 @@ async fn e2e_concurrent_rotation_fail_closed() -> Result<(), TestError> {
   ensure(
     rejections + unavailable == 7,
     "every other racer must be rejected",
+  )?;
+  Ok(())
+}
+
+/// Concurrent redemptions of one authorization code: exactly one exchanges,
+/// every other racer is `invalid_grant` — the code is consumed atomically, so
+/// only that one winner can create a token family.
+#[tokio::test]
+async fn e2e_concurrent_code_redemption_fail_closed() -> Result<(), TestError> {
+  let world = setup().await?;
+  let (challenge, verifier) = oauth2_pkce();
+  let issued = issue_conf_code(&world, CLIENT_ID, &challenge).await?;
+  let verifier = verifier.secret().to_owned();
+  let client = reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .timeout(std::time::Duration::from_secs(60))
+    .build()?;
+  let mut set = tokio::task::JoinSet::new();
+  for _ in 0..2 {
+    let client = client.clone();
+    let base = world.base.clone();
+    let code = issued.code.clone();
+    let verifier = verifier.clone();
+    set.spawn(async move {
+      client
+        .post(format!("{base}/token"))
+        .basic_auth(CLIENT_ID, Some(CLIENT_SECRET))
+        .form(&[
+          ("grant_type", "authorization_code"),
+          ("code", code.as_str()),
+          ("redirect_uri", REDIRECT_URI),
+          ("client_id", CLIENT_ID),
+          ("code_verifier", verifier.as_str()),
+        ])
+        .send()
+        .await
+    });
+  }
+  let mut successes = 0;
+  let mut rejections = 0;
+  let mut unavailable = 0;
+  while let Some(outcome) = set.join_next().await {
+    let response = outcome.map_err(|error| fail(format!("join failed: {error}")))??;
+    let status = response.status();
+    let body = response.text().await?;
+    if status == reqwest::StatusCode::OK {
+      let minted = json_body(&body)?;
+      ensure(
+        minted["access_token"]
+          .as_str()
+          .is_some_and(|token| !token.is_empty()),
+        "the winner must mint an access token",
+      )?;
+      ensure(
+        minted["refresh_token"]
+          .as_str()
+          .is_some_and(|token| !token.is_empty()),
+        "the single winner must create the token family",
+      )?;
+      successes += 1;
+    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+      ensure(
+        json_body(&body)?["error"] == "temporarily_unavailable",
+        format!("store outage must be temporarily_unavailable: {body}"),
+      )?;
+      ensure(!body.contains("access_token"), "failure must mint nothing")?;
+      unavailable += 1;
+    } else {
+      ensure_error(status, &body, "invalid_grant")?;
+      rejections += 1;
+    }
+  }
+  ensure(
+    successes == 1,
+    format!(
+      "exactly one racer must redeem the code (got {successes}; invalid_grant={rejections}, \
+       unavailable={unavailable})"
+    ),
+  )?;
+  ensure(
+    rejections + unavailable == 1,
+    "every other racer must be rejected",
+  )?;
+  Ok(())
+}
+
+/// Concurrent `/authorize` GETs on one PAR `request_uri`: exactly one proceeds
+/// into login, every other racer is the fail-closed `invalid_request` — the
+/// handle is consumed atomically and cannot be replayed.
+#[tokio::test]
+async fn e2e_concurrent_par_consumption_fail_closed() -> Result<(), TestError> {
+  let world = setup().await?;
+  let (challenge, _verifier) = oauth2_pkce();
+  let (status, _, body) = world
+    .post_form(
+      "/par",
+      &[
+        ("client_id", CLIENT_ID),
+        ("redirect_uri", REDIRECT_URI),
+        ("response_type", "code"),
+        ("scope", "read"),
+        ("state", "par-race-state"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+      ],
+      Some((CLIENT_ID, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure(
+    status == reqwest::StatusCode::CREATED,
+    format!("PAR push must 201: {status} {body}"),
+  )?;
+  let request_uri = json_body(&body)?["request_uri"]
+    .as_str()
+    .ok_or_else(|| fail("PAR must return request_uri"))?
+    .to_owned();
+
+  let client = reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .timeout(std::time::Duration::from_secs(60))
+    .build()?;
+  let mut set = tokio::task::JoinSet::new();
+  for _ in 0..2 {
+    let client = client.clone();
+    let base = world.base.clone();
+    let target = format!(
+      "/authorize?client_id={CLIENT_ID}&request_uri={}",
+      encoded(&request_uri)
+    );
+    set.spawn(async move { client.get(format!("{base}{target}")).send().await });
+  }
+  let mut winners = 0;
+  let mut rejections = 0;
+  let mut unavailable = 0;
+  while let Some(outcome) = set.join_next().await {
+    let response = outcome.map_err(|error| fail(format!("join failed: {error}")))??;
+    let status = response.status();
+    let location = response
+      .headers()
+      .get("location")
+      .and_then(|value| value.to_str().ok())
+      .map(str::to_owned);
+    let body = response.text().await?;
+    if status == reqwest::StatusCode::SEE_OTHER {
+      ensure(
+        location
+          .as_deref()
+          .is_some_and(|target| target.starts_with("/login?request_id=")),
+        format!("the winner must enter login: {location:?} {body}"),
+      )?;
+      winners += 1;
+    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+      ensure(
+        json_body(&body)?["error"] == "temporarily_unavailable",
+        format!("store outage must be temporarily_unavailable: {body}"),
+      )?;
+      unavailable += 1;
+    } else {
+      ensure(
+        status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::FOUND,
+        format!("a losing PAR authorize must be rejected: {status} {body}"),
+      )?;
+      let rejected = body.contains("invalid_request")
+        || location
+          .as_deref()
+          .is_some_and(|target| target.contains("error=invalid_request"));
+      ensure(
+        rejected,
+        format!("a losing PAR authorize must be invalid_request: {status} {location:?} {body}"),
+      )?;
+      ensure(
+        location
+          .as_deref()
+          .is_none_or(|target| !target.starts_with("/login")),
+        "a losing racer must never enter login",
+      )?;
+      ensure(
+        !body.contains("request_id="),
+        "a losing racer must not start a flow",
+      )?;
+      rejections += 1;
+    }
+  }
+  ensure(
+    winners == 1,
+    format!("exactly one racer must consume the PAR handle (got {winners})"),
+  )?;
+  ensure(
+    rejections + unavailable == 1,
+    "every other racer must be rejected",
+  )?;
+  Ok(())
+}
+
+/// Concurrent `/token` calls reusing one DPoP `jti`: exactly one mints, every
+/// other racer is `invalid_dpop_proof` — the replay marker is written with
+/// `SET NX`.
+#[tokio::test]
+async fn e2e_concurrent_dpop_jti_reuse_fail_closed() -> Result<(), TestError> {
+  let world = setup().await?;
+  let key = DpopKey::generate()?;
+  let htu = format!("{}/token", world.state.config.issuer);
+  let jti = uuid::Uuid::new_v4().to_string();
+  let mut proofs = Vec::with_capacity(2);
+  for _ in 0..2 {
+    proofs.push(key.proof_with_jti("POST", &htu, &jti)?);
+  }
+  let client = reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .timeout(std::time::Duration::from_secs(60))
+    .build()?;
+  let mut set = tokio::task::JoinSet::new();
+  for proof in proofs {
+    let client = client.clone();
+    let base = world.base.clone();
+    set.spawn(async move {
+      client
+        .post(format!("{base}/token"))
+        .basic_auth(CLIENT_ID, Some(CLIENT_SECRET))
+        .header("dpop", proof)
+        .form(&[("grant_type", "client_credentials")])
+        .send()
+        .await
+    });
+  }
+  let mut successes = 0;
+  let mut rejections = 0;
+  let mut unavailable = 0;
+  while let Some(outcome) = set.join_next().await {
+    let response = outcome.map_err(|error| fail(format!("join failed: {error}")))??;
+    let status = response.status();
+    let body = response.text().await?;
+    if status == reqwest::StatusCode::OK {
+      ensure(
+        json_body(&body)?["token_type"] == "DPoP",
+        "the winner must mint a DPoP-bound token",
+      )?;
+      successes += 1;
+    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+      ensure(
+        json_body(&body)?["error"] == "temporarily_unavailable",
+        format!("store outage must be temporarily_unavailable: {body}"),
+      )?;
+      ensure(!body.contains("access_token"), "failure must mint nothing")?;
+      unavailable += 1;
+    } else {
+      ensure_error(status, &body, "invalid_dpop_proof")?;
+      rejections += 1;
+    }
+  }
+  ensure(
+    successes == 1,
+    format!(
+      "exactly one racer must mint (got {successes}; invalid_dpop_proof={rejections}, \
+       unavailable={unavailable})"
+    ),
+  )?;
+  ensure(
+    rejections + unavailable == 1,
+    "every other racer must be rejected",
+  )?;
+  Ok(())
+}
+
+/// Concurrent `/token` polls of one approved device code: exactly one mints,
+/// every other racer fails closed (`expired_token`/`invalid_grant`, or the
+/// RFC 8628 back-off when it races the interval stamp) — the approval is
+/// consumed atomically and is never redeemed twice.
+#[tokio::test]
+async fn e2e_concurrent_device_poll_fail_closed() -> Result<(), TestError> {
+  let world = setup().await?;
+  let approver = user_repo::create_user(
+    &world.pool,
+    &world.state.keys,
+    world.state.config.pii_dual_write,
+    &user_repo::NewUser {
+      email: "e2e-device-approver@example.test".to_owned(),
+      password_hash: "e2e-not-a-login-credential".to_owned(),
+      is_admin: false,
+      must_change_password: false,
+    },
+  )
+  .await?;
+  user_scope_repo::entitle(&world.pool, approver.id, "read", None)
+    .await
+    .map_err(|error| fail(format!("entitle failed: {error}")))?;
+
+  let (status, _, body) = world
+    .post_form(
+      "/device_authorization",
+      &[("client_id", CLIENT_ID), ("scope", "read")],
+      Some((CLIENT_ID, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure(
+    status.is_success(),
+    format!("device authorization must 200: {status} {body}"),
+  )?;
+  let device_code = json_body(&body)?["device_code"]
+    .as_str()
+    .ok_or_else(|| fail("device authorization must return device_code"))?
+    .to_owned();
+
+  // Approve through the store decision the `/device` UI records.
+  let device_hash = hash_token(&world.state.keys, &device_code)
+    .map_err(|error| fail(format!("device hash failed: {error}")))?;
+  let mut conn = world.state.redis.clone();
+  let approved = decide(
+    &mut conn,
+    &world.store,
+    &device_hash,
+    DeviceStatus::Approved,
+    &approver.id.to_string(),
+    &uuid::Uuid::new_v4().to_string(),
+  )
+  .await
+  .map_err(|error| fail(format!("device approval failed: {error}")))?;
+  ensure(approved, "the device record must be live to approve")?;
+
+  let client = reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .timeout(std::time::Duration::from_secs(60))
+    .build()?;
+  let mut set = tokio::task::JoinSet::new();
+  for _ in 0..2 {
+    let client = client.clone();
+    let base = world.base.clone();
+    let device_code = device_code.clone();
+    set.spawn(async move {
+      client
+        .post(format!("{base}/token"))
+        .basic_auth(CLIENT_ID, Some(CLIENT_SECRET))
+        .form(&[
+          ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+          ("device_code", device_code.as_str()),
+        ])
+        .send()
+        .await
+    });
+  }
+  let mut successes = 0;
+  let mut rejections = 0;
+  let mut unavailable = 0;
+  while let Some(outcome) = set.join_next().await {
+    let response = outcome.map_err(|error| fail(format!("join failed: {error}")))??;
+    let status = response.status();
+    let body = response.text().await?;
+    if status == reqwest::StatusCode::OK {
+      let minted = json_body(&body)?;
+      ensure(
+        minted["access_token"]
+          .as_str()
+          .is_some_and(|token| !token.is_empty()),
+        "the winner must mint an access token",
+      )?;
+      ensure(
+        minted["refresh_token"]
+          .as_str()
+          .is_some_and(|token| !token.is_empty()),
+        "the winner must mint a refresh token",
+      )?;
+      successes += 1;
+    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+      ensure(
+        json_body(&body)?["error"] == "temporarily_unavailable",
+        format!("store outage must be temporarily_unavailable: {body}"),
+      )?;
+      ensure(!body.contains("access_token"), "failure must mint nothing")?;
+      unavailable += 1;
+    } else {
+      let error_code = json_body(&body)?["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+      // A racer that lands after the winner's interval stamp gets the RFC 8628
+      // back-off; one that lands after the atomic consume gets `expired_token`.
+      ensure(
+        matches!(
+          error_code.as_str(),
+          "expired_token" | "invalid_grant" | "slow_down"
+        ),
+        format!("a losing device poll must fail closed, got {status}: {body}"),
+      )?;
+      ensure(!body.contains("access_token"), "failure must mint nothing")?;
+      rejections += 1;
+    }
+  }
+  ensure(
+    successes == 1,
+    format!(
+      "exactly one poll must mint (got {successes}; expired_or_invalid={rejections}, \
+       unavailable={unavailable})"
+    ),
+  )?;
+  ensure(
+    rejections + unavailable == 1,
+    "every other poll must fail closed",
   )?;
   Ok(())
 }

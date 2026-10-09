@@ -1,16 +1,23 @@
 //! Revocation request validation: unauthenticated `401`, missing token `400`.
 
 use axum::{
-  http::{StatusCode, header},
+  Router,
+  body::Body,
+  http::{Request, StatusCode, header},
   response::IntoResponse,
+  routing::post,
 };
+use http_body_util::BodyExt as _;
+use serde_json::Value;
+use tower::ServiceExt as _;
 
 use super::{
-  TestError, TestResult, lazy_pool, lazy_redis, no_credentials, service, store, test_keys,
+  TestError, TestResult, handler_state, lazy_pool, lazy_redis, no_credentials, service, store,
+  test_keys,
 };
 use crate::{
   error::OAuthErrorCode,
-  protocol::revoke::{RevokeContext, RevokeRequest, RevokeStores, revoke_tokens},
+  protocol::revoke::{RevokeContext, RevokeRequest, RevokeStores, revoke_handler, revoke_tokens},
 };
 
 /// An unauthenticated request fails closed with `401 invalid_client`.
@@ -102,4 +109,37 @@ async fn revoke_missing_token_is_invalid_request() -> TestResult {
       "missing token must be invalid_request".to_owned(),
     )),
   }
+}
+
+/// A request missing the `token` form field is `400 invalid_request`
+/// (RFC 7009 §2.1: `token` is REQUIRED; §2.2.1 defines the error response).
+#[tokio::test]
+async fn revoke_missing_token_form_is_400_invalid_request() -> TestResult {
+  let app = Router::new()
+    .route("/revoke", post(revoke_handler))
+    .with_state(handler_state()?);
+  let request = Request::post("/revoke")
+    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+    .header(header::AUTHORIZATION, "Basic cmV2b2tlLXRlc3Q6c2VjcmV0")
+    .body(Body::from("token_type_hint=access_token"))
+    .map_err(|error| TestError::Unexpected(format!("request build failed: {error}")))?;
+  let response = match app.oneshot(request).await {
+    Ok(response) => response,
+    Err(never) => match never {},
+  };
+
+  if response.status() != StatusCode::BAD_REQUEST {
+    return Err(TestError::Unexpected(format!(
+      "a missing token parameter must be 400, got {}",
+      response.status()
+    )));
+  }
+  let bytes = response.into_body().collect().await?.to_bytes();
+  let body: Value = serde_json::from_slice(&bytes)?;
+  if body.get("error").and_then(Value::as_str) != Some("invalid_request") {
+    return Err(TestError::Unexpected(
+      "a missing token parameter must render invalid_request".to_owned(),
+    ));
+  }
+  Ok(())
 }

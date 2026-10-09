@@ -2,9 +2,9 @@
 //!
 //! Covers the two RFC 8705 verifiers (chain-skipping `self_signed` vs
 //! `WebPkiClientVerifier` + client-CA bundle), thumbprint/DN matching,
-//! rejection of unknown/missing/ambiguous identities, the trusted-proxy
-//! header mode, and the request-extension injection over a real TLS
-//! handshake through [`d_oauth::tls::serve_tls`].
+//! rejection of unknown/missing/ambiguous/cross-wired/expired identities,
+//! the trusted-proxy header mode, and the request-extension injection over
+//! a real TLS handshake through [`d_oauth::tls::serve_tls`].
 //!
 //! Test names contain `mtls` so
 //! `cargo nextest run -E 'test(mtls)'` selects exactly them. Bodies use
@@ -295,6 +295,178 @@ async fn mtls_missing_cert_rejects_mtls_clients() -> TestResult {
   let pki = fixture_client("tls_client_auth", Some(PKI_DN), None);
   let result = mtls::authenticate(&pool, &test_keys()?, &pki, None).await;
   assert!(matches!(result, Err(MtlsError::MissingCertificate)));
+  assert!(is_invalid_client(result));
+  Ok(())
+}
+
+/// RFC 8705 §2: the presented certificate must match the identity registered
+/// for the requesting `client_id`. A certificate enrolled for one client must
+/// not authenticate another, in either direction, and no `cnf` may be bound.
+#[tokio::test]
+async fn mtls_cross_wire_certificate_rejected_for_other_client() -> TestResult {
+  let pool = mtls_postgres().await?;
+  mtls_migrate(&pool).await?;
+  let keys = test_keys()?;
+  insert_mtls_client(
+    &pool,
+    "mtls-xwire-a",
+    "self_signed_tls_client_auth",
+    None,
+    Some(SELF_THUMBPRINT),
+  )
+  .await?;
+  insert_mtls_client(
+    &pool,
+    "mtls-xwire-b",
+    "self_signed_tls_client_auth",
+    None,
+    Some(PKI_THUMBPRINT),
+  )
+  .await?;
+  insert_mtls_client(&pool, "mtls-xwire-c", "tls_client_auth", Some(PKI_DN), None).await?;
+  let leaf_a = certs::cert_der(certs::CLIENT_SELF_CERT_PEM)?;
+  let leaf_b = certs::cert_der(certs::CLIENT_PKI_CERT_PEM)?;
+
+  // A's certificate while authenticating as B: B's thumbprint pin differs.
+  let result = mtls::authenticate_by_id(&pool, &keys, "mtls-xwire-b", Some(&leaf_a)).await;
+  assert!(matches!(result, Err(MtlsError::UnknownCertificate)));
+  assert!(is_invalid_client(result));
+  // B's certificate while authenticating as A: A's thumbprint pin differs.
+  let result = mtls::authenticate_by_id(&pool, &keys, "mtls-xwire-a", Some(&leaf_b)).await;
+  assert!(matches!(result, Err(MtlsError::UnknownCertificate)));
+  assert!(is_invalid_client(result));
+  // A's certificate while authenticating as the subject-DN client C.
+  let result = mtls::authenticate_by_id(&pool, &keys, "mtls-xwire-c", Some(&leaf_a)).await;
+  assert!(matches!(result, Err(MtlsError::UnknownCertificate)));
+  assert!(is_invalid_client(result));
+
+  // Controls: each client still binds with its own certificate, so the
+  // rejections above are the cross-wire and not an over-broad guard.
+  assert_eq!(
+    mtls::authenticate_by_id(&pool, &keys, "mtls-xwire-a", Some(&leaf_a))
+      .await?
+      .x5t_s256,
+    SELF_THUMBPRINT
+  );
+  assert_eq!(
+    mtls::authenticate_by_id(&pool, &keys, "mtls-xwire-b", Some(&leaf_b))
+      .await?
+      .x5t_s256,
+    PKI_THUMBPRINT
+  );
+  assert_eq!(
+    mtls::authenticate_by_id(&pool, &keys, "mtls-xwire-c", Some(&leaf_b))
+      .await?
+      .x5t_s256,
+    PKI_THUMBPRINT
+  );
+  Ok(())
+}
+
+/// The registered method is part of the credential: `tls_client_auth` is
+/// matched by subject DN, `self_signed_tls_client_auth` by exact thumbprint,
+/// and neither accepts the other method's identity.
+#[tokio::test]
+async fn mtls_auth_methods_not_interchangeable() -> TestResult {
+  let pool = mtls_postgres().await?;
+  mtls_migrate(&pool).await?;
+  let keys = test_keys()?;
+  insert_mtls_client(
+    &pool,
+    "mtls-method-pinned",
+    "self_signed_tls_client_auth",
+    None,
+    Some(SELF_THUMBPRINT),
+  )
+  .await?;
+  insert_mtls_client(
+    &pool,
+    "mtls-method-dn",
+    "tls_client_auth",
+    Some(PKI_DN),
+    None,
+  )
+  .await?;
+  let self_leaf = certs::cert_der(certs::CLIENT_SELF_CERT_PEM)?;
+  let pki_leaf = certs::cert_der(certs::CLIENT_PKI_CERT_PEM)?;
+
+  // A self-signed certificate is not the identity registered for the
+  // tls_client_auth client.
+  let result = mtls::authenticate_by_id(&pool, &keys, "mtls-method-dn", Some(&self_leaf)).await;
+  assert!(matches!(result, Err(MtlsError::UnknownCertificate)));
+  assert!(is_invalid_client(result));
+  // A CA-issued certificate is not the thumbprint pinned for the
+  // self_signed_tls_client_auth client.
+  let result = mtls::authenticate_by_id(&pool, &keys, "mtls-method-pinned", Some(&pki_leaf)).await;
+  assert!(matches!(result, Err(MtlsError::UnknownCertificate)));
+  assert!(is_invalid_client(result));
+
+  // Controls: each method accepts exactly its own registered identity.
+  assert_eq!(
+    mtls::authenticate_by_id(&pool, &keys, "mtls-method-pinned", Some(&self_leaf))
+      .await?
+      .x5t_s256,
+    SELF_THUMBPRINT
+  );
+  assert_eq!(
+    mtls::authenticate_by_id(&pool, &keys, "mtls-method-dn", Some(&pki_leaf))
+      .await?
+      .x5t_s256,
+    PKI_THUMBPRINT
+  );
+  Ok(())
+}
+
+/// RFC 8705 §2 and RFC 5280 §6.3.3: a certificate outside its validity
+/// window authenticates nobody, even when its thumbprint or subject DN is
+/// registered byte-for-byte; it must never bind a `cnf`.
+#[tokio::test]
+async fn mtls_expired_certificate_never_binds_cnf() -> TestResult {
+  let pool = mtls_postgres().await?;
+  mtls_migrate(&pool).await?;
+  let keys = test_keys()?;
+  let expired = certs::cert_der(certs::CLIENT_EXPIRED_CERT_PEM)?;
+  let expired_thumbprint = mtls::thumbprint_b64url(expired.as_ref());
+  let expired_dn = mtls::subject_dn(expired.as_ref())?;
+  insert_mtls_client(
+    &pool,
+    "mtls-expired-pinned",
+    "self_signed_tls_client_auth",
+    None,
+    Some(&expired_thumbprint),
+  )
+  .await?;
+  insert_mtls_client(
+    &pool,
+    "mtls-expired-dn",
+    "tls_client_auth",
+    Some(&expired_dn),
+    None,
+  )
+  .await?;
+
+  let pinned = client_repo::find_active_by_client_id(&pool, &keys, "mtls-expired-pinned")
+    .await?
+    .ok_or(MtlsError::UnknownClient)?;
+  assert_eq!(
+    pinned.tls_client_auth_cert_thumbprint.as_deref(),
+    Some(expired_thumbprint.as_str())
+  );
+  let by_dn = client_repo::find_active_by_client_id(&pool, &keys, "mtls-expired-dn")
+    .await?
+    .ok_or(MtlsError::UnknownClient)?;
+  assert_eq!(
+    by_dn.tls_client_auth_subject_dn.as_deref(),
+    Some(expired_dn.as_str())
+  );
+
+  // The registered identity matches; only the validity window rejects, and
+  // no `cnf` may be produced for either method.
+  let result = mtls::authenticate_by_id(&pool, &keys, "mtls-expired-pinned", Some(&expired)).await;
+  assert!(matches!(result, Err(MtlsError::ExpiredCertificate)));
+  assert!(is_invalid_client(result));
+  let result = mtls::authenticate_by_id(&pool, &keys, "mtls-expired-dn", Some(&expired)).await;
+  assert!(matches!(result, Err(MtlsError::ExpiredCertificate)));
   assert!(is_invalid_client(result));
   Ok(())
 }

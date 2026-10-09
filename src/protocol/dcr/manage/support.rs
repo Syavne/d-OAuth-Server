@@ -15,13 +15,15 @@ use testcontainers::{
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::super::{RegisterContext, RegisterRequest, RegisterStores, register_client};
+use super::super::{
+  RegisterContext, RegisterRequest, RegisterResponse, RegisterStores, register_client,
+};
 use super::{ManageContext, ManageError, ManageStores};
 use crate::{
   config::{Config, DurabilityMode},
   crypto::tokens as tokens_crypto,
   db::{redirect_repo, scope_repo, test_support::Db},
-  error::OAuthErrorCode,
+  error::{AppError, OAuthErrorCode},
   state::RedisConn,
   store::{Store, dcr as dcr_store},
   test_guard::{ContainerGuard, Lease},
@@ -215,7 +217,7 @@ async fn issue_iat(harness: &mut Harness, uses: u64) -> Result<String, TestError
 }
 
 /// A registration request against `redirect_uri` with DPoP binding.
-fn dpop_request(redirect_uri: &str, scope: Option<&str>) -> RegisterRequest {
+pub(super) fn dpop_request(redirect_uri: &str, scope: Option<&str>) -> RegisterRequest {
   RegisterRequest {
     redirect_uris: Some(vec![redirect_uri.to_owned()]),
     client_name: Some("dcr manage client".to_owned()),
@@ -258,15 +260,9 @@ pub(super) async fn register(
   })
 }
 
-/// Register one mTLS client through the production path.
-pub(super) async fn register_mtls(
-  harness: &mut Harness,
-  redirect_uri: &str,
-  subject_dn: &str,
-) -> Result<Registered, TestError> {
-  seed_redirect(&harness.pool, &harness.config.keys, redirect_uri).await?;
-  let iat = issue_iat(harness, 3).await?;
-  let request = RegisterRequest {
+/// Build an mTLS (`tls_client_auth`) registration body for `subject_dn`.
+pub(super) fn mtls_request(redirect_uri: &str, subject_dn: &str) -> RegisterRequest {
+  RegisterRequest {
     redirect_uris: Some(vec![redirect_uri.to_owned()]),
     client_name: Some("dcr manage mtls client".to_owned()),
     token_endpoint_auth_method: Some("tls_client_auth".to_owned()),
@@ -280,7 +276,18 @@ pub(super) async fn register_mtls(
     contacts: None,
     request_uris: None,
     software_id: None,
-  };
+  }
+}
+
+/// Register one mTLS client through the production path.
+pub(super) async fn register_mtls(
+  harness: &mut Harness,
+  redirect_uri: &str,
+  subject_dn: &str,
+) -> Result<Registered, TestError> {
+  seed_redirect(&harness.pool, &harness.config.keys, redirect_uri).await?;
+  let iat = issue_iat(harness, 3).await?;
+  let request = mtls_request(redirect_uri, subject_dn);
   let response = {
     let (mut stores, ctx) = register_parts(harness);
     register_client(&mut stores, &ctx, Some(&iat), &request)
@@ -292,6 +299,53 @@ pub(super) async fn register_mtls(
     secret: response.client_secret,
     reg_token: response.registration_access_token,
   })
+}
+
+/// Register one client through the production path with an explicit body,
+/// returning the raw application outcome so tests can assert typed errors.
+///
+/// The caller seeds any catalog redirect URI or scope first.
+pub(super) async fn try_register(
+  harness: &mut Harness,
+  request: &RegisterRequest,
+) -> Result<Result<RegisterResponse, AppError>, TestError> {
+  let iat = issue_iat(harness, 3).await?;
+  let outcome = {
+    let (mut stores, ctx) = register_parts(harness);
+    register_client(&mut stores, &ctx, Some(&iat), request).await
+  };
+  Ok(outcome)
+}
+
+/// Assert an application error is exactly the typed `code`/`status` contract.
+pub(super) fn expect_app_error(error: AppError, code: OAuthErrorCode, status: u16) -> TestResult {
+  if error.code() != code || error.status().as_u16() != status {
+    return Err(TestError::Unexpected(format!(
+      "wrong error: {} {} (expected {code} {status})",
+      error.code(),
+      error.status()
+    )));
+  }
+  Ok(())
+}
+
+/// Assert the SSRF guard denies `uri` per the documented fetch policy:
+/// `https` only, and never a private/loopback/link-local literal
+/// (docs/OAUTH.md "JAR and PAR", docs/SECURITY.md "PAR and JAR"). A URL
+/// that fails the scheme or IP-literal check is denied before any socket
+/// is opened, so this never performs network I/O for the fixture URLs.
+pub(super) async fn expect_ssrf_denied(uri: &str) -> TestResult {
+  use crate::protocol::ssrf::{SsrfError, fetch_guarded_bytes};
+
+  match fetch_guarded_bytes(uri).await {
+    Err(SsrfError::NonHttps | SsrfError::BlockedTarget) => Ok(()),
+    Err(error) => Err(TestError::Unexpected(format!(
+      "unexpected guard failure for {uri}: {error}"
+    ))),
+    Ok(_) => Err(TestError::Unexpected(format!(
+      "guard fetched a forbidden request_uri: {uri}"
+    ))),
+  }
 }
 
 /// Assert a management failure is `401 invalid_client`.

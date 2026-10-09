@@ -2,8 +2,10 @@
 
 use super::read_client;
 use super::support::{
-  TestResult, expect_forbidden, expect_unauthorized, harness, manage_parts, register,
+  TestError, TestResult, dpop_request, expect_forbidden, expect_ssrf_denied, expect_unauthorized,
+  harness, manage_parts, register, seed_redirect, try_register,
 };
+use crate::db::client_repo;
 
 #[tokio::test]
 async fn dcr_manage_read_returns_metadata() -> TestResult {
@@ -204,6 +206,55 @@ async fn dcr_manage_forbidden_renders_403() -> TestResult {
     return Err(super::support::TestError::Unexpected(format!(
       "wrong 403 body: {value}"
     )));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn dcr_manage_register_request_uris_stored_verbatim() -> TestResult {
+  // RFC 7591 §2 treats `request_uris` as client metadata to store, not a URL
+  // to fetch at registration; this server stores it verbatim and enforces the
+  // SSRF policy only when a request_uri is resolved at `/authorize`
+  // (docs/OAUTH.md "JAR and PAR", docs/SECURITY.md "PAR and JAR": https only,
+  // no redirects, global IPs only). A plaintext scheme, a loopback literal,
+  // and a non-https scheme must therefore register cleanly and stay inert.
+  let (_guard, mut harness) = harness("catalog").await?;
+  let redirect = "https://app.example.test/cb";
+  seed_redirect(&harness.pool, &harness.config.keys, redirect).await?;
+  let request_uris = serde_json::json!([
+    "http://app.example.test/req.jwt",
+    "https://127.0.0.1/req.jwt",
+    "ftp://app.example.test/req.jwt"
+  ]);
+  let mut request = dpop_request(redirect, None);
+  request.request_uris = Some(request_uris.clone());
+
+  let response = match try_register(&mut harness, &request).await? {
+    Ok(response) => response,
+    Err(error) => {
+      return Err(TestError::Unexpected(format!(
+        "registration with request_uris rejected: {error}"
+      )));
+    }
+  };
+
+  let row =
+    client_repo::find_active_by_client_id(&harness.pool, &harness.config.keys, &response.client_id)
+      .await?
+      .ok_or_else(|| TestError::Unexpected("registered client row missing".to_owned()))?;
+  if row.request_uris.as_ref() != Some(&request_uris) {
+    return Err(TestError::Unexpected(format!(
+      "request_uris not stored verbatim: {:?}",
+      row.request_uris
+    )));
+  }
+
+  for uri in [
+    "http://app.example.test/req.jwt",
+    "https://127.0.0.1/req.jwt",
+    "ftp://app.example.test/req.jwt",
+  ] {
+    expect_ssrf_denied(uri).await?;
   }
   Ok(())
 }

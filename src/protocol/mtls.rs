@@ -42,6 +42,9 @@ pub enum MtlsError {
   /// The presented bytes are not a parseable X.509 certificate.
   #[error("client certificate could not be parsed")]
   MalformedCertificate,
+  /// The presented certificate is outside its validity window.
+  #[error("client certificate is outside its validity period")]
+  ExpiredCertificate,
   /// No active client has this `client_id`.
   #[error("unknown client")]
   UnknownClient,
@@ -71,6 +74,7 @@ impl MtlsError {
       | Self::UnknownCertificate
       | Self::AmbiguousSubjectDn
       | Self::MalformedCertificate
+      | Self::ExpiredCertificate
       | Self::UnknownClient
       | Self::UnexpectedMethod => AppError::invalid_client_non_basic(),
     }

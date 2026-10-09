@@ -9,7 +9,10 @@ mod auth;
 mod cascade;
 
 use std::{
-  sync::atomic::{AtomicU64, Ordering},
+  sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+  },
   time::Duration,
 };
 
@@ -27,7 +30,7 @@ use crate::{
     client_auth::ClientAuthRequest,
     token::{ClientKind, MintRequest, SenderProof, TokenService, TokenServiceError},
   },
-  state::RedisConn,
+  state::{AppState, Clock, RedisConn},
   store::{Store, StoreError},
   test_guard::{ContainerGuard, Lease, Shared},
 };
@@ -125,6 +128,34 @@ fn lazy_pool() -> Result<sqlx::PgPool, TestError> {
       .acquire_timeout(Duration::from_millis(200))
       .connect_lazy("postgres://postgres:secret@127.0.0.1:1/postgres")?,
   )
+}
+
+/// An [`AppState`] for handler-level tests whose Postgres and Redis handles are
+/// lazy and never dialed: the missing-`token` path is rejected before any
+/// datastore call.
+fn handler_state() -> Result<AppState, TestError> {
+  let fixture = serde_json::json!({
+    "issuer": "https://auth.example.test",
+    "environment": "development",
+    "tls": {"cert_path": "/tmp/revoke-test-cert.pem", "key_path": "/tmp/revoke-test-key.pem"},
+    "database": {"url": "postgres://127.0.0.1:1/revoke"},
+    "redis": {"url": "redis://127.0.0.1:1", "durability": "waitaof"},
+    "token_pepper": "revoke-test-pepper-0123456789abcdef",
+    "totp_encryption_key": "revoke-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "revoke-test-pii-key-0123456789abcdef",
+  });
+  let source = ::config::Config::try_from(&fixture)
+    .map_err(|error| TestError::Unexpected(format!("config fixture: {error:?}")))?;
+  let config = crate::config::Config::from_source(source)
+    .map_err(|error| TestError::Unexpected(format!("config fixture: {error:?}")))?;
+  Ok(AppState {
+    pool: lazy_pool()?,
+    redis: lazy_redis()?,
+    config: Arc::new(config),
+    keys: Arc::new(test_keys()?),
+    transition_unsafe: Arc::new(AtomicBool::new(false)),
+    clock: Clock::system(),
+  })
 }
 
 static TEST_NONCE: AtomicU64 = AtomicU64::new(70_000);

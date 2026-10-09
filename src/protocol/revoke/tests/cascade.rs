@@ -224,3 +224,112 @@ async fn revoke_unsupported_hint_is_rejected() -> TestResult {
   }
   Ok(())
 }
+
+/// A `refresh_token` hint on an access token still revokes it: the hint only
+/// guides the lookup (RFC 7009 §2.1), and the located token's real type
+/// decides the scope of revocation (revoke.rs: an access token revokes only
+/// itself, so the sibling refresh token survives).
+#[tokio::test]
+async fn revoke_refresh_hint_on_access_token_still_revokes_it() -> TestResult {
+  let (_redis, mut conn, store) = test_redis().await?;
+  let service = service()?;
+  let client = unique("client");
+  let minted = service
+    .mint(
+      &mut conn,
+      &store,
+      &mint_request(&client, &unique("grant")),
+      now_unix(),
+    )
+    .await?;
+
+  let outcome = revoke_owned(
+    &mut conn,
+    &store,
+    &service,
+    &OwnedToken {
+      owner_client_id: &client,
+      token: &minted.access_token,
+      token_type_hint: Some(HINT_REFRESH),
+    },
+  )
+  .await?;
+  if outcome != RevokeOutcome::Revoked {
+    return Err(TestError::Unexpected(
+      "the misplaced hint must not block revocation".to_owned(),
+    ));
+  }
+  if service
+    .find_access(&mut conn, &store, &minted.access_token)
+    .await?
+    .is_some()
+  {
+    return Err(TestError::Unexpected(
+      "the access token must be gone after revocation".to_owned(),
+    ));
+  }
+  if service
+    .find_refresh(&mut conn, &store, &minted.refresh_token)
+    .await?
+    .is_none()
+  {
+    return Err(TestError::Unexpected(
+      "the hint must not extend revocation beyond an access token".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// Revoking another client's refresh token is a silent no-op: `NoOp`, the
+/// refresh token stays resolvable, and its access sibling is untouched too.
+#[tokio::test]
+async fn revoke_foreign_refresh_token_is_noop_and_untouched() -> TestResult {
+  let (_redis, mut conn, store) = test_redis().await?;
+  let service = service()?;
+  let owner = unique("owner");
+  let attacker = unique("attacker");
+  let minted = service
+    .mint(
+      &mut conn,
+      &store,
+      &mint_request(&owner, &unique("grant")),
+      now_unix(),
+    )
+    .await?;
+
+  let outcome = revoke_owned(
+    &mut conn,
+    &store,
+    &service,
+    &OwnedToken {
+      owner_client_id: &attacker,
+      token: &minted.refresh_token,
+      token_type_hint: Some(HINT_REFRESH),
+    },
+  )
+  .await?;
+  if outcome != RevokeOutcome::NoOp {
+    return Err(TestError::Unexpected(
+      "a foreign refresh token must be a no-op".to_owned(),
+    ));
+  }
+  if service
+    .find_refresh(&mut conn, &store, &minted.refresh_token)
+    .await?
+    .is_none()
+  {
+    return Err(TestError::Unexpected(
+      "a foreign client must never revoke another client's refresh token".to_owned(),
+    ));
+  }
+  if service
+    .find_access(&mut conn, &store, &minted.access_token)
+    .await?
+    .is_none()
+  {
+    return Err(TestError::Unexpected(
+      "the sibling access token must also survive a foreign attempt".to_owned(),
+    ));
+  }
+  Ok(())
+}

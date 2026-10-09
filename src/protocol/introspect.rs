@@ -48,6 +48,10 @@ pub const BEARER: &str = "Bearer";
 #[derive(Debug, Deserialize)]
 pub struct IntrospectForm {
   /// The token to inspect (required).
+  ///
+  /// Defaulted so a missing field reaches [`introspect`] and renders the
+  /// RFC 7662 §2.3 `invalid_request` (400) instead of an extractor rejection.
+  #[serde(default)]
   pub token: String,
   /// Optional hint about the token type.
   #[serde(default)]

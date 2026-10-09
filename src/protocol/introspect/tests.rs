@@ -40,7 +40,11 @@ use crate::{
   config::Config,
   crypto::secret::{Argon2Params, hash_secret},
   db::{NewClient, TokenEndpointAuthMethod, client_repo, test_support::migrated_pool},
-  protocol::token::{ClientKind, MintRequest, SenderProof, TokenService},
+  protocol::{
+    client_auth::ClientAuthRequest,
+    revoke::{RevokeContext, RevokeOutcome, RevokeRequest, RevokeStores, revoke_tokens},
+    token::{ClientKind, MintRequest, SenderProof, TokenService},
+  },
   state::{AppState, Clock, RedisConn},
   store::Store,
   test_guard::{ContainerGuard, Lease},
@@ -153,10 +157,11 @@ fn token_service(h: &Harness) -> TestResult<TokenService> {
   Ok(TokenService::new(&h.config.ttl, &h.config.keys)?)
 }
 
-/// Mint one sender-constrained access token owned by `client_id`.
-async fn mint_constrained(
+/// Mint one token pair owned by `client_id` with an explicit sender proof.
+async fn mint_bound(
   h: &mut Harness,
   client_id: &str,
+  proof: SenderProof,
 ) -> TestResult<crate::protocol::token::MintedTokens> {
   let service = token_service(h)?;
   Ok(
@@ -170,15 +175,28 @@ async fn mint_constrained(
           subject: "user-1".to_owned(),
           scope: "orders:read".to_owned(),
           grant_id: unique("grant"),
-          proof: SenderProof {
-            dpop_jkt: Some("jkt-thumbnail".to_owned()),
-            mtls_x5t_s256: Some("x5t-thumbnail".to_owned()),
-          },
+          proof,
         },
         now_unix(),
       )
       .await?,
   )
+}
+
+/// Mint one sender-constrained access token owned by `client_id`.
+async fn mint_constrained(
+  h: &mut Harness,
+  client_id: &str,
+) -> TestResult<crate::protocol::token::MintedTokens> {
+  mint_bound(
+    h,
+    client_id,
+    SenderProof {
+      dpop_jkt: Some("jkt-thumbnail".to_owned()),
+      mtls_x5t_s256: Some("x5t-thumbnail".to_owned()),
+    },
+  )
+  .await
 }
 
 /// Drive the core with `client_secret_post` credentials.
@@ -230,7 +248,11 @@ fn basic_header(client_id: &str, secret: &str) -> String {
   format!("Basic {encoded}")
 }
 
-async fn post_form(app: Router, auth: Option<&str>, body: &str) -> TestResult<(StatusCode, Value)> {
+async fn post_form_bytes(
+  app: Router,
+  auth: Option<&str>,
+  body: &str,
+) -> TestResult<(StatusCode, Vec<u8>)> {
   let mut builder = Request::builder()
     .method("POST")
     .uri("/introspect")
@@ -242,6 +264,11 @@ async fn post_form(app: Router, auth: Option<&str>, body: &str) -> TestResult<(S
   let response = app.oneshot(request).await?;
   let status = response.status();
   let bytes = response.into_body().collect().await?.to_bytes();
+  Ok((status, bytes.to_vec()))
+}
+
+async fn post_form(app: Router, auth: Option<&str>, body: &str) -> TestResult<(StatusCode, Value)> {
+  let (status, bytes) = post_form_bytes(app, auth, body).await?;
   Ok((status, serde_json::from_slice(&bytes)?))
 }
 
@@ -408,6 +435,402 @@ async fn test_introspect_revoked_token_is_inactive() -> TestResult {
   )
   .await?;
   assert!(!response.active, "revoked token must be inactive");
+  assert_eq!(response, IntrospectionResponse::inactive());
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_missing_token_form_is_400_invalid_request() -> TestResult {
+  let (_container, h) = harness().await?;
+  let client_id = unique("missing-token");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretBasic,
+    Some("secret-mt"),
+  )
+  .await?;
+
+  let auth = basic_header(&client_id, "secret-mt");
+  let (status, bytes) = post_form_bytes(
+    router(&h),
+    Some(&auth),
+    "token_type_hint=access_token&client_secret=secret-mt",
+  )
+  .await?;
+
+  // RFC 7662 §2.1: `token` is REQUIRED; §2.3: a malformed request is
+  // `invalid_request` (HTTP 400), never a silent inactive 200.
+  assert_eq!(
+    status,
+    StatusCode::BAD_REQUEST,
+    "a missing token parameter must be invalid_request 400"
+  );
+  let body: Value = serde_json::from_slice(&bytes)?;
+  assert_eq!(
+    body.get("error").and_then(Value::as_str),
+    Some("invalid_request")
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_empty_token_is_400_invalid_request() -> TestResult {
+  let (_container, h) = harness().await?;
+  let client_id = unique("empty-token");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretBasic,
+    Some("secret-et"),
+  )
+  .await?;
+
+  let auth = basic_header(&client_id, "secret-et");
+  let (status, bytes) = post_form_bytes(
+    router(&h),
+    Some(&auth),
+    "token=&token_type_hint=access_token",
+  )
+  .await?;
+
+  // RFC 7662 §2.1: an empty `token` is no token at all, so §2.3's
+  // `invalid_request` applies rather than the inactive response.
+  assert_eq!(
+    status,
+    StatusCode::BAD_REQUEST,
+    "an empty token must be invalid_request 400"
+  );
+  let body: Value = serde_json::from_slice(&bytes)?;
+  assert_eq!(
+    body.get("error").and_then(Value::as_str),
+    Some("invalid_request")
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_refresh_token_reports_active_shape() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = unique("refresh-shape");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some("secret-rs"),
+  )
+  .await?;
+
+  let minted = mint_bound(&mut h, &client_id, SenderProof::none()).await?;
+  let before = now_unix();
+  let response = run_core(
+    &mut h,
+    &minted.refresh_token,
+    Some("refresh_token"),
+    &client_id,
+    "secret-rs",
+  )
+  .await?;
+
+  assert!(response.active, "a live refresh token must be active");
+  assert_eq!(response.scope.as_deref(), Some("orders:read"));
+  assert_eq!(response.client_id.as_deref(), Some(client_id.as_str()));
+  assert_eq!(response.sub.as_deref(), Some("user-1"));
+  // RFC 7662 §2.2: `token_type` is OPTIONAL; RFC 6749 §5.1 defines a token
+  // type only for access tokens, so a refresh token reports none.
+  assert_eq!(response.token_type, None);
+  assert_eq!(response.cnf, None, "an unbound token has no confirmation");
+  let iat = response.iat.ok_or("iat missing")?;
+  let exp = response.exp.ok_or("exp missing")?;
+  assert!(iat < exp, "iat must precede exp");
+  assert!(exp > before, "exp must be in the future");
+  let ttl = i64::try_from(h.config.ttl.refresh.as_secs())?;
+  assert_eq!(exp - iat, ttl, "window must equal the refresh TTL");
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_dpop_bound_token_reports_jkt_only() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = unique("dpop-bound");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some("secret-dp"),
+  )
+  .await?;
+
+  let minted = mint_bound(
+    &mut h,
+    &client_id,
+    SenderProof {
+      dpop_jkt: Some("jkt-dpop-only".to_owned()),
+      mtls_x5t_s256: None,
+    },
+  )
+  .await?;
+  let response = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-dp",
+  )
+  .await?;
+
+  // RFC 9449 §5/§6: a DPoP-bound token confirms the key with `cnf.jkt`.
+  let cnf = response.cnf.as_ref().ok_or("cnf missing")?;
+  assert_eq!(cnf.jkt.as_deref(), Some("jkt-dpop-only"));
+  assert_eq!(cnf.x5t_s256, None, "no mTLS binding was proven");
+  let json = serde_json::to_value(&response)?;
+  let cnf_json = json
+    .get("cnf")
+    .and_then(Value::as_object)
+    .ok_or("cnf member missing")?;
+  assert_eq!(
+    cnf_json.get("jkt").and_then(Value::as_str),
+    Some("jkt-dpop-only")
+  );
+  assert!(
+    !cnf_json.contains_key("x5t#S256"),
+    "the mTLS thumbprint must not leak into a DPoP-only response"
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_mtls_bound_token_reports_x5t_only() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = unique("mtls-bound");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some("secret-mtls"),
+  )
+  .await?;
+
+  let minted = mint_bound(
+    &mut h,
+    &client_id,
+    SenderProof {
+      dpop_jkt: None,
+      mtls_x5t_s256: Some("x5t-mtls-only".to_owned()),
+    },
+  )
+  .await?;
+  let response = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-mtls",
+  )
+  .await?;
+
+  // RFC 8705 §3.1: an mTLS-bound token confirms the certificate with
+  // `cnf."x5t#S256"`.
+  let cnf = response.cnf.as_ref().ok_or("cnf missing")?;
+  assert_eq!(cnf.x5t_s256.as_deref(), Some("x5t-mtls-only"));
+  assert_eq!(cnf.jkt, None, "no DPoP binding was proven");
+  let json = serde_json::to_value(&response)?;
+  let cnf_json = json
+    .get("cnf")
+    .and_then(Value::as_object)
+    .ok_or("cnf member missing")?;
+  assert_eq!(
+    cnf_json.get("x5t#S256").and_then(Value::as_str),
+    Some("x5t-mtls-only")
+  );
+  assert!(
+    !cnf_json.contains_key("jkt"),
+    "the DPoP thumbprint must not leak into an mTLS-only response"
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_unknown_hint_is_advisory() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = unique("unknown-hint");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some("secret-uh"),
+  )
+  .await?;
+
+  let minted = mint_bound(&mut h, &client_id, SenderProof::none()).await?;
+  let response = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("password"),
+    &client_id,
+    "secret-uh",
+  )
+  .await?;
+
+  // RFC 7662 §2.1: an unknown `token_type_hint` is advisory only; the server
+  // must not reject the request and must still resolve the token.
+  assert!(
+    response.active,
+    "an unknown hint must not inactivate the token"
+  );
+  assert_eq!(response.token_type.as_deref(), Some("Bearer"));
+  assert_eq!(response.client_id.as_deref(), Some(client_id.as_str()));
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_wrong_hint_still_resolves_refresh() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = unique("wrong-hint");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some("secret-wh"),
+  )
+  .await?;
+
+  let minted = mint_bound(&mut h, &client_id, SenderProof::none()).await?;
+  let response = run_core(
+    &mut h,
+    &minted.refresh_token,
+    Some("access_token"),
+    &client_id,
+    "secret-wh",
+  )
+  .await?;
+
+  // RFC 7662 §2.1: a hint that misses must fall back to the other token type,
+  // so the refresh token is still found and reported active.
+  assert!(response.active, "the hint must not hide the refresh token");
+  assert_eq!(response.token_type, None);
+  assert_eq!(response.scope.as_deref(), Some("orders:read"));
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_active_response_leaks_no_token_or_secret() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = unique("no-leak");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretBasic,
+    Some("leak-secret"),
+  )
+  .await?;
+
+  let minted = mint_bound(&mut h, &client_id, SenderProof::none()).await?;
+  let auth = basic_header(&client_id, "leak-secret");
+  let (status, bytes) = post_form_bytes(
+    router(&h),
+    Some(&auth),
+    &format!("token={}", minted.access_token),
+  )
+  .await?;
+
+  assert_eq!(status, StatusCode::OK);
+  let raw = String::from_utf8(bytes)?;
+  assert!(
+    raw.contains("\"active\":true"),
+    "expected an active response"
+  );
+  assert!(
+    !raw.contains(&minted.access_token),
+    "the presented token must never be echoed"
+  );
+  assert!(
+    !raw.contains(&minted.refresh_token),
+    "the sibling refresh token must never leak"
+  );
+  assert!(
+    !raw.contains("leak-secret"),
+    "the client secret must never leak"
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_after_revoke_endpoint_is_inactive() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = unique("revoke-then-introspect");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some("secret-ri"),
+  )
+  .await?;
+  let minted = mint_bound(
+    &mut h,
+    &client_id,
+    SenderProof {
+      dpop_jkt: Some("jkt-revoked".to_owned()),
+      mtls_x5t_s256: None,
+    },
+  )
+  .await?;
+
+  let outcome = {
+    let service = token_service(&h)?;
+    let auth = ClientAuthRequest {
+      basic_header: None,
+      client_id: Some(client_id.as_str()),
+      body_secret: Some(SecretString::from("secret-ri")),
+      assertion_type: None,
+      assertion: None,
+      peer_certs: None,
+    };
+    let mut stores = RevokeStores {
+      pool: &h.pool,
+      keys: &h.config.keys,
+      conn: &mut h.conn,
+      store: &h.store,
+      service: &service,
+    };
+    let ctx = RevokeContext {
+      token_endpoint: "https://auth.example.test/token",
+      now: OffsetDateTime::now_utc(),
+      request_id: Some("req-introspect-revoke"),
+    };
+    let request = RevokeRequest {
+      token: &minted.access_token,
+      token_type_hint: None,
+      auth: &auth,
+    };
+    revoke_tokens(&mut stores, &ctx, &request).await?
+  };
+  assert_eq!(
+    outcome,
+    RevokeOutcome::Revoked,
+    "the owner must revoke its own DPoP-bound token"
+  );
+
+  // RFC 7009 §2.2: after revocation the token is no longer usable, so
+  // RFC 7662 §2.2 introspection reports the inactive shape.
+  let response = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-ri",
+  )
+  .await?;
+  assert!(!response.active, "a revoked token must not be active");
   assert_eq!(response, IntrospectionResponse::inactive());
   Ok(())
 }

@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 
 use super::{
   MtlsCnf, MtlsError,
-  cert::{subject_dn, thumbprint_b64url},
+  cert::{ensure_within_validity, subject_dn, thumbprint_b64url},
 };
 use crate::db::client_repo::{self, Client, TokenEndpointAuthMethod};
 use crate::keys::KeyRing;
@@ -59,6 +59,7 @@ pub async fn authenticate(
   match method {
     TokenEndpointAuthMethod::SelfSignedTlsClientAuth => {
       let der = leaf.ok_or(MtlsError::MissingCertificate)?;
+      ensure_within_validity(der.as_ref())?;
       let thumbprint = thumbprint_b64url(der.as_ref());
       let registered = client
         .tls_client_auth_cert_thumbprint
@@ -73,6 +74,7 @@ pub async fn authenticate(
     }
     TokenEndpointAuthMethod::TlsClientAuth => {
       let der = leaf.ok_or(MtlsError::MissingCertificate)?;
+      ensure_within_validity(der.as_ref())?;
       let dn = subject_dn(der.as_ref())?;
       let registered = client
         .tls_client_auth_subject_dn

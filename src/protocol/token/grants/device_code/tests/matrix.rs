@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use axum::http::StatusCode;
+
 use super::super::{DevicePollError, DevicePollInputs, PollState, poll_device};
 use super::flows::{authorize, decide, now_unix, poll_once, public_inputs, secret};
 use super::{TestError, TestResult, harness, unique};
@@ -216,6 +218,104 @@ async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> Tes
   if tokens.token_type != "DPoP" || tokens.scope != "orders:read" {
     return Err(TestError::Unexpected(
       "a fresh proof must mint a DPoP token for the bound client".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// RFC 6749 §5.2 and the error table in docs/OAUTH.md: a grant issued to
+/// another client is `invalid_grant`. The foreign poll must not consume the
+/// code, so the legitimate client still redeems it.
+#[tokio::test]
+async fn test_grant_device_cross_client_poll_is_invalid_grant() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let owner_id = unique("owner");
+  let intruder_id = unique("intruder");
+  setup::insert_client(
+    &h.pool,
+    &h.config,
+    &owner_id,
+    TokenEndpointAuthMethod::None,
+    None,
+    "orders:read",
+  )
+  .await?;
+  setup::insert_client(
+    &h.pool,
+    &h.config,
+    &intruder_id,
+    TokenEndpointAuthMethod::None,
+    None,
+    "orders:read",
+  )
+  .await?;
+  setup::enable_scopes(&h.pool, &["orders:read"]).await?;
+  let user_id = setup::entitled_user(&h.pool, &h.config, &["orders:read"]).await?;
+  let t0 = now_unix();
+  let owner_key = keys::fresh_key()?;
+  let authorize_htu = keys::device_htu(&h.config);
+  let poll_htu = keys::token_htu(&h.config);
+
+  let authorize_proof = keys::mint_proof(&owner_key, &authorize_htu, &unique("jti"), t0)?;
+  let authorize_inputs = DeviceHttpInputs {
+    client_id: owner_id.as_str(),
+    scope: Some("orders:read"),
+    basic_header: None,
+    body_secret: None,
+    assertion_type: None,
+    assertion: None,
+    dpop_proof: Some(authorize_proof.as_str()),
+    peer_certs: None,
+  };
+  let issued = authorize(&mut h, &authorize_inputs, t0)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("authorize rejected: {error}")))?;
+  if !decide(&mut h, &issued.device_code, true, &user_id.to_string()).await? {
+    return Err(TestError::Unexpected("decide must apply".to_owned()));
+  }
+
+  let t1 = t0 + 6;
+  let intruder_key = keys::fresh_key()?;
+  let intruder_proof = keys::mint_proof(&intruder_key, &poll_htu, &unique("jti"), t1)?;
+  match poll_once(
+    &mut h,
+    &public_inputs(&intruder_id, &issued.device_code, Some(&intruder_proof)),
+    t1,
+  )
+  .await
+  {
+    Err(DevicePollError::Protocol(error))
+      if error.code() == OAuthErrorCode::InvalidGrant
+        && error.status() == StatusCode::BAD_REQUEST => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "cross-client poll must be invalid_grant 400, got {}",
+        other.code()
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "a foreign client must never mint a token".to_owned(),
+      ));
+    }
+  }
+
+  // The rejected poll left the grant untouched: the owner still redeems it.
+  let owner_proof = keys::mint_proof(&owner_key, &poll_htu, &unique("jti"), t1)?;
+  let tokens = poll_once(
+    &mut h,
+    &public_inputs(&owner_id, &issued.device_code, Some(&owner_proof)),
+    t1,
+  )
+  .await
+  .map_err(|error| TestError::Unexpected(format!("owner redemption rejected: {}", error.code())))?;
+  if tokens.token_type != "DPoP"
+    || tokens.access_token.is_empty()
+    || tokens.refresh_token.is_empty()
+    || tokens.scope != "orders:read"
+  {
+    return Err(TestError::Unexpected(
+      "the owner must still redeem the untouched grant".to_owned(),
     ));
   }
   Ok(())

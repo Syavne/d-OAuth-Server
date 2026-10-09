@@ -3,8 +3,8 @@
 //! Parses the form once, authenticates the client through the shared
 //! [`client_auth`] dispatch (or delegates to the grants that authenticate
 //! themselves), verifies the fresh sender proof, dispatches on `grant_type`,
-//! and shapes the RFC 6749 §5.1 JSON response. Unknown grant types fail
-//! closed with `unsupported_grant_type`.
+//! and shapes the RFC 6749 §5.1 JSON response. A missing `grant_type` is
+//! `invalid_request`; an unknown one fails closed with `unsupported_grant_type`.
 //!
 //! The per-grant branches live in [`grants`]; this module owns the HTTP
 //! contract, the request-scoped handles, and the shared authentication and
@@ -13,7 +13,7 @@
 mod grants;
 
 use axum::Json;
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, State, rejection::FormRejection};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use secrecy::SecretString;
@@ -292,8 +292,12 @@ pub async fn handler(
   State(state): State<AppState>,
   peer_certs: Option<Extension<PeerCertificates>>,
   headers: HeaderMap,
-  form: axum::Form<TokenForm>,
+  form: Result<axum::Form<TokenForm>, FormRejection>,
 ) -> Response {
+  let form = match form {
+    Ok(axum::Form(form)) => form,
+    Err(rejection) => return form_rejection_response(rejection),
+  };
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let now_unix = state.clock.now().unix_timestamp();
@@ -309,6 +313,24 @@ pub async fn handler(
   match grants::dispatch_grant(&mut dispatch).await {
     Ok(body) => token_response(body),
     Err(error) => error.into_response(),
+  }
+}
+
+/// Map a form-extractor rejection onto the documented error model.
+///
+/// A deserialization failure is the transport shape of RFC 6749 §5.2
+/// "includes a parameter more than once", so it renders the documented
+/// `invalid_request` JSON error; non-form content types and body-read
+/// failures keep the extractor's own status and body.
+fn form_rejection_response(rejection: FormRejection) -> Response {
+  match rejection {
+    FormRejection::FailedToDeserializeForm(_) | FormRejection::FailedToDeserializeFormBody(_) => {
+      AppError::invalid_request(
+        "the request body is malformed or includes a parameter more than once",
+      )
+      .into_response()
+    }
+    other => other.into_response(),
   }
 }
 

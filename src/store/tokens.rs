@@ -492,6 +492,32 @@ async fn put_member(
     .query_async(conn)
     .await
     .map_err(StoreError::Redis)?;
+  ensure_set_ttl(conn, set_key, ttl).await
+}
+
+/// Keep the per-grant token set alive at least as long as its longest-lived
+/// member: arm an expiry when the set is persistent, extend it when the member
+/// outlives the current one, never shorten it. The set "lives with the grant"
+/// (docs/REDIS.md) instead of leaking member hashes forever.
+///
+/// Both steps are single atomic commands, so a concurrent writer can never
+/// shorten a longer expiry: `NX` arms only a persistent set (a no-op once one
+/// is set), then `GT` extends only a shorter one.
+async fn ensure_set_ttl(
+  conn: &mut RedisConn,
+  set_key: &str,
+  ttl: Duration,
+) -> Result<(), StoreError> {
+  let ttl_ms = ttl.as_millis() as u64;
+  for mode in ["NX", "GT"] {
+    let _: () = redis::cmd("PEXPIRE")
+      .arg(set_key)
+      .arg(ttl_ms)
+      .arg(mode)
+      .query_async(conn)
+      .await
+      .map_err(StoreError::Redis)?;
+  }
   Ok(())
 }
 

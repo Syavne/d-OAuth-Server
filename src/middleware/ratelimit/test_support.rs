@@ -128,6 +128,16 @@ pub(super) fn peer(last: u8) -> SocketAddr {
   SocketAddr::from(([127, 0, 0, last], 40_000))
 }
 
+/// Connection and header extras for one test request.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Extras<'a> {
+  /// Peer address recorded in `ConnectInfo`; `None` models a request the
+  /// limiter receives with no recorded peer.
+  pub peer: Option<SocketAddr>,
+  /// Additional request headers, such as a forged `X-Forwarded-For`.
+  pub headers: &'a [(&'a str, &'a str)],
+}
+
 /// Drive one request through the layered service from `peer_addr`.
 pub(super) async fn send<S>(
   service: S,
@@ -143,12 +153,48 @@ where
     + 'static,
   S::Future: Send + 'static,
 {
-  let mut request = Request::builder()
+  send_with(
+    service,
+    method,
+    uri,
+    body,
+    Extras {
+      peer: Some(peer_addr),
+      headers: &[],
+    },
+  )
+  .await
+}
+
+/// Drive one request through the layered service with [`Extras`].
+///
+/// `extras.peer == None` omits `ConnectInfo`, modeling a request whose peer
+/// the limiter cannot identify.
+pub(super) async fn send_with<S>(
+  service: S,
+  method: &str,
+  uri: &str,
+  body: &str,
+  extras: Extras<'_>,
+) -> Result<Response<Body>, Box<dyn Error>>
+where
+  S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
+    + Clone
+    + Send
+    + 'static,
+  S::Future: Send + 'static,
+{
+  let mut builder = Request::builder()
     .method(method)
     .uri(uri)
-    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-    .body(Body::from(body.to_owned()))?;
-  request.extensions_mut().insert(ConnectInfo(peer_addr));
+    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+  for (name, value) in extras.headers {
+    builder = builder.header(*name, *value);
+  }
+  let mut request = builder.body(Body::from(body.to_owned()))?;
+  if let Some(peer_addr) = extras.peer {
+    request.extensions_mut().insert(ConnectInfo(peer_addr));
+  }
   Ok(service.oneshot(request).await?)
 }
 

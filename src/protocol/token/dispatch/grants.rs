@@ -29,9 +29,21 @@ use crate::{
   },
 };
 
-/// Dispatch on the parsed `grant_type`; unknown values fail closed.
+/// Dispatch on the parsed `grant_type`.
+///
+/// A missing or empty member is the RFC 6749 §5.2 `invalid_request` (the
+/// request is missing a required parameter); an unknown value fails closed
+/// with `unsupported_grant_type`.
 pub(super) async fn dispatch_grant(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
-  match d.form.grant_type.as_deref().unwrap_or("") {
+  let Some(grant_type) = d
+    .form
+    .grant_type
+    .as_deref()
+    .filter(|value| !value.is_empty())
+  else {
+    return Err(AppError::invalid_request("grant_type is required").into());
+  };
+  match grant_type {
     authorization_code::GRANT_TYPE_AUTHORIZATION_CODE => authorization_code(d).await,
     refresh_token::GRANT_TYPE_REFRESH_TOKEN => refresh(d).await,
     client_credentials::GRANT_TYPE_CLIENT_CREDENTIALS => client_credentials(d).await,

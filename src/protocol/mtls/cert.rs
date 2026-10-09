@@ -24,3 +24,14 @@ pub fn subject_dn(der: &[u8]) -> Result<String, MtlsError> {
   let (_, cert) = X509Certificate::from_der(der).map_err(|_| MtlsError::MalformedCertificate)?;
   Ok(cert.subject().to_string())
 }
+
+/// Reject a leaf outside its validity window (RFC 5280 §6.3.3 path
+/// validation): an expired or not-yet-valid certificate must never bind a
+/// `cnf`, whichever method matched its identity.
+pub fn ensure_within_validity(der: &[u8]) -> Result<(), MtlsError> {
+  let (_, cert) = X509Certificate::from_der(der).map_err(|_| MtlsError::MalformedCertificate)?;
+  if !cert.validity().is_valid() {
+    return Err(MtlsError::ExpiredCertificate);
+  }
+  Ok(())
+}

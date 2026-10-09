@@ -143,6 +143,10 @@ Every sender-constrained grant requires a freshly verified proof on every use.
 - mTLS identity is a client certificate subject DN (`tls_client_auth`) or a
   certificate thumbprint (`self_signed_tls_client_auth`), each unique per the
   partial indexes in the schema.
+- A client certificate is matched only against the identity registered for the
+  requesting `client_id`, and only while inside its validity window. A
+  cross-wired or expired certificate is `invalid_client` and never binds a
+  `cnf`.
 - A DPoP proof is rejected if it is malformed, oversized, uses an unsupported
   algorithm, has the wrong `typ`, or has a bad or replayed `jti`, `htm`, `htu`,
   `iat`, or `ath`.

@@ -643,3 +643,148 @@ async fn test_device_authorize_eleventh_bad_guess_rate_limited() -> TestResult {
     )),
   }
 }
+
+/// RFC 8628 §3.2: `verification_uri_complete` carries the `user_code` for
+/// non-textual transmission (QR), while the short `verification_uri` the
+/// user types stays code-free (RFC 8628 §3.3).
+#[tokio::test]
+async fn test_device_authorize_verification_uri_complete_carries_user_code() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = unique("complete");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+    "orders:read",
+  )
+  .await?;
+
+  let key = fresh_key()?;
+  let htu = device_htu(&h.config);
+  let proof = mint_proof(&key, &htu, &unique("jti"), now_unix())?;
+  let inputs = DeviceHttpInputs {
+    client_id: client_id.as_str(),
+    scope: None,
+    basic_header: None,
+    body_secret: None,
+    assertion_type: None,
+    assertion: None,
+    dpop_proof: Some(proof.as_str()),
+    peer_certs: None,
+  };
+  let response = issue(&mut h, &inputs)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("issue rejected: {error}")))?;
+
+  let wire = serde_json::to_value(&response)
+    .map_err(|error| TestError::Unexpected(format!("serialize response: {error}")))?;
+  let complete = wire
+    .get("verification_uri_complete")
+    .and_then(serde_json::Value::as_str)
+    .ok_or_else(|| {
+      TestError::Unexpected("verification_uri_complete must be on the wire".to_owned())
+    })?;
+  let (base, query) = complete
+    .split_once('?')
+    .ok_or_else(|| TestError::Unexpected("complete URI must carry a query".to_owned()))?;
+  if base != response.verification_uri {
+    return Err(TestError::Unexpected(
+      "complete URI must extend verification_uri".to_owned(),
+    ));
+  }
+  let expected_query = format!("user_code={}", response.user_code);
+  if query != expected_query {
+    return Err(TestError::Unexpected(format!(
+      "complete URI must carry user_code={}, got {query}",
+      response.user_code
+    )));
+  }
+
+  if response.verification_uri.contains('?')
+    || response
+      .verification_uri
+      .contains(response.user_code.as_str())
+  {
+    return Err(TestError::Unexpected(
+      "verification_uri must stay code-free".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// RFC 8628 §3.3 and §5.1: every malformed or unknown user code is the same
+/// generic miss — never an error, a panic, or a signal that separates a
+/// guess from a real code. RFC 8628 §6.1 makes user-supplied punctuation
+/// optional, so case and separators do not change identity.
+#[tokio::test]
+async fn test_device_authorize_user_code_misses_are_generic_and_normalized() -> TestResult {
+  let (_container, mut h) = harness().await?;
+
+  for raw in [
+    "",
+    "ABCD",
+    "ABCD-EFGHI",
+    "IIII-IIII",
+    "0000-1111",
+    "ZZZZ-9999",
+    "ΩΩΩΩ-ΩΩΩΩ",
+    "ZZZZ-9999-AAAA-BBBB",
+  ] {
+    let miss =
+      crate::ui::device::lookup_pending(&mut h.conn, &h.store, &h.config.keys, raw).await?;
+    if miss.is_some() {
+      return Err(TestError::Unexpected(format!("{raw:?} must not resolve")));
+    }
+  }
+
+  let client_id = unique("normalize");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+    "orders:read",
+  )
+  .await?;
+  let key = fresh_key()?;
+  let htu = device_htu(&h.config);
+  let proof = mint_proof(&key, &htu, &unique("jti"), now_unix())?;
+  let inputs = DeviceHttpInputs {
+    client_id: client_id.as_str(),
+    scope: None,
+    basic_header: None,
+    body_secret: None,
+    assertion_type: None,
+    assertion: None,
+    dpop_proof: Some(proof.as_str()),
+    peer_certs: None,
+  };
+  let response = issue(&mut h, &inputs)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("issue rejected: {error}")))?;
+
+  let canonical =
+    crate::ui::device::lookup_pending(&mut h.conn, &h.store, &h.config.keys, &response.user_code)
+      .await?
+      .ok_or_else(|| TestError::Unexpected("a fresh code must resolve".to_owned()))?;
+  let variants = [
+    response.user_code.to_lowercase(),
+    response.user_code.replace('-', " "),
+    response.user_code.replace('-', ""),
+  ];
+  for variant in variants {
+    let resolved =
+      crate::ui::device::lookup_pending(&mut h.conn, &h.store, &h.config.keys, &variant)
+        .await?
+        .ok_or_else(|| TestError::Unexpected(format!("{variant:?} must resolve")))?;
+    if resolved.device_hash != canonical.device_hash || resolved.client_id != client_id {
+      return Err(TestError::Unexpected(
+        "code formatting must not change identity".to_owned(),
+      ));
+    }
+  }
+  Ok(())
+}

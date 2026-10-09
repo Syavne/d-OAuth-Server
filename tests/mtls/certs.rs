@@ -1,10 +1,12 @@
 //! `test(mtls)` certificate fixtures.
 //!
-//! Short-lived RSA-2048 fixtures minted with `openssl` for task 21 only:
-//! a TLS server identity, a self-signed client, a client CA plus a
-//! CA-signed client, and an unregistered rogue client. They expire days
-//! after minting; if a fixture expires, re-mint with the same subjects and
-//! update the pinned `x5t#S256` vectors in `tests/mtls.rs`.
+//! RSA-2048 fixtures minted with `openssl` for task 21 only: a TLS server
+//! identity, a self-signed client, a client CA plus a CA-signed client, an
+//! unregistered rogue client, and an already-expired client. The live
+//! fixtures expire years after minting; if one expires, re-mint with the
+//! same subjects and update the pinned `x5t#S256` vectors in
+//! `tests/mtls.rs`. The expired fixture is deliberately outside its
+//! validity window and must stay that way.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -25,6 +27,9 @@ pub const CLIENT_PKI_CERT_PEM: &str = include_str!("certs/client-pki-cert.pem");
 pub const CLIENT_PKI_KEY_PEM: &str = include_str!("certs/client-pki-key.pem");
 /// Unregistered self-signed client certificate (`CN=rogue, O=Example`).
 pub const CLIENT_ROGUE_CERT_PEM: &str = include_str!("certs/client-rogue-cert.pem");
+/// Expired self-signed client certificate (`CN=mtls-expired-client,
+/// O=Example`; valid 2020-01-01 to 2020-12-31 only).
+pub const CLIENT_EXPIRED_CERT_PEM: &str = include_str!("certs/client-expired-cert.pem");
 
 /// Fixture errors.
 #[derive(Debug, thiserror::Error)]

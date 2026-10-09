@@ -565,6 +565,10 @@ pub(crate) static SCRIPT_ROTATE_REFRESH: LazyLock<Script> = LazyLock::new(|| {
     redis.call('HSET', unpack(aargs))
     redis.call('PEXPIRE', KEYS[3], ARGV[5])
     redis.call('SADD', KEYS[4], ARGV[8], ARGV[9])
+    local set_pttl = redis.call('PTTL', KEYS[4])
+    if set_pttl < 0 or set_pttl < tonumber(ARGV[3]) then
+      redis.call('PEXPIRE', KEYS[4], ARGV[3])
+    end
     local pttl = redis.call('PTTL', KEYS[1])
     local tomb_ttl = tonumber(ARGV[10])
     if pttl > 0 and pttl < tomb_ttl then

@@ -1,11 +1,14 @@
 //! `test(dcr_manage)` update suite: full-replace PUT, rotation, redirects.
 
+use super::delete::delete_client;
 use super::read_client;
 use super::support::{
-  TestError, TestResult, harness, manage_parts, register, register_mtls, seed_redirect, seed_scope,
+  TestError, TestResult, expect_forbidden, expect_ssrf_denied, expect_unauthorized, harness,
+  manage_parts, register, register_mtls, seed_redirect, seed_scope,
 };
 use super::update::update_client;
 use crate::db::{client_repo, redirect_repo};
+use crate::error::OAuthErrorCode;
 
 /// Build a PUT body: full replacement metadata for `redirect_uris`.
 fn put_request(
@@ -28,6 +31,347 @@ fn put_request(
     request_uris: None,
     software_id: None,
   }
+}
+
+/// Build a PUT body carrying `request_uris` (RFC 7591 §2 metadata).
+fn put_request_with_request_uris(
+  redirect_uris: Vec<String>,
+  request_uris: serde_json::Value,
+) -> crate::protocol::dcr::RegisterRequest {
+  let mut request = put_request(redirect_uris, Some("dcr manage client"), None);
+  request.request_uris = Some(request_uris);
+  request
+}
+
+#[tokio::test]
+async fn dcr_manage_update_rotated_token_forbidden_on_put_and_delete() -> TestResult {
+  // RFC 7592 §2.2 and Appendix A.1: a successful PUT issues a new registration
+  // access token and invalidates the previous one. The old token must fail for
+  // every management verb, not only the read the existing suite covers.
+  let (_guard, mut harness) = harness("catalog").await?;
+  let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
+
+  let first_put = put_request(
+    vec!["https://app.example.test/cb".to_owned()],
+    Some("rotated"),
+    None,
+  );
+  let rotated = {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    update_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+      &first_put,
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("first PUT failed: {error:?}")))?
+  };
+  let fresh = rotated
+    .registration_access_token
+    .clone()
+    .ok_or_else(|| TestError::Unexpected("PUT must rotate the registration token".to_owned()))?;
+  if fresh == registered.reg_token {
+    return Err(TestError::Unexpected(
+      "registration token was not rotated".to_owned(),
+    ));
+  }
+
+  let second_put = put_request(
+    vec!["https://app.example.test/cb".to_owned()],
+    Some("should not apply"),
+    None,
+  );
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    match update_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+      &second_put,
+    )
+    .await
+    {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "superseded token accepted on PUT".to_owned(),
+        ));
+      }
+      Err(error) => expect_forbidden(error)?,
+    }
+  }
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    match delete_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+    )
+    .await
+    {
+      Ok(()) => {
+        return Err(TestError::Unexpected(
+          "superseded token accepted on DELETE".to_owned(),
+        ));
+      }
+      Err(error) => expect_forbidden(error)?,
+    }
+  }
+
+  let active = client_repo::find_active_by_client_id(
+    &harness.pool,
+    &harness.config.keys,
+    &registered.client_id,
+  )
+  .await?;
+  if active.is_none() {
+    return Err(TestError::Unexpected(
+      "rejected DELETE deactivated the client".to_owned(),
+    ));
+  }
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    let reread = read_client(&mut stores, &ctx, &registered.client_id, Some(&fresh))
+      .await
+      .map_err(|error| TestError::Unexpected(format!("fresh-token read failed: {error:?}")))?;
+    if reread.client_name != "rotated" {
+      return Err(TestError::Unexpected(format!(
+        "fresh token read wrong state: {}",
+        reread.client_name
+      )));
+    }
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn dcr_manage_update_token_denials_match_read() -> TestResult {
+  // Manage denial contract (docs/OAUTH.md error table; manage.rs module doc):
+  // absent credentials or an unknown/deactivated client answer 401, a
+  // mismatched credential on an existing client answers 403. PUT obeys the
+  // same contract as GET. Registration tokens carry no expiry field in the
+  // schema, so revocation (a successful DELETE that deactivates the client)
+  // is the only invalidation path besides rotation.
+  let (_guard, mut harness) = harness("catalog").await?;
+  let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
+  let request = put_request(
+    vec!["https://app.example.test/cb".to_owned()],
+    Some("denied"),
+    None,
+  );
+
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    match update_client(&mut stores, &ctx, &registered.client_id, None, &request).await {
+      Ok(_) => {
+        return Err(TestError::Unexpected("tokenless PUT succeeded".to_owned()));
+      }
+      Err(error) => expect_unauthorized(error)?,
+    }
+  }
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    match update_client(
+      &mut stores,
+      &ctx,
+      "no-such-client",
+      Some(&registered.reg_token),
+      &request,
+    )
+    .await
+    {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "unknown-client PUT succeeded".to_owned(),
+        ));
+      }
+      Err(error) => expect_unauthorized(error)?,
+    }
+  }
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    match update_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some("garbage-token-value"),
+      &request,
+    )
+    .await
+    {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "wrong-token PUT succeeded".to_owned(),
+        ));
+      }
+      Err(error) => expect_forbidden(error)?,
+    }
+  }
+
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    delete_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("delete failed: {error:?}")))?;
+  }
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    match update_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+      &request,
+    )
+    .await
+    {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "revoked token accepted on PUT".to_owned(),
+        ));
+      }
+      Err(error) => expect_unauthorized(error)?,
+    }
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn dcr_manage_update_rejects_jwks_and_jwks_uri_together() -> TestResult {
+  // RFC 7591 §2: "The jwks_uri and jwks parameters MUST NOT both be present in
+  // the same request or response." The PUT validation must reject the pair
+  // before any write, so the client and its registration token stay intact.
+  let (_guard, mut harness) = harness("catalog").await?;
+  let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
+  let mut request = put_request(
+    vec!["https://app.example.test/cb".to_owned()],
+    Some("should not apply"),
+    None,
+  );
+  request.jwks = Some(serde_json::json!({
+    "keys": [{"kty": "RSA", "n": "AQAB", "e": "AQAB"}]
+  }));
+  request.jwks_uri = Some("https://app.example.test/jwks.json".to_owned());
+
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    match update_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+      &request,
+    )
+    .await
+    {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "PUT accepted jwks and jwks_uri together".to_owned(),
+        ));
+      }
+      Err(super::ManageError::Protocol(error)) => {
+        super::support::expect_app_error(error, OAuthErrorCode::InvalidClientMetadata, 400)?;
+      }
+      Err(super::ManageError::Forbidden) => {
+        return Err(TestError::Unexpected(
+          "valid token read as forbidden".to_owned(),
+        ));
+      }
+    }
+  }
+
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    let reread = read_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("post-reject read failed: {error:?}")))?;
+    if reread.client_name != "dcr manage client" {
+      return Err(TestError::Unexpected(format!(
+        "rejected PUT mutated the client: {}",
+        reread.client_name
+      )));
+    }
+    if reread.jwks.is_some() || reread.jwks_uri.is_some() {
+      return Err(TestError::Unexpected(
+        "rejected PUT persisted JWKS metadata".to_owned(),
+      ));
+    }
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn dcr_manage_update_request_uris_stored_verbatim() -> TestResult {
+  // Same RFC 7591 §2 metadata-passthrough contract as registration: PUT stores
+  // request_uris verbatim and never fetches them; the SSRF guard is the
+  // fetch-time enforcement point (docs/OAUTH.md "JAR and PAR",
+  // docs/SECURITY.md "PAR and JAR"). Full-replace semantics must persist the
+  // array exactly, including plaintext, loopback, and non-https values.
+  let (_guard, mut harness) = harness("catalog").await?;
+  let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
+  let request_uris = serde_json::json!([
+    "http://app.example.test/req.jwt",
+    "https://127.0.0.1/req.jwt",
+    "ftp://app.example.test/req.jwt"
+  ]);
+  let request = put_request_with_request_uris(
+    vec!["https://app.example.test/cb".to_owned()],
+    request_uris.clone(),
+  );
+
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    let response = update_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+      &request,
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("PUT with request_uris failed: {error:?}")))?;
+    if response.registration_access_token.is_none() {
+      return Err(TestError::Unexpected(
+        "successful PUT did not rotate the registration token".to_owned(),
+      ));
+    }
+  }
+
+  let row = client_repo::find_active_by_client_id(
+    &harness.pool,
+    &harness.config.keys,
+    &registered.client_id,
+  )
+  .await?
+  .ok_or_else(|| TestError::Unexpected("client row missing after PUT".to_owned()))?;
+  if row.request_uris.as_ref() != Some(&request_uris) {
+    return Err(TestError::Unexpected(format!(
+      "request_uris not stored verbatim on PUT: {:?}",
+      row.request_uris
+    )));
+  }
+
+  for uri in [
+    "http://app.example.test/req.jwt",
+    "https://127.0.0.1/req.jwt",
+    "ftp://app.example.test/req.jwt",
+  ] {
+    expect_ssrf_denied(uri).await?;
+  }
+  Ok(())
 }
 
 #[tokio::test]

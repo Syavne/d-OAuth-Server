@@ -17,10 +17,10 @@ use testcontainers::{
 
 use super::{
   ErrorClass, OpClass, Store, StoreError, classify_redis, codes, dcr, device, durability_barrier,
-  grants, may_retry_op, par, ratelimit, retry_op, sessions, tokens,
+  grants, may_retry_op, par, pending, ratelimit, retry_op, sessions, sha256_hex, tokens,
 };
 use crate::{
-  config::{ConfigError, DurabilityMode, RedisConfig, redis::RawRedisConfig},
+  config::{ConfigError, DurabilityMode, RedisConfig, TtlConfig, redis::RawRedisConfig},
   state::RedisConn,
   test_guard::ContainerGuard,
 };
@@ -152,6 +152,28 @@ fn rotation_input(
     new_access_ttl: Duration::from_secs(300),
     request_id,
   }
+}
+
+/// Remaining TTL of a key in milliseconds (`-1` persistent, `-2` absent).
+async fn pttl_ms(conn: &mut RedisConn, key: &str) -> Result<i64, TestError> {
+  let pttl: i64 = redis::cmd("PTTL").arg(key).query_async(conn).await?;
+  Ok(pttl)
+}
+
+/// Assert a key carries a live TTL inside the design window `(0, cap]`.
+///
+/// `cap` comes from the configured/design lifetime, never from the observed
+/// value. A non-positive TTL means the key is persistent or absent (a defect:
+/// the artifact would outlive its intended window); the upper bound can only
+/// drift downward while the test runs, so a slow run cannot flake it.
+fn assert_ttl_within(pttl: i64, cap: Duration) -> TestResult {
+  if pttl <= 0 || pttl > cap.as_millis() as i64 {
+    return Err(TestError::Unexpected(format!(
+      "PTTL {pttl} ms must be within (0, {} ms]",
+      cap.as_millis()
+    )));
+  }
+  Ok(())
 }
 
 #[tokio::test]
@@ -971,6 +993,319 @@ async fn store_device_par_and_dcr_round_trip() -> TestResult {
     ));
   }
   Ok(())
+}
+
+/// docs/REDIS.md: `oauth:{state}:code:<hash>` carries the authorization-code
+/// lifetime, capped at [`crate::protocol::code::CODE_TTL_CAP`] (60 s).
+#[tokio::test]
+async fn store_code_ttl_within_configured_window() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let ttl = TtlConfig::default();
+  let hash = unique("code");
+
+  codes::issue(
+    &mut conn,
+    &store,
+    &hash,
+    &code_record(&unique("client"), &unique("grant")),
+    ttl.code,
+  )
+  .await?;
+  let cap = ttl.code.min(crate::protocol::code::CODE_TTL_CAP);
+  assert_ttl_within(pttl_ms(&mut conn, &store.code_key(&hash)).await?, cap)
+}
+
+/// docs/REDIS.md: the PAR handle lives under `ttl.par` (90 s) and both the
+/// device-code record and its user-code mapping under `ttl.device` (600 s).
+#[tokio::test]
+async fn store_par_device_and_user_code_ttl_within_configured_windows() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let ttl = TtlConfig::default();
+  let client = unique("client");
+
+  let request_id = unique("par");
+  par::put(
+    &mut conn,
+    &store,
+    &request_id,
+    &par::ParRecord {
+      client_id: client.clone(),
+      request: "{\"response_type\":\"code\"}".to_owned(),
+    },
+    ttl.par,
+  )
+  .await?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.par_key(&request_id)).await?,
+    ttl.par,
+  )?;
+
+  let device_hash = unique("device");
+  let user_code = unique("user-code");
+  device::put(
+    &mut conn,
+    &store,
+    &device_hash,
+    &user_code,
+    &device::DeviceRecord {
+      client_id: client,
+      scope: "orders:read".to_owned(),
+      status: device::DeviceStatus::Pending,
+      subject: String::new(),
+      grant_id: String::new(),
+    },
+    ttl.device,
+  )
+  .await?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.device_key(&device_hash)).await?,
+    ttl.device,
+  )?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.user_code_key(&user_code)).await?,
+    ttl.device,
+  )
+}
+
+/// docs/REDIS.md: the DCR initial-access-token record lives under the CLI
+/// `--ttl`, defaulting to the configured `ttl.dcr_initial_access` (24 h).
+#[tokio::test]
+async fn store_dcr_initial_access_ttl_within_configured_window() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let ttl = TtlConfig::default();
+  let iat = unique("iat");
+
+  dcr::issue(
+    &mut conn,
+    &store,
+    &iat,
+    &dcr::InitialAccessRecord {
+      uses_remaining: 2,
+      label: "ops-token".to_owned(),
+    },
+    ttl.dcr_initial_access,
+  )
+  .await?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.dcr_iat_key(&iat)).await?,
+    ttl.dcr_initial_access,
+  )
+}
+
+/// docs/REDIS.md: the rotation idempotency mapping is bounded by
+/// `min(900 s, refresh TTL)`, the old refresh record becomes a tombstone with
+/// the refresh lifetime, and the per-grant token index lives with the grant.
+#[tokio::test]
+async fn store_rotation_grace_tombstone_and_grant_index_ttl() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let grant = unique("grant");
+  let client = unique("client");
+  let old = unique("old-refresh");
+  let new_refresh = unique("new-refresh");
+  let new_access = unique("new-access");
+  let pepper = b"store-test-pepper";
+  let refresh_ttl = Duration::from_secs(3600);
+  let access_ttl = Duration::from_secs(300);
+  let rotation_grace = Duration::from_secs(900);
+
+  grants::create(
+    &mut conn,
+    &store,
+    &grants::GrantRecord {
+      grant_id: grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "orders:read".to_owned(),
+    },
+    refresh_ttl,
+  )
+  .await?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.grant_key(&grant)).await?,
+    refresh_ttl,
+  )?;
+
+  // The index is born with the access member, then extended by the refresh
+  // member: it must outlive the short access TTL and stay within the grant's.
+  tokens::put_access(
+    &mut conn,
+    &store,
+    &unique("access-seed"),
+    &access_record(&client, &grant),
+    access_ttl,
+  )
+  .await?;
+  tokens::put_refresh(
+    &mut conn,
+    &store,
+    &old,
+    &refresh_record(&client, &grant),
+    refresh_ttl,
+  )
+  .await?;
+  let index_key = store.grant_tokens_key(&grant);
+  let index_ttl = pttl_ms(&mut conn, &index_key).await?;
+  if index_ttl <= access_ttl.as_millis() as i64 {
+    return Err(TestError::Unexpected(
+      "grant index must outlive the access-token TTL".to_owned(),
+    ));
+  }
+  assert_ttl_within(index_ttl, refresh_ttl)?;
+
+  // Simulate the index having expired: the rotation script must re-arm it
+  // rather than recreate it persistent.
+  let _: () = redis::cmd("DEL")
+    .arg(&index_key)
+    .query_async(&mut conn)
+    .await?;
+  let outcome = tokens::rotate(
+    &mut conn,
+    &store,
+    pepper,
+    &rotation_input(&old, &client, &new_refresh, &new_access, &grant, None),
+  )
+  .await?;
+  if !matches!(outcome, tokens::RotateOutcome::Rotated { .. }) {
+    return Err(TestError::Unexpected("rotation must apply".to_owned()));
+  }
+  assert_ttl_within(pttl_ms(&mut conn, &index_key).await?, refresh_ttl)?;
+
+  let request_id = tokens::derive_rotation_id(pepper, &old)?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.rotation_map_key(&request_id)).await?,
+    rotation_grace.min(refresh_ttl),
+  )?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.refresh_key(&old)).await?,
+    refresh_ttl,
+  )
+}
+
+/// docs/REDIS.md: `oauth:{state}:session:<id>` lives under `ttl.session`
+/// (12 h); a presession is the same record before login binds a subject.
+#[tokio::test]
+async fn store_session_and_presession_ttl_within_configured_window() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let session_ttl = TtlConfig::default().session;
+
+  let session_id = unique("session");
+  sessions::put(
+    &mut conn,
+    &store,
+    &session_id,
+    &sessions::SessionRecord {
+      subject: "user-1".to_owned(),
+      mfa_verified: true,
+      restricted: false,
+    },
+    session_ttl,
+  )
+  .await?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.session_key(&session_id)).await?,
+    session_ttl,
+  )?;
+
+  let presession_id = unique("presession");
+  sessions::put(
+    &mut conn,
+    &store,
+    &presession_id,
+    &sessions::SessionRecord {
+      subject: String::new(),
+      mfa_verified: false,
+      restricted: false,
+    },
+    session_ttl,
+  )
+  .await?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.session_key(&presession_id)).await?,
+    session_ttl,
+  )
+}
+
+/// docs/REDIS.md: `oauth:{state}:pending:<id>` is short, request-scoped
+/// (`routes::PENDING_TTL`, 300 s).
+#[tokio::test]
+async fn store_pending_auth_ttl_within_request_window() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let request_id = unique("pending");
+
+  pending::put(
+    &mut conn,
+    &store,
+    &request_id,
+    &pending::PendingAuth {
+      client_id: unique("client"),
+      redirect_uri: "https://client.example.test/cb".to_owned(),
+      scope: "orders:read".to_owned(),
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+      state: Some("state-xyz".to_owned()),
+      dpop_jkt: None,
+      iss: "https://as.example.test".to_owned(),
+      post_logout_uri: None,
+    },
+    crate::routes::PENDING_TTL,
+  )
+  .await?;
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.token_key("pending", &request_id)).await?,
+    crate::routes::PENDING_TTL,
+  )
+}
+
+/// docs/REDIS.md: the failed-login counter lives under the lockout window
+/// (`ui::login::LOCKOUT_WINDOW`, 15 min) and keys a hash of the account label.
+#[tokio::test]
+async fn store_login_failure_counter_ttl_within_lockout_window() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let window = crate::ui::login::LOCKOUT_WINDOW;
+  let account = unique("alice@example.test");
+
+  sessions::record_failed_login(&mut conn, &store, &account, window).await?;
+  let key = store.login_fail_key(&sha256_hex(account.as_bytes()));
+  assert_ttl_within(pttl_ms(&mut conn, &key).await?, window)
+}
+
+/// docs/REDIS.md: the DPoP and `private_key_jwt` replay markers are bounded by
+/// the proof window ([`crate::jose::dpop::DPOP_JTI_TTL`] and the assertion
+/// module's `JTI_TTL`, both 300 s).
+#[tokio::test]
+async fn store_replay_marker_ttl_within_proof_window() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+
+  let dpop_ttl = crate::jose::dpop::DPOP_JTI_TTL;
+  let jti = unique("jti");
+  if !dcr::claim_dpop_jti(&mut conn, &store, &jti, dpop_ttl).await? {
+    return Err(TestError::Unexpected(
+      "first DPoP claim must win".to_owned(),
+    ));
+  }
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.dpop_jti_key(&jti)).await?,
+    dpop_ttl,
+  )?;
+
+  let assertion_ttl = Duration::from_secs(300);
+  let assertion = unique("assertion");
+  if !dcr::claim_client_assertion_jti(&mut conn, &store, &assertion, assertion_ttl).await? {
+    return Err(TestError::Unexpected(
+      "first assertion claim must win".to_owned(),
+    ));
+  }
+  assert_ttl_within(
+    pttl_ms(&mut conn, &store.client_assertion_jti_key(&assertion)).await?,
+    assertion_ttl,
+  )
 }
 
 #[test]
