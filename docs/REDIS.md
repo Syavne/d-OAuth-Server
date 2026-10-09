@@ -22,20 +22,23 @@ differ.
 | --- | --- | --- |
 | `oauth:{state}:code:<hash>` | Single-use authorization code, PKCE-bound. | `ttl.code` (60s) |
 | `oauth:{state}:access:<hash>` | Access-token record. | `ttl.access` (300s) |
+| `oauth:{state}:access:<hash>:act` | Token-exchange `act` claim sidecar. | Lives with the access record |
 | `oauth:{state}:refresh:<hash>` | Refresh-token record or tombstone. | `ttl.refresh` (30d) |
 | `oauth:{state}:grant:<id>` | Grant-chain record. | Refresh lifetime |
 | `oauth:{state}:grant:<id>:tokens` | Set of member token hashes for cascade revoke. | Lives with the grant |
 | `oauth:{state}:session:<id>` | Server-side login session. | `ttl.session` (12h) |
 | `oauth:{state}:session:<id>:meta` | Session sidecar: `auth_time`, CSRF secret, bound `request_id`, and the bound post-logout client/URI. | `ttl.session` |
 | `oauth:{state}:par:<id>` | PAR `request_uri` record. | `ttl.par` (90s) |
-| `oauth:{state}:pending:<id>` | Validated pending-auth record. | Short, request-scoped |
+| `oauth:{state}:pending:<id>` | Validated pending-auth record. | `routes::PENDING_TTL` (300s) |
 | `oauth:{state}:device:<hash>` | Device-code record. | `ttl.device` (600s) |
+| `oauth:{state}:device:<hash>:cnf` | Device sender-binding sidecar. | Lives with the device record |
+| `oauth:{state}:device:<hash>:poll` | Device poll-throttle marker. | Lives with the device record |
 | `oauth:{state}:user_code:<code-hash>` | User code to device-hash mapping. | `ttl.device` |
 | `oauth:{state}:dcr_iat:<hash>` | DCR initial-access token budget. | CLI `--ttl` |
 | `oauth:{state}:dpop_jti:<hash>` | DPoP `jti` replay marker. | Proof freshness window |
-| `oauth:{state}:client_assertion_jti:<hash>` | `private_key_jwt` `jti` replay marker. | Assertion window |
+| `oauth:{state}:client_assertion_jti:<hash>` | `private_key_jwt` `jti` replay marker. | Remaining assertion validity (`exp + 30s skew - now`), clamped `[1s, 360s]` (300s max lifetime + 2×30s skew) |
 | `oauth:{state}:rotation:<request-id>` | Rotation idempotency mapping. | `min(900s, refresh TTL)` |
-| `oauth:{state}:loginfail:<sha256>` | Failed-login counter (hashed label). | Rate-limit window |
+| `oauth:{state}:loginfail:<sha256>` | Failed-login counter (hashed label). | `ui::login::LOCKOUT_WINDOW` (15 min) |
 | `oauth:{state}:totp_replay:<fingerprint>` | TOTP used-code replay marker. | Time step window |
 | `oauth:{rl}:ratelimit:<bucket-hash>` | Fixed-window rate-limit counter. | `rate_limit.window` (60s) |
 
@@ -56,6 +59,13 @@ token state. This is what keeps two promises:
 
 The server asserts both properties at startup and refuses a prefix that lacks
 its tag.
+
+## Record writes
+
+Every hash record is written through one atomic Lua script (`hset_record` →
+`HSET_TTL`): the fields and the `PEXPIRE` happen in a single script, so no
+record can ever be observed — or survive a crash — without its TTL. Replay
+markers are `SET NX PX` plus a durability barrier.
 
 ## Rotation, tombstones, and idempotency
 

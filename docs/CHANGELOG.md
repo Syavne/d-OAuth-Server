@@ -60,6 +60,11 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   rejects one), and `automountServiceAccountToken` is `false`. Remote JAR
   `request_uri` is documented as unsupported under the default-deny, with the
   Cilium FQDN opt-in path in `docs/DEPLOYMENT.md`.
+- `user disable` now purges all Redis state for the subject (sessions and their
+  meta, codes, devices with their sidecars and mappings, grants via cascade
+  revoke, standalone tokens, and the lockout counter) before flipping
+  `users.disabled`; a Redis failure aborts before the flag changes, so the
+  command fails closed.
 
 ### Changed
 
@@ -79,6 +84,10 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   security-header layer) now sets `Cache-Control: no-store` and
   `X-Content-Type-Options: nosniff` on its own probe responses, with a
   regression test pinning both.
+- Forwarded client-cert and IP headers are never trusted; the dead
+  proxy-header fallback is removed.
+- The login lockout now also covers TOTP enrollment confirmation, and the rate
+  limiter classifies requests by their full path.
 
 ### Security
 
@@ -87,6 +96,16 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   emits a `pii.decrypt_failure` audit event carrying only the request id, never
   a value. Full-blob substitution by an attacker with database write access
   remains out of the threat model and is documented in `docs/SECURITY.md`.
+- Introspection and refresh re-check `users.disabled`, and refresh re-checks
+  the subject's current entitlements; a disabled subject introspects inactive
+  and refresh rejects with `invalid_grant` before any token is minted.
+- Master keys (the token pepper, TOTP key, PII key, and any retained previous
+  key) shorter than 32 bytes are rejected at load with `WeakKeyMaterial`.
+- `private_key_jwt` assertion lifetime is capped and its `jti` replay marker
+  now tracks the remaining validity; `PS256` is added to the assertion
+  algorithm allowlist.
+- DCR `open` redirect policy now accepts only `https` or RFC 8252 loopback
+  URIs, and the SSRF guard pins the fetch to the addresses it pre-validated.
 
 ### Fixed
 

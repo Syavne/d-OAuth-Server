@@ -236,6 +236,12 @@ certificate.
 - The token pepper, TOTP encryption key, and PII field-encryption key are
   required; losing the pepper invalidates every live opaque token, and losing
   the PII key makes the sealed directory unreadable.
+- Master keys (pepper, TOTP, and PII) must each be at least 32 bytes; shorter
+  values are refused at load (`WeakKeyMaterial`).
+- `user disable` purges the account's Redis sessions, tokens, grants, codes,
+  device records, and lockout counter before flipping `users.disabled`; that
+  user's live tokens then introspect inactive and refuse refresh
+  (`invalid_grant`).
 - Production requires `issuer` on `https` and a database URL with
   `sslmode=verify-full`.
 - Redis must run with `noeviction` and persistence. The server asserts this at

@@ -21,7 +21,7 @@ the admin surface.
 | JOSE verification (DPoP, JAR, `private_key_jwt`) | `src/jose/` | Reject fail-closed with the exact error code. |
 | Postgres query or repository | `src/db/` | `query!`/`query_as!` macros; regenerate `.sqlx`. |
 | Redis record or Lua script | `src/store/` | Keep every key under `{state}`; update [docs/REDIS.md](docs/REDIS.md). |
-| OAuth endpoint or grant | `src/protocol/` | Cite the RFC section in a comment. Update [docs/OAUTH.md](docs/OAUTH.md). |
+| OAuth endpoint or grant | `src/protocol/` | Cite the RFC section in a comment. Update [docs/OAUTH.md](docs/OAUTH.md). A subject-scoped Redis purge lives at `src/protocol/purge.rs` (`purge_subject`), used by `user disable`; keep every key under `{state}` and update docs/REDIS.md. |
 | Login, consent, or device page | `src/ui/` | Keep CSP and CSRF intact. |
 | Cross-cutting HTTP concern | `src/middleware/` | Mind the layer order in `src/routes.rs`. |
 | Endpoint or layer order | `src/routes.rs` | Update [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). |
@@ -67,6 +67,8 @@ Before finishing any change, confirm:
 - [ ] Only hashed or encrypted secrets are stored; no raw token at rest.
 - [ ] A sender-constrained grant re-verifies a fresh proof on every use.
 - [ ] `private_key_jwt` is treated as authentication only, never as a binding.
+- [ ] Master keys (pepper, TOTP/PII keys, and retained previous keys) carry at least 32 bytes; shorter material is rejected at load (`WeakKeyMaterial`).
+- [ ] A disabled subject is dead everywhere: introspection reports inactive, refresh rejects with `invalid_grant` before minting, and refresh re-checks current entitlements; `user disable` purges the subject's Redis state (sessions, codes, devices, grants, standalone tokens, lockout) before flipping `users.disabled`, failing closed on a Redis error.
 - [ ] The change does not introduce a wildcard scope, redirect URI, or CORS
       origin.
 
@@ -125,8 +127,8 @@ updates the relevant guide in the same commit:
   `docs/SECURITY.md`.
 - Modules, lifecycle, topology: `docs/ARCHITECTURE.md`.
 - Config keys and defaults: `docs/CONFIGURATION.md`.
-- Schema and migrations: `docs/DATABASE.md`.
-- Redis keys, TTLs, durability: `docs/REDIS.md`.
+- Schema and migrations, disabled-user re-check: `docs/DATABASE.md`.
+- Redis keys, TTLs, durability, subject purge: `docs/REDIS.md`.
 - Image, manifests, probes: `docs/DEPLOYMENT.md`.
 - CLI and runbooks: `docs/OPERATIONS.md`, `RUNBOOK.md`.
 - This file, when the module map or rules change.

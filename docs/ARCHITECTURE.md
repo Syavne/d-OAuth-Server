@@ -27,7 +27,7 @@ the library.
 | `src/jose/` | DPoP proof verification, JAR request objects, `private_key_jwt` client assertions, and JWK parsing. |
 | `src/db/` | Postgres repositories for the six domain tables. See [DATABASE.md](DATABASE.md). |
 | `src/store/` | Redis ephemeral state and the durability barrier. See [REDIS.md](REDIS.md). |
-| `src/protocol/` | OAuth endpoints and grants. See [OAUTH.md](OAUTH.md). |
+| `src/protocol/` | OAuth endpoints and grants, plus the subject-scoped Redis purge (`src/protocol/purge.rs`, `purge_subject`, used by `user disable`). |
 | `src/ui/` | Server-rendered login, consent, and device pages (Askama templates) plus the embedded same-origin stylesheet served at `/assets/app.css`. |
 | `src/middleware/` | Request id, tracing and redaction, rate limiting, security headers, and audit. |
 | `src/resilience.rs` | Load-shed, concurrency-limit, and timeout guard between CORS and rate limiting. |
@@ -86,7 +86,12 @@ The split is strict and drives the whole design:
 - PostgreSQL holds durable domain state only: `oauth_clients`, `users`,
   `scopes`, `user_scopes`, `redirect_uris`, `client_redirect_uris`, plus sqlx's
   `_sqlx_migrations`. Nothing is written to Postgres per request. A failed login
-  does not touch Postgres; the counter lives in Redis.
+  does not touch Postgres; the counter lives in Redis. Introspection and refresh
+  do re-read Postgres on every use: a non-empty subject resolving to a disabled
+  user yields inactive (introspection) or `invalid_grant` (refresh) without
+  minting, and refresh re-reads the user's current entitlements; an empty or
+  unknown subject stays live. `user disable` purges the user's Redis state
+  before flipping `users.disabled`, failing closed on a Redis error.
 - Redis holds every short-lived value: authorization codes, access and refresh
   tokens, grant chains, sessions, PAR request URIs, device codes, DCR
   initial-access tokens, DPoP and `private_key_jwt` replay markers, and

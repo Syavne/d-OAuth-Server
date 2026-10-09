@@ -1,7 +1,8 @@
 //! Router assembly: public listener routes plus the middleware chain.
 //!
 //! [`build_router`] mounts every endpoint behind one [`tower::ServiceBuilder`]
-//! whose execution order is exactly {request-id → tracing/redaction →
+//! whose execution order (outer-to-inner) is exactly {request-id → CORS (when
+//! configured) → resilience (load-shed → concurrency-limit → timeout) →
 //! rate-limit → body limit → security headers}:
 //!
 //! 1. [`middleware::request_id::RequestIdLayer`] mints/propagates

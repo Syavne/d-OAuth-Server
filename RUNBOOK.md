@@ -85,7 +85,7 @@ admin-gated actions deny it until both steps complete.
 - [ ] Create a named second admin:
       `d-oauth-server user create --admin --email <name>@example.com`
 - [ ] Log in as the named admin and verify full access.
-- [ ] Disable the bootstrap account: `d-oauth-server user disable --email ops@example.com`
+- [ ] Disable the bootstrap account: `d-oauth-server user disable --email ops@example.com`. `user disable` purges the account's Redis sessions, tokens, grants, codes, device records, and lockout counter before flipping the Postgres `disabled` flag, and fails closed (leaving the user enabled) if Redis is unavailable. Records with no subject (PAR, pending, replay markers, rotation map, TOTP replay, rate-limit counters) are untouched. See docs/OPERATIONS.md.
 - [ ] Rotate/expire the bootstrap secret: delete the mounted
       `/run/secrets/bootstrap-password` material and revoke any copy of a
       generated one-time password.

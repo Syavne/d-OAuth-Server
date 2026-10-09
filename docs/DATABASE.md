@@ -85,7 +85,7 @@ One row per resource owner.
 | `is_admin` | `bool` | Default false. Gates privileged actions. |
 | `must_change_password` | `bool` | Default false; true for a bootstrapped admin. |
 | `password_changed_at` | `timestamptz` | Stamped on password change. |
-| `disabled` | `bool` | Default false. |
+| `disabled` | `bool` | Default false. Introspection and refresh re-check this flag on every use via the subject account-status lookup: a disabled subject is inactive / `invalid_grant`, while an empty or unknown subject stays live; a datastore failure propagates and never reports active. |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
 
 `ux_users_email_index` is a partial unique index on `email_index` where it is
@@ -265,6 +265,9 @@ during a maintenance window with the app tier quiesced.
   Postgres, so RFC 7592 client management survives a Redis loss.
 - Foreign keys with `ON DELETE CASCADE` keep the join tables consistent, and a
   scope referenced by `user_scopes` is disabled rather than deleted.
+- `user disable` purges the subject's Redis state before the
+  `UPDATE users SET disabled` runs; a Redis failure aborts before the flag
+  flips.
 
 ## Access hardening
 

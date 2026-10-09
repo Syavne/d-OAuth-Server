@@ -132,6 +132,14 @@ JSON response; an unknown `grant_type` is `unsupported_grant_type`. The DCR
 routes map onto `protocol::dcr::register_handler` and
 `protocol::dcr::manage::{read,update,delete}_handler` (RFC 7591 / RFC 7592).
 
+### Dynamic client registration
+
+Dynamic registration redirect policy (`dcr_redirect_policy`): `catalog` attaches
+only catalog-registered URIs; `catalog_loopback` additionally upserts RFC 8252
+loopback URIs; `open` additionally upserts any absolute `https` URI with a
+non-empty host and no userinfo, fragment, or whitespace. Loopback URIs are
+always allowed. Anything else is `invalid_redirect_uri`.
+
 ## The five grants
 
 The advertised set is `authorization_code`, `refresh_token`,
@@ -159,14 +167,17 @@ Reference: RFC 6749 §6, RFC 9700 §2.2.2 and §4.14, RFC 9449 §5.
 
 Parameters: `client_id`, `refresh_token`, optional `requested_scope` (which may
 narrow but never widen), and a freshly verified sender proof. The effective
-scope is re-checked against the client's current registration and the user's
-current entitlements, so a revoked scope or entitlement drops on refresh.
+scope is re-checked against the current `enabled` catalog and the client's
+current registration and the user's current entitlements (fresh Postgres
+reads), so a revoked scope or entitlement drops on refresh.
 
 Behavior: rotation on every use. The presented token is tombstoned with a
 `rotated_to` member. Presenting a rotated token again is reuse: the whole grant
 family is revoked and the request fails with `invalid_grant`. A lost reply does
 not double-rotate, because the rotation is keyed by a deterministic request id
-and a retry returns the same tokens.
+and a retry returns the same tokens. If the refresh token's non-empty subject
+resolves to a disabled user, the request fails `invalid_grant` before minting or
+rotating.
 
 ### client_credentials
 
@@ -286,7 +297,10 @@ on every use.
 `private_key_jwt` is client authentication only. It produces no confirmation and
 never satisfies sender constraint. For token exchange, the proof must match the
 subject token's confirmation. See [SECURITY.md](SECURITY.md) for the full matrix
-and the confirmation propagation rule.
+and the confirmation propagation rule. It accepts `RS256`, `PS256`, `ES256`, and
+`EdDSA` only (`none` and HMAC are rejected); `exp` may lie at most 300 s past
+`now` plus 30 s clock skew, and the single-use `jti` marker lives for the
+assertion's remaining validity, clamped to `[1 s, 360 s]`.
 
 ## Metadata
 
@@ -300,7 +314,9 @@ than advertising an unknown list.
 The document carries no `jwks_uri`: the server signs no artifact of its own.
 `code_challenge_methods_supported` advertises only `S256`.
 `authorization_response_iss_parameter_supported` is true, so the authorization
-response carries `iss` (RFC 9207).
+response carries `iss` (RFC 9207). The document advertises
+`token_endpoint_auth_signing_alg_values_supported = [ES256, EdDSA, RS256,
+PS256]`; `dpop_signing_alg_values_supported` stays `[ES256, EdDSA, RS256]`.
 
 ## JAR and PAR
 
@@ -314,7 +330,9 @@ Reference: RFC 9101 §4.1 and §5.2, RFC 9126 §2 and §3.
   algorithm. Conflicts between the object and the query string are rejected.
 - A `request_uri` is a one-time, client-bound PAR handle or an exactly
   pre-registered URI. It is fetched only with the SSRF guard: https only, no
-  redirects, global IPs only, size and time capped.
+  redirects, global IPs only, size and time capped. The connection is pinned to
+  the addresses validated before the fetch, so a rebinding hostname cannot steer
+  it to a blocked address.
 - A remote (pre-registered, non-PAR) `request_uri` is fetched over outbound
   HTTPS, which the shipped cluster network policy default-denies. It is
   available only when the deployment adds a scoped egress allowance for the
@@ -331,8 +349,11 @@ Reference: RFC 9101 §4.1 and §5.2, RFC 9126 §2 and §3.
 
 ## Edge cases
 
-- A refresh request that omits `scope` keeps the prior scope; a request that
-  asks for a scope the client was not granted fails.
+- A refresh request that omits `scope` keeps the prior grant only while still
+  enabled, then narrows to the still-registered ∩ still-entitled intersection
+  (possibly empty, from fresh Postgres reads of the client registration, the
+  user entitlements, and the `enabled` catalog); an explicit `scope` must be a
+  subset of the prior grant and all three current sets.
 - A second authorization code made from the same request is a distinct code;
   each is single-use.
 - A DPoP proof outside the `iat` freshness window, or with a replayed `jti`, is
@@ -350,6 +371,8 @@ curl -s https://auth.example.com/.well-known/oauth-authorization-server | jq .
 
 - A code flow starts with `GET /authorize?response_type=code&client_id=...&redirect_uri=...&scope=...&state=...&code_challenge=...&code_challenge_method=S256`.
 - Introspect a token: `POST /introspect` with `token` and client authentication.
+  A token whose subject is a disabled user returns `{"active": false}` like an
+  unknown token.
 - Revoke a token: `POST /revoke` with `token` and an optional `token_type_hint`.
 - If every security endpoint returns `503`, check `/health/ready` and the
   Postgres and Redis connections.

@@ -64,7 +64,7 @@ class, or runtime setting).
 | Kubernetes API access from the pod | `automountServiceAccountToken: false`; the binary never calls the API | A future feature that needs the API would have to re-enable it deliberately. |
 | Image/registry compromise | Digest pinning, cosign verification, and a committed digest reference with no shippable `:latest`; CI writes the signed build digest into `kustomization.yaml` | A registry compromise before the digest is recorded still ships; the pin step must run. |
 
-Last reviewed: 2026-10-05. File-mounted DB/Redis passwords, digest pinning,
+Last reviewed: 2026-10-09. File-mounted DB/Redis passwords, digest pinning,
 NetworkPolicy, `automountServiceAccountToken: false`, and scheduled fuzzing are
 implemented in the shipped manifests and workflows.
 
@@ -74,6 +74,11 @@ implemented in the shipped manifests and workflows.
 - `unwrap`, `expect`, and `panic` are denied by lint in request paths.
 - A raw token, secret, password, OTP, or client secret never appears in
   Postgres, Redis, logs, an error body, or an evidence file.
+- Log redaction masks `authorization`, `cookie`, `dpop`, `code`, `token`,
+  `client_secret`, `code_verifier`, `password`, `user_code`, `device_code`, and
+  `request_uri`, plus any `*_token`/`*_secret`/`*_password`/`*_code` key, in
+  headers, JSON, form bodies, and query strings; `code_challenge` and
+  `request_id` stay visible.
 - Secret comparisons are constant time.
 
 ## Browser and intermediary caching
@@ -237,8 +242,13 @@ Reference: AES-256-GCM (`ring`), HKDF-SHA256, HMAC-SHA256.
   the inline value wins (`resolve_secret` in `src/config/build.rs`). The key ids
   default to `v1` through `token_pepper_id` / `totp_key_id` / `pii_key_id`
   (`src/config/raw.rs`). Each purpose may retain one previous key
-  (`*_previous_key` / `*_previous_key_file`) with an explicit, distinct
+  (  `*_previous_key` / `*_previous_key_file`) with an explicit, distinct
   `*_previous_key_id`; a previous key without its active key is a config error.
+- **Minimum length.** Every resolved master-key value — `token_pepper`,
+  `totp_encryption_key`, `pii_encryption_key`, and each retained
+  `*_previous_key`, inline or `*_FILE` — must be at least 32 bytes (256 bits).
+  Shorter material is rejected at load with `ConfigError::WeakKeyMaterial`,
+  which names the offending key.
 - The shipped cluster manifests never use the inline or environment forms: the
   Secret file-mounts the keys `0400` on a tmpfs volume at `/run/secrets`, and
   the loader reads them through `D_OAUTH_TOKEN_PEPPER_FILE`,
@@ -293,7 +303,8 @@ configure one as fail-open is a load-time error.
 - A device code is consumed atomically on approval.
 - DPoP and `private_key_jwt` `jti` values are recorded with `SET NX`, so a
   replayed proof or assertion is rejected. A `private_key_jwt` marker lives for
-  the assertion's full remaining validity, bounded by the 300 s lifetime cap.
+  the assertion's full remaining validity, bounded by the 360 s bound (a 300 s
+  maximum assertion lifetime plus 2×30 s clock skew).
 - A TOTP code is recorded in a replay cache for its time-step window.
 
 ## Input and output safety
@@ -302,9 +313,12 @@ configure one as fail-open is a load-time error.
   There are no wildcards and no prefix matches.
 - PKCE is `S256` only. A verifier cannot be omitted to downgrade.
 - Scope is intersected: `requested ∩ client-registered ∩ user-entitled ∩
-  enabled`. Refresh can only narrow and re-checks the current client-registered
-  and user-entitled sets (a fresh Postgres read), so revoking a scope or an
-  entitlement drops it on the next refresh.
+  enabled`. Refresh can only narrow and re-checks the current `enabled` catalog
+  plus the current client-registered and user-entitled sets (fresh Postgres
+  reads): an omitted `scope` keeps the prior grant only while still enabled,
+  then silently narrows to the still-registered ∩ still-entitled intersection
+  (possibly empty); an explicit `scope` must be a subset of the prior grant and
+  of all three current sets.
 - The login, consent, and device pages set a strict CSP with
   `frame-ancestors 'none'`. They use server-side sessions, CSRF protection, and
   no open redirect.
@@ -320,8 +334,25 @@ configure one as fail-open is a load-time error.
   `id_token_hint`.
 - Failed-login and lockout counters live in Redis, not Postgres, so a login
   flood does not write rows.
-- Rate limiting is per IP and per client. Counters live in a Redis keyspace
-  separated from token state.
+- Rate limiting classifies by full request path: `/token`,
+  `/authorize`/`/consent`/`/device*`/`/introspect`/`/revoke`/`/par`,
+  `/login*`/`/logout`, and `/register*`; `/health`, `/.well-known`, and
+  `/assets` are unrated. Counters live in a Redis keyspace separated from token
+  state. A breach is `429` + `Retry-After`; a store outage or a missing peer
+  address fails closed `503`.
+- TOTP enrollment confirmation (`confirm_totp`) shares the login lockout counter
+  and policy: a failed code increments it, success clears it, and a locked
+  account rejects even a correct code — indistinguishably — until the window
+  expires.
+- A disabled subject is dead everywhere: introspection reports it inactive and
+  refresh rejects it with `invalid_grant` before minting; `user disable` first
+  purges every Redis record whose subject is the user (sessions + `:meta`, the
+  `loginfail` counter, authorization codes, device records + `:cnf`/`:poll` +
+  `user_code` mappings, grants via cascade revoke plus member `:act`, and
+  standalone access/refresh records), then flips Postgres `disabled`. A Redis
+  outage fails closed and leaves the user enabled. Records with no subject
+  (`par:`, `pending:`, `dpop_jti:`, `client_assertion_jti:`, `rotation:`,
+  `totp_replay:`, rate-limit counters) are untouched.
 - CORS is empty by default and never a wildcard.
 - DCR is protected by a one-time initial-access token; open registration is off
   by default.

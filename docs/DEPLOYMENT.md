@@ -264,6 +264,7 @@ loader at them:
 ```text
 D_OAUTH_TOKEN_PEPPER_FILE=/run/secrets/token-pepper
 D_OAUTH_TOTP_ENCRYPTION_KEY_FILE=/run/secrets/totp-encryption-key
+D_OAUTH_PII_ENCRYPTION_KEY_FILE=/run/secrets/pii-encryption-key
 D_OAUTH_DATABASE__PASSWORD_FILE=/run/secrets/database-password
 D_OAUTH_REDIS__PASSWORD_FILE=/run/secrets/redis-password
 ```
@@ -277,20 +278,22 @@ describe` output, or in a crash dump — a `kubectl exec` into the container
 reads nothing useful from the environment. `scripts/check_manifests.py` fails
 the build if a workload injects a secret through a `secretKeyRef` env, or if a
 ConfigMap DSN embeds a password. The inline `D_OAUTH_TOKEN_PEPPER` /
-`D_OAUTH_TOTP_ENCRYPTION_KEY` forms remain supported and take precedence when
-both are set (`src/config/build.rs`), so an existing environment-based
-deployment still starts; the shipped manifests deliberately never set them.
+`D_OAUTH_TOTP_ENCRYPTION_KEY` / `D_OAUTH_PII_ENCRYPTION_KEY` forms remain
+supported and take precedence when the inline forms are set
+(`src/config/build.rs`), so an existing environment-based deployment still
+starts; the shipped manifests deliberately never set them.
 The migrate Job mounts the same files. To rotate a password, update it in
 Postgres/Redis and the Secret together, then roll the replicas; see
 [CONFIGURATION.md](CONFIGURATION.md) and [OPERATIONS.md](OPERATIONS.md).
 
 ### Master key custody and KMS/HSM
 
-The token pepper and the TOTP-encryption key are the server's master keys. The
-binary never fetches a key and carries no cloud KMS or HSM SDK; it reads the
-material from `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`
-(or the inline forms), so custody is entirely the deployment's responsibility.
-Treat this as a hard requirement, not a preference:
+The token pepper, the TOTP-encryption key, and the PII field-encryption key are
+the server's master keys. The binary never fetches a key and carries no cloud
+KMS or HSM SDK; it reads the material from `D_OAUTH_TOKEN_PEPPER_FILE` /
+`D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` / `D_OAUTH_PII_ENCRYPTION_KEY_FILE` (or the
+inline forms), so custody is entirely the deployment's responsibility. Treat
+this as a hard requirement, not a preference:
 
 - **Never co-locate the key with the database.** The keys must not live in a
   Postgres table, in the database backup, or in any archive that also carries a
@@ -308,6 +311,10 @@ Treat this as a hard requirement, not a preference:
 - **Keep the backup key separate too.** If the database backup is encrypted, its
   key is a second secret and is custodied under the same rule, apart from the
   backup it protects.
+
+Every resolved key value — pepper, TOTP, PII, active or retained previous —
+must be at least 32 bytes (256 bits); shorter values are refused at load
+(`ConfigError::WeakKeyMaterial`).
 
 Rotation keeps the chain honest: retaining the old pepper key id is what lets
 live tokens verify until they expire, and retaining the old TOTP key id is only
@@ -483,9 +490,9 @@ The image pipeline is gated on:
   surface to the binary.
 - Non-root with a read-only root filesystem.
 - Secrets and CA material are mounted, never baked into the image or manifests.
-- Every secret — token pepper, TOTP key, and the database and Redis passwords —
-  is a `0400` tmpfs file, not an environment variable, and the pod carries no
-  service-account token.
+- Every secret — token pepper, TOTP key, PII key, and the database and Redis
+  passwords — is a `0400` tmpfs file, not an environment variable, and the pod
+  carries no service-account token.
 - `kubectl exec` / `docker exec` reach a non-root process with a read-only
   rootfs, no capabilities, and no shell, but still bypass the application's own
   auth; restrict `pods/exec` with RBAC and audit it (see
@@ -546,7 +553,8 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
   weekly rebuild.
 - `deploy/k8s/` for the cluster manifests: `namespace.yaml`, `configmap.yaml`
   (non-secret settings only, including the passwordless DSNs), `secret.yaml`
-  (placeholder secrets — pepper, TOTP key, database and Redis passwords — all
+  (placeholder secrets — pepper, TOTP key, PII key, database and Redis
+  passwords — all
   file-mounted and replaced by the secret manager), `service.yaml` (public TLS
   port only, never the health port), `deployment.yaml` (3 stateless replicas,
   probes on the plaintext health listener, PDB + topology spread,

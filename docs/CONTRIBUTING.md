@@ -34,7 +34,12 @@ cargo build --locked --release  # release (thin LTO, stripped)
 
 The build is offline-safe for SQL: with `SQLX_OFFLINE=true` the `query!` macros
 compile against the committed `.sqlx/` cache, so no database is needed at build
-time. The Docker build relies on exactly this.
+time. The Docker build relies on exactly this. When a query or a migration
+changes, regenerate and commit the cache:
+
+```bash
+cargo sqlx prepare --workspace
+```
 
 ## Quality gates
 
@@ -47,6 +52,7 @@ cargo nextest run --all-targets
 cargo test --doc
 cargo audit
 cargo deny check
+python3 scripts/check_doc_links.py
 ```
 
 Start the shared test services before `cargo nextest run --all-targets`:
