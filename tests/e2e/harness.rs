@@ -161,7 +161,13 @@ impl World {
       "bind_addr": "127.0.0.1:0",
       "health_addr": "127.0.0.1:0",
       "tls": {"cert_path": "/tmp/e2e-cert.pem", "key_path": "/tmp/e2e-key.pem"},
-      "database": {"url": pg_url},
+      "database": {
+        "url": pg_url,
+        "lock_timeout_secs": 5,
+        "statement_timeout_secs": 15,
+        "acquire_timeout_secs": 20,
+      },
+      "failure_policy": {"request_timeout_secs": 60},
       "redis": {
         "url": redis_url,
         "durability": "waitaof",

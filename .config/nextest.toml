@@ -1,0 +1,6 @@
+[test-groups]
+heavy-e2e = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'binary(e2e_grants) | binary(e2e_abuse)'
+test-group = 'heavy-e2e'
