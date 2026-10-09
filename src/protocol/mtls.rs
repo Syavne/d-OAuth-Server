@@ -5,19 +5,15 @@
 //! (PKI / subject-DN over the client-CA bundle). Both verifiers offer but
 //! never require a certificate at the TLS layer; [`select::authenticate`]
 //! decides per registered client. The leaf arrives via
-//! [`crate::tls::PeerCertificates`], with a `trusted_proxy` header fallback
-//! (see [`source`]).
+//! [`crate::tls::PeerCertificates`], injected per request by the custom
+//! accept loop.
 
 mod cert;
 mod select;
-mod source;
 mod verifier;
 
 pub use cert::{subject_dn, thumbprint_b64url};
 pub use select::{authenticate, authenticate_by_id, select_by_subject_dn, select_by_thumbprint};
-pub use source::{
-  PROXY_CERT_HEADER, PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS, presented_leaf, strip_proxy_headers,
-};
 pub use verifier::{pki_verifier, pki_verifier_from_file, self_signed_verifier, server_config};
 
 use crate::error::{AppError, OAuthErrorCode};

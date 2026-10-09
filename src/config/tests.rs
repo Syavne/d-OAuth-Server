@@ -28,11 +28,11 @@ fn base() -> Map<String, Value> {
       "durability": "waitaof",
       "root_cert_path": "/etc/d-oauth/redis-ca.pem"
     },
-    "token_pepper": "SUPER_SECRET_PEPPER_VALUE",
+    "token_pepper": "SUPER_SECRET_PEPPER_VALUE-0123456789abcdef",
     "token_pepper_id": "v1",
-    "totp_encryption_key": "SUPER_SECRET_TOTP_KEY",
+    "totp_encryption_key": "SUPER_SECRET_TOTP_KEY-0123456789abcdef",
     "totp_key_id": "v1",
-    "pii_encryption_key": "SUPER_SECRET_PII_KEY",
+    "pii_encryption_key": "SUPER_SECRET_PII_KEY-0123456789abcdef",
     "pii_key_id": "v1",
     "cookie_secure": true,
     "allow_open_registration": false,
@@ -96,7 +96,6 @@ fn config_loads_with_empty_scope_registry() -> Result<(), Box<dyn Error>> {
   assert!(cfg.cookie_secure);
   assert_eq!(cfg.dcr_redirect_policy, DcrRedirectPolicy::Catalog);
   assert!(!cfg.allow_open_registration);
-  assert!(cfg.trusted_proxy.is_none());
   assert!(cfg.cors_allowed_origins.is_empty());
   Ok(())
 }
@@ -272,9 +271,9 @@ fn config_redis_startup_assertions_are_callable() -> Result<(), Box<dyn Error>> 
 fn config_debug_redacts_secret_values() -> Result<(), Box<dyn Error>> {
   let cfg = try_load(&base())?;
   let rendered = format!("{cfg:?}");
-  assert!(!rendered.contains("SUPER_SECRET_PEPPER_VALUE"));
-  assert!(!rendered.contains("SUPER_SECRET_TOTP_KEY"));
-  assert!(!rendered.contains("SUPER_SECRET_PII_KEY"));
+  assert!(!rendered.contains("SUPER_SECRET_PEPPER_VALUE-0123456789abcdef"));
+  assert!(!rendered.contains("SUPER_SECRET_TOTP_KEY-0123456789abcdef"));
+  assert!(!rendered.contains("SUPER_SECRET_PII_KEY-0123456789abcdef"));
   assert!(!rendered.contains("DB_PASSWORD_XYZ"));
   assert!(rendered.contains("REDACTED"));
   Ok(())
@@ -353,12 +352,67 @@ fn config_rejects_empty_active_pii_key() {
   }
 }
 
+/// A resolved pepper/TOTP/PII key shorter than 32 bytes is rejected with the
+/// offending key named; retained previous keys are checked too.
+#[test]
+fn config_rejects_weak_key_material() {
+  for (key, value) in [
+    ("token_pepper", "short-pepper-material"),
+    ("totp_encryption_key", "short-totp-key-material"),
+    ("pii_encryption_key", "short-pii-key-material"),
+  ] {
+    let mut map = base();
+    map.insert(key.to_owned(), Value::String(value.to_owned()));
+    assert!(
+      matches!(
+        try_load(&map),
+        Err(ConfigError::WeakKeyMaterial { key: rejected }) if rejected == key
+      ),
+      "{key} shorter than 32 bytes must be rejected"
+    );
+  }
+  for key in ["totp_previous_key", "pii_previous_key"] {
+    let mut map = base();
+    map.insert(
+      key.to_owned(),
+      Value::String("short-previous-key".to_owned()),
+    );
+    map.insert(format!("{key}_id"), Value::String("v0".to_owned()));
+    assert!(
+      matches!(
+        try_load(&map),
+        Err(ConfigError::WeakKeyMaterial { key: rejected }) if rejected == key
+      ),
+      "previous key {key} shorter than 32 bytes must be rejected"
+    );
+  }
+}
+
+/// The key-length boundary is exact: 31 bytes is rejected, 32 accepted.
+#[test]
+fn config_key_length_boundary_is_32_bytes() -> Result<(), Box<dyn Error>> {
+  let mut exact = base();
+  exact.insert("token_pepper".to_owned(), Value::String("p".repeat(32)));
+  let cfg = try_load(&exact)?;
+  assert!(cfg.keys.active_pepper().is_some());
+
+  let mut short = base();
+  short.insert("token_pepper".to_owned(), Value::String("p".repeat(31)));
+  assert!(matches!(
+    try_load(&short),
+    Err(ConfigError::WeakKeyMaterial {
+      key: "token_pepper"
+    })
+  ));
+  Ok(())
+}
+
 #[test]
 fn config_builds_pii_chain() -> Result<(), Box<dyn Error>> {
   let mut map = base();
   map.insert(
     "pii_previous_key".to_owned(),
-    Value::String("SUPER_SECRET_PII_PREVIOUS".to_owned()),
+    Value::String("SUPER_SECRET_PII_PREVIOUS-0123456789abcdef".to_owned()),
   );
   map.insert(
     "pii_previous_key_id".to_owned(),
@@ -392,7 +446,7 @@ fn config_rejects_previous_key_without_id() {
   let mut map = base();
   map.insert(
     "pii_previous_key".to_owned(),
-    Value::String("SUPER_SECRET_PII_PREVIOUS".to_owned()),
+    Value::String("SUPER_SECRET_PII_PREVIOUS-0123456789abcdef".to_owned()),
   );
   let result = try_load(&map);
   assert!(matches!(result, Err(ConfigError::MissingPreviousKeyId)));
@@ -400,7 +454,7 @@ fn config_rejects_previous_key_without_id() {
   let mut same_id = base();
   same_id.insert(
     "pii_previous_key".to_owned(),
-    Value::String("SUPER_SECRET_PII_PREVIOUS".to_owned()),
+    Value::String("SUPER_SECRET_PII_PREVIOUS-0123456789abcdef".to_owned()),
   );
   same_id.insert(
     "pii_previous_key_id".to_owned(),
@@ -412,7 +466,7 @@ fn config_rejects_previous_key_without_id() {
   let mut totp = base();
   totp.insert(
     "totp_previous_key".to_owned(),
-    Value::String("SUPER_SECRET_TOTP_PREVIOUS".to_owned()),
+    Value::String("SUPER_SECRET_TOTP_PREVIOUS-0123456789abcdef".to_owned()),
   );
   let result = try_load(&totp);
   assert!(matches!(result, Err(ConfigError::MissingPreviousKeyId)));
@@ -423,7 +477,7 @@ fn config_rejects_previous_key_without_active() {
   let mut pii = without("pii_encryption_key");
   pii.insert(
     "pii_previous_key".to_owned(),
-    Value::String("SUPER_SECRET_PII_PREVIOUS".to_owned()),
+    Value::String("SUPER_SECRET_PII_PREVIOUS-0123456789abcdef".to_owned()),
   );
   pii.insert(
     "pii_previous_key_id".to_owned(),
@@ -438,7 +492,7 @@ fn config_rejects_previous_key_without_active() {
   let mut totp = without("totp_encryption_key");
   totp.insert(
     "totp_previous_key".to_owned(),
-    Value::String("SUPER_SECRET_TOTP_PREVIOUS".to_owned()),
+    Value::String("SUPER_SECRET_TOTP_PREVIOUS-0123456789abcdef".to_owned()),
   );
   totp.insert(
     "totp_previous_key_id".to_owned(),

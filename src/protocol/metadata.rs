@@ -54,8 +54,13 @@ pub const INTROSPECTION_AUTH_METHODS: [&str; 5] = [
   "self_signed_tls_client_auth",
 ];
 
-/// JWS algorithms accepted for `private_key_jwt` assertions and DPoP proofs.
-pub const SIGNING_ALG_VALUES: [&str; 3] = ["ES256", "EdDSA", "RS256"];
+/// JWS algorithms accepted for `private_key_jwt` client assertions
+/// (`token_endpoint_auth_signing_alg_values_supported`); kept in sync with
+/// `protocol::client_auth::assertion::ALLOWED_ALGS`.
+pub const CLIENT_ASSERTION_SIGNING_ALG_VALUES: [&str; 4] = ["ES256", "EdDSA", "RS256", "PS256"];
+
+/// JWS algorithms accepted for DPoP proofs (`dpop_signing_alg_values_supported`).
+pub const DPOP_SIGNING_ALG_VALUES: [&str; 3] = ["ES256", "EdDSA", "RS256"];
 
 /// RFC 8414 authorization-server metadata document.
 #[derive(Debug, Serialize)]
@@ -83,7 +88,7 @@ pub struct AuthorizationServerMetadata {
   /// Token-endpoint client-authentication methods.
   pub token_endpoint_auth_methods_supported: [&'static str; 6],
   /// Signing algorithms for `private_key_jwt` client assertions.
-  pub token_endpoint_auth_signing_alg_values_supported: [&'static str; 3],
+  pub token_endpoint_auth_signing_alg_values_supported: [&'static str; 4],
   /// Introspection-endpoint client-authentication methods.
   pub introspection_endpoint_auth_methods_supported: [&'static str; 5],
   /// Revocation-endpoint client-authentication methods.
@@ -119,11 +124,11 @@ impl AuthorizationServerMetadata {
       response_types_supported: ["code"],
       grant_types_supported: GRANT_TYPES_SUPPORTED,
       token_endpoint_auth_methods_supported: TOKEN_AUTH_METHODS,
-      token_endpoint_auth_signing_alg_values_supported: SIGNING_ALG_VALUES,
+      token_endpoint_auth_signing_alg_values_supported: CLIENT_ASSERTION_SIGNING_ALG_VALUES,
       introspection_endpoint_auth_methods_supported: INTROSPECTION_AUTH_METHODS,
       revocation_endpoint_auth_methods_supported: REVOCATION_AUTH_METHODS,
       code_challenge_methods_supported: ["S256"],
-      dpop_signing_alg_values_supported: SIGNING_ALG_VALUES,
+      dpop_signing_alg_values_supported: DPOP_SIGNING_ALG_VALUES,
       tls_client_certificate_bound_access_tokens: true,
       authorization_response_iss_parameter_supported: true,
       scopes_supported,

@@ -88,8 +88,8 @@ than disabling it, trust a private CA so the proxy verifies both the backend
 chain and its hostname.
 
 This L7 model cannot carry a client certificate, so it does not support
-in-process client-certificate mTLS. For that, use L4/TCP passthrough or the
-explicit trusted-proxy mode described below. Everything else, including DPoP,
+in-process client-certificate mTLS. For that, use L4/TCP passthrough (see the
+mTLS section below). Everything else, including DPoP,
 PAR, and JAR, works unchanged.
 
 ### Generate a private CA and a server certificate
@@ -453,16 +453,10 @@ in-flight requests to be cut off. Keep it above the budget.
 In-process client-certificate verification needs the peer certificate to reach
 the application. That requires L4/TCP passthrough at the load balancer
 (a network load balancer gateway or a `TLSRoute`). An L7 ingress that terminates
-TLS strips the client certificate, so in-process mTLS cannot work behind it.
-
-Two correct options:
-
-- Use L4/TCP passthrough so the server terminates TLS and sees the client
-  certificate.
-- Use the explicit trusted-proxy mode: terminate at a proxy you control, have it
-  forward a verified client-cert representation, and set `trusted_proxy` to that
-  proxy's address. When `trusted_proxy` is unset, forwarded client-cert headers
-  are stripped.
+TLS strips the client certificate, so in-process mTLS cannot work behind it;
+the only correct option is L4/TCP passthrough, where the server terminates TLS
+and sees the client certificate itself. Forwarded client-cert headers from an
+intermediary are never trusted.
 
 This constraint is documented here and is not claimed to be exercised end to end
 in CI. CI validates the manifests for the forbidden pairing of an L7 ingress
@@ -508,7 +502,7 @@ The image pipeline is gated on:
 
 - A root or privileged pod violates the policy and must be rejected.
 - An L7-terminated ingress with client-cert auth cannot carry the cert; use
-  passthrough or trusted-proxy mode.
+  L4/TCP passthrough.
 - Booting three replicas without the migration Job lets readiness block them
   until the schema matches.
 - A replica that has no shared state is a bug: token state is in Redis, not in

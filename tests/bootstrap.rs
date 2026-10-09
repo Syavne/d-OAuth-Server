@@ -27,9 +27,8 @@
 
 #[path = "mtls/certs.rs"]
 // The fixture module is shared per-target with `test(mtls)`: this target
-// uses a subset (`der_b64` belongs to the proxy-header suite), so the
-// include carries a scoped, documented allow instead of restructuring a
-// peer-owned file.
+// uses a subset of it, so the include carries a scoped, documented allow
+// instead of restructuring a peer-owned file.
 #[allow(dead_code)]
 mod certs;
 

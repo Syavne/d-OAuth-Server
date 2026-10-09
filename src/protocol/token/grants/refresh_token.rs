@@ -21,7 +21,12 @@ mod tests;
 
 use super::super::{ClientKind, Cnf, MintRequest, MintedTokens, SenderProof, TokenService};
 use crate::{
+  db::{
+    user_repo::{self, SubjectAccountStatus},
+    user_scope_repo,
+  },
   error::AppError,
+  keys::KeyRing,
   protocol::scope::{ScopeSet, narrow_on_refresh},
   state::RedisConn,
   store::{
@@ -48,6 +53,13 @@ pub struct RefreshInput<'a> {
   pub proof: &'a SenderProof,
   /// Enabled catalog rows, freshly read at issuance.
   pub enabled: &'a ScopeSet,
+  /// Current scopes registered to the authenticated client (fresh parse of
+  /// the client's `scope` at issuance).
+  pub client_registered: &'a ScopeSet,
+  /// Current user entitlements. [`refresh_with_subject_check`] replaces this
+  /// with a fresh Postgres read for real users; direct [`refresh`] callers
+  /// (Redis-only tests) supply the term themselves.
+  pub user_entitled: &'a ScopeSet,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
 }
@@ -67,6 +79,83 @@ pub struct RefreshedTokens {
   pub expires_in: u64,
   /// Grant chain the rotated pair joins (unchanged across rotations).
   pub grant_id: String,
+}
+
+/// Datastore handles for the use-time disabled-user re-check in
+/// [`refresh_with_subject_check`]. `refresh` itself stays Redis-only so its
+/// existing callers keep compiling; the dispatcher must prefer the checked
+/// entry point (see the note there).
+pub struct RefreshUserStores<'a> {
+  /// Postgres pool for the `users.disabled` lookup.
+  pub pool: &'a sqlx::PgPool,
+  /// Versioned PII keys for the email blind-index lookup.
+  pub keys: &'a KeyRing,
+}
+
+/// Rotate with a fail-closed use-time disabled-user re-check and fresh
+/// entitlement enforcement.
+///
+/// The presented refresh token is located first; when its non-empty subject
+/// resolves to a disabled user the grant is rejected with `invalid_grant`
+/// BEFORE anything is minted or rotated, so the presented token stays live
+/// for a retry after re-enable. Otherwise the current user entitlements are
+/// read fresh from Postgres (a subject that maps to no user — empty
+/// client-credentials subjects, synthetic principals — carries no user term)
+/// and the rotation narrows against the current `client_registered`,
+/// `user_entitled`, and `enabled` sets, so a revoked entitlement or a removed
+/// client scope drops out on refresh instead of surviving for the token's
+/// whole lifetime. The disabled check preserves unknown-token,
+/// tombstone-cascade, and proof-check behavior. A datastore failure propagates
+/// as an error.
+///
+/// # Errors
+///
+/// Returns `invalid_grant` for a disabled subject, plus every error
+/// [`refresh`] can return.
+pub async fn refresh_with_subject_check(
+  conn: &mut RedisConn,
+  store: &Store,
+  service: &TokenService,
+  users: &RefreshUserStores<'_>,
+  input: &RefreshInput<'_>,
+) -> Result<RefreshedTokens, AppError> {
+  let raw = input.refresh_token.trim();
+  let found = if raw.is_empty() {
+    None
+  } else {
+    service
+      .find_refresh(conn, store, raw)
+      .await
+      .map_err(AppError::from)?
+  };
+  let Some(found) = found else {
+    return refresh(conn, store, service, input).await;
+  };
+  if !found.record.subject.trim().is_empty()
+    && matches!(
+      user_repo::subject_account_status(users.pool, users.keys, &found.record.subject).await?,
+      SubjectAccountStatus::Disabled
+    )
+  {
+    return Err(AppError::invalid_grant("account is disabled"));
+  }
+  let entitled =
+    match user_repo::subject_user_id(users.pool, users.keys, &found.record.subject).await? {
+      Some(id) => ScopeSet::from_names(&user_scope_repo::list_for_user(users.pool, id).await?)?,
+      None => ScopeSet::parse(&found.record.scope).map_err(|_| AppError::server_error())?,
+    };
+  let fresh = RefreshInput {
+    client_id: input.client_id,
+    client_kind: input.client_kind,
+    refresh_token: input.refresh_token,
+    requested_scope: input.requested_scope,
+    proof: input.proof,
+    enabled: input.enabled,
+    client_registered: input.client_registered,
+    user_entitled: &entitled,
+    now_unix: input.now_unix,
+  };
+  refresh(conn, store, service, &fresh).await
 }
 
 /// Rotate a refresh token: fresh proof-of-possession, scope narrowing, then
@@ -111,7 +200,21 @@ pub async fn refresh(
   }
   check_proofs(input.client_kind, &found.record.cnf, input.proof)?;
   let previous = ScopeSet::parse(&found.record.scope).map_err(|_| AppError::server_error())?;
-  let narrowed = narrow_on_refresh(&previous, input.requested_scope, input.enabled)?;
+  // An empty subject is a client-credentials-style principal with no user
+  // term; the previous grant itself stands in so only the client and catalog
+  // sets narrow.
+  let user_term = if found.record.subject.trim().is_empty() {
+    &previous
+  } else {
+    input.user_entitled
+  };
+  let narrowed = narrow_on_refresh(
+    &previous,
+    input.requested_scope,
+    input.enabled,
+    input.client_registered,
+    user_term,
+  )?;
   let minted = service
     .mint(
       conn,

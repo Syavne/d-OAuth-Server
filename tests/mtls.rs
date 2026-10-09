@@ -3,8 +3,8 @@
 //! Covers the two RFC 8705 verifiers (chain-skipping `self_signed` vs
 //! `WebPkiClientVerifier` + client-CA bundle), thumbprint/DN matching,
 //! rejection of unknown/missing/ambiguous/cross-wired/expired identities,
-//! the trusted-proxy header mode, and the request-extension injection over
-//! a real TLS handshake through [`d_oauth::tls::serve_tls`].
+//! and the request-extension injection over a real TLS handshake through
+//! [`d_oauth::tls::serve_tls`].
 //!
 //! Test names contain `mtls` so
 //! `cargo nextest run -E 'test(mtls)'` selects exactly them. Bodies use
@@ -13,19 +13,14 @@
 #[path = "mtls/certs.rs"]
 mod certs;
 
-use std::{
-  net::{IpAddr, SocketAddr},
-  sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use certs::FixtureError;
 use d_oauth::{
   db::client_repo::{self, Client, NewClient},
   error::{AppError, OAuthErrorCode},
   keys::{KeyId, KeyRing},
-  protocol::mtls::{
-    self, MtlsCnf, MtlsError, PROXY_CERT_HEADER, PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS,
-  },
+  protocol::mtls::{self, MtlsCnf, MtlsError},
 };
 use secrecy::SecretString;
 mod common;
@@ -565,75 +560,6 @@ fn mtls_subject_dn_ambiguity_rejected() -> TestResult {
     mtls::select_by_subject_dn(&clients, "CN=nobody, O=Example"),
     Err(MtlsError::UnknownCertificate)
   ));
-  Ok(())
-}
-
-/// Build request parts carrying the given proxy headers.
-fn mtls_proxy_parts(pairs: &[(&str, &str)]) -> Result<axum::http::request::Parts, TestError> {
-  let mut builder = axum::http::Request::builder().uri("/token");
-  for (name, value) in pairs {
-    builder = builder.header(*name, *value);
-  }
-  Ok(builder.body(())?.into_parts().0)
-}
-
-/// A forged proxy header is ignored without a valid verification signal,
-/// and always ignored when no proxy is trusted.
-#[test]
-fn mtls_forged_proxy_header_ignored_without_success_signal() -> TestResult {
-  let der_b64 = certs::der_b64(certs::CLIENT_SELF_CERT_PEM)?;
-  let proxy: Option<IpAddr> = Some("127.0.0.1".parse()?);
-  // No trusted proxy: even a SUCCESS-signed header is ignored.
-  let parts = mtls_proxy_parts(&[
-    (PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS),
-    (PROXY_CERT_HEADER, &der_b64),
-  ])?;
-  assert!(mtls::presented_leaf(&parts, None)?.is_none());
-  // Trusted proxy but no signal: ignored.
-  let parts = mtls_proxy_parts(&[(PROXY_CERT_HEADER, &der_b64)])?;
-  assert!(mtls::presented_leaf(&parts, proxy)?.is_none());
-  // Trusted proxy with a failed signal: ignored.
-  let parts = mtls_proxy_parts(&[
-    (PROXY_VERIFY_HEADER, "FAILED"),
-    (PROXY_CERT_HEADER, &der_b64),
-  ])?;
-  assert!(mtls::presented_leaf(&parts, proxy)?.is_none());
-  // SUCCESS signal but no certificate: nothing to trust.
-  let parts = mtls_proxy_parts(&[(PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS)])?;
-  assert!(mtls::presented_leaf(&parts, proxy)?.is_none());
-  Ok(())
-}
-
-/// A SUCCESS-signed header is honored only with `trusted_proxy`, and the
-/// direct listener strips inbound headers before routing.
-#[test]
-fn mtls_proxy_success_signal_accepted_and_stripped() -> TestResult {
-  let der_b64 = certs::der_b64(certs::CLIENT_SELF_CERT_PEM)?;
-  let proxy: Option<IpAddr> = Some("127.0.0.1".parse()?);
-  let parts = mtls_proxy_parts(&[
-    (PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS),
-    (PROXY_CERT_HEADER, &der_b64),
-  ])?;
-  let leaf = mtls::presented_leaf(&parts, proxy)?.ok_or(MtlsError::MissingCertificate)?;
-  assert_eq!(mtls::thumbprint_b64url(leaf.as_ref()), SELF_THUMBPRINT);
-  // A SUCCESS-signed garbage header fails closed instead of binding.
-  let parts = mtls_proxy_parts(&[
-    (PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS),
-    (PROXY_CERT_HEADER, "!!!"),
-  ])?;
-  assert!(matches!(
-    mtls::presented_leaf(&parts, proxy),
-    Err(MtlsError::MalformedCertificate)
-  ));
-  // Stripping removes both headers, so downstream sees no certificate.
-  let mut parts = mtls_proxy_parts(&[
-    (PROXY_VERIFY_HEADER, PROXY_VERIFY_SUCCESS),
-    (PROXY_CERT_HEADER, &der_b64),
-  ])?;
-  mtls::strip_proxy_headers(&mut parts.headers);
-  assert!(!parts.headers.contains_key(PROXY_CERT_HEADER));
-  assert!(!parts.headers.contains_key(PROXY_VERIFY_HEADER));
-  assert!(mtls::presented_leaf(&parts, proxy)?.is_none());
   Ok(())
 }
 

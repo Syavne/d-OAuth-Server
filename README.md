@@ -58,9 +58,9 @@ export D_OAUTH_TLS__KEY_PATH=/path/to/tls.key
 export D_OAUTH_DATABASE__URL='postgres://oauth:password@127.0.0.1:5432/oauth?sslmode=disable'
 export D_OAUTH_REDIS__URL=redis://127.0.0.1:6379
 export D_OAUTH_REDIS__DURABILITY=waitaof
-export D_OAUTH_TOKEN_PEPPER='replace-with-32-bytes-of-random'
-export D_OAUTH_TOTP_ENCRYPTION_KEY='replace-with-32-bytes-of-random'
-export D_OAUTH_PII_ENCRYPTION_KEY='replace-with-32-bytes-of-random'
+export D_OAUTH_TOKEN_PEPPER='replace-with-32-bytes-of-random-00'
+export D_OAUTH_TOTP_ENCRYPTION_KEY='replace-with-32-bytes-of-random-00'
+export D_OAUTH_PII_ENCRYPTION_KEY='replace-with-32-bytes-of-random-00'
 ```
 
 Development relaxes the database TLS requirement. Production requires

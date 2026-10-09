@@ -147,6 +147,27 @@ fn metadata_never_advertises_plain_or_jwks_uri() {
   );
 }
 
+#[test]
+fn metadata_advertises_ps256_for_client_assertions() {
+  let doc = AuthorizationServerMetadata::for_issuer(ISSUER, Vec::new());
+  let json = serde_json::to_value(&doc).unwrap_or(Value::Null);
+  assert_eq!(
+    json.get("token_endpoint_auth_signing_alg_values_supported"),
+    Some(&serde_json::json!(
+      super::CLIENT_ASSERTION_SIGNING_ALG_VALUES
+    )),
+    "client-assertion allowlist must include PS256"
+  );
+  let dpop_has_ps256 = json
+    .get("dpop_signing_alg_values_supported")
+    .and_then(Value::as_array)
+    .is_some_and(|algs| algs.iter().any(|alg| alg.as_str() == Some("PS256")));
+  assert!(
+    !dpop_has_ps256,
+    "DPoP allowlist is unchanged by assertion PS256"
+  );
+}
+
 #[tokio::test]
 async fn metadata_postgres_down_fails_closed() -> TestResult {
   let pool = sqlx::postgres::PgPoolOptions::new()

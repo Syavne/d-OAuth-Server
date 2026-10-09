@@ -17,7 +17,8 @@ use testcontainers::{
 
 use super::{
   ErrorClass, OpClass, Store, StoreError, classify_redis, codes, dcr, device, durability_barrier,
-  grants, may_retry_op, par, pending, ratelimit, retry_op, sessions, sha256_hex, tokens,
+  grants, hget_record, hset_record, may_retry_op, par, pending, ratelimit, retry_op, sessions,
+  sha256_hex, tokens,
 };
 use crate::{
   config::{ConfigError, DurabilityMode, RedisConfig, TtlConfig, redis::RawRedisConfig},
@@ -1275,9 +1276,9 @@ async fn store_login_failure_counter_ttl_within_lockout_window() -> TestResult {
   assert_ttl_within(pttl_ms(&mut conn, &key).await?, window)
 }
 
-/// docs/REDIS.md: the DPoP and `private_key_jwt` replay markers are bounded by
-/// the proof window ([`crate::jose::dpop::DPOP_JTI_TTL`] and the assertion
-/// module's `JTI_TTL`, both 300 s).
+/// docs/REDIS.md: the DPoP replay marker is bounded by the proof window
+/// ([`crate::jose::dpop::DPOP_JTI_TTL`]); the `private_key_jwt` marker is
+/// bounded by the assertion's remaining validity (at most 360 s).
 #[tokio::test]
 async fn store_replay_marker_ttl_within_proof_window() -> TestResult {
   let (_container, url) = redis_container(Vec::new()).await?;
@@ -1517,4 +1518,90 @@ async fn store_retry_budget_bounds_idempotent_reads() -> TestResult {
     }
   }
   Ok(())
+}
+
+/// The record write is a single atomic `HSET`+`PEXPIRE` script: a record
+/// observed after [`hset_record`] always carries both its fields AND a live
+/// TTL, and a rewrite re-arms the expiry (never a persistent key).
+#[tokio::test]
+async fn store_hset_record_writes_fields_and_ttl() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, _store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let key = unique("hset-record");
+  let ttl = Duration::from_secs(300);
+  let pairs = vec![
+    ("client_id".to_owned(), "client-1".to_owned()),
+    ("scope".to_owned(), "orders:read".to_owned()),
+  ];
+
+  hset_record(&mut conn, &key, &pairs, ttl).await?;
+  let record = hget_record(&mut conn, &key).await?;
+  if record
+    .as_ref()
+    .is_none_or(|fields| fields.get("client_id").map(String::as_str) != Some("client-1"))
+  {
+    return Err(TestError::Unexpected(
+      "written record must carry its fields".to_owned(),
+    ));
+  }
+  assert_ttl_within(pttl_ms(&mut conn, &key).await?, ttl)?;
+
+  // Rewrite: a shorter lifetime must be observable, proving the write
+  // re-arms the TTL and does not leave the previous expiry in place.
+  let rewrite = Duration::from_secs(120);
+  let updated = vec![
+    ("client_id".to_owned(), "client-2".to_owned()),
+    ("scope".to_owned(), "orders:read".to_owned()),
+  ];
+  hset_record(&mut conn, &key, &updated, rewrite).await?;
+  let record = hget_record(&mut conn, &key).await?;
+  if record
+    .as_ref()
+    .is_none_or(|fields| fields.get("client_id").map(String::as_str) != Some("client-2"))
+  {
+    return Err(TestError::Unexpected(
+      "rewrite must replace the field value".to_owned(),
+    ));
+  }
+  assert_ttl_within(pttl_ms(&mut conn, &key).await?, rewrite)?;
+
+  // A key whose TTL was stripped must regain a live expiry when rewritten
+  // through the atomic write, so no record can remain persistent.
+  let _: () = redis::cmd("PERSIST")
+    .arg(&key)
+    .query_async(&mut conn)
+    .await?;
+  if pttl_ms(&mut conn, &key).await? != -1 {
+    return Err(TestError::Unexpected(
+      "PERSIST must strip the TTL for the simulation".to_owned(),
+    ));
+  }
+  hset_record(&mut conn, &key, &pairs, ttl).await?;
+  assert_ttl_within(pttl_ms(&mut conn, &key).await?, ttl)
+}
+
+/// A field-less `HSET` is a Redis arity error; the empty-pairs guard falls
+/// back to the TTL touch alone, so an existing record keeps its fields and a
+/// live expiry instead of becoming persistent (or erroring out).
+#[tokio::test]
+async fn store_hset_record_empty_pairs_keeps_ttl() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, _store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let key = unique("hset-empty");
+  let ttl = Duration::from_secs(300);
+  let pairs = vec![("client_id".to_owned(), "client-1".to_owned())];
+
+  hset_record(&mut conn, &key, &pairs, ttl).await?;
+  hset_record(&mut conn, &key, &[], ttl).await?;
+
+  let record = hget_record(&mut conn, &key).await?;
+  if record
+    .as_ref()
+    .is_none_or(|fields| fields.get("client_id").map(String::as_str) != Some("client-1"))
+  {
+    return Err(TestError::Unexpected(
+      "empty rewrite must preserve the fields".to_owned(),
+    ));
+  }
+  assert_ttl_within(pttl_ms(&mut conn, &key).await?, ttl)
 }

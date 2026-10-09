@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT disabled FROM users\n         WHERE email_index = ANY($1)\n            OR (email_enc IS NULL AND email = $2::text::citext)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "disabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "disabled"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c3d1b3b177daf4a4b62eede8e75d810f56f6d976f07acf9fc4a1f3846d2e1c24"
+}

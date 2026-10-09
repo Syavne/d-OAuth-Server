@@ -147,3 +147,50 @@ async fn ssrf_guarded_fetch_rejects_http_without_network() -> TestResult {
     )),
   }
 }
+
+#[tokio::test]
+async fn ssrf_check_returns_pinned_addrs_for_public_literal() -> TestResult {
+  match check_fetch_host("8.8.8.8", 443).await {
+    Ok(addrs) => {
+      let expected: IpAddr = "8.8.8.8"
+        .parse()
+        .map_err(|_| TestError::Unexpected("fixture literal must parse".to_owned()))?;
+      if addrs
+        .iter()
+        .any(|addr| addr.ip() == expected && addr.port() == 443)
+      {
+        Ok(())
+      } else {
+        Err(TestError::Unexpected(
+          "validated addresses must contain the pinned literal".to_owned(),
+        ))
+      }
+    }
+    Err(other) => Err(TestError::Unexpected(format!("wrong error: {other}"))),
+  }
+}
+
+#[tokio::test]
+async fn ssrf_check_denies_blocked_literal_with_blocked_target() -> TestResult {
+  match check_fetch_host("127.0.0.1", 443).await {
+    Err(super::SsrfError::BlockedTarget) => Ok(()),
+    Err(other) => Err(TestError::Unexpected(format!("wrong error: {other}"))),
+    Ok(_) => Err(TestError::Unexpected(
+      "loopback literal must never validate".to_owned(),
+    )),
+  }
+}
+
+#[tokio::test]
+async fn ssrf_check_denies_hostname_resolving_to_blocked() -> TestResult {
+  // `localhost` resolves via the local hosts file (no external DNS), so
+  // this stays offline while proving a hostname whose addresses are all
+  // blocked is denied with the validated addresses withheld.
+  match check_fetch_host("localhost", 443).await {
+    Err(super::SsrfError::BlockedTarget) => Ok(()),
+    Err(other) => Err(TestError::Unexpected(format!("wrong error: {other}"))),
+    Ok(_) => Err(TestError::Unexpected(
+      "localhost must never validate".to_owned(),
+    )),
+  }
+}

@@ -34,16 +34,14 @@ https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1).
 - A stolen token used from another key or certificate.
 - An operator or job that could leak a secret through logs, argv, or an error
   body.
-- A forged reverse-proxy header claiming a client certificate.
 
 ### Trust boundaries
 
 - The TLS public listener is the only route to OAuth handlers.
 - The plaintext health listener carries no OAuth routes.
 - Postgres holds durable domain state; Redis holds ephemeral state.
-- Forwarded client-cert and client-IP headers are trusted only from the
-  configured `trusted_proxy`; otherwise they are stripped before any handler
-  reads them.
+- Forwarded client-cert and client-IP headers are never trusted: the listener
+  uses only the TLS peer address and the certificate chain it verified itself.
 
 ## Attack surface
 
@@ -139,7 +137,11 @@ Every sender-constrained grant requires a freshly verified proof on every use.
 - For token exchange, the proof must match the subject token's confirmation,
   not merely the caller's.
 - `private_key_jwt` is client authentication only. It produces no confirmation
-  and never satisfies sender constraint. This is deliberate.
+  and never satisfies sender constraint. This is deliberate. Its `exp` may lie
+  at most 300 s past `now` (plus clock skew), and the `jti` replay marker is
+  held for the assertion's full remaining validity, so a long-lived assertion
+  cannot be replayed once its marker expires. `RS256`, `PS256`, `ES256`, and
+  `EdDSA` are accepted; `none` and HMAC are rejected.
 - mTLS identity is a client certificate subject DN (`tls_client_auth`) or a
   certificate thumbprint (`self_signed_tls_client_auth`), each unique per the
   partial indexes in the schema.
@@ -162,7 +164,9 @@ Reference: RFC 9126, RFC 9101.
   with the query string are rejected.
 - A `request_uri` is one-time and client-bound, or exactly pre-registered, and
   is fetched only through the SSRF guard (https only, no redirects, global IPs
-  only, size and time capped).
+  only, size and time capped). The connection is pinned to the addresses
+  validated before the fetch, so a rebinding hostname cannot redirect it to a
+  blocked address.
 - PAR credentials are read from the header and body only, never the query.
 
 ## Key ring and rotation
@@ -288,7 +292,8 @@ configure one as fail-open is a load-time error.
 - A PAR `request_uri` is consumed atomically.
 - A device code is consumed atomically on approval.
 - DPoP and `private_key_jwt` `jti` values are recorded with `SET NX`, so a
-  replayed proof or assertion is rejected.
+  replayed proof or assertion is rejected. A `private_key_jwt` marker lives for
+  the assertion's full remaining validity, bounded by the 300 s lifetime cap.
 - A TOTP code is recorded in a replay cache for its time-step window.
 
 ## Input and output safety
@@ -297,7 +302,9 @@ configure one as fail-open is a load-time error.
   There are no wildcards and no prefix matches.
 - PKCE is `S256` only. A verifier cannot be omitted to downgrade.
 - Scope is intersected: `requested ∩ client-registered ∩ user-entitled ∩
-  enabled`, and refresh can only narrow.
+  enabled`. Refresh can only narrow and re-checks the current client-registered
+  and user-entitled sets (a fresh Postgres read), so revoking a scope or an
+  entitlement drops it on the next refresh.
 - The login, consent, and device pages set a strict CSP with
   `frame-ancestors 'none'`. They use server-side sessions, CSRF protection, and
   no open redirect.
@@ -451,9 +458,7 @@ service up mid-rotation. The operator checklist with concrete commands is in
   redirect URIs. DCR client management survives because its token hash is in
   Postgres.
 - An L7 ingress that terminates TLS strips the client certificate; in-process
-  mTLS then fails. Use L4 passthrough or trusted-proxy mode.
-- A trusted proxy that is misconfigured to a broad address trusts forged
-  headers. Keep `trusted_proxy` as narrow as possible.
+  mTLS then fails. Use L4 passthrough.
 - A public client that loses its DPoP key cannot use its tokens; there is no
   bearer fallback for a sender-constrained grant.
 

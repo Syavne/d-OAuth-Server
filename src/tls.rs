@@ -5,9 +5,8 @@
 //! NOT `axum-server`, whose `RustlsAcceptor` discards the TLS session and
 //! exposes no `peer_certificates()`). After the handshake, the verified peer
 //! certificate chain is inserted into every request's extensions as
-//! [`PeerCertificates`], which `mtls.rs` (todo 21) reads. The `trusted_proxy`
-//! header mode is the documented alternative for deployments that terminate
-//! TLS at a reverse proxy.
+//! [`PeerCertificates`], which `mtls.rs` reads. The verified chain is the only
+//! source of mTLS evidence; no forwarded header is ever trusted.
 
 use std::{io, sync::Arc};
 

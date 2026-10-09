@@ -39,7 +39,8 @@ contract WITHOUT a live cluster:
 - L7-vs-L4 mTLS constraint: an L7 Ingress that terminates TLS while
   in-process client-cert auth is enabled (`D_OAUTH_TLS__CLIENT_CA_PATH`
   set, or client-cert Ingress annotations) FAILS. mTLS needs L4/TCP
-  passthrough (NLB gateway / TLSRoute) or explicit trusted-proxy mode.
+  passthrough (NLB gateway / TLSRoute); forwarded client-cert headers are
+  never trusted.
   This constraint is DOCUMENTED (docs/DEPLOYMENT.md) and lint-checked
   here; it is explicitly NOT exercised end-to-end in CI.
 
@@ -508,7 +509,8 @@ def check_l7_mtls(docs: list[dict], fails: Failures) -> None:
       fails.add(
         f"ingress/{name}: L7 TLS termination strips the client certificate "
         "while in-process client-cert auth is enabled — use L4/TCP "
-        "passthrough (NLB gateway / TLSRoute) or explicit trusted-proxy mode"
+        "passthrough (NLB gateway / TLSRoute); forwarded client-cert "
+        "headers are never trusted"
       )
 
 

@@ -510,9 +510,9 @@ async fn resolve_redirects(
         }
       }
       DcrRedirectPolicy::Open => {
-        if !has_valid_scheme(uri) {
+        if !is_open_redirect_uri(uri) {
           return Err(AppError::invalid_redirect_uri(
-            "redirect URI is not a valid absolute URI",
+            "redirect URI must be an absolute https URI or a loopback URI",
           ));
         }
       }
@@ -589,21 +589,44 @@ fn is_loopback_uri(uri: &str) -> bool {
   }
 }
 
-/// Whether `uri` is absolute with a valid RFC 3986 §3.1 scheme and a
-/// non-empty remainder without whitespace.
-fn has_valid_scheme(uri: &str) -> bool {
-  let Some((scheme, rest)) = uri.split_once(':') else {
+/// Whether `uri` may be registered under the `open` DCR redirect policy: an
+/// RFC 8252 loopback URI, or an absolute `https` URI with a non-empty host
+/// and no userinfo, fragment, or whitespace. Accepting an arbitrary absolute
+/// URI here would turn the opt-in `open` policy into an open-redirect
+/// factory.
+fn is_open_redirect_uri(uri: &str) -> bool {
+  if is_loopback_uri(uri) {
+    return true;
+  }
+  if uri.contains('#') || uri.chars().any(char::is_whitespace) {
+    return false;
+  }
+  let Some(rest) = strip_scheme_prefix(uri, "https") else {
     return false;
   };
-  let mut chars = scheme.chars();
-  match chars.next() {
-    Some(first) if first.is_ascii_alphabetic() => {}
-    _ => return false,
-  }
-  if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+  let Some(after_slashes) = rest.strip_prefix("//") else {
+    return false;
+  };
+  let authority = match after_slashes.find(['/', '?']) {
+    Some(index) => &after_slashes[..index],
+    None => after_slashes,
+  };
+  if authority.contains('@') {
     return false;
   }
-  !rest.is_empty() && !rest.chars().any(char::is_whitespace)
+  if let Some(inner) = authority.strip_prefix('[') {
+    match inner.find(']') {
+      Some(close) => {
+        close > 0 && (inner.len() == close + 1 || inner.as_bytes().get(close + 1) == Some(&b':'))
+      }
+      None => false,
+    }
+  } else {
+    match authority.split_once(':') {
+      Some((host, _)) => !host.is_empty(),
+      None => !authority.is_empty(),
+    }
+  }
 }
 
 /// Strip a case-insensitive `scheme:` prefix without ever slicing at a

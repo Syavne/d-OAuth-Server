@@ -159,6 +159,30 @@ rotation mapping or the record instead of replaying the write.
 - A `CROSSSLOT` error fails closed. It is never worked around by splitting an
   atomic operation across slots.
 
+## Subject purge (`user disable`)
+
+`d-oauth-server user disable --email <email>` revokes the user's ephemeral
+state before the Postgres `disabled` flag flips (fail closed: a Redis outage
+leaves the user enabled). The purge deletes every record whose `subject`
+field is the canonical email or the user-id string:
+
+- `session:<id>` records plus their `:meta` sidecars.
+- The `loginfail:<sha256>` lockout counter for the normalized email.
+- `code:<hash>` authorization-code records.
+- `device:<hash>` records plus their `:cnf`/`:poll` sidecars and the
+  `user_code:<code-hash>` mappings that point at them.
+- `grant:<id>` families via the grant cascade (member token keys, the
+  `:tokens` set, the record, and member `:act` sidecars), plus standalone
+  `access:<hash>` (with `:act`) and `refresh:<hash>` records.
+
+Records without a `subject` field are never touched: `par:`, `pending:`,
+`dpop_jti:`, `client_assertion_jti:`, `rotation:`, `totp_replay:`, and the
+`{rl}` rate-limit counters.
+
+Like the DCR `DELETE` revocation, the purge scans with `SCAN MATCH <prefix>*
+COUNT 100` and filters on the raw hash field. On Cluster topologies a scan
+covers the contacted node only (Single and Sentinel scan fully).
+
 ## Operational runbook
 
 Configure Redis with persistence and eviction off. A minimal single-node
@@ -185,5 +209,6 @@ family, use `SCAN` with the prefix; never use `KEYS` in a request path.
 - `src/store/tokens.rs`, `src/store/grants.rs`, `src/store/codes.rs`,
   `src/store/sessions.rs`, `src/store/par.rs`, `src/store/device.rs`,
   `src/store/dcr.rs`, `src/store/ratelimit.rs` for the per-family records.
+- `src/protocol/purge.rs` for the `user disable` subject purge.
 - `src/config/redis.rs` for topology, durability, and prefix validation.
 - `src/state/redis.rs`, `src/state/sentinel.rs` for connection management.

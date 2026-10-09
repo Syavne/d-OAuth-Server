@@ -57,7 +57,6 @@ pub(crate) struct RawConfig {
   pub rate_limit: RawRateLimit,
   pub cookie_domain: Option<String>,
   pub cookie_secure: Option<bool>,
-  pub trusted_proxy: Option<String>,
   pub allow_open_registration: bool,
   pub dcr_redirect_policy: DcrRedirectPolicy,
   pub cors_allowed_origins: Vec<String>,

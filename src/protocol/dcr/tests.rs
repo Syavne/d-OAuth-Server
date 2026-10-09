@@ -13,7 +13,10 @@ use testcontainers::{
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{RegisterContext, RegisterRequest, RegisterStores, is_loopback_uri, register_client};
+use super::{
+  RegisterContext, RegisterRequest, RegisterStores, is_loopback_uri, is_open_redirect_uri,
+  register_client,
+};
 use crate::{
   config::{Config, DurabilityMode},
   crypto::{secret as secret_crypto, tokens as tokens_crypto},
@@ -667,6 +670,94 @@ async fn dcr_register_open_anonymous_201() -> TestResult {
 }
 
 #[tokio::test]
+async fn dcr_register_open_policy_rejects_plaintext_non_loopback() -> TestResult {
+  let (_guard, mut harness) = harness(false, "open").await?;
+  let iat = issue_iat(&mut harness, 3).await?;
+  let request = dpop_request("http://evil.example.com/cb", None);
+  let (mut stores, ctx) = parts_of(&mut harness);
+  match register_client(&mut stores, &ctx, Some(&iat), &request).await {
+    Ok(_) => Err(TestError::Unexpected(
+      "plaintext non-loopback redirect accepted under open".to_owned(),
+    )),
+    Err(error) => expect_error(error, OAuthErrorCode::InvalidRedirectUri, 400),
+  }
+}
+
+#[tokio::test]
+async fn dcr_register_open_policy_rejects_custom_scheme() -> TestResult {
+  let (_guard, mut harness) = harness(false, "open").await?;
+  let iat = issue_iat(&mut harness, 3).await?;
+  let request = dpop_request("myapp://cb", None);
+  let (mut stores, ctx) = parts_of(&mut harness);
+  match register_client(&mut stores, &ctx, Some(&iat), &request).await {
+    Ok(_) => Err(TestError::Unexpected(
+      "custom-scheme redirect accepted under open".to_owned(),
+    )),
+    Err(error) => expect_error(error, OAuthErrorCode::InvalidRedirectUri, 400),
+  }
+}
+
+#[tokio::test]
+async fn dcr_register_open_policy_rejects_fragment() -> TestResult {
+  let (_guard, mut harness) = harness(false, "open").await?;
+  let iat = issue_iat(&mut harness, 3).await?;
+  let request = dpop_request("https://app.example.com/cb?x=1#frag", None);
+  let (mut stores, ctx) = parts_of(&mut harness);
+  match register_client(&mut stores, &ctx, Some(&iat), &request).await {
+    Ok(_) => Err(TestError::Unexpected(
+      "fragment redirect accepted under open".to_owned(),
+    )),
+    Err(error) => expect_error(error, OAuthErrorCode::InvalidRedirectUri, 400),
+  }
+}
+
+#[tokio::test]
+async fn dcr_register_open_policy_accepts_https() -> TestResult {
+  let (_guard, mut harness) = harness(false, "open").await?;
+  let iat = issue_iat(&mut harness, 3).await?;
+  let request = dpop_request("https://app.example.com/cb", None);
+  let response = {
+    let (mut stores, ctx) = parts_of(&mut harness);
+    register_client(&mut stores, &ctx, Some(&iat), &request)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("https register failed: {error}")))?
+  };
+  let effective =
+    redirect_repo::effective_for_client(&harness.pool, &harness.config.keys, &response.client_id)
+      .await?;
+  if effective.len() != 1 || effective[0].uri != "https://app.example.com/cb" {
+    return Err(TestError::Unexpected(format!(
+      "https URI not attached: {:?}",
+      effective.iter().map(|row| &row.uri).collect::<Vec<_>>()
+    )));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn dcr_register_open_policy_accepts_loopback() -> TestResult {
+  let (_guard, mut harness) = harness(false, "open").await?;
+  let iat = issue_iat(&mut harness, 3).await?;
+  let request = dpop_request("http://127.0.0.1:1234/cb", None);
+  let response = {
+    let (mut stores, ctx) = parts_of(&mut harness);
+    register_client(&mut stores, &ctx, Some(&iat), &request)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("loopback register failed: {error}")))?
+  };
+  let effective =
+    redirect_repo::effective_for_client(&harness.pool, &harness.config.keys, &response.client_id)
+      .await?;
+  if effective.len() != 1 || effective[0].uri != "http://127.0.0.1:1234/cb" {
+    return Err(TestError::Unexpected(format!(
+      "loopback URI not attached: {:?}",
+      effective.iter().map(|row| &row.uri).collect::<Vec<_>>()
+    )));
+  }
+  Ok(())
+}
+
+#[tokio::test]
 async fn dcr_register_mtls_client_201() -> TestResult {
   let (_guard, mut harness) = harness(false, "catalog").await?;
   seed_redirect(
@@ -749,6 +840,29 @@ fn dcr_register_loopback_shapes() {
   assert!(!is_loopback_uri("http://user@127.0.0.1/cb"));
   assert!(!is_loopback_uri("http://192.168.1.1/cb"));
   assert!(!is_loopback_uri("not a uri"));
+}
+
+#[test]
+fn dcr_register_open_redirect_shapes() {
+  assert!(is_open_redirect_uri("https://app.example.com/cb"));
+  assert!(is_open_redirect_uri("https://app.example.com/cb?x=1"));
+  assert!(is_open_redirect_uri("https://app.example.com:8443/cb"));
+  assert!(is_open_redirect_uri("HTTPS://APP.EXAMPLE.COM/cb"));
+  assert!(is_open_redirect_uri("https://[2001:db8::1]/cb"));
+  assert!(is_open_redirect_uri("http://127.0.0.1:1234/cb"));
+  assert!(is_open_redirect_uri("http://[::1]:1234/cb"));
+  assert!(!is_open_redirect_uri("http://evil.example.com/cb"));
+  assert!(!is_open_redirect_uri("myapp://cb"));
+  assert!(!is_open_redirect_uri("//app.example.com/cb"));
+  assert!(!is_open_redirect_uri("https://app.example.com/cb?x=1#frag"));
+  assert!(!is_open_redirect_uri("https://app.example.com/cb#frag"));
+  assert!(!is_open_redirect_uri("https://user@app.example.com/cb"));
+  assert!(!is_open_redirect_uri("https:///cb"));
+  assert!(!is_open_redirect_uri("https://"));
+  assert!(!is_open_redirect_uri("https:app.example.com/cb"));
+  assert!(!is_open_redirect_uri("https://[]/cb"));
+  assert!(!is_open_redirect_uri("https://app.example.com/cb "));
+  assert!(!is_open_redirect_uri("not a uri"));
 }
 
 #[test]

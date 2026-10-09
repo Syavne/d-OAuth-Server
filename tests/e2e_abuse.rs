@@ -326,7 +326,7 @@ async fn e2e_rate_limit_429_with_retry_after() -> Result<(), TestError> {
   Ok(())
 }
 
-/// Forged proxy client-cert headers are stripped: the request is treated as
+/// Forged proxy client-cert headers are never read: the request is treated as
 /// uncertified (401 without credentials), and valid credentials still work
 /// with the forged headers present.
 #[tokio::test]

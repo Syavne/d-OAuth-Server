@@ -7,15 +7,15 @@
 //! socket is opened. A denial is fail-closed and never carries the fetched
 //! content.
 //!
-//! Residual risk: DNS is re-resolved by the HTTP client at connect time, so
-//! a rebinding hostname could resolve differently between the pre-flight
-//! check and the connection. The redirect ban and the `https`-only rule
-//! bound the blast radius; IP pinning is deferred to task 22 if needed.
+//! DNS-rebinding hardening: the pre-flight check returns the validated
+//! addresses and the fetch pins the HTTP client to exactly those addresses
+//! (`resolve_to_addrs`), so a hostname that flips to a blocked address
+//! between validation and connect time cannot steer the connection.
 
 #[cfg(test)]
 mod tests;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use reqwest::redirect::Policy;
@@ -127,35 +127,42 @@ pub fn validate_fetch_url(raw: &str) -> Result<reqwest::Url, SsrfError> {
 
 /// Resolve `host` and deny the fetch if any resolved address is blocked.
 ///
-/// IP literals are checked without touching DNS.
-pub async fn check_fetch_host(host: &str, port: u16) -> Result<(), SsrfError> {
+/// Returns the validated addresses so the caller can pin the connection to
+/// exactly these addresses. IP literals are checked without touching DNS
+/// and pin to themselves.
+///
+/// A DNS-rebinding hostname that resolves to a mix of public and blocked
+/// addresses is denied outright: any blocked address fails the whole host.
+pub async fn check_fetch_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, SsrfError> {
   if let Ok(literal) = host.parse::<IpAddr>() {
-    return if is_blocked_ip(&literal) {
-      Err(SsrfError::BlockedTarget)
-    } else {
-      Ok(())
-    };
+    if is_blocked_ip(&literal) {
+      return Err(SsrfError::BlockedTarget);
+    }
+    return Ok(vec![SocketAddr::new(literal, port)]);
   }
-  let addrs = tokio::net::lookup_host((host, port))
+  let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
     .await
-    .map_err(|_| SsrfError::DnsFailed)?;
-  let mut resolved_any = false;
-  for addr in addrs {
-    resolved_any = true;
+    .map_err(|_| SsrfError::DnsFailed)?
+    .collect();
+  if addrs.is_empty() {
+    return Err(SsrfError::DnsFailed);
+  }
+  for addr in &addrs {
     if is_blocked_ip(&addr.ip()) {
       return Err(SsrfError::BlockedTarget);
     }
   }
-  if resolved_any {
-    Ok(())
-  } else {
-    Err(SsrfError::DnsFailed)
-  }
+  Ok(addrs)
 }
 
 /// Fetch `raw` through the full SSRF guard: URL policy, DNS target check,
 /// then an `https` GET with redirects disabled, a total timeout of
 /// [`SSRF_TIMEOUT`], and a body cap of [`SSRF_MAX_BYTES`].
+///
+/// The connection is pinned to the addresses validated by the DNS check
+/// (`resolve_to_addrs` for hostnames; IP literals need no DNS and connect
+/// directly to the validated literal), closing the DNS-rebinding window
+/// between validation and connect time.
 ///
 /// # Errors
 ///
@@ -165,14 +172,18 @@ pub async fn fetch_guarded_bytes(raw: &str) -> Result<Vec<u8>, SsrfError> {
   let url = validate_fetch_url(raw)?;
   let host = url.host_str().unwrap_or_default().to_owned();
   let port = url.port_or_known_default().unwrap_or(443);
-  check_fetch_host(&host, port).await?;
+  let addrs = check_fetch_host(&host, port).await?;
 
-  let client = reqwest::Client::builder()
+  let builder = reqwest::Client::builder()
     .redirect(Policy::none())
     .timeout(SSRF_TIMEOUT)
-    .no_proxy()
-    .build()
-    .map_err(|_| SsrfError::FetchFailed)?;
+    .no_proxy();
+  let builder = if host.parse::<IpAddr>().is_ok() {
+    builder
+  } else {
+    builder.resolve_to_addrs(&host, &addrs)
+  };
+  let client = builder.build().map_err(|_| SsrfError::FetchFailed)?;
   let mut response = client
     .get(url)
     .send()

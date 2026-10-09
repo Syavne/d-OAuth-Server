@@ -157,28 +157,96 @@ fn scope_refresh_narrows_only_and_rechecks_catalog() -> TestResult {
   let enabled = names(&["read", "write"]);
   let previous = names(&["read", "write"]);
   assert_eq!(
-    narrow_on_refresh(&previous, None, &enabled)?.render(),
+    narrow_on_refresh(&previous, None, &enabled, &enabled, &enabled)?.render(),
     "read write"
   );
   assert_eq!(
-    narrow_on_refresh(&previous, Some("read"), &enabled)?.render(),
+    narrow_on_refresh(&previous, Some("read"), &enabled, &enabled, &enabled)?.render(),
     "read"
   );
   assert!(is_invalid_scope(narrow_on_refresh(
     &names(&["read"]),
     Some("read write"),
+    &enabled,
+    &enabled,
     &enabled
   )));
   assert!(is_invalid_scope(narrow_on_refresh(
     &previous,
     Some("admin"),
+    &enabled,
+    &enabled,
     &enabled
   )));
   assert!(is_invalid_scope(narrow_on_refresh(
     &previous,
     None,
-    &names(&["read"])
+    &names(&["read"]),
+    &enabled,
+    &enabled
   )));
+  Ok(())
+}
+
+#[test]
+fn scope_refresh_enforces_current_entitlements() -> TestResult {
+  let enabled = names(&["read", "write"]);
+  let previous = names(&["read", "write"]);
+  let entitled_both = names(&["read", "write"]);
+  let entitled_read = names(&["read"]);
+  let registered_both = names(&["read", "write"]);
+  let registered_read = names(&["read"]);
+  // Omitted scope silently narrows to the still-entitled, still-registered
+  // intersection; a fully de-entitled grant narrows to empty.
+  assert_eq!(
+    narrow_on_refresh(&previous, None, &enabled, &registered_both, &entitled_read)?.render(),
+    "read"
+  );
+  assert_eq!(
+    narrow_on_refresh(&previous, None, &enabled, &registered_read, &entitled_both)?.render(),
+    "read"
+  );
+  assert_eq!(
+    narrow_on_refresh(&previous, None, &enabled, &registered_both, &entitled_both)?.render(),
+    "read write"
+  );
+  assert!(
+    narrow_on_refresh(
+      &previous,
+      None,
+      &enabled,
+      &registered_both,
+      &ScopeSet::empty()
+    )?
+    .is_empty()
+  );
+  // An explicit request for a no-longer-entitled or de-registered scope is
+  // `invalid_scope`; a still-entitled explicit narrow is kept.
+  assert!(is_invalid_scope(narrow_on_refresh(
+    &previous,
+    Some("read write"),
+    &enabled,
+    &registered_both,
+    &entitled_read
+  )));
+  assert!(is_invalid_scope(narrow_on_refresh(
+    &previous,
+    Some("read write"),
+    &enabled,
+    &registered_read,
+    &entitled_both
+  )));
+  assert_eq!(
+    narrow_on_refresh(
+      &previous,
+      Some("read"),
+      &enabled,
+      &registered_both,
+      &entitled_both
+    )?
+    .render(),
+    "read"
+  );
   Ok(())
 }
 

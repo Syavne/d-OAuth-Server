@@ -619,17 +619,21 @@ pub enum ConfirmOutcome {
   },
   /// Authenticator proven but a password change is still required.
   StillRestricted,
-  /// Wrong code: the session is unchanged and may retry.
+  /// Wrong code, no enrolled secret, or a locked-out account: the session is
+  /// unchanged and may retry.
   Rejected,
 }
 
 /// Confirm TOTP enrollment with an authenticator code (TOTP only: recovery
-/// codes never confirm enrollment).
+/// codes never confirm enrollment). Failed attempts increment the shared
+/// login lockout counter; a successful confirmation clears it.
 ///
 /// # Errors
 ///
 /// Returns `invalid_request` without a subject session and a masked `5xx`
-/// for store/crypto/database failures. A wrong code is `Ok(Rejected)`.
+/// for store/crypto/database failures. A wrong code, and a locked-out account
+/// even when the code is correct, are `Ok(Rejected)` with no distinguishing
+/// signal.
 pub async fn confirm_totp(
   deps: &mut LoginDeps<'_>,
   session_id: &str,
@@ -641,11 +645,23 @@ pub async fn confirm_totp(
   if live.record.subject.is_empty() {
     return Err(AppError::invalid_request("the login session has expired"));
   }
+  // Failed-confirmation lockout: the same counter and policy `attempt_login`
+  // uses, keyed by the session subject. Checked before verification so a
+  // locked account rejects even a correct code, indistinguishably from a
+  // wrong one, until the window expires.
+  let policy = user_repo::LockoutPolicy {
+    threshold: LOCKOUT_THRESHOLD,
+    lock_duration: LOCKOUT_WINDOW,
+  };
+  if user_repo::is_locked_out(deps.conn, deps.store, policy, &live.record.subject).await? {
+    return Ok(ConfirmOutcome::Rejected);
+  }
   let Some(user) = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject).await?
   else {
     return Err(AppError::invalid_request("the login session has expired"));
   };
   let Some(blob) = user_repo::totp_secret_blob(deps.pool, user.id).await? else {
+    user_repo::register_login_failure(deps.conn, deps.store, policy, &live.record.subject).await?;
     return Ok(ConfirmOutcome::Rejected);
   };
   let secret = totp::decrypt_secret(deps.keys, &blob)?;
@@ -667,6 +683,7 @@ pub async fn confirm_totp(
   )
   .await?
   {
+    user_repo::register_login_failure(deps.conn, deps.store, policy, &live.record.subject).await?;
     audit_failure(
       live.meta.pending_request_id.as_deref(),
       Some(&live.record.subject),
@@ -674,6 +691,7 @@ pub async fn confirm_totp(
     );
     return Ok(ConfirmOutcome::Rejected);
   }
+  user_repo::clear_login_failures(deps.conn, deps.store, &live.record.subject).await?;
   let fresh = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject).await?;
   if fresh.is_some_and(|user| !user.must_change_password) {
     let promoted = promote_to_full(deps, session_id, &live).await?;

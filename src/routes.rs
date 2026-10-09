@@ -7,19 +7,16 @@
 //! 1. [`middleware::request_id::RequestIdLayer`] mints/propagates
 //!    `X-Request-Id` and opens the redacted `http_request` tracing span
 //!    (tracing and redaction live in this layer).
-//! 2. [`middleware::security_headers::StripProxyHeadersLayer`] removes forged
-//!    forwarded client-cert headers — mounted only when no `trusted_proxy`
-//!    is configured, so proxy evidence is never trusted by default.
-//! 3. [`middleware::security_headers::cors_layer`] answers CORS preflights
+//! 2. [`middleware::security_headers::cors_layer`] answers CORS preflights
 //!    from the explicit allowlist before the limiter can bill them — mounted
 //!    only when `cors_allowed_origins` is non-empty (default empty: no CORS
 //!    headers, browser clients unsupported).
-//! 4. [`middleware::ratelimit::RateLimitLayer`] enforces per-IP/per-client
+//! 3. [`middleware::ratelimit::RateLimitLayer`] enforces per-IP/per-client
 //!    budgets on every endpoint except health and metadata (those paths have
 //!    no rule and pass through to handlers that fail closed on their own).
-//! 5. [`tower_http::limit::RequestBodyLimitLayer`] caps form bodies at
+//! 4. [`tower_http::limit::RequestBodyLimitLayer`] caps form bodies at
 //!    [`MAX_BODY_BYTES`].
-//! 6. [`middleware::security_headers::SecurityHeadersLayer`] decorates
+//! 5. [`middleware::security_headers::SecurityHeadersLayer`] decorates
 //!    responses with `Referrer-Policy`, `X-Content-Type-Options`, a CSP with
 //!    `frame-ancestors 'none'` (plus a strict script policy on the
 //!    login/consent/device pages), and HSTS on the TLS listener. Every response
@@ -60,9 +57,7 @@ use crate::jose::dpop::{DpopRequest, verify_dpop};
 use crate::middleware::audit::AuditEvent;
 use crate::middleware::ratelimit::RateLimitLayer;
 use crate::middleware::request_id::{REQUEST_ID_HEADER, RequestId, RequestIdLayer};
-use crate::middleware::security_headers::{
-  SecurityHeadersLayer, StripProxyHeadersLayer, cors_layer,
-};
+use crate::middleware::security_headers::{SecurityHeadersLayer, cors_layer};
 use crate::protocol::mtls::{self, MtlsError};
 use crate::protocol::{authorize, dcr, device, introspect, metadata, par, revoke, token};
 use crate::resilience::{ResilienceConfig, ResilienceLayer};
@@ -104,10 +99,9 @@ pub fn build_router(state: AppState) -> axum::Router {
 ///
 /// Layers below run outer-to-inner in declaration order here because each
 /// [`axum::Router::layer`] call wraps everything added before it; the calls
-/// are therefore issued innermost-first. Conditional layers (CORS, proxy
-/// stripping) slot into their spec positions only when configured.
+/// are therefore issued innermost-first. The conditional CORS layer slots
+/// into its spec position only when configured.
 pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axum::Router {
-  let trusted_proxy = state.config.trusted_proxy;
   let cors = cors_layer(&state.config.cors_allowed_origins);
   // Task 44 resilience insertion: timeout + concurrency-limit + load-shed sit
   // outside the rate limiter (so overload sheds 503 before it can queue into
@@ -166,11 +160,6 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axu
   let router = match cors {
     Some(layer) => router.layer(layer),
     None => router,
-  };
-  let router = if trusted_proxy.is_none() {
-    router.layer(StripProxyHeadersLayer)
-  } else {
-    router
   };
   router.layer(RequestIdLayer)
 }
@@ -311,7 +300,7 @@ mod router_tests {
 
   use super::{RouterOptions, build_router, build_router_with_options, build_server_config};
   use crate::config::Config;
-  use crate::middleware::security_headers::{StripProxyHeadersLayer, cors_layer};
+  use crate::middleware::security_headers::cors_layer;
   use crate::state::{AppState, Clock, RedisConn};
 
   /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -690,32 +679,28 @@ mod router_tests {
 
   /// The engaged limiter fails every classified OAuth route closed (503 +
   /// limiter marker); metadata and liveness pass through untouched.
-  ///
-  /// `KNOWN_UNCLASSIFIED` tracks routes the task-13 classifier
-  /// (`Rule::for_path`, last-segment match) does not yet cover: `POST /par`
-  /// has no arm at all, and `/register/{client_id}` carries a dynamic last
-  /// segment. Both traverse the limiter layer (mounted globally) but the
-  /// rule passes them through today — filed as a task-13 follow-up in the
-  /// task-40 evidence. The assertions below ratchet the fix: once the rule
-  /// covers them they limiter-503 like the rest and the entries must be
-  /// deleted (a stale entry fails this test on purpose).
   #[tokio::test]
   async fn router_rate_limit_engaged_on_every_oauth_route() -> TestResult {
-    const KNOWN_UNCLASSIFIED: &[(&str, &str)] =
-      &[("POST", "/par"), ("GET", "/register/some-client")];
     let router = build_router(limited_state(Vec::new())?);
     let form = [("content-type", "application/x-www-form-urlencoded")];
     let protected: &[Route<'_>] = &[
       ("GET", "/authorize?client_id=nobody", &[]),
+      ("POST", "/par", &form),
       ("POST", "/token", &form),
       ("POST", "/device_authorization", &form),
       ("GET", "/device", &[]),
       ("POST", "/device", &form),
       ("GET", "/login", &[]),
       ("POST", "/login", &form),
+      ("GET", "/login/success", &[]),
+      ("GET", "/login/change-password", &[]),
+      ("GET", "/login/totp/setup", &[]),
+      ("GET", "/login/totp/confirm", &[]),
+      ("GET", "/logout", &[]),
       ("GET", "/consent", &[]),
       ("POST", "/consent", &form),
       ("POST", "/register", &form),
+      ("GET", "/register/some-client", &[]),
       ("POST", "/introspect", &form),
       ("POST", "/revoke", &form),
     ];
@@ -726,21 +711,6 @@ mod router_tests {
           format!("route {method} {uri} must fail closed via the limiter, got {status}: {body}")
             .into(),
         );
-      }
-    }
-    for (method, uri) in KNOWN_UNCLASSIFIED {
-      let (status, response_headers, body) = drive(router.clone(), method, uri, &form, "").await?;
-      if status == StatusCode::NOT_FOUND {
-        return Err(format!("route {method} {uri} must stay mounted").into());
-      }
-      if body.contains(LIMITER_MARKER) {
-        return Err(
-          format!("route {method} {uri} is limiter-gated now: delete its KNOWN_UNCLASSIFIED entry")
-            .into(),
-        );
-      }
-      if response_headers.get("x-request-id").is_none() {
-        return Err(format!("route {method} {uri} must still carry the middleware headers").into());
       }
     }
     // Metadata has no limiter rule: it reaches its handler (which fails
@@ -760,6 +730,52 @@ mod router_tests {
     let (live_status, _, _) = drive(router, "GET", "/health/live", &[], "").await?;
     if live_status != StatusCode::OK {
       return Err(format!("GET /health/live must be 200, got {live_status}").into());
+    }
+    Ok(())
+  }
+
+  /// Every mounted sensitive route is classified by `Rule::for_path`, and the
+  /// exempt routes are not. The list mirrors the mount table in
+  /// `build_router_with_options`; a newly mounted sensitive endpoint that is
+  /// not classified fails here.
+  #[test]
+  fn router_every_sensitive_route_has_a_rate_limit_rule() -> TestResult {
+    let config = test_config(
+      "redis://127.0.0.1:1",
+      serde_json::json!({"enabled": true}),
+      Vec::new(),
+    )?;
+    for path in [
+      "/authorize",
+      "/par",
+      "/token",
+      "/device_authorization",
+      "/device",
+      "/login",
+      "/login/success",
+      "/login/change-password",
+      "/login/totp/setup",
+      "/login/totp/confirm",
+      "/logout",
+      "/consent",
+      "/register",
+      "/register/some-client",
+      "/introspect",
+      "/revoke",
+    ] {
+      if crate::middleware::ratelimit::Rule::for_path(config.rate_limit, path).is_none() {
+        return Err(format!("sensitive route {path} must have a rate-limit rule").into());
+      }
+    }
+    for path in [
+      "/.well-known/oauth-authorization-server",
+      "/health/live",
+      "/health/ready",
+      "/assets/app.css",
+    ] {
+      if crate::middleware::ratelimit::Rule::for_path(config.rate_limit, path).is_some() {
+        return Err(format!("exempt route {path} must not have a rate-limit rule").into());
+      }
     }
     Ok(())
   }
@@ -833,49 +849,6 @@ mod router_tests {
     }
     if cors_layer(&[]).is_some() {
       return Err("empty allowlist must yield no CORS layer".into());
-    }
-    Ok(())
-  }
-
-  /// Without a trusted proxy, forged client-cert headers never reach the
-  /// inner service.
-  #[tokio::test]
-  async fn router_proxy_cert_header_stripped_without_trusted_proxy() -> TestResult {
-    use tower::Layer as _;
-    let inner = tower::service_fn(|request: Request<Body>| async move {
-      let seen = request
-        .headers()
-        .contains_key("x-forwarded-tls-client-cert")
-        || request
-          .headers()
-          .contains_key("x-forwarded-tls-client-verify");
-      let mut response = axum::http::Response::new(Body::empty());
-      response.headers_mut().insert(
-        "x-headers-seen",
-        if seen {
-          header::HeaderValue::from_static("1")
-        } else {
-          header::HeaderValue::from_static("0")
-        },
-      );
-      Ok::<_, std::convert::Infallible>(response)
-    });
-    let service = StripProxyHeadersLayer.layer(inner);
-    let request = Request::builder()
-      .uri("/introspect")
-      .header("x-forwarded-tls-client-cert", "Zm9yZ2Vk")
-      .header("x-forwarded-tls-client-verify", "SUCCESS")
-      .body(Body::empty())?;
-    let response = tower::ServiceExt::oneshot(service, request)
-      .await
-      .map_err(|_| "strip service error")?;
-    let seen = response
-      .headers()
-      .get("x-headers-seen")
-      .and_then(|value| value.to_str().ok())
-      .unwrap_or("1");
-    if seen != "0" {
-      return Err("proxy cert headers must be stripped without trusted_proxy".into());
     }
     Ok(())
   }

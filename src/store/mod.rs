@@ -397,6 +397,36 @@ impl Store {
   pub(crate) fn access_key_prefix(&self) -> String {
     format!("{}access:", self.token_prefix)
   }
+
+  /// Key prefix for server-side login session records (`session:<id>`).
+  #[must_use]
+  pub(crate) fn session_key_prefix(&self) -> String {
+    format!("{}session:", self.token_prefix)
+  }
+
+  /// Key prefix for authorization-code records (`code:<hash>`).
+  #[must_use]
+  pub(crate) fn code_key_prefix(&self) -> String {
+    format!("{}code:", self.token_prefix)
+  }
+
+  /// Key prefix for device-code records (`device:<hash>`).
+  #[must_use]
+  pub(crate) fn device_key_prefix(&self) -> String {
+    format!("{}device:", self.token_prefix)
+  }
+
+  /// Key prefix for user-code to device-hash mappings (`user_code:<hash>`).
+  #[must_use]
+  pub(crate) fn user_code_key_prefix(&self) -> String {
+    format!("{}user_code:", self.token_prefix)
+  }
+
+  /// Key prefix for grant-chain records (`grant:<id>`).
+  #[must_use]
+  pub(crate) fn grant_key_prefix(&self) -> String {
+    format!("{}grant:", self.token_prefix)
+  }
 }
 
 /// SHA-256 hex of `input` (key/bucket hashing; never a raw secret or token).
@@ -436,26 +466,33 @@ pub(crate) fn hmac_sha256(pepper: &[u8], message: &[u8]) -> [u8; 32] {
 // Typed hash-keyed access
 // ---------------------------------------------------------------------------
 
-/// Write a record as a Redis hash plus TTL (idempotent rewrite; safe to retry
-/// on transient errors via [`retry_op`]).
+/// Write a record as one atomic `HSET` + `PEXPIRE` script (idempotent
+/// rewrite; safe to retry on transient errors via [`retry_op`]). The fields
+/// and the expiry land together, so no crash can leave an immortal key.
 pub(crate) async fn hset_record(
   conn: &mut RedisConn,
   key: &str,
   pairs: &[(String, String)],
   ttl: Duration,
 ) -> Result<(), StoreError> {
-  let mut pipe = redis::pipe();
-  {
-    let cmd = pipe.cmd("HSET").arg(key);
-    for (field, value) in pairs {
-      cmd.arg(field).arg(value);
-    }
+  // A field-less `HSET` is a Redis arity error; with nothing to write, the
+  // TTL touch alone remains (a no-op on a missing key, a refresh otherwise).
+  if pairs.is_empty() {
+    let _: () = redis::cmd("PEXPIRE")
+      .arg(key)
+      .arg(ttl.as_millis() as u64)
+      .query_async(conn)
+      .await
+      .map_err(StoreError::Redis)?;
+    return Ok(());
   }
-  pipe
-    .cmd("PEXPIRE")
-    .arg(key)
-    .arg(ttl.as_millis() as u64)
-    .query_async::<()>(conn)
+  let mut invocation = HSET_TTL.prepare_invoke();
+  invocation.key(key).arg(ttl.as_millis() as u64);
+  for (field, value) in pairs {
+    invocation.arg(field).arg(value);
+  }
+  let _: i64 = invocation
+    .invoke_async(conn)
     .await
     .map_err(StoreError::Redis)?;
   Ok(())
@@ -501,6 +538,22 @@ pub(crate) fn flat_to_map(flat: Vec<String>) -> Result<HashMap<String, String>, 
 // ---------------------------------------------------------------------------
 // Lua registry (every multi-key op is single-slot via the `{state}` tag)
 // ---------------------------------------------------------------------------
+
+/// Atomic record write: `HSET` the fields, then `PEXPIRE` the key, before the
+/// script returns — the record can never be observed (or survive a crash)
+/// without its TTL.
+///
+/// KEYS: record. ARGV: TTL ms, then the flattened field/value pairs (never
+/// empty: [`hset_record`] guards that case).
+pub(crate) static HSET_TTL: LazyLock<Script> = LazyLock::new(|| {
+  Script::new(
+    r"
+    redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+    redis.call('PEXPIRE', KEYS[1], ARGV[1])
+    return 1
+    ",
+  )
+});
 
 /// Single-use consume with `GETDEL` semantics: return the hash fields and
 /// delete the key atomically, or `false` when absent.

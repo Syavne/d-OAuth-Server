@@ -83,19 +83,35 @@ pub async fn enroll_totp(context: &Context, email: &str) -> Result<Enrollment, C
 
 /// Disable a user account.
 ///
+/// The user's Redis ephemeral state (sessions, tokens, grants, codes, device
+/// records, and the lockout counter) is purged BEFORE the Postgres `disabled`
+/// flag flips, mirroring the DCR `DELETE` ordering. A Redis or connect failure
+/// fails closed: the command errors and the user stays enabled.
+///
 /// # Errors
-/// Returns [`CliError`] when the user is missing or the write fails.
+/// Returns [`CliError`] when the user is missing, when Redis is unavailable,
+/// or when a write fails.
 pub async fn disable(context: &Context, email: &str) -> Result<(), CliError> {
-  let email = normalized_email(email)?;
-  let id = find_user_id(context, &email).await?;
-  let updated = user_repo::disable_user(context.pool(), id)
+  let email = email.trim();
+  require_nonempty(email, "email")?;
+  let record = user_repo::find_by_email(context.pool(), &context.config().keys, email)
+    .await
+    .map_err(map_user_repo_error)?
+    .ok_or_else(|| CliError::NotFound("user not found".to_owned()))?;
+  let state = crate::state::AppState::connect(context.config().clone()).await?;
+  let store = crate::store::Store::from_config(&context.config().redis);
+  let mut conn = state.redis.clone();
+  crate::protocol::purge::purge_subject(&mut conn, &store, &record.email, &record.id.to_string())
+    .await
+    .map_err(CliError::from)?;
+  let updated = user_repo::disable_user(context.pool(), record.id)
     .await
     .map_err(map_user_repo_error)?;
   if !updated {
     return Err(CliError::NotFound("user not found".to_owned()));
   }
-  audit("user.disable", &email);
-  println!("disabled user {email}");
+  audit("user.disable", &record.email);
+  println!("disabled user {}", record.email);
   Ok(())
 }
 

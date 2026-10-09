@@ -77,7 +77,7 @@ static SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LUA));
 /// The buckets a protected endpoint enforces. `per_client` is `None` for
 /// endpoints that have no client identity (login, registration).
 #[derive(Debug, Clone, Copy)]
-struct Rule {
+pub(crate) struct Rule {
   /// Per-IP request budget per window.
   per_ip: u32,
   /// Per-client request budget per window, when a client is identifiable.
@@ -85,36 +85,55 @@ struct Rule {
 }
 
 impl Rule {
-  /// Classify a path by its last segment so both `/token` and `/oauth/token`
-  /// (and similar prefixes) match.
-  fn for_path(limits: RateLimitConfig, path: &str) -> Option<Self> {
-    let last = path
-      .trim_end_matches('/')
-      .rsplit('/')
+  /// Classify a request path against the mounted route table. The match is on
+  /// the full path (query stripped, trailing slash normalized) so a dynamic
+  /// segment such as `/register/{client_id}` is classified by its prefix and
+  /// a sensitive route can never fall through to an unrated handler.
+  /// `/health`, `/.well-known`, and `/assets` are deliberately unrated.
+  pub(crate) fn for_path(limits: RateLimitConfig, path: &str) -> Option<Self> {
+    let normalized = path
+      .split('?')
       .next()
-      .unwrap_or_default();
-    match last {
-      "token" => Some(Self {
+      .unwrap_or_default()
+      .trim_end_matches('/');
+    if normalized.starts_with("/health/")
+      || normalized.starts_with("/.well-known/")
+      || normalized.starts_with("/assets/")
+    {
+      return None;
+    }
+    match normalized {
+      "/token" => Some(Self {
         per_ip: limits.per_ip,
         per_client: Some(limits.token_per_client),
       }),
-      "login" => Some(Self {
+      "/authorize"
+      | "/consent"
+      | "/device"
+      | "/device_authorization"
+      | "/device_verification"
+      | "/introspect"
+      | "/revoke"
+      | "/par" => Some(Self {
+        per_ip: limits.per_ip,
+        per_client: Some(limits.per_client),
+      }),
+      "/login"
+      | "/login/success"
+      | "/login/change-password"
+      | "/login/totp/setup"
+      | "/login/totp/confirm"
+      | "/logout" => Some(Self {
         per_ip: limits.login_per_ip,
         per_client: None,
       }),
-      "register" => Some(Self {
+      "/register" => Some(Self {
         per_ip: limits.per_ip,
         per_client: None,
       }),
-      "authorize"
-      | "consent"
-      | "device"
-      | "device_authorization"
-      | "device_verification"
-      | "introspect"
-      | "revoke" => Some(Self {
+      _ if normalized.starts_with("/register/") => Some(Self {
         per_ip: limits.per_ip,
-        per_client: Some(limits.per_client),
+        per_client: None,
       }),
       _ => None,
     }

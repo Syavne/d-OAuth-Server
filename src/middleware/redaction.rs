@@ -25,14 +25,18 @@ const SENSITIVE_FIELDS: &[&str] = &[
   "client_secret",
   "code_verifier",
   "password",
+  "user_code",
+  "device_code",
+  "request_uri",
 ];
 
 /// Whether a header/body/query key holds secret material.
 ///
 /// The match is on the normalized (trimmed, lowercased, `-`→`_`) key: an exact
-/// member of [`SENSITIVE_FIELDS`], or any key ending in `_token`, `_secret`, or
-/// `_password`. `code_challenge` deliberately stays visible — RFC 9449 makes it
-/// public, unlike `code_verifier`.
+/// member of [`SENSITIVE_FIELDS`], or any key ending in `_token`, `_secret`,
+/// `_password`, or `_code`. `code_challenge` deliberately stays visible — RFC
+/// 9449 makes it public, unlike `code_verifier`; it does not end in `_code`.
+/// `request_id` stays visible because it is a correlation id, not a credential.
 #[must_use]
 pub fn is_sensitive(key: &str) -> bool {
   let normalized = key.trim().to_ascii_lowercase().replace('-', "_");
@@ -43,6 +47,7 @@ pub fn is_sensitive(key: &str) -> bool {
     || normalized.ends_with("_token")
     || normalized.ends_with("_secret")
     || normalized.ends_with("_password")
+    || normalized.ends_with("_code")
     || normalized.contains("secret")
 }
 
@@ -215,8 +220,88 @@ mod redaction_tests {
     assert!(is_sensitive("code-verifier"));
     assert!(is_sensitive("access_token"));
     assert!(is_sensitive("REFRESH_SECRET"));
+    assert!(is_sensitive("user_code"));
+    assert!(is_sensitive("device_code"));
+    assert!(is_sensitive("request_uri"));
+    assert!(is_sensitive("USER-CODE"));
     assert!(!is_sensitive("code_challenge"));
+    assert!(!is_sensitive("request_id"));
     assert!(!is_sensitive("client_id"));
+    assert!(!is_sensitive("state"));
     assert!(!is_sensitive(""));
+  }
+
+  #[test]
+  fn redaction_header_map_masks_device_flow_fields() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+      HeaderName::from_static("user-code"),
+      HeaderValue::from_static("ABCD-1234"),
+    );
+    headers.insert(
+      HeaderName::from_static("device_code"),
+      HeaderValue::from_static("device-secret"),
+    );
+    headers.insert(
+      HeaderName::from_static("request-uri"),
+      HeaderValue::from_static("urn:ietf:params:oauth:request_uri:abc"),
+    );
+    headers.insert(
+      HeaderName::from_static("request-id"),
+      HeaderValue::from_static("req-1"),
+    );
+
+    let redacted = redact_headers(&headers);
+    let map: std::collections::HashMap<_, _> = redacted.into_iter().collect();
+
+    assert_eq!(map.get("user-code").map(String::as_str), Some(REDACTED));
+    assert_eq!(map.get("device_code").map(String::as_str), Some(REDACTED));
+    assert_eq!(map.get("request-uri").map(String::as_str), Some(REDACTED));
+    assert_eq!(map.get("request-id").map(String::as_str), Some("req-1"));
+  }
+
+  #[test]
+  fn redaction_json_masks_device_flow_fields_but_keeps_public_ids() {
+    let mut value = json!({
+      "user_code": "ABCD-1234",
+      "device_code": "device-secret",
+      "request_uri": "urn:ietf:params:oauth:request_uri:abc",
+      "code_challenge": "public-challenge",
+      "request_id": "req-1",
+      "client_id": "public-client",
+      "state": "s1",
+      "nested": { "user_code": "EFGH-5678" }
+    });
+
+    redact_json(&mut value);
+
+    assert_eq!(value["user_code"], json!(REDACTED));
+    assert_eq!(value["device_code"], json!(REDACTED));
+    assert_eq!(value["request_uri"], json!(REDACTED));
+    assert_eq!(value["nested"]["user_code"], json!(REDACTED));
+    assert_eq!(value["code_challenge"], json!("public-challenge"));
+    assert_eq!(value["request_id"], json!("req-1"));
+    assert_eq!(value["client_id"], json!("public-client"));
+    assert_eq!(value["state"], json!("s1"));
+  }
+
+  #[test]
+  fn redaction_form_and_query_mask_device_flow_fields() {
+    assert_eq!(
+      redact_form(
+        "user_code=ABCD-1234&device_code=device-secret&request_uri=urn%3Aabc&client_id=web"
+      ),
+      format!("user_code={REDACTED}&device_code={REDACTED}&request_uri={REDACTED}&client_id=web")
+    );
+
+    let uri: Uri = "/device?user_code=ABCD-1234&device_code=device-secret&request_uri=urn%3Aabc&code_challenge=public&request_id=req-1&state=s1"
+      .parse()
+      .unwrap_or_else(|_| Uri::from_static("/"));
+    assert_eq!(
+      redact_uri(&uri),
+      format!(
+        "/device?user_code={REDACTED}&device_code={REDACTED}&request_uri={REDACTED}&code_challenge=public&request_id=req-1&state=s1"
+      )
+    );
   }
 }

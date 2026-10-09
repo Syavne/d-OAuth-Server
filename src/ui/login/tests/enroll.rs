@@ -1,18 +1,26 @@
 //! `test(login)` enrollment suite: bootstrap cycle, gating, password change.
 
+use axum::Extension;
+use axum::extract::{Form, State};
+use axum::http::StatusCode;
+use axum_extra::extract::CookieJar;
+
+use super::super::TOTP_CONFIRM_ACTION;
 use super::{
-  Harness, LoginAttempt, TestError, TestResult, attempt, create_user, current_code, deps_of,
-  harness, pending_request, presession,
+  Harness, LoginAttempt, TestError, TestResult, app_state, attempt, create_user, current_code,
+  deps_of, harness, pending_request, presession,
 };
 use crate::{
   crypto::totp,
   db::user_repo,
   error::OAuthErrorCode,
+  middleware::request_id::RequestId,
   store::sessions,
   ui::login::{
-    CHANGE_PASSWORD_PATH, CONSENT_PATH, ConfirmOutcome, LOGIN_SUCCESS_PATH, LoginOutcome,
-    PasswordOutcome, attempt_login, bind_pending_request, change_password, confirm_totp,
-    load_session, logout, provision_totp, restricted_allows_path,
+    CHANGE_PASSWORD_PATH, CONSENT_PATH, ConfirmForm, ConfirmOutcome, LOCKOUT_THRESHOLD,
+    LOCKOUT_WINDOW, LOGIN_SUCCESS_PATH, LoginOutcome, PasswordOutcome, attempt_login,
+    bind_pending_request, change_password, confirm_totp, form_token, load_session, logout,
+    post_totp_confirm, provision_totp, restricted_allows_path, session_cookie,
   },
 };
 
@@ -440,6 +448,198 @@ async fn login_totp_enrollment() -> TestResult {
   }
   if !live.record.mfa_verified || live.record.restricted {
     return Err(unexpected("the re-issued session must be full"));
+  }
+  Ok(())
+}
+
+/// Drive one `POST /login/totp/confirm` against a restricted session, returning
+/// the status and body bytes of the rendered page.
+async fn post_confirm(
+  harness: &Harness,
+  session_id: &str,
+  csrf: &str,
+  code: &str,
+) -> Result<(StatusCode, Vec<u8>), TestError> {
+  let jar = CookieJar::new().add(session_cookie(&harness.config, session_id));
+  let response = post_totp_confirm(
+    State(app_state(harness)),
+    Extension(RequestId::new()),
+    jar,
+    Form(ConfirmForm {
+      code: code.to_owned(),
+      csrf: csrf.to_owned(),
+    }),
+  )
+  .await;
+  let status = response.status();
+  let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+    .await
+    .map_err(|_| unexpected("response body"))?;
+  Ok((status, body.to_vec()))
+}
+
+#[tokio::test]
+async fn login_confirm_burst_locks_and_rejects_correct_code() -> TestResult {
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "confirm-lock@example.test",
+    "temp-password-20",
+    true,
+    false,
+  )
+  .await?;
+  let restricted = restricted_login(&mut h, &user.email, &user.password, None).await?;
+  let offer = {
+    let mut deps = deps_of(&mut h);
+    provision_totp(&mut deps, &restricted).await?
+  };
+  let bad = wrong_for_secret(&offer.secret, h.counter)?;
+  for _ in 0..LOCKOUT_THRESHOLD {
+    let outcome = {
+      let mut deps = deps_of(&mut h);
+      confirm_totp(&mut deps, &restricted, &bad).await?
+    };
+    if !matches!(outcome, ConfirmOutcome::Rejected) {
+      return Err(unexpected("a wrong confirmation code must be rejected"));
+    }
+  }
+  let policy = user_repo::LockoutPolicy {
+    threshold: LOCKOUT_THRESHOLD,
+    lock_duration: LOCKOUT_WINDOW,
+  };
+  if !user_repo::is_locked_out(&mut h.conn, &h.store, policy, &user.email).await? {
+    return Err(unexpected("a burst of wrong codes must lock the account"));
+  }
+  let verifier = totp::build_totp(&offer.secret)?;
+  let correct = verifier
+    .generate(h.counter * totp::TOTP_STEP_SECS)
+    .to_string();
+  let outcome = {
+    let mut deps = deps_of(&mut h);
+    confirm_totp(&mut deps, &restricted, &correct).await?
+  };
+  if !matches!(outcome, ConfirmOutcome::Rejected) {
+    return Err(unexpected(
+      "a locked account must reject even a correct code",
+    ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn login_confirm_success_clears_failures() -> TestResult {
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "confirm-clear@example.test",
+    "temp-password-21",
+    true,
+    false,
+  )
+  .await?;
+  let restricted = restricted_login(&mut h, &user.email, &user.password, None).await?;
+  {
+    let mut deps = deps_of(&mut h);
+    match change_password(
+      &mut deps,
+      &restricted,
+      "new-strong-password-21",
+      "new-strong-password-21",
+    )
+    .await?
+    {
+      PasswordOutcome::StillRestricted { .. } => {}
+      PasswordOutcome::Promoted { .. } => {
+        return Err(unexpected("promotion needs TOTP enrollment first"));
+      }
+    }
+  }
+  let offer = {
+    let mut deps = deps_of(&mut h);
+    provision_totp(&mut deps, &restricted).await?
+  };
+  let bad = wrong_for_secret(&offer.secret, h.counter)?;
+  for _ in 1..LOCKOUT_THRESHOLD {
+    let outcome = {
+      let mut deps = deps_of(&mut h);
+      confirm_totp(&mut deps, &restricted, &bad).await?
+    };
+    if !matches!(outcome, ConfirmOutcome::Rejected) {
+      return Err(unexpected("a wrong confirmation code must be rejected"));
+    }
+  }
+  let count = user_repo::login_failure_count(&mut h.conn, &h.store, &user.email).await?;
+  if count != LOCKOUT_THRESHOLD - 1 {
+    return Err(unexpected("each wrong code must count toward lockout"));
+  }
+  let verifier = totp::build_totp(&offer.secret)?;
+  let correct = verifier
+    .generate(h.counter * totp::TOTP_STEP_SECS)
+    .to_string();
+  let outcome = {
+    let mut deps = deps_of(&mut h);
+    confirm_totp(&mut deps, &restricted, &correct).await?
+  };
+  match outcome {
+    ConfirmOutcome::Completed { .. } => {}
+    _ => {
+      return Err(unexpected(
+        "a correct code below the threshold must complete enrollment",
+      ));
+    }
+  }
+  let count = user_repo::login_failure_count(&mut h.conn, &h.store, &user.email).await?;
+  if count != 0 {
+    return Err(unexpected(
+      "a successful confirmation must clear the failure counter",
+    ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn login_confirm_locked_page_matches_wrong_code() -> TestResult {
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "confirm-oracle@example.test",
+    "temp-password-22",
+    true,
+    false,
+  )
+  .await?;
+  let restricted = restricted_login(&mut h, &user.email, &user.password, None).await?;
+  let offer = {
+    let mut deps = deps_of(&mut h);
+    provision_totp(&mut deps, &restricted).await?
+  };
+  let live = load_session(&mut h.conn, &h.store, &restricted)
+    .await?
+    .ok_or_else(|| unexpected("the restricted session must be live"))?;
+  let csrf = form_token(&live.meta.csrf_secret, TOTP_CONFIRM_ACTION);
+  let bad = wrong_for_secret(&offer.secret, h.counter)?;
+  let (wrong_status, wrong_body) = post_confirm(&h, &restricted, &csrf, &bad).await?;
+  for _ in 1..LOCKOUT_THRESHOLD {
+    let _ = post_confirm(&h, &restricted, &csrf, &bad).await?;
+  }
+  let policy = user_repo::LockoutPolicy {
+    threshold: LOCKOUT_THRESHOLD,
+    lock_duration: LOCKOUT_WINDOW,
+  };
+  if !user_repo::is_locked_out(&mut h.conn, &h.store, policy, &user.email).await? {
+    return Err(unexpected("the confirm burst must lock the account"));
+  }
+  let (locked_status, locked_body) = post_confirm(&h, &restricted, &csrf, &bad).await?;
+  if wrong_status != locked_status {
+    return Err(unexpected(
+      "a locked rejection must keep the wrong-code status",
+    ));
+  }
+  if wrong_body != locked_body {
+    return Err(unexpected(
+      "a locked rejection must render exactly like a wrong code",
+    ));
   }
   Ok(())
 }

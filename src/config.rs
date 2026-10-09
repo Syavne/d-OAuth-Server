@@ -2,7 +2,7 @@
 //!
 //! Loads env + optional YAML via the `config` crate: issuer, bind/health
 //! addresses, TLS and CA paths, Postgres/Redis connection blocks, failure
-//! policy, versioned key ids, TTLs, Argon2 params, cookie/proxy/CORS knobs,
+//! policy, versioned key ids, TTLs, Argon2 params, cookie/CORS knobs,
 //! rate-limit knobs, and the optional declarative `scope_registry`.
 //!
 //! Validation is fail-fast: an insecure issuer, a missing token pepper, a
@@ -17,7 +17,7 @@
 
 use std::{
   fmt,
-  net::{IpAddr, SocketAddr},
+  net::SocketAddr,
   path::{Path, PathBuf},
 };
 
@@ -93,9 +93,6 @@ pub struct Config {
   pub cookie_domain: Option<String>,
   /// Whether cookies carry the `Secure` attribute (default true).
   pub cookie_secure: bool,
-  /// Trusted reverse proxy whose forwarded client-cert/client-IP headers are
-  /// honored (default none: headers are ignored).
-  pub trusted_proxy: Option<IpAddr>,
   /// Whether unauthenticated dynamic registration is allowed (default false).
   pub allow_open_registration: bool,
   /// DCR redirect-URI policy (default [`DcrRedirectPolicy::Catalog`]).
@@ -128,7 +125,6 @@ impl fmt::Debug for Config {
       .field("rate_limit", &self.rate_limit)
       .field("cookie_domain", &self.cookie_domain)
       .field("cookie_secure", &self.cookie_secure)
-      .field("trusted_proxy", &self.trusted_proxy)
       .field("allow_open_registration", &self.allow_open_registration)
       .field("dcr_redirect_policy", &self.dcr_redirect_policy)
       .field("cors_allowed_origins", &self.cors_allowed_origins)
@@ -292,11 +288,11 @@ pub enum ConfigError {
     /// The offending endpoint.
     endpoint: String,
   },
-  /// The trusted-proxy address was not a valid IP.
-  #[error("invalid trusted proxy address: {value}")]
-  InvalidTrustedProxy {
-    /// The rejected value.
-    value: String,
+  /// A resolved master key was shorter than the required 32 bytes.
+  #[error("key material for {key} must be at least 32 bytes")]
+  WeakKeyMaterial {
+    /// The configuration key that carried the weak material.
+    key: &'static str,
   },
   /// Argon2 parameters were outside the safe range.
   #[error("invalid argon2 parameters")]

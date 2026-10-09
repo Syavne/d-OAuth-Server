@@ -55,6 +55,13 @@ d-oauth-server user scopes --email <email>
   user always starts with `must_change_password = true`.
 - `enroll-totp` generates an encrypted TOTP secret and prints the secret and the
   `otpauth://` URI exactly once. Register the secret in an authenticator now.
+- `disable` first purges all of the user's Redis ephemeral state (login
+  sessions and their `:meta` sidecars, access/refresh tokens and their grants,
+  authorization codes, device records with their `:cnf`/`:poll` sidecars and
+  `user_code` mappings, and the lockout counter), then flips the Postgres
+  `disabled` flag. If Redis is unavailable the command fails and the user
+  stays enabled (fail closed). Disabling alone does not touch PAR records,
+  replay markers, or rate-limit counters, which carry no subject.
 - `grant-scope` requires the scope to exist in the catalog.
 - `revoke-scope` is idempotent.
 

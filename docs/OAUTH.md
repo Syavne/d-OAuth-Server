@@ -158,7 +158,9 @@ registered for the refresh grant.
 Reference: RFC 6749 §6, RFC 9700 §2.2.2 and §4.14, RFC 9449 §5.
 
 Parameters: `client_id`, `refresh_token`, optional `requested_scope` (which may
-narrow but never widen), and a freshly verified sender proof.
+narrow but never widen), and a freshly verified sender proof. The effective
+scope is re-checked against the client's current registration and the user's
+current entitlements, so a revoked scope or entitlement drops on refresh.
 
 Behavior: rotation on every use. The presented token is tombstoned with a
 `rotated_to` member. Presenting a rotated token again is reuse: the whole grant

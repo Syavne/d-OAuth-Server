@@ -48,17 +48,14 @@ is fixed in `build_router_with_options` in `src/routes.rs`:
 
 1. Request id: mints or propagates `X-Request-Id` and opens the redacted
    `http_request` tracing span. Tracing and redaction live here.
-2. Proxy-header stripping: when no `trusted_proxy` is configured, forged
-   `x-forwarded-tls-client-*` headers are removed before any handler can read
-   them. Without a configured proxy, proxy evidence is never trusted.
-3. CORS: answers preflights from the explicit allowlist. Absent when the
+2. CORS: answers preflights from the explicit allowlist. Absent when the
    allowlist is empty, which is the default.
-4. Resilience: sheds excess load, caps concurrency, and times out slow
+3. Resilience: sheds excess load, caps concurrency, and times out slow
    handlers before they reach rate limiting.
-5. Rate limit: enforces the per-IP and per-client budgets. Health and metadata
+4. Rate limit: enforces the per-IP and per-client budgets. Health and metadata
    have no rule and pass through; those handlers fail closed on their own.
-6. Body limit: caps request bodies at 2 MiB.
-7. Security headers: adds `Referrer-Policy`, `X-Content-Type-Options`, a CSP
+5. Body limit: caps request bodies at 2 MiB.
+6. Security headers: adds `Referrer-Policy`, `X-Content-Type-Options`, a CSP
    with `frame-ancestors 'none'`, HSTS on the TLS listener, and
    `Cache-Control: no-store` on every response except `/.well-known/…` metadata.
 
@@ -120,16 +117,15 @@ so they stay on a single slot. See [REDIS.md](REDIS.md).
 - Secrets stay in `secrecy`/`zeroize` types and never reach a `Debug` output,
   a log, or an error body.
 - Dependency failure on a security path fails closed with `503`.
-- Middleware order puts request identity and redaction before any handler, and
-  strips untrusted proxy headers before they could be read.
+- Middleware order puts request identity and redaction before any handler.
 - The health listener cannot reach OAuth handlers, so a probe port cannot
   become a second, unauthenticated API surface.
 
 ## Edge cases
 
 - A mTLS client certificate terminates at an L7 ingress that strips it. In that
-  case in-process verification fails; use L4/TCP passthrough or the explicit
-  trusted-proxy mode. See [DEPLOYMENT.md](DEPLOYMENT.md).
+  case in-process verification fails; use L4/TCP passthrough. See
+  [DEPLOYMENT.md](DEPLOYMENT.md).
 - `/metadata` reads the enabled scope catalog from Postgres on every request, so
   a CLI catalog mutation is visible immediately on every replica; when Postgres
   is down it returns `503` rather than advertising an empty or unknown scope

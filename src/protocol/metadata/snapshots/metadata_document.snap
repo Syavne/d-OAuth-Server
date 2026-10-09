@@ -32,7 +32,8 @@ expression: rendered
   "token_endpoint_auth_signing_alg_values_supported": [
     "ES256",
     "EdDSA",
-    "RS256"
+    "RS256",
+    "PS256"
   ],
   "introspection_endpoint_auth_methods_supported": [
     "client_secret_basic",

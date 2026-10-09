@@ -155,21 +155,35 @@ pub fn effective_scope(input: &ScopeInput<'_>) -> Result<ScopeSet, AppError> {
 }
 
 /// Refresh may narrow but never widen: `None` keeps the previous grant
-/// (re-checked against the current catalog), `Some` must be a subset of it.
+/// (re-checked against the current catalog, then silently narrowed to the
+/// still-registered and still-entitled intersection, which may be empty),
+/// `Some` must be a subset of the previous grant and of every current set.
 pub fn narrow_on_refresh(
   previous: &ScopeSet,
   requested: Option<&str>,
   enabled: &ScopeSet,
+  client_registered: &ScopeSet,
+  user_entitled: &ScopeSet,
 ) -> Result<ScopeSet, AppError> {
   match requested {
     None => {
       require_subset(previous, enabled, "granted scope no longer enabled")?;
-      Ok(previous.clone())
+      Ok(
+        previous
+          .intersect(client_registered)
+          .intersect(user_entitled),
+      )
     }
     Some(raw) => {
       let candidate = ScopeSet::parse(raw)?;
       require_subset(&candidate, enabled, "unknown or disabled scope")?;
       require_subset(&candidate, previous, "refresh must not widen scope")?;
+      require_subset(
+        &candidate,
+        client_registered,
+        "scope exceeds client registration",
+      )?;
+      require_subset(&candidate, user_entitled, "scope not granted to user")?;
       Ok(candidate)
     }
   }

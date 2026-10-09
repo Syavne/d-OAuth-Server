@@ -1262,3 +1262,212 @@ async fn open_pool_uses_mounted_database_password() -> Result<(), TestError> {
   let _ = std::fs::remove_file(&pw_path);
   Ok(())
 }
+
+/// `user disable` purges the user's Redis ephemeral state before flipping the
+/// Postgres `disabled` flag; unrelated subjects' keys survive.
+#[tokio::test]
+async fn user_disable_purges_ephemeral_state() -> Result<(), TestError> {
+  let (_harness, context) = test_support::context().await?;
+  let email = test_support::unique_email("disable-purge");
+  user::create(&context, &email, false, PASSWORD).await?;
+  let record = user_repo::find_by_email(context.pool(), &context.config().keys, &email)
+    .await?
+    .ok_or(TestError::Missing("created user"))?;
+  let canonical = record.email.clone();
+  let user_id = record.id.to_string();
+  let tag = uuid::Uuid::new_v4().to_string();
+
+  let store = crate::store::Store::from_config(&context.config().redis);
+  let mut conn = AppState::connect(context.config().clone())
+    .await?
+    .redis
+    .clone();
+
+  async fn hset(conn: &mut RedisConn, key: &str, pairs: &[(&str, &str)]) -> Result<(), TestError> {
+    let mut cmd = redis::cmd("HSET");
+    cmd.arg(key);
+    for (field, value) in pairs {
+      cmd.arg(field).arg(value);
+    }
+    cmd.query_async::<()>(conn).await?;
+    redis::cmd("PEXPIRE")
+      .arg(key)
+      .arg(60_000)
+      .query_async::<()>(conn)
+      .await?;
+    Ok(())
+  }
+
+  let session_key = store.session_key(&format!("disable-purge-session-{tag}"));
+  hset(
+    &mut conn,
+    &session_key,
+    &[
+      ("subject", &canonical),
+      ("mfa_verified", "true"),
+      ("restricted", "false"),
+    ],
+  )
+  .await?;
+  let session_meta = format!("{session_key}:meta");
+  hset(
+    &mut conn,
+    &session_meta,
+    &[("auth_time", "1700000000"), ("csrf", "csrf-secret")],
+  )
+  .await?;
+
+  let code_key = store.code_key(&format!("disable-purge-code-{tag}"));
+  hset(
+    &mut conn,
+    &code_key,
+    &[
+      ("client_id", "client-a"),
+      ("redirect_uri", "https://client.example.test/cb"),
+      ("scope", "orders:read"),
+      (
+        "code_challenge",
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      ),
+      ("subject", &canonical),
+      ("grant_id", "grant-code"),
+      ("cnf", ""),
+    ],
+  )
+  .await?;
+
+  let grant_id = format!("disable-purge-grant-{tag}");
+  let grant_key = store.grant_key(&grant_id);
+  hset(
+    &mut conn,
+    &grant_key,
+    &[
+      ("grant_id", &grant_id),
+      ("client_id", "client-a"),
+      ("subject", &canonical),
+      ("scope", "orders:read"),
+    ],
+  )
+  .await?;
+  let access_hash = format!("disable-purge-access-{tag}");
+  let refresh_hash = format!("disable-purge-refresh-{tag}");
+  let access_key = store.access_key(&access_hash);
+  let refresh_key = store.refresh_key(&refresh_hash);
+  for (key, hash) in [(&access_key, &access_hash), (&refresh_key, &refresh_hash)] {
+    hset(
+      &mut conn,
+      key,
+      &[
+        ("client_id", "client-a"),
+        ("grant_id", &grant_id),
+        ("scope", "orders:read"),
+        ("subject", &canonical),
+        ("cnf", ""),
+      ],
+    )
+    .await?;
+    redis::cmd("SADD")
+      .arg(store.grant_tokens_key(&grant_id))
+      .arg(hash)
+      .query_async::<()>(&mut conn)
+      .await?;
+  }
+  let access_act = format!("{access_key}:act");
+  redis::cmd("SET")
+    .arg(&access_act)
+    .arg("jkt")
+    .arg("PX")
+    .arg(60_000)
+    .query_async::<()>(&mut conn)
+    .await?;
+
+  let device_hash = format!("disable-purge-device-{tag}");
+  let device_key = store.device_key(&device_hash);
+  hset(
+    &mut conn,
+    &device_key,
+    &[
+      ("client_id", "client-a"),
+      ("scope", "orders:read"),
+      ("status", "approved"),
+      ("subject", &user_id),
+      ("grant_id", ""),
+    ],
+  )
+  .await?;
+  let device_cnf = format!("{device_key}:cnf");
+  let device_poll = format!("{device_key}:poll");
+  for key in [&device_cnf, &device_poll] {
+    redis::cmd("SET")
+      .arg(key)
+      .arg("sidecar")
+      .arg("PX")
+      .arg(60_000)
+      .query_async::<()>(&mut conn)
+      .await?;
+  }
+  let user_code_key = store.user_code_key(&format!("disable-purge-usercode-{tag}"));
+  redis::cmd("SET")
+    .arg(&user_code_key)
+    .arg(&device_hash)
+    .arg("PX")
+    .arg(60_000)
+    .query_async::<()>(&mut conn)
+    .await?;
+
+  let fail_key = store.login_fail_key(&crate::store::sha256_hex(
+    crate::db::user_repo::normalize_email(&canonical).as_bytes(),
+  ));
+  redis::cmd("INCR")
+    .arg(&fail_key)
+    .query_async::<()>(&mut conn)
+    .await?;
+
+  let decoy_email = test_support::unique_email("disable-purge-decoy");
+  let decoy_session_key = store.session_key(&format!("disable-purge-decoy-{tag}"));
+  hset(
+    &mut conn,
+    &decoy_session_key,
+    &[
+      ("subject", &decoy_email),
+      ("mfa_verified", "true"),
+      ("restricted", "false"),
+    ],
+  )
+  .await?;
+
+  user::disable(&context, &email).await?;
+
+  let after = user_repo::find_by_email(context.pool(), &context.config().keys, &email)
+    .await?
+    .ok_or(TestError::Missing("disabled user"))?;
+  assert!(after.disabled, "user disable must set the disabled flag");
+
+  for key in [
+    session_key,
+    session_meta,
+    code_key,
+    grant_key,
+    store.grant_tokens_key(&grant_id),
+    access_key,
+    access_act,
+    refresh_key,
+    device_key,
+    device_cnf,
+    device_poll,
+    user_code_key,
+    fail_key,
+  ] {
+    let present: i64 = redis::cmd("EXISTS")
+      .arg(&key)
+      .query_async(&mut conn)
+      .await?;
+    assert_eq!(present, 0, "disable must purge {key}");
+  }
+  let decoy_present: i64 = redis::cmd("EXISTS")
+    .arg(&decoy_session_key)
+    .query_async(&mut conn)
+    .await?;
+  assert_eq!(decoy_present, 1, "disable must keep unrelated subjects");
+  Ok(())
+}

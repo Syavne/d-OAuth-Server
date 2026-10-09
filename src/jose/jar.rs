@@ -10,10 +10,10 @@
 //! and client-bound from the PAR store) or an exact pre-registered client
 //! URI fetched behind the SSRF guard — never an arbitrary fetch.
 //!
-//! SEAM(task 18): `fetch` implements the SSRF policy inline (https-only, no
-//! redirects, 64 KiB / 5 s caps, deny non-global IPs after a
-//! pre-resolution check). Once `protocol::ssrf` exposes a guarded fetch,
-//! that module must delegate to it instead of duplicating the policy.
+//! `fetch` delegates to the shared `protocol::ssrf` guarded fetch
+//! (`https`-only, no redirects, DNS-validated and connection-pinned
+//! targets, 5 s / 256 KiB caps) and then enforces the 64 KiB
+//! request-object cap with a UTF-8 requirement here.
 //!
 //! INTEGRATION(task 23): `protocol::authorize` must call [`resolve`]. The
 //! JAR/PAR-mandatory rule for confidential clients is enforced here by
@@ -36,7 +36,8 @@ use verify::verify_request_object;
 pub const PAR_REQUEST_URI_PREFIX: &str = "urn:ietf:params:oauth:request_uri:";
 /// Maximum fetched request-object body (SSRF size cap).
 pub const MAX_REQUEST_OBJECT_BYTES: usize = 64 * 1024;
-/// Outbound `request_uri` fetch timeout (SSRF time cap).
+/// Outbound `request_uri` fetch timeout, matching the shared SSRF guard's
+/// budget; the effective timeout is enforced by `protocol::ssrf`.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Authorize-time JAR input: at most one of `request` / `request_uri`.

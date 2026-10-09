@@ -3,11 +3,7 @@
 //! Kept in a submodule so the root `config.rs` stays focused on the public
 //! types and loader surface.
 
-use std::{
-  net::{IpAddr, SocketAddr},
-  path::Path,
-  str::FromStr,
-};
+use std::{net::SocketAddr, path::Path, str::FromStr};
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -47,7 +43,6 @@ impl Config {
     let ttl = TtlConfig::from_raw(raw.ttl)?;
     let argon2 = Argon2Params::from_raw(raw.argon2)?;
     let rate_limit = RateLimitConfig::from_raw(raw.rate_limit)?;
-    let trusted_proxy = parse_trusted_proxy(raw.trusted_proxy.as_deref())?;
     let scope_registry = raw
       .scope_registry
       .into_iter()
@@ -74,7 +69,6 @@ impl Config {
       rate_limit,
       cookie_domain: raw.cookie_domain,
       cookie_secure: raw.cookie_secure.unwrap_or(true),
-      trusted_proxy,
       allow_open_registration: raw.allow_open_registration,
       pii_dual_write: raw.pii_dual_write,
       dcr_redirect_policy: raw.dcr_redirect_policy,
@@ -130,40 +124,60 @@ where
   SocketAddr::from_str(value).map_err(|_| invalid(value.to_owned()))
 }
 
-fn parse_trusted_proxy(raw: Option<&str>) -> Result<Option<IpAddr>, ConfigError> {
-  match raw.map(str::trim).filter(|value| !value.is_empty()) {
-    None => Ok(None),
-    Some(value) => {
-      IpAddr::from_str(value)
-        .map(Some)
-        .map_err(|_| ConfigError::InvalidTrustedProxy {
-          value: value.to_owned(),
-        })
+/// Master keys must carry at least 256 bits of material.
+const MIN_KEY_BYTES: usize = 32;
+
+/// Reject a resolved key shorter than [`MIN_KEY_BYTES`]. `None` (no key
+/// configured) passes through: the key-ring chain builder reports a missing
+/// active key as its own error.
+fn require_min_key_bytes(
+  secret: Option<SecretString>,
+  key: &'static str,
+) -> Result<Option<SecretString>, ConfigError> {
+  match secret {
+    Some(secret) if secret.expose_secret().len() < MIN_KEY_BYTES => {
+      Err(ConfigError::WeakKeyMaterial { key })
     }
+    other => Ok(other),
   }
 }
 
 fn build_key_ring(raw: &RawConfig) -> Result<KeyRing, ConfigError> {
-  let pepper = resolve_secret(
-    raw.token_pepper.as_deref(),
-    raw.token_pepper_file.as_deref(),
+  let pepper = require_min_key_bytes(
+    resolve_secret(
+      raw.token_pepper.as_deref(),
+      raw.token_pepper_file.as_deref(),
+    )?,
+    "token_pepper",
   )?;
-  let totp = resolve_secret(
-    raw.totp_encryption_key.as_deref(),
-    raw.totp_encryption_key_file.as_deref(),
+  let totp = require_min_key_bytes(
+    resolve_secret(
+      raw.totp_encryption_key.as_deref(),
+      raw.totp_encryption_key_file.as_deref(),
+    )?,
+    "totp_encryption_key",
   )?;
-  let pii = non_blank(resolve_secret(
-    raw.pii_encryption_key.as_deref(),
-    raw.pii_encryption_key_file.as_deref(),
-  )?);
-  let totp_previous = non_blank(resolve_secret(
-    raw.totp_previous_key.as_deref(),
-    raw.totp_previous_key_file.as_deref(),
-  )?);
-  let pii_previous = non_blank(resolve_secret(
-    raw.pii_previous_key.as_deref(),
-    raw.pii_previous_key_file.as_deref(),
-  )?);
+  let pii = require_min_key_bytes(
+    non_blank(resolve_secret(
+      raw.pii_encryption_key.as_deref(),
+      raw.pii_encryption_key_file.as_deref(),
+    )?),
+    "pii_encryption_key",
+  )?;
+  let totp_previous = require_min_key_bytes(
+    non_blank(resolve_secret(
+      raw.totp_previous_key.as_deref(),
+      raw.totp_previous_key_file.as_deref(),
+    )?),
+    "totp_previous_key",
+  )?;
+  let pii_previous = require_min_key_bytes(
+    non_blank(resolve_secret(
+      raw.pii_previous_key.as_deref(),
+      raw.pii_previous_key_file.as_deref(),
+    )?),
+    "pii_previous_key",
+  )?;
   let pepper_id = key_id_or_default(raw.token_pepper_id.as_deref());
   let totp_id = key_id_or_default(raw.totp_key_id.as_deref());
   let pii_id = key_id_or_default(raw.pii_key_id.as_deref());

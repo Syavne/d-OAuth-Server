@@ -1,6 +1,8 @@
 //! `test(client_auth)` pure suite: header parsing, expiry, assertion
 //! verification, and the SSRF policy on the `jwks_uri` path (offline).
 
+use std::time::Duration;
+
 use base64::Engine as _;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use ring::rand::SystemRandom;
@@ -9,7 +11,7 @@ use secrecy::ExposeSecret as _;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::assertion::{unverified_iss, validate_assertion};
+use super::assertion::{ALLOWED_ALGS, unverified_iss, validate_assertion};
 use super::{is_secret_expired, parse_basic_header, token_endpoint};
 use crate::protocol::ssrf;
 
@@ -84,6 +86,27 @@ fn mint(
     jti: format!("jti-{client_id}-{now}"),
     exp: now + 300 + skew_secs,
     iat: now,
+  };
+  encode(&header, &claims, &key.encoding)
+    .map_err(|error| TestError::Crypto(format!("mint failed: {error}")))
+}
+
+/// Mint a signed assertion with explicit `exp`/`iat` Unix seconds.
+fn mint_at(
+  key: &TestKey,
+  client_id: &str,
+  audience: &str,
+  header: Header,
+  exp: i64,
+  iat: i64,
+) -> Result<String, TestError> {
+  let claims = TestClaims {
+    iss: client_id.to_owned(),
+    sub: client_id.to_owned(),
+    aud: TestAud::One(audience.to_owned()),
+    jti: format!("jti-at-{exp}"),
+    exp,
+    iat,
   };
   encode(&header, &claims, &key.encoding)
     .map_err(|error| TestError::Crypto(format!("mint failed: {error}")))
@@ -286,6 +309,152 @@ fn client_auth_assertion_expired_rejected() -> TestResult {
     return Err(TestError::Unexpected(
       "expired assertion accepted".to_owned(),
     ));
+  }
+  Ok(())
+}
+
+#[test]
+fn client_auth_assertion_long_exp_rejected() -> TestResult {
+  let key = TestKey::generate("k1")?;
+  let client_id = "client-auth-long-exp";
+  let aud = token_endpoint("https://auth.example.com");
+  let now = OffsetDateTime::now_utc();
+  let now_secs = now.unix_timestamp();
+  let token = mint_at(
+    &key,
+    client_id,
+    &aud,
+    Header::new(Algorithm::EdDSA),
+    now_secs + 3600,
+    now_secs,
+  )?;
+  if validate_assertion(&token, &key.jwks, client_id, &aud, now).is_ok() {
+    return Err(TestError::Unexpected("far-future exp accepted".to_owned()));
+  }
+  Ok(())
+}
+
+#[test]
+fn client_auth_assertion_exp_before_iat_rejected() -> TestResult {
+  let key = TestKey::generate("k1")?;
+  let client_id = "client-auth-neg-lifetime";
+  let aud = token_endpoint("https://auth.example.com");
+  let now = OffsetDateTime::now_utc();
+  let now_secs = now.unix_timestamp();
+  let token = mint_at(
+    &key,
+    client_id,
+    &aud,
+    Header::new(Algorithm::EdDSA),
+    now_secs - 10,
+    now_secs + 25,
+  )?;
+  if validate_assertion(&token, &key.jwks, client_id, &aud, now).is_ok() {
+    return Err(TestError::Unexpected("exp before iat accepted".to_owned()));
+  }
+  Ok(())
+}
+
+#[test]
+fn client_auth_assertion_short_exp_accepted() -> TestResult {
+  let key = TestKey::generate("k1")?;
+  let client_id = "client-auth-short-exp";
+  let aud = token_endpoint("https://auth.example.com");
+  let now = OffsetDateTime::now_utc();
+  let now_secs = now.unix_timestamp();
+  let token = mint_at(
+    &key,
+    client_id,
+    &aud,
+    Header::new(Algorithm::EdDSA),
+    now_secs + 60,
+    now_secs,
+  )?;
+  validate_assertion(&token, &key.jwks, client_id, &aud, now)
+    .map_err(|error| TestError::Unexpected(format!("short-lived assertion rejected: {error}")))?;
+  Ok(())
+}
+
+#[test]
+fn client_auth_assertion_jti_ttl_matches_remaining_validity() -> TestResult {
+  let key = TestKey::generate("k1")?;
+  let client_id = "client-auth-ttl";
+  let aud = token_endpoint("https://auth.example.com");
+  let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+  let now = OffsetDateTime::from_unix_timestamp(now_secs)
+    .map_err(|error| TestError::Unexpected(format!("bad test timestamp: {error}")))?;
+  let token = mint_at(
+    &key,
+    client_id,
+    &aud,
+    Header::new(Algorithm::EdDSA),
+    now_secs + 60,
+    now_secs,
+  )?;
+  let validated = validate_assertion(&token, &key.jwks, client_id, &aud, now)
+    .map_err(|error| TestError::Unexpected(format!("assertion rejected: {error}")))?;
+  if validated.jti_ttl != Duration::from_secs(90) {
+    return Err(TestError::Unexpected(format!(
+      "jti_ttl {}s != 90s (60s remaining + 30s skew)",
+      validated.jti_ttl.as_secs()
+    )));
+  }
+  Ok(())
+}
+
+#[test]
+fn client_auth_assertion_jti_ttl_bounded_by_cap() -> TestResult {
+  let key = TestKey::generate("k1")?;
+  let client_id = "client-auth-ttl-cap";
+  let aud = token_endpoint("https://auth.example.com");
+  let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+  let now = OffsetDateTime::from_unix_timestamp(now_secs)
+    .map_err(|error| TestError::Unexpected(format!("bad test timestamp: {error}")))?;
+  let token = mint_at(
+    &key,
+    client_id,
+    &aud,
+    Header::new(Algorithm::EdDSA),
+    now_secs + 300,
+    now_secs,
+  )?;
+  let validated = validate_assertion(&token, &key.jwks, client_id, &aud, now)
+    .map_err(|error| TestError::Unexpected(format!("assertion rejected: {error}")))?;
+  if validated.jti_ttl != Duration::from_secs(330) {
+    return Err(TestError::Unexpected(format!(
+      "jti_ttl {}s != 330s (300s cap + 30s skew)",
+      validated.jti_ttl.as_secs()
+    )));
+  }
+  if validated.jti_ttl > Duration::from_secs(360) {
+    return Err(TestError::Unexpected(
+      "jti_ttl exceeds the 300s + 2*30s clamp".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+#[test]
+fn client_auth_allowed_algs_include_ps256() -> TestResult {
+  if !ALLOWED_ALGS.contains(&Algorithm::PS256) {
+    return Err(TestError::Unexpected("PS256 not allowed".to_owned()));
+  }
+  Ok(())
+}
+
+#[test]
+fn client_auth_allowed_algs_match_metadata_advertisement() -> TestResult {
+  let mut advertised: Vec<String> = crate::protocol::metadata::CLIENT_ASSERTION_SIGNING_ALG_VALUES
+    .iter()
+    .map(|alg| (*alg).to_owned())
+    .collect();
+  advertised.sort();
+  let mut allowed: Vec<String> = ALLOWED_ALGS.iter().map(|alg| format!("{alg:?}")).collect();
+  allowed.sort();
+  if allowed != advertised {
+    return Err(TestError::Unexpected(format!(
+      "allowlist {allowed:?} != metadata {advertised:?}"
+    )));
   }
   Ok(())
 }

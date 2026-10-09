@@ -39,7 +39,11 @@ use super::{
 use crate::{
   config::Config,
   crypto::secret::{Argon2Params, hash_secret},
-  db::{NewClient, TokenEndpointAuthMethod, client_repo, test_support::migrated_pool},
+  db::{
+    NewClient, TokenEndpointAuthMethod, client_repo,
+    test_support::migrated_pool,
+    user_repo::{self, NewUser, UserRecord},
+  },
   protocol::{
     client_auth::ClientAuthRequest,
     revoke::{RevokeContext, RevokeOutcome, RevokeRequest, RevokeStores, revoke_tokens},
@@ -832,5 +836,192 @@ async fn test_introspect_after_revoke_endpoint_is_inactive() -> TestResult {
   .await?;
   assert!(!response.active, "a revoked token must not be active");
   assert_eq!(response, IntrospectionResponse::inactive());
+  Ok(())
+}
+
+/// Mint one token pair owned by `client_id` with an explicit subject.
+async fn mint_subject(
+  h: &mut Harness,
+  client_id: &str,
+  subject: &str,
+) -> TestResult<crate::protocol::token::MintedTokens> {
+  let service = token_service(h)?;
+  Ok(
+    service
+      .mint(
+        &mut h.conn,
+        &h.store,
+        &MintRequest {
+          client_id: client_id.to_owned(),
+          client_kind: ClientKind::Confidential,
+          subject: subject.to_owned(),
+          scope: "orders:read".to_owned(),
+          grant_id: unique("grant"),
+          proof: SenderProof::none(),
+        },
+        now_unix(),
+      )
+      .await?,
+  )
+}
+
+/// Provision one enabled user with a fast test password hash.
+async fn provision_user(h: &Harness, email: &str) -> TestResult<UserRecord> {
+  let params = Argon2Params::new(8, 1, 1, 32).map_err(|error| format!("{error:?}"))?;
+  Ok(
+    user_repo::create_user(
+      &h.pool,
+      &h.config.keys,
+      false,
+      &NewUser {
+        email: email.to_owned(),
+        password_hash: hash_secret("correct-horse-01", &params)?,
+        is_admin: false,
+        must_change_password: false,
+      },
+    )
+    .await?,
+  )
+}
+
+async fn introspect_client(h: &mut Harness, label: &str, secret: &str) -> TestResult<String> {
+  let client_id = unique(label);
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some(secret),
+  )
+  .await?;
+  Ok(client_id)
+}
+
+#[tokio::test]
+async fn test_introspect_disabled_email_subject_is_inactive() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = introspect_client(&mut h, "disabled-email", "secret-de").await?;
+  let user = provision_user(&h, "disabled-introspect@example.test").await?;
+  let minted = mint_subject(&mut h, &client_id, &user.email).await?;
+  assert!(user_repo::disable_user(&h.pool, user.id).await?);
+
+  let response = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-de",
+  )
+  .await?;
+  assert!(!response.active, "a disabled user's token must be inactive");
+  assert_eq!(response, IntrospectionResponse::inactive());
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_disabled_uuid_subject_is_inactive() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = introspect_client(&mut h, "disabled-uuid", "secret-du").await?;
+  let user = provision_user(&h, "disabled-uuid@example.test").await?;
+  // Device-code tokens carry the user UUID string as subject.
+  let minted = mint_subject(&mut h, &client_id, &user.id.to_string()).await?;
+  assert!(user_repo::disable_user(&h.pool, user.id).await?);
+
+  let response = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-du",
+  )
+  .await?;
+  assert!(!response.active, "a disabled user's token must be inactive");
+  assert_eq!(response, IntrospectionResponse::inactive());
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_enabled_email_subject_stays_active() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = introspect_client(&mut h, "enabled-email", "secret-ee").await?;
+  let user = provision_user(&h, "enabled-introspect@example.test").await?;
+  let minted = mint_subject(&mut h, &client_id, &user.email).await?;
+
+  let response = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-ee",
+  )
+  .await?;
+  assert!(response.active, "an enabled user's token must stay active");
+  assert_eq!(response.sub.as_deref(), Some(user.email.as_str()));
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_reenabled_subject_is_active_again() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = introspect_client(&mut h, "reenabled", "secret-re").await?;
+  let user = provision_user(&h, "reenabled-introspect@example.test").await?;
+  let minted = mint_subject(&mut h, &client_id, &user.email).await?;
+  assert!(user_repo::disable_user(&h.pool, user.id).await?);
+  let disabled = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-re",
+  )
+  .await?;
+  assert!(!disabled.active, "a disabled user's token must be inactive");
+
+  sqlx::query("UPDATE users SET disabled = false, updated_at = now() WHERE id = $1")
+    .bind(user.id)
+    .execute(&h.pool)
+    .await?;
+  let response = run_core(
+    &mut h,
+    &minted.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-re",
+  )
+  .await?;
+  assert!(
+    response.active,
+    "a re-enabled user's token must be active again"
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_empty_and_unknown_subjects_stay_active() -> TestResult {
+  let (_container, mut h) = harness().await?;
+  let client_id = introspect_client(&mut h, "non-user-sub", "secret-nu").await?;
+  // Client-credentials tokens carry an empty subject.
+  let empty = mint_subject(&mut h, &client_id, "").await?;
+  let response = run_core(
+    &mut h,
+    &empty.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-nu",
+  )
+  .await?;
+  assert!(response.active, "an empty subject must stay active");
+  // Synthetic subjects resolve to no user and must stay live.
+  let synthetic = mint_subject(&mut h, &client_id, "synthetic-subject-9").await?;
+  let response = run_core(
+    &mut h,
+    &synthetic.access_token,
+    Some("access_token"),
+    &client_id,
+    "secret-nu",
+  )
+  .await?;
+  assert!(response.active, "an unmapped subject must stay active");
+  assert_eq!(response.sub.as_deref(), Some("synthetic-subject-9"));
   Ok(())
 }

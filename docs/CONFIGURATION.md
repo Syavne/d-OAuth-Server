@@ -46,6 +46,10 @@ mount them `0400` on a tmpfs (the shipped manifests project them at
 both are set, so an existing environment-based deployment still starts. Each
 purpose also has an optional retained previous key (`*_previous_key` and its
 `*_previous_key_file` form) so a rotation can keep old ciphertext readable.
+Every resolved key — `token_pepper`, `totp_encryption_key`,
+`pii_encryption_key`, and each retained `*_previous_key` — must be at least 32
+bytes (256 bits). A shorter key is rejected at load with `WeakKeyMaterial`,
+which names the offending key.
 
 ## Top-level keys
 
@@ -57,7 +61,6 @@ purpose also has an optional retained previous key (`*_previous_key` and its
 | `environment` | `production` | `production` or `development`. Development relaxes the database TLS requirement. |
 | `cookie_domain` | none (host-only) | Optional cookie domain. |
 | `cookie_secure` | `true` | Adds the `Secure` attribute. Set `false` only for localhost testing. |
-| `trusted_proxy` | none | An IP. When set, that proxy's forwarded client-cert and client-IP headers are honored. When unset, those headers are stripped. |
 | `allow_open_registration` | `false` | When false, DCR requires a valid initial-access token. |
 | `dcr_redirect_policy` | `catalog` | `catalog`, `catalog_loopback`, or `open`. See below. |
 | `cors_allowed_origins` | empty | An explicit origin allowlist. Empty means no CORS layer. A lone `*` is silently dropped (no CORS layer, no error). |
@@ -265,8 +268,9 @@ the statement.
 - `catalog`: only redirect URIs present in the runtime catalog may be
   registered. This is the default.
 - `catalog_loopback`: catalog URIs plus dynamic loopback URIs (RFC 8252).
-- `open`: any redirect URI may be registered. This is an explicit opt-in and is
-  not the default.
+- `open`: any absolute `https` redirect URI, or an RFC 8252 loopback URI, may
+  be registered. This is an explicit opt-in and is not the default; other
+  schemes and plaintext non-loopback URIs are still rejected.
 
 ## Security properties
 
@@ -275,8 +279,10 @@ the statement.
 - A production database URL without `sslmode=verify-full` is refused.
 - A Redis topology that does not satisfy the durability contract is refused at
   load and re-checked live at startup.
-- `trusted_proxy` is unset by default, so forwarded client-cert headers from an
-  untrusted hop are stripped before any handler reads them.
+- A pepper/TOTP/PII key shorter than 32 bytes is refused at load
+  (`WeakKeyMaterial`).
+- Forwarded client-cert and client-IP headers are never trusted: the listener
+  uses only the TLS peer address and the certificate chain it verified itself.
 - CORS and open registration are off by default.
 - File-backed pepper/TOTP/PII keys are read from a `0400` tmpfs file, never
   from the process environment.
@@ -298,8 +304,8 @@ the statement.
 - `scope delete` and `redirect-uri delete` disable a referenced row instead of
   deleting it. See [OPERATIONS.md](OPERATIONS.md).
 - A deliberate mismatch of `dcr_redirect_policy = open` and mTLS is a deployment
-  error, not a load error: open registration lets a caller register an arbitrary
-  redirect URI.
+  error, not a load error: open registration lets a caller register any
+  `https`/loopback redirect URI without pre-registration.
 
 ## Operational runbook
 

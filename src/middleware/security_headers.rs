@@ -1,4 +1,4 @@
-//! Security headers, CORS allowlist, and proxy-header stripping.
+//! Security headers and CORS allowlist.
 //!
 //! [`SecurityHeadersLayer`] decorates every response that reaches the router
 //! with `X-Content-Type-Options`, `Referrer-Policy`, and a
@@ -19,10 +19,7 @@
 //! [`cors_layer`] builds the explicit browser-facing CORS policy from
 //! `config.cors_allowed_origins`: an empty allowlist yields `None` (no CORS
 //! headers at all — browser clients are unsupported by default), and the
-//! wildcard `*` is never honored. [`StripProxyHeadersLayer`] removes
-//! forwarded client-cert headers on the direct TLS listener so a forged
-//! header can never reach [`crate::protocol::mtls`]; it is mounted only when
-//! no `trusted_proxy` is configured.
+//! wildcard `*` is never honored.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -220,58 +217,6 @@ pub fn cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
       ])
       .max_age(Duration::from_secs(CORS_MAX_AGE_SECS)),
   )
-}
-
-/// Tower layer stripping forwarded client-cert headers on the direct listener.
-///
-/// Mounted only when no `trusted_proxy` is configured, so a forged
-/// `x-forwarded-tls-client-cert` / `x-forwarded-tls-client-verify` header can
-/// never be mistaken for proxy evidence downstream. When a trusted proxy IS
-/// configured this layer is omitted and
-/// [`crate::protocol::mtls::presented_leaf`] applies its own
-/// `trusted_proxy`-gated fallback.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct StripProxyHeadersLayer;
-
-impl<S> Layer<S> for StripProxyHeadersLayer {
-  type Service = StripProxyHeadersService<S>;
-
-  fn layer(&self, inner: S) -> Self::Service {
-    StripProxyHeadersService::new(inner)
-  }
-}
-
-/// Service produced by [`StripProxyHeadersLayer`].
-#[derive(Debug, Clone, Copy)]
-pub struct StripProxyHeadersService<S> {
-  inner: S,
-}
-
-impl<S> StripProxyHeadersService<S> {
-  /// Wrap an inner service.
-  pub const fn new(inner: S) -> Self {
-    Self { inner }
-  }
-}
-
-impl<S, B> Service<Request<B>> for StripProxyHeadersService<S>
-where
-  S: Service<Request<B>> + Clone + Send + 'static,
-  S::Future: Send + 'static,
-  B: Send + 'static,
-{
-  type Response = S::Response;
-  type Error = S::Error;
-  type Future = S::Future;
-
-  fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-    self.inner.poll_ready(cx)
-  }
-
-  fn call(&mut self, mut request: Request<B>) -> Self::Future {
-    crate::protocol::mtls::strip_proxy_headers(request.headers_mut());
-    self.inner.call(request)
-  }
 }
 
 #[cfg(test)]

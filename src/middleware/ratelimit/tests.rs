@@ -211,11 +211,11 @@ async fn ratelimit_leaves_unlisted_paths_untouched_on_store_outage() -> TestResu
   Ok(())
 }
 
-/// Without a `trusted_proxy`, a forged `X-Forwarded-For` is never an identity:
-/// the limiter keys off the recorded peer, so rotating spoofed addresses
-/// cannot mint a fresh bucket and evade the limit.
+/// A forged `X-Forwarded-For` is never an identity: the limiter keys off the
+/// recorded peer, so rotating spoofed addresses cannot mint a fresh bucket and
+/// evade the limit.
 #[tokio::test]
-async fn ratelimit_ignores_spoofed_x_forwarded_for_without_trusted_proxy() -> TestResult {
+async fn ratelimit_ignores_spoofed_x_forwarded_for() -> TestResult {
   let (_redis, url) = redis_container().await?;
   let config = test_config(
     &url,
@@ -270,10 +270,10 @@ async fn ratelimit_ignores_spoofed_x_forwarded_for_without_trusted_proxy() -> Te
   Ok(())
 }
 
-/// The same rule for RFC 7239 `Forwarded`: with no `trusted_proxy` it can
-/// never select a bucket different from the recorded peer.
+/// The same rule for RFC 7239 `Forwarded`: it can never select a bucket
+/// different from the recorded peer.
 #[tokio::test]
-async fn ratelimit_ignores_spoofed_forwarded_header_without_trusted_proxy() -> TestResult {
+async fn ratelimit_ignores_spoofed_forwarded_header() -> TestResult {
   let (_redis, url) = redis_container().await?;
   let config = test_config(
     &url,

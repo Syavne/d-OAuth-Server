@@ -2,10 +2,13 @@
 //!
 //! The assertion is verified against the client's inline `jwks`, or against
 //! `jwks_uri` fetched ONLY through the SSRF guard. Enforced: `alg`
-//! allowlist (`RS256`/`ES256`/`EdDSA`; never `none`/HMAC), `typ`, `iss` and
-//! `sub` equal to `client_id`, `aud` equal to the token endpoint, `exp`
-//! with clock-skew leeway, and single-use `jti` via the
-//! `oauth:client_assertion_jti:<hash>` replay store.
+//! allowlist (`RS256`/`PS256`/`ES256`/`EdDSA`; never `none`/HMAC), `typ`,
+//! `iss` and `sub` equal to `client_id`, `aud` equal to the token endpoint,
+//! `exp` with clock-skew leeway and a bounded lifetime, `exp >= iat` (with
+//! skew) when `iat` is present, and single-use `jti` via the
+//! `oauth:client_assertion_jti:<hash>` replay store, with the marker TTL
+//! derived from the assertion's remaining validity so the marker always
+//! outlives the assertion.
 
 use std::time::Duration;
 
@@ -23,13 +26,20 @@ use crate::{
 
 /// Allowed client-assertion signing algorithms (matches the metadata
 /// `token_endpoint_auth_signing_alg_values_supported` allowlist).
-const ALLOWED_ALGS: [Algorithm; 3] = [Algorithm::RS256, Algorithm::ES256, Algorithm::EdDSA];
+pub(crate) const ALLOWED_ALGS: [Algorithm; 4] = [
+  Algorithm::RS256,
+  Algorithm::PS256,
+  Algorithm::ES256,
+  Algorithm::EdDSA,
+];
 
 /// Clock-skew leeway applied to `exp`/`nbf`/`iat` (seconds).
 const CLOCK_SKEW_SECS: u64 = 30;
 
-/// How long a consumed assertion `jti` stays reserved (bounded TTL).
-const JTI_TTL: Duration = Duration::from_secs(300);
+/// Maximum assertion lifetime past `now` (seconds), before skew. The
+/// single-use `jti` marker TTL is derived from the remaining validity, so an
+/// assertion claiming to live longer than this cannot be covered by it.
+const MAX_ASSERTION_LIFETIME_SECS: u64 = 300;
 
 /// Maximum assertion compact-serialization length accepted.
 const MAX_ASSERTION_BYTES: usize = 16 * 1024;
@@ -79,6 +89,9 @@ struct AssertionClaims {
 pub struct ValidatedAssertion {
   /// Hex hash of the `jti`, the replay-store key suffix.
   pub jti_hash: String,
+  /// Lifetime for the `jti` replay marker: the assertion's remaining validity
+  /// (`exp + skew - now`), clamped to `[1s, 300s + 2*skew]`.
+  pub jti_ttl: Duration,
 }
 
 /// Read `iss` from an assertion WITHOUT verifying the signature.
@@ -189,13 +202,28 @@ pub fn validate_assertion(
   if claims.exp.saturating_add(skew) < now_secs {
     return Err(invalid());
   }
-  if let Some(iat) = claims.iat
-    && iat > now_secs.saturating_add(skew)
-  {
+  let max_lifetime = i64::try_from(MAX_ASSERTION_LIFETIME_SECS).unwrap_or(i64::MAX);
+  if claims.exp > now_secs.saturating_add(max_lifetime.saturating_add(skew)) {
     return Err(invalid());
   }
+  if let Some(iat) = claims.iat {
+    if iat > now_secs.saturating_add(skew) {
+      return Err(invalid());
+    }
+    if claims.exp.saturating_add(skew) < iat {
+      return Err(invalid());
+    }
+  }
+  let max_ttl = i64::try_from(MAX_ASSERTION_LIFETIME_SECS.saturating_add(2 * CLOCK_SKEW_SECS))
+    .unwrap_or(i64::MAX);
+  let remaining_secs = claims
+    .exp
+    .saturating_add(skew)
+    .saturating_sub(now_secs)
+    .clamp(1, max_ttl);
   Ok(ValidatedAssertion {
     jti_hash: store::sha256_hex(claims.jti.as_bytes()),
+    jti_ttl: Duration::from_secs(u64::try_from(remaining_secs).unwrap_or(1)),
   })
 }
 
@@ -221,9 +249,13 @@ pub async fn authenticate(
     ctx.token_endpoint,
     ctx.now,
   )?;
-  let claimed =
-    dcr::claim_client_assertion_jti(stores.conn, stores.store, &validated.jti_hash, JTI_TTL)
-      .await?;
+  let claimed = dcr::claim_client_assertion_jti(
+    stores.conn,
+    stores.store,
+    &validated.jti_hash,
+    validated.jti_ttl,
+  )
+  .await?;
   if !claimed {
     return Err(AppError::invalid_client_non_basic());
   }

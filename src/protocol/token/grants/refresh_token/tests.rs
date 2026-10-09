@@ -4,6 +4,8 @@
 //! uses unique client/grant labels so the shared keyspace never collides.
 
 mod concurrent;
+mod disabled_subject;
+mod entitlements;
 mod failover;
 mod proofs;
 mod recovery;
@@ -183,6 +185,11 @@ async fn mint_grant(
 }
 
 /// Baseline refresh inputs; tests override what they probe.
+///
+/// Redis-only suites carry no Postgres user, so the client registration and
+/// the user entitlement both default to the enabled catalog (fully entitled):
+/// scope assertions there probe narrowing/widening only. Suites with a real
+/// user build [`RefreshInput`] literally with the current sets instead.
 fn input<'a>(
   client: &'a str,
   kind: ClientKind,
@@ -198,6 +205,8 @@ fn input<'a>(
     requested_scope: scope,
     proof,
     enabled,
+    client_registered: enabled,
+    user_entitled: enabled,
     now_unix: now_unix(),
   }
 }

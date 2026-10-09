@@ -100,10 +100,20 @@ async fn refresh(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> 
   require_dpop_binding(&client, &proof)?;
   let enabled = enabled_scopes(&d.state.pool).await?;
   let service = token_service(d.state)?;
-  let refreshed = refresh_token::refresh(
+  let users = refresh_token::RefreshUserStores {
+    pool: &d.state.pool,
+    keys: &d.state.keys,
+  };
+  let registered = ScopeSet::parse(&client.scope).map_err(|_| AppError::server_error())?;
+  // The user term is resolved fresh inside `refresh_with_subject_check` from
+  // the presented token's subject; this placeholder only flows through on the
+  // unknown-token path, where scope is never minted.
+  let no_user_term = ScopeSet::empty();
+  let refreshed = refresh_token::refresh_with_subject_check(
     &mut *d.conn,
     d.store,
     &service,
+    &users,
     &RefreshInput {
       client_id: &client.client_id,
       client_kind: kind,
@@ -111,6 +121,8 @@ async fn refresh(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> 
       requested_scope: d.form.scope.as_deref(),
       proof: &proof,
       enabled: &enabled,
+      client_registered: &registered,
+      user_entitled: &no_user_term,
       now_unix: d.now_unix,
     },
   )

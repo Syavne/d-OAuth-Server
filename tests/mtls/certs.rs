@@ -8,7 +8,6 @@
 //! `tests/mtls.rs`. The expired fixture is deliberately outside its
 //! validity window and must stay that way.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 /// TLS server certificate (`CN=localhost`, SAN `localhost`/127.0.0.1).
@@ -47,10 +46,4 @@ pub fn cert_der(pem: &str) -> Result<CertificateDer<'static>, FixtureError> {
 /// Decode the first private key from a PEM fixture.
 pub fn private_key(pem: &str) -> Result<PrivateKeyDer<'static>, FixtureError> {
   Ok(PrivateKeyDer::from_pem_slice(pem.as_bytes())?)
-}
-
-/// Standard-base64 DER of the first certificate in a PEM fixture (the
-/// trusted-proxy header encoding).
-pub fn der_b64(pem: &str) -> Result<String, FixtureError> {
-  Ok(STANDARD.encode(cert_der(pem)?.as_ref()))
 }

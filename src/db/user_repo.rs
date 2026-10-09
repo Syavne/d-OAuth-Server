@@ -17,6 +17,9 @@
 //! `lockout` section); no lockout state is ever written to Postgres, which is
 //! what makes the counters safe under horizontal scaling.
 
+#[cfg(test)]
+mod tests;
+
 use std::fmt;
 
 use time::OffsetDateTime;
@@ -204,6 +207,113 @@ pub async fn find_by_email(
       })
     })
     .transpose()
+}
+
+/// Use-time account status of a token subject.
+///
+/// Token subjects are inconsistent by origin: authorization-code and
+/// refresh-token records carry the session subject (the user email), while
+/// device-code records carry the user UUID string, and client-credentials
+/// records carry an empty subject. This enum lets callers treat "resolves to
+/// a disabled user" as fatal while leaving unmapped (synthetic or
+/// client-credentials) subjects live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectAccountStatus {
+  /// The subject maps to no user; the token stays live.
+  Unmapped,
+  /// The subject maps to an enabled user; the token stays live.
+  Enabled,
+  /// The subject maps to a disabled user; the token must go inactive.
+  Disabled,
+}
+
+/// Resolve a token subject to its account status without decrypting PII.
+///
+/// An empty subject (client-credentials tokens) short-circuits to
+/// [`SubjectAccountStatus::Unmapped`]. A subject that parses as a `Uuid` is
+/// looked up by primary key; an email-shaped subject is normalized and matched
+/// through the email blind index, mirroring [`find_by_email`]. Only the
+/// `disabled` flag is read, never the sealed email. A subject that matches no
+/// row reports [`SubjectAccountStatus::Unmapped`].
+///
+/// # Errors
+/// Returns a masked error on any database failure; callers must fail closed
+/// (treat the token as unusable) rather than defaulting to active.
+pub async fn subject_account_status(
+  pool: &sqlx::PgPool,
+  keys: &KeyRing,
+  subject: &str,
+) -> Result<SubjectAccountStatus, AppError> {
+  const fn map(disabled: bool) -> SubjectAccountStatus {
+    if disabled {
+      SubjectAccountStatus::Disabled
+    } else {
+      SubjectAccountStatus::Enabled
+    }
+  }
+  let subject = subject.trim();
+  if subject.is_empty() {
+    return Ok(SubjectAccountStatus::Unmapped);
+  }
+  if let Ok(id) = subject.parse::<Uuid>() {
+    let row = sqlx::query!(r#"SELECT disabled FROM users WHERE id = $1"#, id)
+      .fetch_optional(pool)
+      .await?;
+    return Ok(row.map_or(SubjectAccountStatus::Unmapped, |row| map(row.disabled)));
+  }
+  // A user identifier is a UUID or an email; a value that is neither cannot
+  // match a row, so skip the query (this keeps synthetic subjects off the
+  // database hot path).
+  if !subject.contains('@') {
+    return Ok(SubjectAccountStatus::Unmapped);
+  }
+  let canonical = normalize_email(subject);
+  let candidates = blind_index_candidates(keys, &canonical);
+  let row = sqlx::query!(
+    r#"SELECT disabled FROM users
+         WHERE email_index = ANY($1)
+            OR (email_enc IS NULL AND email = $2::text::citext)"#,
+    &candidates,
+    canonical,
+  )
+  .fetch_optional(pool)
+  .await?;
+  Ok(row.map_or(SubjectAccountStatus::Unmapped, |row| map(row.disabled)))
+}
+
+/// Resolve a token subject to its user id, or `None` when it maps to no user.
+///
+/// Mirrors [`subject_account_status`] without decrypting PII: an empty subject
+/// (client-credentials tokens) and a non-email, non-UUID subject short-circuit
+/// to `None`; a UUID subject resolves by primary key; an email-shaped subject
+/// is normalized and matched through the email blind index like
+/// [`find_by_email`]. Callers treat `None` as "no user term".
+///
+/// # Errors
+/// Returns a masked error on any database failure.
+pub async fn subject_user_id(
+  pool: &sqlx::PgPool,
+  keys: &KeyRing,
+  subject: &str,
+) -> Result<Option<Uuid>, AppError> {
+  let subject = subject.trim();
+  if subject.is_empty() {
+    return Ok(None);
+  }
+  if let Ok(id) = subject.parse::<Uuid>() {
+    return match subject_account_status(pool, keys, subject).await? {
+      SubjectAccountStatus::Unmapped => Ok(None),
+      SubjectAccountStatus::Enabled | SubjectAccountStatus::Disabled => Ok(Some(id)),
+    };
+  }
+  if !subject.contains('@') {
+    return Ok(None);
+  }
+  Ok(
+    find_by_email(pool, keys, subject)
+      .await?
+      .map(|user| user.id),
+  )
 }
 
 /// Verify a password against the stored Argon2id hash.

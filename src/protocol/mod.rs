@@ -15,6 +15,7 @@ pub mod introspect;
 pub mod metadata;
 pub mod mtls;
 pub mod par;
+pub mod purge;
 pub mod redirect_repo;
 pub mod revoke;
 pub mod scope;

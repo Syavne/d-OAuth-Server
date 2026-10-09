@@ -32,7 +32,7 @@ use super::{
   token::{Cnf, TokenService, TokenServiceError},
 };
 use crate::{
-  db::{Client, TokenEndpointAuthMethod},
+  db::{Client, TokenEndpointAuthMethod, user_repo},
   error::{AppError, OAuthErrorCode},
   state::{AppState, RedisConn},
   store::{Store, StoreError},
@@ -226,6 +226,18 @@ pub async fn introspect(
       .await
       .map_err(AppError::from)?
       .is_some()
+  {
+    return Ok(IntrospectionResponse::inactive());
+  }
+  // Use-time disabled-user re-check: a token whose non-empty subject resolves
+  // to a disabled user reports the same inactive shape as an unknown token.
+  // Unmapped subjects (client-credentials empties, synthetic principals) stay
+  // live; a datastore failure propagates as an error, never as active.
+  if !located.subject.trim().is_empty()
+    && matches!(
+      user_repo::subject_account_status(stores.pool, stores.keys, &located.subject).await?,
+      user_repo::SubjectAccountStatus::Disabled
+    )
   {
     return Ok(IntrospectionResponse::inactive());
   }
