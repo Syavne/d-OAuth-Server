@@ -110,7 +110,11 @@ pub async fn consume_one_use(
 ///
 /// A winning claim is durability-barriered BEFORE the caller treats the proof
 /// as fresh (same contract as token rotation in [`super::tokens`]): a marker
-/// that could vanish on failover would let a replayed `jti` through.
+/// that could vanish on failover would let a replayed `jti` through. When the
+/// barrier fails after the marker was written, the marker is removed before
+/// the `Durability` error surfaces, so the originating proof can be claimed
+/// again instead of reading back as a replay; a concurrent non-originating
+/// claimant still loses while the marker stands.
 pub async fn claim_marker(
   conn: &mut RedisConn,
   store: &Store,
@@ -130,7 +134,14 @@ pub async fn claim_marker(
   .map(|set| set.is_some())
   .map_err(StoreError::Redis)?;
   if fresh {
-    durability_barrier(conn, store).await?;
+    match durability_barrier(conn, store).await {
+      Ok(()) => {}
+      Err(StoreError::Durability) => {
+        let _ = redis::cmd("DEL").arg(key).query_async::<i64>(conn).await;
+        return Err(StoreError::Durability);
+      }
+      Err(other) => return Err(other),
+    }
   }
   Ok(fresh)
 }

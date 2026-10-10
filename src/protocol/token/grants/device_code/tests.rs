@@ -24,6 +24,7 @@ mod flows;
 mod keys;
 mod matrix;
 mod poll;
+mod race;
 mod scope;
 mod setup;
 

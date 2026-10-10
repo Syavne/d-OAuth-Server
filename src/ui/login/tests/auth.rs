@@ -6,6 +6,7 @@ use axum::http::{StatusCode, header};
 use axum_extra::extract::CookieJar;
 use sqlx::Row as _;
 
+use super::super::LOGOUT_ACTION;
 use super::{
   Harness, LoginAttempt, TestError, TestResult, TestUser, app_state, attempt, cookie_header,
   create_user, current_code, deps_of, harness, pending_request, presession, wrong_code,
@@ -21,8 +22,8 @@ use crate::{
   store::{pending, sessions},
   ui::login::{
     CONSENT_PATH, LOCKOUT_THRESHOLD, LOCKOUT_WINDOW, LOGIN_SUCCESS_PATH, LoginForm, LoginOutcome,
-    LoginPageQuery, attempt_login, bind_pending_request, get_login, get_logout, load_session,
-    post_login, session_cookie,
+    LoginPageQuery, LogoutForm, attempt_login, bind_pending_request, expired_session_cookie,
+    form_token, get_login, get_logout, load_session, post_login, post_logout, session_cookie,
   },
 };
 
@@ -111,12 +112,19 @@ async fn login_success_sets_session_cookie_and_bound_redirect() -> TestResult {
   Ok(())
 }
 
+async fn logout_csrf(harness: &mut Harness, session_id: &str) -> Result<String, TestError> {
+  let live = load_session(&mut harness.conn, &harness.store, session_id)
+    .await?
+    .ok_or_else(|| unexpected("the session must be live"))?;
+  Ok(form_token(&live.meta.csrf_secret, LOGOUT_ACTION))
+}
+
 #[tokio::test]
-async fn get_logout_destroys_session_and_clears_cookie() -> TestResult {
+async fn post_logout_destroys_session_and_clears_cookie() -> TestResult {
   let mut h = harness().await?;
   let user = create_user(
     &mut h,
-    "logout-get@example.test",
+    "logout-post@example.test",
     "correct-horse-03",
     false,
     true,
@@ -129,17 +137,24 @@ async fn get_logout_destroys_session_and_clears_cookie() -> TestResult {
     _ => return Err(unexpected("correct credentials must authenticate")),
   };
 
+  let token = logout_csrf(&mut h, &session_id).await?;
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(LogoutForm { csrf: token }),
+  )
+  .await;
 
   if response.status() != StatusCode::OK {
     return Err(unexpected(
-      "GET /logout must render a neutral page, not redirect",
+      "POST /logout must render a neutral page, not redirect",
     ));
   }
   if response.headers().get(header::LOCATION).is_some() {
     return Err(unexpected(
-      "GET /logout must never auto-redirect (no CSRF bounce)",
+      "POST /logout must never auto-redirect (no CSRF bounce)",
     ));
   }
   let set_cookie = response
@@ -148,14 +163,245 @@ async fn get_logout_destroys_session_and_clears_cookie() -> TestResult {
     .and_then(|value| value.to_str().ok())
     .unwrap_or_default();
   if !set_cookie.contains("session_id=") || !set_cookie.contains("Max-Age=0") {
-    return Err(unexpected("GET /logout must expire the session cookie"));
+    return Err(unexpected("POST /logout must expire the session cookie"));
+  }
+  if cookie_attr_names(&cookie_header(&h, &session_id)) != cookie_attr_names(set_cookie) {
+    return Err(unexpected(
+      "the clearing cookie must mirror the session cookie attributes",
+    ));
   }
   if sessions::get(&mut h.conn, &h.store, &session_id)
     .await?
     .is_some()
   {
     return Err(unexpected(
-      "GET /logout must destroy the server-side session",
+      "POST /logout must destroy the server-side session",
+    ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn post_logout_without_csrf_is_rejected_and_session_survives() -> TestResult {
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "logout-csrf@example.test",
+    "correct-horse-31",
+    false,
+    true,
+  )
+  .await?;
+  let (pre, csrf) = presession(&mut h).await?;
+  let code = current_code(&user, &h)?;
+  let session_id = match try_login(&mut h, attempt(&pre, &csrf, &user, &code)).await? {
+    LoginOutcome::Authenticated { session_id, .. } => session_id,
+    _ => return Err(unexpected("correct credentials must authenticate")),
+  };
+  for presented in [String::new(), "forged-token".to_owned()] {
+    let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
+    let response = post_logout(
+      State(app_state(&h)),
+      Extension(RequestId::new()),
+      jar,
+      Form(LogoutForm {
+        csrf: presented.clone(),
+      }),
+    )
+    .await;
+    if response.status() != StatusCode::BAD_REQUEST {
+      return Err(unexpected(
+        "POST /logout without a valid token must be rejected",
+      ));
+    }
+    if response.headers().contains_key(header::SET_COOKIE) {
+      return Err(unexpected("a rejected sign-out must not touch cookies"));
+    }
+    if load_session(&mut h.conn, &h.store, &session_id)
+      .await?
+      .is_none()
+    {
+      return Err(unexpected(
+        "a rejected sign-out must leave the session intact",
+      ));
+    }
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn post_logout_rejects_other_sessions_form_token() -> TestResult {
+  let mut h = harness().await?;
+  let user_a = create_user(
+    &mut h,
+    "logout-cross-a@example.test",
+    "correct-horse-32",
+    false,
+    true,
+  )
+  .await?;
+  let user_b = create_user(
+    &mut h,
+    "logout-cross-b@example.test",
+    "correct-horse-33",
+    false,
+    true,
+  )
+  .await?;
+  let (pre_a, csrf_a) = presession(&mut h).await?;
+  let code_a = current_code(&user_a, &h)?;
+  let session_a = match try_login(&mut h, attempt(&pre_a, &csrf_a, &user_a, &code_a)).await? {
+    LoginOutcome::Authenticated { session_id, .. } => session_id,
+    _ => return Err(unexpected("correct credentials must authenticate")),
+  };
+  let (pre_b, csrf_b) = presession(&mut h).await?;
+  let code_b = current_code(&user_b, &h)?;
+  let session_b = match try_login(&mut h, attempt(&pre_b, &csrf_b, &user_b, &code_b)).await? {
+    LoginOutcome::Authenticated { session_id, .. } => session_id,
+    _ => return Err(unexpected("correct credentials must authenticate")),
+  };
+  // A form token minted for session B (action-separated per-session context)
+  // must not authorize session A's sign-out.
+  let foreign = logout_csrf(&mut h, &session_b).await?;
+  let jar = CookieJar::new().add(session_cookie(&h.config, &session_a));
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(LogoutForm { csrf: foreign }),
+  )
+  .await;
+  if response.status() != StatusCode::BAD_REQUEST {
+    return Err(unexpected(
+      "POST /logout with another session's token must be rejected",
+    ));
+  }
+  if response.headers().contains_key(header::SET_COOKIE) {
+    return Err(unexpected("a rejected sign-out must not touch cookies"));
+  }
+  if load_session(&mut h.conn, &h.store, &session_a)
+    .await?
+    .is_none()
+  {
+    return Err(unexpected(
+      "a rejected sign-out must leave the victim session intact",
+    ));
+  }
+  if load_session(&mut h.conn, &h.store, &session_b)
+    .await?
+    .is_none()
+  {
+    return Err(unexpected(
+      "a rejected sign-out must leave the other session intact",
+    ));
+  }
+  // A token for a different action on the same session must also fail: form
+  // tokens are action-separated, not interchangeable.
+  let live_a = load_session(&mut h.conn, &h.store, &session_a)
+    .await?
+    .ok_or_else(|| unexpected("the session must be live"))?;
+  let cross_action = form_token(&live_a.meta.csrf_secret, "change-password");
+  let jar = CookieJar::new().add(session_cookie(&h.config, &session_a));
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(LogoutForm { csrf: cross_action }),
+  )
+  .await;
+  if response.status() != StatusCode::BAD_REQUEST {
+    return Err(unexpected(
+      "POST /logout with another action's token must be rejected",
+    ));
+  }
+  if load_session(&mut h.conn, &h.store, &session_a)
+    .await?
+    .is_none()
+  {
+    return Err(unexpected(
+      "a cross-action reject must leave the session intact",
+    ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn post_logout_wrong_content_type_fails_closed() -> TestResult {
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "logout-ctype@example.test",
+    "correct-horse-34",
+    false,
+    true,
+  )
+  .await?;
+  let (pre, csrf) = presession(&mut h).await?;
+  let code = current_code(&user, &h)?;
+  let session_id = match try_login(&mut h, attempt(&pre, &csrf, &user, &code)).await? {
+    LoginOutcome::Authenticated { session_id, .. } => session_id,
+    _ => return Err(unexpected("correct credentials must authenticate")),
+  };
+  let token = logout_csrf(&mut h, &session_id).await?;
+  let app = axum::Router::new()
+    .route("/logout", axum::routing::post(post_logout))
+    .with_state(app_state(&h))
+    .layer(Extension(RequestId::new()));
+  // A well-formed token sent under the wrong content type must fail closed:
+  // the Form extractor rejects before any session state is touched.
+  let body = format!("csrf={token}");
+  let request = axum::http::Request::post("/logout")
+    .header(axum::http::header::CONTENT_TYPE, "application/json")
+    .header(
+      axum::http::header::COOKIE,
+      format!("session_id={session_id}"),
+    )
+    .body(axum::body::Body::from(body))
+    .map_err(|_| unexpected("request build failed"))?;
+  let response = tower::ServiceExt::oneshot(app, request)
+    .await
+    .map_err(|_| unexpected("router failed"))?;
+  if !response.status().is_client_error() {
+    return Err(unexpected(
+      "POST /logout with the wrong content type must fail closed with 4xx",
+    ));
+  }
+  if load_session(&mut h.conn, &h.store, &session_id)
+    .await?
+    .is_none()
+  {
+    return Err(unexpected(
+      "a content-type reject must leave the session intact",
+    ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn post_logout_without_session_is_idempotent() -> TestResult {
+  let h = harness().await?;
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    CookieJar::new(),
+    Form(LogoutForm {
+      csrf: String::new(),
+    }),
+  )
+  .await;
+  if response.status() != StatusCode::SEE_OTHER {
+    return Err(unexpected(
+      "POST /logout without a session must land on login",
+    ));
+  }
+  let set_cookie = response
+    .headers()
+    .get(header::SET_COOKIE)
+    .and_then(|value| value.to_str().ok())
+    .unwrap_or_default();
+  if !set_cookie.contains("session_id=") || !set_cookie.contains("Max-Age=0") {
+    return Err(unexpected(
+      "an anonymous sign-out must still expire the cookie",
     ));
   }
   Ok(())
@@ -164,12 +410,7 @@ async fn get_logout_destroys_session_and_clears_cookie() -> TestResult {
 #[tokio::test]
 async fn get_logout_without_session_is_idempotent() -> TestResult {
   let h = harness().await?;
-  let response = get_logout(
-    State(app_state(&h)),
-    Extension(RequestId::new()),
-    CookieJar::new(),
-  )
-  .await;
+  let response = get_logout(State(app_state(&h)), CookieJar::new()).await;
   if response.status() != StatusCode::OK {
     return Err(unexpected(
       "GET /logout without a session must still succeed",
@@ -179,6 +420,9 @@ async fn get_logout_without_session_is_idempotent() -> TestResult {
     return Err(unexpected(
       "GET /logout must not redirect even when anonymous",
     ));
+  }
+  if response.headers().contains_key(header::SET_COOKIE) {
+    return Err(unexpected("GET /logout must not touch cookies"));
   }
   Ok(())
 }
@@ -276,7 +520,7 @@ async fn bind_logout_flow(
 }
 
 #[tokio::test]
-async fn get_logout_redirects_to_bound_post_logout_uri() -> TestResult {
+async fn post_logout_redirects_to_bound_post_logout_uri() -> TestResult {
   let mut h = harness().await?;
   let uri = "https://client.example.test/signed-out";
   let session_id = bind_logout_flow(
@@ -288,8 +532,15 @@ async fn get_logout_redirects_to_bound_post_logout_uri() -> TestResult {
   )
   .await?;
 
+  let token = logout_csrf(&mut h, &session_id).await?;
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(LogoutForm { csrf: token }),
+  )
+  .await;
 
   if response.status() != StatusCode::SEE_OTHER {
     return Err(unexpected("a bound logout must redirect"));
@@ -314,7 +565,7 @@ async fn get_logout_redirects_to_bound_post_logout_uri() -> TestResult {
 }
 
 #[tokio::test]
-async fn get_logout_ignores_disabled_post_logout_uri() -> TestResult {
+async fn post_logout_ignores_disabled_post_logout_uri() -> TestResult {
   let mut h = harness().await?;
   let uri = "https://client.example.test/disabled-out";
   let session_id = bind_logout_flow(
@@ -326,8 +577,15 @@ async fn get_logout_ignores_disabled_post_logout_uri() -> TestResult {
   )
   .await?;
 
+  let token = logout_csrf(&mut h, &session_id).await?;
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(LogoutForm { csrf: token }),
+  )
+  .await;
 
   if response.status() != StatusCode::OK {
     return Err(unexpected("a disabled post-logout URI must not redirect"));
@@ -339,7 +597,7 @@ async fn get_logout_ignores_disabled_post_logout_uri() -> TestResult {
 }
 
 #[tokio::test]
-async fn get_logout_ignores_deactivated_client() -> TestResult {
+async fn post_logout_ignores_deactivated_client() -> TestResult {
   let mut h = harness().await?;
   let uri = "https://client.example.test/inactive-out";
   let session_id = bind_logout_flow(
@@ -352,8 +610,15 @@ async fn get_logout_ignores_deactivated_client() -> TestResult {
   .await?;
   client_repo::deactivate(&h.pool, "logout-inactive").await?;
 
+  let token = logout_csrf(&mut h, &session_id).await?;
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(LogoutForm { csrf: token }),
+  )
+  .await;
 
   if response.status() != StatusCode::OK {
     return Err(unexpected(
@@ -848,8 +1113,15 @@ async fn logout_redirects_to_registered_uri() -> TestResult {
   if sealed.is_none() {
     return Err(unexpected("the sealed client name must be stored"));
   }
+  let token = logout_csrf(&mut h, &session_id).await?;
   let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
-  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(LogoutForm { csrf: token }),
+  )
+  .await;
   if response.status() != StatusCode::SEE_OTHER {
     return Err(unexpected("a bound logout must redirect"));
   }
@@ -885,8 +1157,15 @@ async fn logout_redirects_to_registered_uri() -> TestResult {
     .bind(corrupt)
     .execute(&h.pool)
     .await?;
+  let token = logout_csrf(&mut h, &other).await?;
   let jar = CookieJar::new().add(session_cookie(&h.config, &other));
-  let response = get_logout(State(app_state(&h)), Extension(RequestId::new()), jar).await;
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    jar,
+    Form(LogoutForm { csrf: token }),
+  )
+  .await;
   if response.status() != StatusCode::SERVICE_UNAVAILABLE {
     return Err(unexpected("a corrupt client row must fail closed with 503"));
   }
@@ -962,6 +1241,88 @@ async fn login_corrupt_totp_ciphertext_fails_closed_with_503() -> TestResult {
   .await;
   if response.status() != StatusCode::SERVICE_UNAVAILABLE {
     return Err(unexpected("a corrupt TOTP row must render 503"));
+  }
+  Ok(())
+}
+
+/// Attribute names of a `Set-Cookie` value, minus the leading pair and any
+/// expiry marker, lowercased and sorted for set comparison.
+fn cookie_attr_names(header: &str) -> Vec<String> {
+  let mut names = Vec::new();
+  for part in header.split(';').skip(1) {
+    let trimmed = part.trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+    let name = match trimmed.split('=').next() {
+      Some(name) => name.trim().to_ascii_lowercase(),
+      None => continue,
+    };
+    if name == "max-age" || name == "expires" {
+      continue;
+    }
+    names.push(name);
+  }
+  names.sort();
+  names
+}
+
+#[tokio::test]
+async fn get_logout_leaves_session_intact_and_renders_confirm() -> TestResult {
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "logout-readonly@example.test",
+    "correct-horse-30",
+    false,
+    true,
+  )
+  .await?;
+  let (pre, csrf) = presession(&mut h).await?;
+  let code = current_code(&user, &h)?;
+  let session_id = match try_login(&mut h, attempt(&pre, &csrf, &user, &code)).await? {
+    LoginOutcome::Authenticated { session_id, .. } => session_id,
+    _ => return Err(unexpected("correct credentials must authenticate")),
+  };
+  let jar = CookieJar::new().add(session_cookie(&h.config, &session_id));
+  let response = get_logout(State(app_state(&h)), jar).await;
+  if response.status() != StatusCode::OK {
+    return Err(unexpected("GET /logout must render the confirm page"));
+  }
+  if response.headers().contains_key(header::SET_COOKIE) {
+    return Err(unexpected("GET /logout must not touch cookies"));
+  }
+  let raw = http_body_util::BodyExt::collect(response.into_body())
+    .await
+    .map_err(|_| unexpected("the confirm body must read"))?
+    .to_bytes();
+  let body = String::from_utf8_lossy(&raw);
+  if !body.contains("action=\"/logout\"") || !body.contains("name=\"csrf\"") {
+    return Err(unexpected(
+      "GET /logout must render the sign-out confirm form",
+    ));
+  }
+  if load_session(&mut h.conn, &h.store, &session_id)
+    .await?
+    .is_none()
+  {
+    return Err(unexpected("GET /logout must never destroy the session"));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn logout_clearing_cookie_mirrors_session_cookie_attrs() -> TestResult {
+  let h = harness().await?;
+  let session = session_cookie(&h.config, "logout-attr-session").to_string();
+  let clearing = expired_session_cookie(&h.config).to_string();
+  if !clearing.contains("Max-Age=0") {
+    return Err(unexpected("the clearing cookie must expire immediately"));
+  }
+  if cookie_attr_names(&session) != cookie_attr_names(&clearing) {
+    return Err(unexpected(
+      "the clearing cookie must mirror the session cookie attributes",
+    ));
   }
   Ok(())
 }

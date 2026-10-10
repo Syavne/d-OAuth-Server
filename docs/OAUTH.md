@@ -112,15 +112,20 @@ mounts only `/health/live` and `/health/ready`.
 | GET, PUT, DELETE | `/register/{client_id}` | RFC 7592 §2 | Wired |
 
 `GET /logout` and `POST /logout` are a server-specific session endpoint, not a
-feature defined by OAuth 2.1 or OIDC. They destroy the authorization-server
-session and expire the `session_id` cookie. `GET /logout` takes **no query
-parameters** and issues no client-supplied redirect, so a forced navigation
-cannot cause an open redirect; the only redirect it may issue is to a
+feature defined by OAuth 2.1 or OIDC. `GET /logout` is read-only: it renders
+a confirm page (live session) or a neutral signed-out page (anonymous) and
+never destroys the session or writes cookies. Only `POST /logout`, carrying
+the session-bound CSRF `form_token`, destroys the authorization-server
+session and expires the `session_id` cookie (the clearing cookie mirrors the
+session cookie's `Path`/`HttpOnly`/`SameSite`/`Secure`/`Domain`). `GET /logout` takes **no query
+parameters** and issues no redirect at all, so a forced navigation
+cannot cause an open redirect; only `POST /logout` may redirect, and only to a
 `post_logout` URI that was **registered for the client and frozen in session
 meta when the authorization flow was bound**. It redirects there only when the
 owning client is still active and still registers that exact URI (exact-string
 match, with the RFC 8252 loopback exception); otherwise it renders a neutral
-signed-out page. `POST /logout` clears the session and redirects to `GET /login`.
+signed-out page. A `POST /logout` with a live session but no bound redirect
+target renders the neutral signed-out page instead of redirecting.
 This is what lets a client end the browser SSO session so a different user can
 sign in. There is no `post_logout_redirect_uri` parameter, no `id_token_hint`,
 and no `end_session_endpoint` in metadata.
@@ -326,8 +331,9 @@ Reference: RFC 9101 §4.1 and §5.2, RFC 9126 §2 and §3.
   `request_uri` or a signed `request` object. A public client may use the query
   string.
 - A signed request object must be signed, must have `iss` equal to `client_id`,
-  must target the issuer as `aud`, and must not use `none` or a symmetric
-  algorithm. Conflicts between the object and the query string are rejected.
+  must target the issuer as `aud`, and must use `RS256`, `PS256`, `ES256`, or
+  `EdDSA` (`none` and everything else are rejected before key selection).
+  Conflicts between the object and the query string are rejected.
 - A `request_uri` is a one-time, client-bound PAR handle or an exactly
   pre-registered URI. It is fetched only with the SSRF guard: https only, no
   redirects, global IPs only, size and time capped. The connection is pinned to

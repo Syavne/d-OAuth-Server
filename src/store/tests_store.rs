@@ -1493,6 +1493,132 @@ fn store_error_classification_and_retry_scope() -> TestResult {
   Ok(())
 }
 
+#[test]
+fn store_permanent_infra_errors_map_to_503() -> TestResult {
+  use crate::error::{AppError, OAuthErrorCode};
+  use axum::http::StatusCode;
+
+  let cross_slot = redis::RedisError::from((
+    redis::ErrorKind::Server(redis::ServerErrorKind::CrossSlot),
+    "slot",
+  ));
+  let readonly = redis::RedisError::from((
+    redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly),
+    "ro",
+  ));
+  let auth = redis::RedisError::from((redis::ErrorKind::AuthenticationFailed, "auth"));
+  let oom_value = redis::parse_redis_value(b"-OOM command not allowed\r\n");
+  let oom = match oom_value {
+    Ok(redis::Value::ServerError(server)) => redis::RedisError::from(server),
+    _ => {
+      return Err(TestError::Unexpected(
+        "expected an OOM server error value".to_owned(),
+      ));
+    }
+  };
+
+  for error in [cross_slot, readonly, auth, oom] {
+    let mapped = AppError::from(StoreError::Redis(error));
+    if mapped.code() != OAuthErrorCode::TemporarilyUnavailable {
+      return Err(TestError::Unexpected(
+        "permanent Redis infra failure must map to temporarily_unavailable".to_owned(),
+      ));
+    }
+    if mapped.status() != StatusCode::SERVICE_UNAVAILABLE {
+      return Err(TestError::Unexpected(
+        "permanent Redis infra failure must render 503".to_owned(),
+      ));
+    }
+  }
+
+  // Genuinely internal bugs stay masked as server_error (500).
+  for error in [StoreError::InvalidData, StoreError::Mismatch] {
+    let mapped = AppError::from(error);
+    if mapped.code() != OAuthErrorCode::ServerError {
+      return Err(TestError::Unexpected(
+        "internal store bug must stay server_error".to_owned(),
+      ));
+    }
+    if mapped.status() != StatusCode::INTERNAL_SERVER_ERROR {
+      return Err(TestError::Unexpected(
+        "internal store bug must render 500".to_owned(),
+      ));
+    }
+  }
+  Ok(())
+}
+
+#[test]
+fn store_error_classification() -> TestResult {
+  use crate::error::{AppError, OAuthErrorCode};
+  use axum::http::StatusCode;
+
+  let parse = redis::RedisError::from((redis::ErrorKind::Parse, "parse"));
+  let unexpected = redis::RedisError::from((redis::ErrorKind::UnexpectedReturnType, "type"));
+  let client = redis::RedisError::from((redis::ErrorKind::Client, "client"));
+  let wrongtype_value = redis::parse_redis_value(
+    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+  );
+  let wrongtype = match wrongtype_value {
+    Ok(redis::Value::ServerError(server)) => redis::RedisError::from(server),
+    _ => {
+      return Err(TestError::Unexpected(
+        "expected a WRONGTYPE server error value".to_owned(),
+      ));
+    }
+  };
+  for error in [parse, unexpected, client, wrongtype] {
+    let mapped = AppError::from(StoreError::Redis(error));
+    if mapped.code() != OAuthErrorCode::ServerError {
+      return Err(TestError::Unexpected(
+        "programming Redis error must map to server_error".to_owned(),
+      ));
+    }
+    if mapped.status() != StatusCode::INTERNAL_SERVER_ERROR {
+      return Err(TestError::Unexpected(
+        "programming Redis error must render 500".to_owned(),
+      ));
+    }
+  }
+
+  let cross_slot = redis::RedisError::from((
+    redis::ErrorKind::Server(redis::ServerErrorKind::CrossSlot),
+    "slot",
+  ));
+  let readonly = redis::RedisError::from((
+    redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly),
+    "ro",
+  ));
+  let auth = redis::RedisError::from((redis::ErrorKind::AuthenticationFailed, "auth"));
+  let transient = redis::RedisError::from(std::io::Error::new(
+    std::io::ErrorKind::TimedOut,
+    "timed out",
+  ));
+  let oom_value = redis::parse_redis_value(b"-OOM command not allowed\r\n");
+  let oom = match oom_value {
+    Ok(redis::Value::ServerError(server)) => redis::RedisError::from(server),
+    _ => {
+      return Err(TestError::Unexpected(
+        "expected an OOM server error value".to_owned(),
+      ));
+    }
+  };
+  for error in [cross_slot, readonly, auth, transient, oom] {
+    let mapped = AppError::from(StoreError::Redis(error));
+    if mapped.code() != OAuthErrorCode::TemporarilyUnavailable {
+      return Err(TestError::Unexpected(
+        "infra Redis failure must map to temporarily_unavailable".to_owned(),
+      ));
+    }
+    if mapped.status() != StatusCode::SERVICE_UNAVAILABLE {
+      return Err(TestError::Unexpected(
+        "infra Redis failure must render 503".to_owned(),
+      ));
+    }
+  }
+  Ok(())
+}
+
 #[tokio::test]
 async fn store_retry_budget_bounds_idempotent_reads() -> TestResult {
   use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -1580,6 +1706,602 @@ async fn store_hset_record_writes_fields_and_ttl() -> TestResult {
   assert_ttl_within(pttl_ms(&mut conn, &key).await?, ttl)
 }
 
+/// Revoke drain exhaustion must fail closed, never report silent success.
+///
+/// A zero-pass budget models the exhausted drain (a mint landing after every
+/// snapshot, so the set never reads empty): members still indexed must
+/// surface [`StoreError::InvalidData`], never a silent `Ok` count. The full
+/// production budget on the same grant then still drains to zero with no live
+/// member records behind it.
+#[tokio::test]
+async fn store_grant_revoke_exhaustion_is_not_silent() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let grant = unique("grant");
+  let client = unique("client");
+  let seed = unique("seed-refresh");
+  grants::create(
+    &mut conn,
+    &store,
+    &grants::GrantRecord {
+      grant_id: grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "orders:read".to_owned(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  tokens::put_refresh(
+    &mut conn,
+    &store,
+    &seed,
+    &refresh_record(&client, &grant),
+    Duration::from_secs(3600),
+  )
+  .await?;
+
+  match grants::revoke_with_passes(&mut conn, &store, &grant, 0).await {
+    Err(StoreError::InvalidData) => {}
+    Ok(count) => {
+      return Err(TestError::Unexpected(format!(
+        "exhausted drain must fail closed, got Ok({count})"
+      )));
+    }
+    Err(error) => {
+      return Err(TestError::Unexpected(format!(
+        "exhausted drain must be InvalidData, got {error:?}"
+      )));
+    }
+  }
+
+  // The production budget on the same grant drains fully: no live members.
+  let drained = grants::revoke(&mut conn, &store, &grant).await?;
+  if drained == 0 {
+    return Err(TestError::Unexpected(
+      "production revoke must count the seed member".to_owned(),
+    ));
+  }
+  if tokens::get_refresh(&mut conn, &store, &seed)
+    .await?
+    .is_some()
+  {
+    return Err(TestError::Unexpected(
+      "revoke must leave no live member record".to_owned(),
+    ));
+  }
+  if !grants::members(&mut conn, &store, &grant).await?.is_empty() {
+    return Err(TestError::Unexpected(
+      "revoke must leave the grant set empty".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// A corrupt poll-interval marker must fail closed, never fail open.
+///
+/// A non-numeric sidecar value trips the script's `-1` path, which
+/// `claim_poll_slot` surfaces as `InvalidData` (500-masked, never an
+/// admission).
+#[tokio::test]
+async fn claim_poll_slot_corrupt_marker_fails_closed() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let device_hash = unique("device");
+  let key = device::poll_key(&store, &device_hash);
+  let _: () = redis::cmd("SET")
+    .arg(&key)
+    .arg("not-a-number")
+    .query_async(&mut conn)
+    .await?;
+
+  match device::claim_poll_slot(
+    &mut conn,
+    &store,
+    &device_hash,
+    1_700_000_000,
+    Duration::from_secs(5),
+    Duration::from_secs(600),
+  )
+  .await
+  {
+    Err(StoreError::InvalidData) => Ok(()),
+    Ok(slot) => Err(TestError::Unexpected(format!(
+      "corrupt poll marker must fail closed, admitted {slot:?}"
+    ))),
+    Err(error) => Err(TestError::Unexpected(format!(
+      "corrupt poll marker must be InvalidData, got {error:?}"
+    ))),
+  }
+}
+
+/// Generic Lua-runtime failures (`ERR`/`EXECABORT` server errors that are not
+/// `WRONGTYPE`) are programming errors: they must map to masked
+/// `server_error` (500) so 500-alerts fire, while genuine infrastructure
+/// (`OOM`, `READONLY`, `CROSSSLOT`, auth, transient/connection) stays 503.
+#[test]
+fn store_error_classification_lua_runtime_is_500() -> TestResult {
+  use crate::error::{AppError, OAuthErrorCode};
+  use axum::http::StatusCode;
+
+  let lua_err = redis::RedisError::from((
+    redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+    "ERR Error running script: @user_script:1: bad argument",
+  ));
+  let exec_abort = redis::RedisError::from((
+    redis::ErrorKind::Server(redis::ServerErrorKind::ExecAbort),
+    "EXECABORT Script aborted",
+  ));
+  for error in [lua_err, exec_abort] {
+    let mapped = AppError::from(StoreError::Redis(error));
+    if mapped.code() != OAuthErrorCode::ServerError {
+      return Err(TestError::Unexpected(
+        "generic Lua-runtime failure must map to server_error".to_owned(),
+      ));
+    }
+    if mapped.status() != StatusCode::INTERNAL_SERVER_ERROR {
+      return Err(TestError::Unexpected(
+        "generic Lua-runtime failure must render 500".to_owned(),
+      ));
+    }
+  }
+
+  // Genuine infrastructure stays fail-closed 503.
+  let oom_value = redis::parse_redis_value(b"-OOM command not allowed\r\n");
+  let oom = match oom_value {
+    Ok(redis::Value::ServerError(server)) => redis::RedisError::from(server),
+    _ => {
+      return Err(TestError::Unexpected(
+        "expected an OOM server error value".to_owned(),
+      ));
+    }
+  };
+  let readonly = redis::RedisError::from((
+    redis::ErrorKind::Server(redis::ServerErrorKind::ReadOnly),
+    "ro",
+  ));
+  let cross_slot = redis::RedisError::from((
+    redis::ErrorKind::Server(redis::ServerErrorKind::CrossSlot),
+    "slot",
+  ));
+  let auth = redis::RedisError::from((redis::ErrorKind::AuthenticationFailed, "auth"));
+  let transient = redis::RedisError::from(std::io::Error::new(
+    std::io::ErrorKind::TimedOut,
+    "timed out",
+  ));
+  for error in [oom, readonly, cross_slot, auth, transient] {
+    let mapped = AppError::from(StoreError::Redis(error));
+    if mapped.code() != OAuthErrorCode::TemporarilyUnavailable {
+      return Err(TestError::Unexpected(
+        "infra failure must map to temporarily_unavailable".to_owned(),
+      ));
+    }
+    if mapped.status() != StatusCode::SERVICE_UNAVAILABLE {
+      return Err(TestError::Unexpected(
+        "infra failure must render 503".to_owned(),
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// T3-B1: `decide` (EXISTS then HSET) racing `consume` (atomic DEL) must
+/// never resurrect a zombie record. Every round puts a fresh record and runs
+/// both ops concurrently; after both settle the key must be gone in every
+/// case (decide won and consume reaped the verdict, or consume won and
+/// decide saw the miss) — a surviving record is a verdict recreated after
+/// the delete, i.e. a lost update.
+#[tokio::test]
+async fn store_device_decide_consume_leaves_no_zombie() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let client = unique("client");
+  for round in 0..100u32 {
+    let device_hash = format!("{}-{round:03}", unique("device-race"));
+    let user_code = format!("{}-{round:03}", unique("user-race"));
+    let grant = format!("{}-{round:03}", unique("grant-race"));
+    device::put(
+      &mut conn,
+      &store,
+      &device_hash,
+      &user_code,
+      &device::DeviceRecord {
+        client_id: client.clone(),
+        scope: "orders:read".to_owned(),
+        status: device::DeviceStatus::Pending,
+        subject: String::new(),
+        grant_id: String::new(),
+      },
+      Duration::from_secs(600),
+    )
+    .await?;
+    let decide_task = tokio::spawn({
+      let conn = conn.clone();
+      let store = store.clone();
+      let device_hash = device_hash.clone();
+      let grant = grant.clone();
+      async move {
+        let mut conn = conn;
+        device::decide(
+          &mut conn,
+          &store,
+          &device_hash,
+          device::DeviceStatus::Approved,
+          "user-1",
+          &grant,
+        )
+        .await
+      }
+    });
+    let consume_task = tokio::spawn({
+      let conn = conn.clone();
+      let store = store.clone();
+      let device_hash = device_hash.clone();
+      async move {
+        let mut conn = conn;
+        device::consume(&mut conn, &store, &device_hash).await
+      }
+    });
+    let decided = decide_task
+      .await
+      .map_err(|_| TestError::Join)?
+      .map_err(|error| TestError::Unexpected(format!("round {round} decide: {error:?}")))?;
+    let consumed_present = consume_task
+      .await
+      .map_err(|_| TestError::Join)?
+      .map_err(|error| TestError::Unexpected(format!("round {round} consume: {error:?}")))?
+      .is_some();
+    let observed = device::poll(&mut conn, &store, &device_hash)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("round {round} poll: {error:?}")))?;
+    if observed.is_some() {
+      return Err(TestError::Unexpected(format!(
+        "round {round}: zombie (decided={decided}, consumed={consumed_present})"
+      )));
+    }
+  }
+  Ok(())
+}
+
+/// T3-B4: a rotation into a revoked grant must be fenced, never minted.
+///
+/// A token minted mid-cascade (live record, grant record already gone) must
+/// not rotate into fresh tokens: the fence rejects with `Absent`, writes no
+/// new records, indexes no new members, and leaves the presented record live
+/// (fail closed, no cascade on a fenced write).
+#[tokio::test]
+async fn store_grant_revoke_fence_rejects_rotation_into_revoked_grant() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let grant = unique("grant");
+  let client = unique("client");
+  let old = unique("old-refresh");
+  let pepper = b"store-test-pepper";
+
+  grants::create(
+    &mut conn,
+    &store,
+    &grants::GrantRecord {
+      grant_id: grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "orders:read".to_owned(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  tokens::put_refresh(
+    &mut conn,
+    &store,
+    &old,
+    &refresh_record(&client, &grant),
+    Duration::from_secs(3600),
+  )
+  .await?;
+  grants::revoke(&mut conn, &store, &grant).await?;
+
+  // The mid-cascade mint: a live record re-indexed after the grant record
+  // died (the rotation SADD that slipped through the revoke snapshot).
+  let late_old = unique("late-refresh");
+  tokens::put_refresh(
+    &mut conn,
+    &store,
+    &late_old,
+    &refresh_record(&client, &grant),
+    Duration::from_secs(3600),
+  )
+  .await?;
+
+  let new_refresh = unique("fenced-refresh");
+  let new_access = unique("fenced-access");
+  let outcome = tokens::rotate(
+    &mut conn,
+    &store,
+    pepper,
+    &rotation_input(&late_old, &client, &new_refresh, &new_access, &grant, None),
+  )
+  .await?;
+  if !matches!(outcome, tokens::RotateOutcome::Absent) {
+    return Err(TestError::Unexpected(
+      "rotation into a revoked grant must be fenced to Absent".to_owned(),
+    ));
+  }
+  if tokens::get_refresh(&mut conn, &store, &new_refresh)
+    .await?
+    .is_some()
+    || tokens::get_access(&mut conn, &store, &new_access)
+      .await?
+      .is_some()
+  {
+    return Err(TestError::Unexpected(
+      "fenced rotation must leave no minted records behind".to_owned(),
+    ));
+  }
+  if grants::members(&mut conn, &store, &grant)
+    .await?
+    .iter()
+    .any(|member| member == &new_refresh || member == &new_access)
+  {
+    return Err(TestError::Unexpected(
+      "fenced rotation must index no new members".to_owned(),
+    ));
+  }
+  if tokens::get_refresh(&mut conn, &store, &late_old)
+    .await?
+    .is_none()
+  {
+    return Err(TestError::Unexpected(
+      "fenced rotation must not cascade on the presented record".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// T3-B4: one `revoke` call drains members indexed mid-cascade.
+///
+/// A single-shot `SMEMBERS`-snapshot revoke leaves a member `SADD`ed after
+/// its snapshot alive; `revoke` must loop until the grant set reads empty so
+/// a mint that lands mid-cascade is deleted by a later pass.
+#[tokio::test]
+async fn store_grant_revoke_drains_mid_cascade_members() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let grant = unique("grant");
+  let client = unique("client");
+
+  grants::create(
+    &mut conn,
+    &store,
+    &grants::GrantRecord {
+      grant_id: grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "orders:read".to_owned(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  tokens::put_refresh(
+    &mut conn,
+    &store,
+    &unique("seed-refresh"),
+    &refresh_record(&client, &grant),
+    Duration::from_secs(3600),
+  )
+  .await?;
+  tokens::put_access(
+    &mut conn,
+    &store,
+    &unique("seed-access"),
+    &access_record(&client, &grant),
+    Duration::from_secs(300),
+  )
+  .await?;
+
+  // First pass: the cascade snapshot. A mint lands after it (the SADD the
+  // single-shot script can never see).
+  let set_key = store.grant_tokens_key(&grant);
+  let grant_key = store.grant_key(&grant);
+  let mut first = super::SCRIPT_GRANT_REVOKE.prepare_invoke();
+  first.key(set_key.as_str()).key(grant_key.as_str());
+  first
+    .arg(store.refresh_key_prefix().as_str())
+    .arg(store.access_key_prefix().as_str());
+  let _: u64 = first.invoke_async(&mut conn).await?;
+
+  let late_refresh = unique("late-refresh");
+  let late_access = unique("late-access");
+  tokens::put_refresh(
+    &mut conn,
+    &store,
+    &late_refresh,
+    &refresh_record(&client, &grant),
+    Duration::from_secs(3600),
+  )
+  .await?;
+  tokens::put_access(
+    &mut conn,
+    &store,
+    &late_access,
+    &access_record(&client, &grant),
+    Duration::from_secs(300),
+  )
+  .await?;
+
+  // One `revoke` call must drain the stragglers: no survivor records, an
+  // empty index, and a count that includes the late pair.
+  let drained = grants::revoke(&mut conn, &store, &grant).await?;
+  if drained < 2 {
+    return Err(TestError::Unexpected(
+      "revoke must count the mid-cascade pair".to_owned(),
+    ));
+  }
+  if tokens::get_refresh(&mut conn, &store, &late_refresh)
+    .await?
+    .is_some()
+    || tokens::get_access(&mut conn, &store, &late_access)
+      .await?
+      .is_some()
+  {
+    return Err(TestError::Unexpected(
+      "revoke must delete tokens minted mid-cascade".to_owned(),
+    ));
+  }
+  if !grants::members(&mut conn, &store, &grant).await?.is_empty() {
+    return Err(TestError::Unexpected(
+      "revoke must leave the grant set empty".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// T3-B5: a barrier failure after the rotation write returns the originating
+/// request's tokens instead of a whole-grant lockout.
+///
+/// On a replica-less `WAIT` node the barrier always fails closed; the
+/// originating rotation (this request id) must still resolve to its
+/// already-minted pair (`RotatedUnbarriered`), while a non-originating request id on the
+/// tombstoned old token still cascades (fail closed, no tokens).
+#[tokio::test]
+async fn store_rotation_barrier_failure_returns_replay_for_originating_id() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, durable) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let fragile = Store::from_parts(
+    "oauth:{state}:".to_owned(),
+    "oauth:{rl}:".to_owned(),
+    DurabilityMode::Wait,
+  );
+  let grant = unique("grant");
+  let client = unique("client");
+  let old = unique("old-refresh");
+  let new_refresh = unique("new-refresh");
+  let new_access = unique("new-access");
+  let pepper = b"store-test-pepper";
+
+  grants::create(
+    &mut conn,
+    &durable,
+    &grants::GrantRecord {
+      grant_id: grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "orders:read".to_owned(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  tokens::put_refresh(
+    &mut conn,
+    &durable,
+    &old,
+    &refresh_record(&client, &grant),
+    Duration::from_secs(3600),
+  )
+  .await?;
+
+  let outcome = tokens::rotate(
+    &mut conn,
+    &fragile,
+    pepper,
+    &rotation_input(&old, &client, &new_refresh, &new_access, &grant, None),
+  )
+  .await?;
+  match outcome {
+    tokens::RotateOutcome::RotatedUnbarriered {
+      new_refresh_hash,
+      new_access_hash,
+    } if new_refresh_hash == new_refresh && new_access_hash == new_access => {}
+    _ => {
+      return Err(TestError::Unexpected(
+        "barrier failure must return the originating pair as RotatedUnbarriered".to_owned(),
+      ));
+    }
+  }
+  if tokens::get_refresh(&mut conn, &durable, &new_refresh)
+    .await?
+    .is_none()
+    || tokens::get_access(&mut conn, &durable, &new_access)
+      .await?
+      .is_none()
+  {
+    return Err(TestError::Unexpected(
+      "originating pair must be readable after barrier failure".to_owned(),
+    ));
+  }
+
+  // A non-originating request id on the tombstoned old token gets no tokens:
+  // reuse, plus the cascade.
+  let request_id = tokens::derive_rotation_id(pepper, &old)?;
+  let map_key = durable.rotation_map_key(&request_id);
+  let _: () = redis::cmd("DEL")
+    .arg(&map_key)
+    .query_async(&mut conn)
+    .await?;
+  let foreign = tokens::rotate(
+    &mut conn,
+    &durable,
+    pepper,
+    &rotation_input(
+      &old,
+      &client,
+      &unique("foreign"),
+      &unique("foreign-a"),
+      &grant,
+      Some("req-foreign".to_owned()),
+    ),
+  )
+  .await?;
+  if !matches!(foreign, tokens::RotateOutcome::Reused { .. }) {
+    return Err(TestError::Unexpected(
+      "non-originating retry must stay fail-closed reuse".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// T3-B5: a barrier failure after a winning replay-marker claim must not burn
+/// the proof.
+///
+/// The marker is removed before the `Durability` error surfaces, so the
+/// originating `jti` can be claimed again; a concurrent non-originating
+/// claimant still loses while the marker stands.
+#[tokio::test]
+async fn store_replay_marker_barrier_failure_does_not_burn_proof() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, durable) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let fragile = Store::from_parts(
+    "oauth:{state}:".to_owned(),
+    "oauth:{rl}:".to_owned(),
+    DurabilityMode::Wait,
+  );
+  let jti = unique("jti");
+  let ttl = Duration::from_secs(300);
+
+  match dcr::claim_dpop_jti(&mut conn, &fragile, &jti, ttl).await {
+    Err(StoreError::Durability) => {}
+    _ => {
+      return Err(TestError::Unexpected(
+        "failing barrier must surface Durability".to_owned(),
+      ));
+    }
+  }
+  let marker: Option<String> = redis::cmd("GET")
+    .arg(durable.dpop_jti_key(&jti))
+    .query_async(&mut conn)
+    .await?;
+  if marker.is_some() {
+    return Err(TestError::Unexpected(
+      "failed claim must not leave the marker behind".to_owned(),
+    ));
+  }
+  if !dcr::claim_dpop_jti(&mut conn, &durable, &jti, ttl).await? {
+    return Err(TestError::Unexpected(
+      "originating jti must be claimable after the failure".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
 /// A field-less `HSET` is a Redis arity error; the empty-pairs guard falls
 /// back to the TTL touch alone, so an existing record keeps its fields and a
 /// live expiry instead of becoming persistent (or erroring out).
@@ -1604,4 +2326,134 @@ async fn store_hset_record_empty_pairs_keeps_ttl() -> TestResult {
     ));
   }
   assert_ttl_within(pttl_ms(&mut conn, &key).await?, ttl)
+}
+
+/// Wait-mode writes without a replica always fail the barrier; the pending
+/// pre-mint must skip it (`Ok`) while the barriered write fails closed.
+#[tokio::test]
+async fn store_put_access_pending_skips_barrier() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, _) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let fragile = Store::from_parts(
+    "oauth:{state}:".to_owned(),
+    "oauth:{rl}:".to_owned(),
+    DurabilityMode::Wait,
+  );
+  let grant = unique("grant");
+  let client = unique("client");
+  let pending_hash = unique("pending-access");
+  let barriered_hash = unique("barriered-access");
+
+  tokens::put_access_pending(
+    &mut conn,
+    &fragile,
+    &pending_hash,
+    &access_record(&client, &grant),
+    Duration::from_secs(300),
+  )
+  .await?;
+  if tokens::get_access(&mut conn, &fragile, &pending_hash)
+    .await?
+    .is_none()
+  {
+    return Err(TestError::Unexpected(
+      "pending write must be readable without a barrier".to_owned(),
+    ));
+  }
+
+  match tokens::put_access(
+    &mut conn,
+    &fragile,
+    &barriered_hash,
+    &access_record(&client, &grant),
+    Duration::from_secs(300),
+  )
+  .await
+  {
+    Err(StoreError::Durability) => Ok(()),
+    Ok(()) => Err(TestError::Unexpected(
+      "barriered write without replicas must fail closed".to_owned(),
+    )),
+    Err(error) => Err(TestError::Unexpected(format!(
+      "barriered write must be Durability, got {error:?}"
+    ))),
+  }
+}
+
+/// A barrier failure still mints a readable pair; revoking the grant must
+/// delete that recovered pair, so no unbarriered token survives revocation.
+#[tokio::test]
+async fn store_recovered_pair_revocable_after_unbarriered_rotation() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, durable) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let fragile = Store::from_parts(
+    "oauth:{state}:".to_owned(),
+    "oauth:{rl}:".to_owned(),
+    DurabilityMode::Wait,
+  );
+  let grant = unique("grant");
+  let client = unique("client");
+  let old = unique("old-refresh");
+  let new_refresh = unique("new-refresh");
+  let new_access = unique("new-access");
+  let pepper = b"store-test-pepper";
+
+  grants::create(
+    &mut conn,
+    &durable,
+    &grants::GrantRecord {
+      grant_id: grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "orders:read".to_owned(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  tokens::put_refresh(
+    &mut conn,
+    &durable,
+    &old,
+    &refresh_record(&client, &grant),
+    Duration::from_secs(3600),
+  )
+  .await?;
+
+  match tokens::rotate(
+    &mut conn,
+    &fragile,
+    pepper,
+    &rotation_input(&old, &client, &new_refresh, &new_access, &grant, None),
+  )
+  .await?
+  {
+    tokens::RotateOutcome::RotatedUnbarriered {
+      new_refresh_hash,
+      new_access_hash,
+    } if new_refresh_hash == new_refresh && new_access_hash == new_access => {}
+    _ => {
+      return Err(TestError::Unexpected(
+        "barrier failure must force RotatedUnbarriered".to_owned(),
+      ));
+    }
+  }
+
+  grants::revoke(&mut conn, &durable, &grant).await?;
+  if tokens::get_refresh(&mut conn, &durable, &new_refresh)
+    .await?
+    .is_some()
+  {
+    return Err(TestError::Unexpected(
+      "revoke must delete the recovered refresh token".to_owned(),
+    ));
+  }
+  if tokens::get_access(&mut conn, &durable, &new_access)
+    .await?
+    .is_some()
+  {
+    return Err(TestError::Unexpected(
+      "revoke must delete the recovered access token".to_owned(),
+    ));
+  }
+  Ok(())
 }

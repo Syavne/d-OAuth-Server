@@ -396,6 +396,23 @@ async fn code_issue_ttl_clamped_to_sixty_seconds() -> TestResult {
   Ok(())
 }
 
+#[test]
+fn code_issuer_debug_redacts_pepper() -> TestResult {
+  let issuer = CodeIssuer::new(&TtlConfig::default(), &test_ring()?)?;
+  let rendered = format!("{issuer:?}");
+  if rendered.contains("code-issue-pepper") {
+    return Err(TestError::Unexpected(
+      "Debug must never print raw pepper bytes".to_owned(),
+    ));
+  }
+  if !rendered.contains("[REDACTED]") {
+    return Err(TestError::Unexpected(
+      "Debug must mark pepper material as [REDACTED]".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
 #[tokio::test]
 async fn code_issue_debug_redacts_raw_code() -> TestResult {
   let (_guard, url) = redis_container().await?;

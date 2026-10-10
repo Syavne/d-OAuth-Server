@@ -3,6 +3,7 @@
 //! Child suites drive the public [`super::super::refresh`] API. Every test
 //! uses unique client/grant labels so the shared keyspace never collides.
 
+mod barrier;
 mod concurrent;
 mod disabled_subject;
 mod entitlements;

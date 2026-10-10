@@ -21,8 +21,8 @@ use std::{collections::HashMap, time::Duration};
 use serde::{Deserialize, Serialize};
 
 use super::{
-  OpClass, SCRIPT_ROTATE_REFRESH, Store, StoreError, durability_barrier, hmac_sha256, hset_record,
-  may_retry_op, retry_op,
+  OpClass, SCRIPT_PUT_MEMBER, SCRIPT_ROTATE_REFRESH, Store, StoreError, durability_barrier,
+  hmac_sha256, may_retry_op, retry_op,
 };
 use crate::state::RedisConn;
 
@@ -30,6 +30,11 @@ use crate::state::RedisConn;
 const ROTATION_MAP_GRACE: Duration = Duration::from_secs(900);
 
 /// A stored access-token record, keyed by the token hash.
+///
+/// `Debug` is intentionally derived: the record holds only identifiers
+/// (`client_id`, `grant_id`, scope, subject, `cnf`) and never a raw token,
+/// so the [`crate::protocol::token::types::FoundAccess`] redaction stays
+/// transitive through this field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessRecord {
   /// Client the token was issued to.
@@ -45,6 +50,11 @@ pub struct AccessRecord {
 }
 
 /// A stored refresh-token record (or tombstone), keyed by the token hash.
+///
+/// `Debug` is intentionally derived: the record holds only identifiers
+/// (`client_id`, `grant_id`, scope, subject, `cnf`) and never a raw token,
+/// so the [`crate::protocol::token::types::FoundRefresh`] redaction stays
+/// transitive through this field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshRecord {
   /// Client the token was issued to.
@@ -105,7 +115,20 @@ pub enum RotateOutcome {
     /// Hash of the new access token.
     new_access_hash: String,
   },
-  /// Idempotent retry: the mapping already held these tokens.
+  /// Rotation applied but the durability barrier failed after this request
+  /// id's write already landed. Only the originating request may resolve to
+  /// these tokens (returned as-is, never discarded); any non-originating
+  /// caller still fails closed through [`RotateOutcome::Replay`] or
+  /// [`RotateOutcome::Reused`].
+  RotatedUnbarriered {
+    /// Hash of the new refresh token.
+    new_refresh_hash: String,
+    /// Hash of the new access token.
+    new_access_hash: String,
+  },
+  /// Idempotent retry: the mapping already held these tokens. The raw pair of
+  /// the first rotation is unrecoverable from hashes alone, so the retry
+  /// cannot be served (fail closed without cascading the grant family).
   Replay {
     /// Hash of the new refresh token.
     new_refresh_hash: String,
@@ -147,6 +170,33 @@ pub async fn put_access(
   record: &AccessRecord,
   ttl: Duration,
 ) -> Result<(), StoreError> {
+  put_access_inner(conn, store, token_hash, record, ttl, true).await
+}
+
+/// Store an access-token record and index it in its grant set WITHOUT the
+/// durability barrier.
+///
+/// Only for the refresh-rotation pre-mint: the pair is unreachable until the
+/// rotation script commits it, and the rotation's own barrier runs on the
+/// same connection afterwards, so it covers these writes before any response.
+pub async fn put_access_pending(
+  conn: &mut RedisConn,
+  store: &Store,
+  token_hash: &str,
+  record: &AccessRecord,
+  ttl: Duration,
+) -> Result<(), StoreError> {
+  put_access_inner(conn, store, token_hash, record, ttl, false).await
+}
+
+async fn put_access_inner(
+  conn: &mut RedisConn,
+  store: &Store,
+  token_hash: &str,
+  record: &AccessRecord,
+  ttl: Duration,
+  apply_barrier: bool,
+) -> Result<(), StoreError> {
   let key = store.access_key(token_hash);
   let set_key = store.grant_tokens_key(&record.grant_id);
   let pairs = record_pairs(
@@ -162,7 +212,11 @@ pub async fn put_access(
       .map_err(store_redis)
   })
   .map_err(StoreError::Redis)?;
-  durability_barrier(conn, store).await
+  if apply_barrier {
+    durability_barrier(conn, store).await
+  } else {
+    Ok(())
+  }
 }
 
 /// Store a refresh-token record and index it in its grant set, then apply the
@@ -173,6 +227,33 @@ pub async fn put_refresh(
   token_hash: &str,
   record: &RefreshRecord,
   ttl: Duration,
+) -> Result<(), StoreError> {
+  put_refresh_inner(conn, store, token_hash, record, ttl, true).await
+}
+
+/// Store a refresh-token record and index it in its grant set WITHOUT the
+/// durability barrier.
+///
+/// Only for the refresh-rotation pre-mint: the pair is unreachable until the
+/// rotation script commits it, and the rotation's own barrier runs on the
+/// same connection afterwards, so it covers these writes before any response.
+pub async fn put_refresh_pending(
+  conn: &mut RedisConn,
+  store: &Store,
+  token_hash: &str,
+  record: &RefreshRecord,
+  ttl: Duration,
+) -> Result<(), StoreError> {
+  put_refresh_inner(conn, store, token_hash, record, ttl, false).await
+}
+
+async fn put_refresh_inner(
+  conn: &mut RedisConn,
+  store: &Store,
+  token_hash: &str,
+  record: &RefreshRecord,
+  ttl: Duration,
+  apply_barrier: bool,
 ) -> Result<(), StoreError> {
   let key = store.refresh_key(token_hash);
   let set_key = store.grant_tokens_key(&record.grant_id);
@@ -189,7 +270,11 @@ pub async fn put_refresh(
       .map_err(store_redis)
   })
   .map_err(StoreError::Redis)?;
-  durability_barrier(conn, store).await
+  if apply_barrier {
+    durability_barrier(conn, store).await
+  } else {
+    Ok(())
+  }
 }
 
 /// Read an access-token record; `Ok(None)` when absent.
@@ -254,10 +339,12 @@ pub async fn tombstone_of(
 
 /// Atomically rotate a refresh token (compare-and-set with reuse signal).
 ///
-/// On `Rotated`/`Replay` the durability barrier is met BEFORE returning. On
-/// `Reused` the grant family is cascade-revoked before returning. On an
-/// indeterminate transport result state is re-read (mapping, then the old
-/// record), never blindly replayed.
+/// On `Rotated` the durability barrier was met before returning; when the
+/// barrier fails after the originating write applied the minted pair is
+/// returned as `RotatedUnbarriered` instead of a lockout error. On `Reused`
+/// the grant family is cascade-revoked before returning. On an indeterminate
+/// transport result state is re-read (mapping, then the old record), never
+/// blindly replayed.
 pub async fn rotate(
   conn: &mut RedisConn,
   store: &Store,
@@ -272,6 +359,7 @@ pub async fn rotate(
   let new_refresh_key = store.refresh_key(&input.new_refresh_hash);
   let new_access_key = store.access_key(&input.new_access_hash);
   let grant_key = store.grant_tokens_key(&input.new_refresh.grant_id);
+  let grant_record_key = store.grant_key(&input.new_refresh.grant_id);
   let map_key = store.rotation_map_key(&request_id);
   let new_refresh_json = input.new_refresh.to_json()?;
   let new_access_json = input.new_access.to_json()?;
@@ -285,6 +373,7 @@ pub async fn rotate(
         new_refresh_key: &new_refresh_key,
         new_access_key: &new_access_key,
         grant_key: &grant_key,
+        grant_record_key: &grant_record_key,
         map_key: &map_key,
         expected_client: &input.expected_client_id,
         new_refresh_json: &new_refresh_json,
@@ -320,7 +409,8 @@ async fn invoke_rotate(
     .key(args.new_refresh_key)
     .key(args.new_access_key)
     .key(args.grant_key)
-    .key(args.map_key);
+    .key(args.map_key)
+    .key(args.grant_record_key);
   invocation
     .arg(args.expected_client)
     .arg(args.new_refresh_json)
@@ -347,6 +437,7 @@ struct InvokeRotate<'a> {
   new_refresh_key: &'a str,
   new_access_key: &'a str,
   grant_key: &'a str,
+  grant_record_key: &'a str,
   map_key: &'a str,
   expected_client: &'a str,
   new_refresh_json: &'a str,
@@ -362,7 +453,7 @@ struct InvokeRotate<'a> {
 }
 
 /// Settle a script reply: barrier first for token-bearing outcomes, cascade
-/// for reuse.
+/// for reuse, fail closed for a fenced (revoked-grant) write.
 async fn finish_rotate(
   conn: &mut RedisConn,
   store: &Store,
@@ -372,15 +463,20 @@ async fn finish_rotate(
   match tag.as_str() {
     "ROTATED" => {
       let (new_refresh, new_access) = take_pair(&parts)?;
-      durability_barrier(conn, store).await?;
-      Ok(RotateOutcome::Rotated {
-        new_refresh_hash: new_refresh,
-        new_access_hash: new_access,
-      })
+      match barrier_or_recover(conn, store).await? {
+        BarrierVerdict::Held => Ok(RotateOutcome::Rotated {
+          new_refresh_hash: new_refresh,
+          new_access_hash: new_access,
+        }),
+        BarrierVerdict::FailedAfterWrite => Ok(RotateOutcome::RotatedUnbarriered {
+          new_refresh_hash: new_refresh,
+          new_access_hash: new_access,
+        }),
+      }
     }
     "REPLAY" => {
       let (new_refresh, new_access) = take_pair(&parts)?;
-      durability_barrier(conn, store).await?;
+      barrier_or_recover(conn, store).await?;
       Ok(RotateOutcome::Replay {
         new_refresh_hash: new_refresh,
         new_access_hash: new_access,
@@ -395,8 +491,34 @@ async fn finish_rotate(
       Ok(RotateOutcome::Reused { rotated_to })
     }
     "ABSENT" => Ok(RotateOutcome::Absent),
+    "NOGRANT" => Ok(RotateOutcome::Absent),
     "MISMATCH" => Ok(RotateOutcome::Mismatch),
     _ => Err(StoreError::InvalidData),
+  }
+}
+
+/// Verdict of the durability barrier for a token-bearing outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarrierVerdict {
+  /// The barrier held; the write is durable.
+  Held,
+  /// The barrier failed after this request id's write already applied: only
+  /// the originating request may resolve to its own pair. Any other failure
+  /// propagates (fail closed for every non-originating caller).
+  FailedAfterWrite,
+}
+
+/// Run the durability barrier for a token-bearing outcome, distinguishing a
+/// held barrier from a failure after this request id's write applied (the
+/// caller resolves the originating request instead of locking out).
+async fn barrier_or_recover(
+  conn: &mut RedisConn,
+  store: &Store,
+) -> Result<BarrierVerdict, StoreError> {
+  match durability_barrier(conn, store).await {
+    Ok(()) => Ok(BarrierVerdict::Held),
+    Err(StoreError::Durability) => Ok(BarrierVerdict::FailedAfterWrite),
+    Err(other) => Err(other),
   }
 }
 
@@ -431,7 +553,7 @@ async fn recover_rotate(
     if new_refresh.is_empty() || new_access.is_empty() {
       return Err(StoreError::InvalidData);
     }
-    durability_barrier(conn, store).await?;
+    barrier_or_recover(conn, store).await?;
     return Ok(RotateOutcome::Replay {
       new_refresh_hash: new_refresh,
       new_access_hash: new_access,
@@ -477,6 +599,25 @@ fn record_pairs(
   ]
 }
 
+/// Write one grant member (record + index entry) in a single Lua script.
+///
+/// Previously this was three round-trips (`HSET`+`PEXPIRE`, `SADD`,
+/// arm-or-extend the set TTL), so a revoke drain could interleave between the
+/// record write and the `SADD`: with the record deleted but the `SADD` still
+/// landing afterwards, the set kept an orphan member (and, symmetrically, a
+/// record could sit briefly with no index entry for the drain to find). One
+/// script closes that post-barrier late-`SADD` orphan window at the producer:
+/// the record and its index entry become visible together.
+///
+/// Residual limits (by design, not by omission): the script is atomic but a
+/// revoke drain is still `SMEMBERS`-then-delete, so a member `SADD`ed after
+/// the drain's snapshot still survives that pass — the drain therefore loops
+/// until the set reads empty and re-reads after the barrier (see
+/// [`super::grants::revoke`]). A mint that lands after the final pass leaves
+/// a live record the cascade never saw; that survivor is contained, not
+/// exploitable: introspection re-checks `users.disabled` (so a
+/// disabled-subject orphan still introspects inactive) and refresh re-checks
+/// current entitlements before minting.
 async fn put_member(
   conn: &mut RedisConn,
   key: &str,
@@ -485,39 +626,19 @@ async fn put_member(
   set_key: &str,
   member: &str,
 ) -> Result<(), StoreError> {
-  hset_record(conn, key, pairs, ttl).await?;
-  let _: () = redis::cmd("SADD")
-    .arg(set_key)
-    .arg(member)
-    .query_async(conn)
+  let mut invocation = SCRIPT_PUT_MEMBER.prepare_invoke();
+  invocation
+    .key(key)
+    .key(set_key)
+    .arg(ttl.as_millis() as u64)
+    .arg(member);
+  for (field, value) in pairs {
+    invocation.arg(field).arg(value);
+  }
+  let _: i64 = invocation
+    .invoke_async(conn)
     .await
     .map_err(StoreError::Redis)?;
-  ensure_set_ttl(conn, set_key, ttl).await
-}
-
-/// Keep the per-grant token set alive at least as long as its longest-lived
-/// member: arm an expiry when the set is persistent, extend it when the member
-/// outlives the current one, never shorten it. The set "lives with the grant"
-/// (docs/REDIS.md) instead of leaking member hashes forever.
-///
-/// Both steps are single atomic commands, so a concurrent writer can never
-/// shorten a longer expiry: `NX` arms only a persistent set (a no-op once one
-/// is set), then `GT` extends only a shorter one.
-async fn ensure_set_ttl(
-  conn: &mut RedisConn,
-  set_key: &str,
-  ttl: Duration,
-) -> Result<(), StoreError> {
-  let ttl_ms = ttl.as_millis() as u64;
-  for mode in ["NX", "GT"] {
-    let _: () = redis::cmd("PEXPIRE")
-      .arg(set_key)
-      .arg(ttl_ms)
-      .arg(mode)
-      .query_async(conn)
-      .await
-      .map_err(StoreError::Redis)?;
-  }
   Ok(())
 }
 
@@ -547,5 +668,184 @@ fn store_redis(error: StoreError) -> redis::RedisError {
   match error {
     StoreError::Redis(inner) => inner,
     _ => redis::RedisError::from((redis::ErrorKind::Client, "store token write failed")),
+  }
+}
+
+#[cfg(test)]
+mod put_member_tests {
+  use std::time::Duration;
+
+  use testcontainers::{
+    GenericImage, ImageExt,
+    core::{IntoContainerPort, WaitFor},
+    runners::AsyncRunner,
+  };
+
+  use super::{AccessRecord, RefreshRecord, get_access, get_refresh, put_access, put_refresh};
+  use crate::{
+    config::{DurabilityMode, RedisConfig, redis::RawRedisConfig},
+    state::RedisConn,
+    store::{Store, StoreError},
+    test_guard::ContainerGuard,
+  };
+
+  type TestResult = Result<(), TestError>;
+
+  #[derive(Debug, thiserror::Error)]
+  enum TestError {
+    #[error("container error: {0}")]
+    Containers(#[from] testcontainers::TestcontainersError),
+    #[error("config error: {0}")]
+    Config(#[from] crate::config::ConfigError),
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+    #[error("unexpected test value: {0}")]
+    Unexpected(String),
+  }
+
+  /// `put_member` lands the record and its grant-set entry in one Lua script,
+  /// so a revoke drain can never observe one without the other: every stream
+  /// below asserts the no-orphan invariant in both directions (each readable
+  /// record is indexed, each indexed member resolves to a live record), the
+  /// record and set TTLs are armed, and a shorter-lived second member never
+  /// shortens the set TTL.
+  #[tokio::test]
+  async fn put_member_writes_record_and_index_atomically() -> TestResult {
+    let container = GenericImage::new("redis", "7.2-alpine")
+      .with_exposed_port(6379.tcp())
+      .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+      .with_cmd(vec!["redis-server", "--appendonly", "yes"])
+      .start()
+      .await?;
+    let guarded = ContainerGuard::new(container);
+    let port = guarded.get_host_port_ipv4(6379).await?;
+    let url = format!("redis://127.0.0.1:{port}");
+    let client = redis::Client::open(url.as_str())?;
+    let manager_config = redis::aio::ConnectionManagerConfig::new()
+      .set_response_timeout(Some(Duration::from_secs(10)))
+      .set_connection_timeout(Some(Duration::from_secs(5)));
+    let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+    let mut conn = RedisConn::Single(manager);
+    let raw = RawRedisConfig {
+      url: Some(url),
+      durability: Some(DurabilityMode::WaitAof),
+      response_timeout_secs: 10,
+      connect_timeout_secs: 5,
+      ..Default::default()
+    };
+    let store = Store::from_config(&RedisConfig::from_raw(raw)?);
+
+    let grant = "put-member-grant";
+    let client_id = "put-member-client";
+    let refresh_hash = "put-member-refresh";
+    let access_hash = "put-member-access";
+    put_refresh(
+      &mut conn,
+      &store,
+      refresh_hash,
+      &RefreshRecord {
+        client_id: client_id.to_owned(),
+        grant_id: grant.to_owned(),
+        scope: "orders:read".to_owned(),
+        subject: "user-1".to_owned(),
+        cnf: String::new(),
+      },
+      Duration::from_secs(3600),
+    )
+    .await?;
+    put_access(
+      &mut conn,
+      &store,
+      access_hash,
+      &AccessRecord {
+        client_id: client_id.to_owned(),
+        grant_id: grant.to_owned(),
+        scope: "orders:read".to_owned(),
+        subject: "user-1".to_owned(),
+        cnf: String::new(),
+      },
+      Duration::from_secs(300),
+    )
+    .await?;
+
+    // Direction 1: every readable record is indexed.
+    if get_refresh(&mut conn, &store, refresh_hash)
+      .await?
+      .is_none()
+    {
+      return Err(TestError::Unexpected(
+        "refresh record must be readable".to_owned(),
+      ));
+    }
+    if get_access(&mut conn, &store, access_hash).await?.is_none() {
+      return Err(TestError::Unexpected(
+        "access record must be readable".to_owned(),
+      ));
+    }
+    let set_key = store.grant_tokens_key(grant);
+    for hash in [refresh_hash, access_hash] {
+      let indexed: bool = redis::cmd("SISMEMBER")
+        .arg(&set_key)
+        .arg(hash)
+        .query_async(&mut conn)
+        .await?;
+      if !indexed {
+        return Err(TestError::Unexpected(format!(
+          "{hash} must be indexed in the grant set"
+        )));
+      }
+    }
+
+    // Direction 2: every indexed member resolves to a live record (no orphan
+    // index entries from a record write racing its own SADD).
+    let members: Vec<String> = redis::cmd("SMEMBERS")
+      .arg(&set_key)
+      .query_async(&mut conn)
+      .await?;
+    if members.len() != 2 {
+      return Err(TestError::Unexpected(format!(
+        "grant set must hold exactly the pair, saw {}",
+        members.len()
+      )));
+    }
+    for member in &members {
+      let live = get_refresh(&mut conn, &store, member).await?.is_some()
+        || get_access(&mut conn, &store, member).await?.is_some();
+      if !live {
+        return Err(TestError::Unexpected(format!(
+          "indexed {member} must resolve to a record"
+        )));
+      }
+    }
+
+    // TTLs preserved: the record and the set both carry an expiry.
+    let record_pttl: i64 = redis::cmd("PTTL")
+      .arg(store.refresh_key(refresh_hash))
+      .query_async(&mut conn)
+      .await?;
+    let set_pttl: i64 = redis::cmd("PTTL")
+      .arg(&set_key)
+      .query_async(&mut conn)
+      .await?;
+    if record_pttl <= 0 {
+      return Err(TestError::Unexpected(
+        "refresh record must carry a TTL".to_owned(),
+      ));
+    }
+    if set_pttl <= 0 {
+      return Err(TestError::Unexpected(
+        "grant set must carry a TTL".to_owned(),
+      ));
+    }
+    // The 300 s access member must not have shortened the set TTL armed by the
+    // 3600 s refresh member (arm-or-extend, never shorten).
+    if set_pttl <= 1_000_000 {
+      return Err(TestError::Unexpected(format!(
+        "grant set TTL must track the longest-lived member, saw {set_pttl} ms"
+      )));
+    }
+    Ok(())
   }
 }

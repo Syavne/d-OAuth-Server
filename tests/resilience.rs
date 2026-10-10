@@ -44,6 +44,7 @@ use d_oauth::{
   store::{
     ErrorClass, OpClass, Store, StoreError, classify_redis,
     dcr::claim_dpop_jti,
+    grants::{GrantRecord, create as create_grant},
     tokens::{
       AccessRecord, RefreshRecord, RotateOutcome, RotationInput, get_refresh, put_refresh, rotate,
       tombstone_of,
@@ -321,6 +322,18 @@ async fn seed_refresh(
       scope: "api:read".to_owned(),
       subject: "user-1".to_owned(),
       cnf: String::new(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  create_grant(
+    &mut conn,
+    &store,
+    &GrantRecord {
+      grant_id: grant.to_owned(),
+      client_id: client.to_owned(),
+      subject: "user-1".to_owned(),
+      scope: "api:read".to_owned(),
     },
     Duration::from_secs(3600),
   )

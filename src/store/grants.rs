@@ -78,25 +78,6 @@ pub async fn get(
     .transpose()
 }
 
-/// Index a token hash in its grant set (idempotent `SADD`).
-pub async fn add_token(
-  conn: &mut RedisConn,
-  store: &Store,
-  grant_id: &str,
-  token_hash: &str,
-) -> Result<(), StoreError> {
-  let set_key = store.grant_tokens_key(grant_id);
-  retry_op!(conn, store.retry_budget(), async {
-    let _: () = redis::cmd("SADD")
-      .arg(&set_key)
-      .arg(token_hash)
-      .query_async(conn)
-      .await?;
-    Ok(())
-  })
-  .map_err(StoreError::Redis)
-}
-
 /// List the token hashes indexed under a grant.
 pub async fn members(
   conn: &mut RedisConn,
@@ -113,8 +94,21 @@ pub async fn members(
   .map_err(StoreError::Redis)
 }
 
-/// Cascade-revoke a grant: atomically delete every member token key plus the
-/// grant set and record (single-slot Lua, no `KEYS` scan).
+/// Cascade-revoke a grant: delete every member token key plus the grant set
+/// and record (single-slot Lua, no `KEYS` scan).
+///
+/// One script pass is atomic but blind to a mint racing the cascade: a member
+/// `SADD`ed after the pass's `SMEMBERS` snapshot would survive with live
+/// records. The pass therefore repeats until the set reads empty (bounded),
+/// so a token minted mid-cascade is deleted by a later pass instead of
+/// surviving the revoke.
+///
+/// The bound is fail-closed: when the set is still non-empty after the pass
+/// budget (a mint landing after every snapshot), revocation reports
+/// [`super::StoreError::InvalidData`] instead of a silent success count, and
+/// a post-barrier re-read rejects a member `SADD`ed after the final pass the
+/// same way — a late `SADD` can never leave a live TTL-less member behind
+/// quietly.
 ///
 /// Returns the number of token keys deleted. Unknown grants revoke to zero.
 pub async fn revoke(
@@ -122,23 +116,66 @@ pub async fn revoke(
   store: &Store,
   grant_id: &str,
 ) -> Result<u64, StoreError> {
+  revoke_with_passes(conn, store, grant_id, REVOKE_DRAIN_PASSES).await
+}
+
+/// Drain budget: enough passes to absorb a racing mint, small enough to fail
+/// closed fast under continuous churn.
+const REVOKE_DRAIN_PASSES: u32 = 8;
+
+/// Cascade-revoke with an explicit drain budget (the production path uses
+/// [`REVOKE_DRAIN_PASSES`]); a zero budget models an already-exhausted drain.
+pub(crate) async fn revoke_with_passes(
+  conn: &mut RedisConn,
+  store: &Store,
+  grant_id: &str,
+  max_passes: u32,
+) -> Result<u64, StoreError> {
   let set_key = store.grant_tokens_key(grant_id);
   let grant_key = store.grant_key(grant_id);
   let refresh_prefix = store.refresh_key_prefix();
   let access_prefix = store.access_key_prefix();
-  let mut invocation = SCRIPT_GRANT_REVOKE.prepare_invoke();
-  invocation.key(set_key.as_str()).key(grant_key.as_str());
-  invocation
-    .arg(refresh_prefix.as_str())
-    .arg(access_prefix.as_str());
-  let deleted: u64 = invocation
-    .invoke_async(conn)
-    .await
-    .map_err(StoreError::Redis)?;
+  let mut total = 0_u64;
+  let mut drained = false;
+  for _ in 0..max_passes {
+    let mut invocation = SCRIPT_GRANT_REVOKE.prepare_invoke();
+    invocation.key(set_key.as_str()).key(grant_key.as_str());
+    invocation
+      .arg(refresh_prefix.as_str())
+      .arg(access_prefix.as_str());
+    let deleted: u64 = invocation
+      .invoke_async(conn)
+      .await
+      .map_err(StoreError::Redis)?;
+    total = total.saturating_add(deleted);
+    let remaining: Vec<String> = redis::cmd("SMEMBERS")
+      .arg(&set_key)
+      .query_async(conn)
+      .await
+      .map_err(StoreError::Redis)?;
+    if remaining.is_empty() {
+      drained = true;
+      break;
+    }
+  }
+  if !drained {
+    return Err(StoreError::InvalidData);
+  }
   // Revocation is a reuse-driven security response: barrier it like any
   // tombstone-class write before the caller reports the outcome.
   super::durability_barrier(conn, store).await?;
-  Ok(deleted)
+  // A member `SADD`ed after the final pass would otherwise survive with live
+  // records behind a success count: re-read after the barrier and fail closed.
+  let late: Vec<String> = redis::cmd("SMEMBERS")
+    .arg(&set_key)
+    .query_async(conn)
+    .await
+    .map_err(StoreError::Redis)?;
+  if late.is_empty() {
+    Ok(total)
+  } else {
+    Err(StoreError::InvalidData)
+  }
 }
 
 /// Cascade-revoke the grant family containing `token_hash`: resolve the grant

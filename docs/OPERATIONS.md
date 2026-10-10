@@ -100,8 +100,9 @@ unaffected. Deleting a referenced URI disables it instead.
 
 `kind` selects the URI's role. `authorize` (the default) is an
 authorization-response callback. `post_logout` is a bare return target used only
-by `GET /logout` to send the browser back to the client after the session ends.
-A client may register at most one enabled `post_logout` URI; `GET /logout`
+by `POST /logout` to send the browser back to the client after the session ends
+(`GET /logout` is read-only and issues no redirect).
+A client may register at most one enabled `post_logout` URI; `POST /logout`
 redirects only to it, and only while the URI is enabled and the client active.
 
 ### Declarative config
@@ -372,6 +373,10 @@ survives a Redis loss.
   needed, restrict `pods/exec` to a break-glass role and audit the subresource.
 - Health: liveness `GET /health/live`, readiness `GET /health/ready` on the
   plaintext health listener.
+- Durability barrier: a `RotatedUnbarriered` refresh response means the
+  originating rotation applied but the barrier failed after the write, so the
+  returned pair is the live one; every other barrier failure stays
+  fail-closed (`503`).
 
 ## File and directory references
 

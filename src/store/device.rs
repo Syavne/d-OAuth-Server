@@ -75,6 +75,28 @@ impl DeviceRecord {
   }
 }
 
+/// Polling-attempt sidecar: last poll time (Unix seconds) for a device hash.
+///
+/// It derives from the device record key, so it shares the `{state}` hash
+/// slot, and it carries the device TTL so it can never outlive its record by
+/// more than one issuance lifetime.
+#[must_use]
+pub fn poll_key(store: &Store, device_hash: &str) -> String {
+  format!("{}:poll", store.device_key(device_hash))
+}
+
+/// Outcome of one atomic polling-interval gate attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollSlot {
+  /// This attempt is allowed; the stamp now reads the attempt time.
+  Allowed,
+  /// Too fast: wait this many whole seconds (the stamp still advanced).
+  SlowDown {
+    /// Whole seconds the device should wait before polling again.
+    retry_after_secs: u64,
+  },
+}
+
 /// Store a device record and its user-code mapping (both idempotent rewrites).
 pub async fn put(
   conn: &mut RedisConn,
@@ -139,6 +161,10 @@ pub async fn resolve_user_code(
 
 /// Record the user's verdict and bind the grant; returns false when the
 /// device record is already gone.
+///
+/// The existence check and the write run as one Lua script, so a verdict
+/// racing the atomic consume can neither resurrect a zombie record nor lose
+/// the consume's delete. The key TTL is preserved.
 pub async fn decide(
   conn: &mut RedisConn,
   store: &Store,
@@ -149,24 +175,52 @@ pub async fn decide(
 ) -> Result<bool, StoreError> {
   let key = store.device_key(device_hash);
   let budget = store.retry_budget();
-  retry_op!(conn, budget, async {
-    let exists: bool = redis::cmd("EXISTS").arg(&key).query_async(conn).await?;
-    if !exists {
-      return Ok(false);
-    }
-    redis::cmd("HSET")
-      .arg(&key)
-      .arg("status")
-      .arg(status.as_str())
-      .arg("subject")
-      .arg(subject)
-      .arg("grant_id")
-      .arg(grant_id)
-      .query_async::<()>(conn)
-      .await?;
-    Ok(true)
+  let applied: i64 = retry_op!(conn, budget, async {
+    let mut invocation = super::SCRIPT_DEVICE_DECIDE.prepare_invoke();
+    invocation.key(key.as_str());
+    invocation.arg(status.as_str());
+    invocation.arg(subject);
+    invocation.arg(grant_id);
+    invocation.invoke_async(conn).await
   })
-  .map_err(StoreError::Redis)
+  .map_err(StoreError::Redis)?;
+  Ok(applied == 1)
+}
+
+/// Enforce the polling interval and count this attempt, atomically.
+///
+/// The read-compare-write runs as one Lua compare-and-set, so concurrent
+/// polls cannot both pass the gate: exactly one attempt is admitted and the
+/// rest observe `slow_down`. A corrupt marker surfaces as
+/// [`StoreError::InvalidData`] (fail closed, never fail open).
+pub async fn claim_poll_slot(
+  conn: &mut RedisConn,
+  store: &Store,
+  device_hash: &str,
+  now_unix: i64,
+  interval: Duration,
+  device_ttl: Duration,
+) -> Result<PollSlot, StoreError> {
+  let key = poll_key(store, device_hash);
+  let budget = store.retry_budget();
+  let interval_secs = interval.as_secs();
+  let ttl_ms = device_ttl.as_millis() as u64;
+  let outcome: i64 = retry_op!(conn, budget, async {
+    let mut invocation = super::SCRIPT_DEVICE_POLL_CAS.prepare_invoke();
+    invocation.key(key.as_str());
+    invocation.arg(now_unix);
+    invocation.arg(interval_secs);
+    invocation.arg(ttl_ms);
+    invocation.invoke_async(conn).await
+  })
+  .map_err(StoreError::Redis)?;
+  match outcome {
+    0 => Ok(PollSlot::Allowed),
+    wait if wait > 0 => Ok(PollSlot::SlowDown {
+      retry_after_secs: wait as u64,
+    }),
+    _ => Err(StoreError::InvalidData),
+  }
 }
 
 /// Atomically consume an approved device record for token issuance.

@@ -78,8 +78,8 @@ pub fn hash_password(config: &Config, password: &str) -> Result<String, CliError
 
 /// Keyed token hash for at-rest storage under the active pepper.
 ///
-/// The numeric generation is derived from the configured key id (`v1` → `1`)
-/// so rotated peppers retain distinct storage strings.
+/// The configured key id is preserved verbatim, so rotated peppers retain
+/// distinct storage strings.
 ///
 /// # Errors
 /// Returns [`CliError::Crypto`] when no active pepper is configured.
@@ -88,9 +88,8 @@ pub fn token_hash(config: &Config, token: &str) -> Result<String, CliError> {
     .keys
     .active_pepper()
     .ok_or_else(|| CliError::Crypto("no active token pepper configured".to_owned()))?;
-  let generation = numeric_key_id(key_id.as_str());
   let hash = crate::crypto::tokens::token_hash(
-    &crate::crypto::tokens::KeyId::new(generation),
+    &crate::crypto::tokens::KeyId::new(key_id.as_str()),
     pepper.expose_secret().as_bytes(),
     token,
   );
@@ -464,10 +463,6 @@ impl hkdf::KeyType for HkdfAesKey {
   fn len(&self) -> usize {
     KEY_LEN
   }
-}
-
-fn numeric_key_id(key_id: &str) -> u32 {
-  key_id.trim_start_matches('v').parse::<u32>().unwrap_or(1)
 }
 
 fn pem_encode(label: &str, der: &[u8]) -> String {

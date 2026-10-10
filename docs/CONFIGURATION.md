@@ -179,7 +179,11 @@ The exact environment spellings:
 
 The token pepper and the PII field-encryption key are required: without either
 the key ring cannot be built and the server refuses to start with
-`MissingPiiKey` (or `MissingPepper`). The shipped cluster manifests set
+`MissingPiiKey` (or `MissingPepper`). Key ids (`token_pepper_id`,
+`totp_key_id`, `pii_key_id`, and any `*_previous_key_id`) are stored verbatim:
+token hashes as `<kid>.<digest>` (split on the first `.`) and PII blind
+indexes as `<kid>:<digest>`, so an id must contain neither `.` (token split)
+nor `:` (PII ambiguity); keep to `[A-Za-z0-9_-]+`. The shipped cluster manifests set
 `D_OAUTH_TOKEN_PEPPER_FILE`, `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, and
 `D_OAUTH_PII_ENCRYPTION_KEY_FILE` rather than the inline keys; see
 [DEPLOYMENT.md](DEPLOYMENT.md).

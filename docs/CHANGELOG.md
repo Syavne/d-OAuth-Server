@@ -25,9 +25,13 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   expand/dual-write/scale-to-zero-backfill/cutover rollout, and the PII/TOTP
   rotation runbooks across `docs/DATABASE.md`, `docs/SECURITY.md`,
   `docs/CONFIGURATION.md`, and `docs/OPERATIONS.md`.
-- `GET /logout` (a server-specific session endpoint, not an OAuth 2.1 or OIDC
-  feature) ends the browser session so a different user can sign in. It destroys
-  the session and expires the cookie, then renders a neutral page or redirects to
+- `GET /logout` and `POST /logout` (a server-specific session endpoint, not
+  an OAuth 2.1 or OIDC feature) end the browser session so a different user
+  can sign in. `GET /logout` is read-only: it renders a confirm page (live
+  session) or a neutral signed-out page (anonymous) and never destroys the
+  session or writes cookies. Only `POST /logout`, carrying the session-bound
+  CSRF `form_token`, destroys the session and expires the cookie, then renders
+  a neutral page or redirects to
   the flow's registered `post_logout` URI. It accepts no query parameters: the
   redirect target is frozen in session meta when the authorization flow is bound
   and used only while the owning client is active and still registers that exact
@@ -65,6 +69,11 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   revoke, standalone tokens, and the lockout counter) before flipping
   `users.disabled`; a Redis failure aborts before the flag changes, so the
   command fails closed.
+- `POST /revoke` authenticates mTLS-registered clients (RFC 8705 §2) with the
+  verified peer chain injected by the TLS accept loop, exactly as the token and
+  introspection endpoints do; a missing or unregistered chain fails closed as
+  `invalid_client`. Client certificates are expected to be short-lived, so
+  expiry bounds exposure without a revocation list.
 
 ### Changed
 
@@ -88,6 +97,14 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   proxy-header fallback is removed.
 - The login lockout now also covers TOTP enrollment confirmation, and the rate
   limiter classifies requests by their full path.
+- Key ids are `String`-backed and preserved verbatim end to end: a `vN` id
+  mixes the 4-byte big-endian generation into the token HMAC message
+  (byte-identical to the pre-change scheme) and any other id mixes its UTF-8
+  bytes, stored as `<kid>.<digest>`, so non-`vN` labels hash distinctly and
+  every `trim/parse::<u32>` collapse site is gone. Back-compat is scoped to
+  `vN` ids: hashes issued under an old `vN` id keep verifying through the
+  retained-key chain (newest-first, capped at 8 generations), so rotation
+  needs no re-issuance.
 
 ### Security
 
@@ -106,6 +123,27 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   algorithm allowlist.
 - DCR `open` redirect policy now accepts only `https` or RFC 8252 loopback
   URIs, and the SSRF guard pins the fetch to the addresses it pre-validated.
+- Secret-holding token types keep a locked `Debug`: the pepper,
+  `TokenService`, and minted pairs print ids/lengths plus a `[REDACTED]`
+  marker, never raw pepper bytes or token strings, and the located-token
+  wrappers stay transitive through identifier-only records. Positive
+  `[REDACTED]` assertions pin the markers.
+- Regression tests pin the hardening headers (`no-store`, `nosniff`) on
+  every short-circuit path: limiter 429/503, CORS preflights, body-limit
+  413, and resilience 503.
+- The TOTP replay fingerprint is an HMAC under the token pepper instead of
+  unkeyed SHA-256, so a Redis dump no longer exposes the 6-digit code space.
+- JAR request objects are verified against an explicit asymmetric allowlist
+  (`RS256`/`PS256`/`ES256`/`EdDSA`, kept in sync with the `private_key_jwt`
+  assertion allowlist); anything else is rejected before key selection.
+- Token lookup validates the 43-char base64url shape before HMAC and Redis
+  work, so junk tokens are rejected fast. This is a cost guard only:
+  well-formed lookups still retry retained peppers newest-first.
+- `POST /logout` verifies the session-bound CSRF `form_token` and rejects a
+  missing or forged token with `invalid_request` leaving the session intact,
+  so a cross-site POST cannot sign the user out; `GET /logout` is read-only
+  (confirm page, no `Set-Cookie`) and the clearing cookie mirrors every
+  attribute of the session cookie.
 
 ### Fixed
 
@@ -123,6 +161,34 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 - `GET /login?request_id=…` rebinds an already-authenticated session to the
   fresh authorization request instead of redirecting on the session's stale
   pending binding.
+- Permanent Redis infrastructure failures (`OOM`, `READONLY`, `CROSSSLOT`,
+  auth, and connection-type errors) fail closed as `503
+  temporarily_unavailable` instead of `500`, while programming-error classes
+  stay masked as `server_error` so 500-alerts still fire on real bugs.
+- Dead audit-misleading code is removed: the `client_assertion` JOSE stub
+  (the real logic lives in `protocol::client_auth::assertion`) and the
+  caller-less `store::grants::add_token` helper.
+- Auditor-facing comments corrected: the `jose` module TODO no longer lists
+  the deleted stub, the token shape-gate comment no longer claims to mask
+  generation probing, and the two algorithm allowlists carry keep-in-sync
+  pointers.
+- Device `decide` runs a single conditional-`HSET` Lua script instead of
+  `EXISTS`-then-`HSET`, so a concurrent consume cannot leave a zombie record;
+  the device poll marker is a Lua compare-and-set admitting exactly one poller
+  (the rest get `slow_down`).
+- PAR/code consume binds the ownership check into the consume Lua
+  (`consume_bound` over `client_id`, plus `redirect_uri`/PKCE challenge for
+  codes): a foreign-client or wrong-verifier presentation leaves the single-use
+  record intact instead of burning the victim's value.
+- Grant cascade `revoke` drains in a bounded loop until the member set reads
+  empty, and the rotation script carries a grant-record fence (`NOGRANT`
+  before any write), so a token minted mid-cascade is deleted by a later pass
+  or refused outright.
+- A durability-barrier failure after the originating write returns the minted
+  pair (`RotatedUnbarriered` on rotation) or deletes the won DPoP marker so the
+  originating `jti` can re-claim, instead of locking the client out; other
+  callers stay fail-closed (a `Replay` hit discards its orphan pre-mint and
+  rejects with `invalid_grant`).
 
 ## [0.1.0] - 2026-10-03
 

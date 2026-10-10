@@ -146,7 +146,8 @@ once every `uri` is NULL.
 
 `kind` separates the two browser landings: `authorize` URIs are valid
 authorization-response callbacks (they carry `code`/`state`); `post_logout` URIs
-are bare navigation targets used only by `GET /logout`. Both kinds are matched
+are bare navigation targets used only by `POST /logout` (`GET /logout` is
+read-only and issues no redirect). Both kinds are matched
 with the same exact-string + RFC 8252 loopback rule.
 
 ### client_redirect_uris

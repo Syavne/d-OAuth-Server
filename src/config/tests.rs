@@ -551,6 +551,31 @@ fn config_treats_empty_previous_key_as_absent() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn config_rejects_dotted_key_id() {
+  for key in ["token_pepper_id", "totp_key_id", "pii_key_id"] {
+    let mut map = base();
+    map.insert(key.to_owned(), Value::String("v1.evil".to_owned()));
+    assert!(
+      matches!(try_load(&map), Err(ConfigError::InvalidKeyId { .. })),
+      "{key} must reject a dotted key id"
+    );
+  }
+  let mut previous = base();
+  previous.insert(
+    "pii_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PII_PREVIOUS-0123456789abcdef".to_owned()),
+  );
+  previous.insert(
+    "pii_previous_key_id".to_owned(),
+    Value::String("v0.evil".to_owned()),
+  );
+  assert!(matches!(
+    try_load(&previous),
+    Err(ConfigError::InvalidKeyId { .. })
+  ));
+}
+
+#[test]
 fn read_secret_file_preserves_surrounding_spaces() -> Result<(), Box<dyn Error>> {
   use secrecy::ExposeSecret as _;
   let path = std::env::temp_dir().join(format!(

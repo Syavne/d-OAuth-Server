@@ -57,6 +57,10 @@ fn is_registered_request_uri(client: &Client, uri: &str) -> bool {
 
 /// Consume a PAR-issued `request_uri` one-time, bound to `client`.
 ///
+/// The expected client travels inside the consume script: a foreign presenter
+/// observes `Mismatched` and the victim record survives for its owner, so a
+/// cross-client presentation can never burn the single-use value.
+///
 /// # Errors
 ///
 /// Returns `invalid_request` for an empty, unknown, consumed, or
@@ -72,17 +76,19 @@ async fn resolve_par(
   if id.is_empty() {
     return Err(AppError::invalid_request("request_uri is malformed"));
   }
-  let record = par::consume(conn, store, id).await?;
-  let Some(record) = record else {
-    return Err(AppError::invalid_request(
-      "request_uri is unknown, expired, or already used",
-    ));
+  let record = match par::consume_bound(conn, store, id, client.client_id.as_str()).await? {
+    par::ConsumeOutcome::Consumed(record) => record,
+    par::ConsumeOutcome::Mismatched => {
+      return Err(AppError::invalid_request(
+        "request_uri was issued to a different client",
+      ));
+    }
+    par::ConsumeOutcome::Absent => {
+      return Err(AppError::invalid_request(
+        "request_uri is unknown, expired, or already used",
+      ));
+    }
   };
-  if record.client_id != client.client_id {
-    return Err(AppError::invalid_request(
-      "request_uri was issued to a different client",
-    ));
-  }
   let stored: Value = serde_json::from_str(&record.request).map_err(AppError::internal)?;
   let Some(object) = stored.as_object() else {
     return Err(AppError::internal(std::io::Error::new(

@@ -53,6 +53,19 @@ impl KeyId {
   }
 }
 
+/// Whether `id` is storage-safe: non-empty `[A-Za-z0-9_-]+`.
+///
+/// A `.` would collide with the `<kid>.<digest>` storage format and split
+/// stored hashes at the wrong boundary, so it is rejected here and at config
+/// load; empty and whitespace-only values never reach this check as valid.
+#[must_use]
+pub fn is_valid_key_id(id: &str) -> bool {
+  !id.is_empty()
+    && id
+      .bytes()
+      .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 impl fmt::Display for KeyId {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.write_str(&self.0)
@@ -128,6 +141,12 @@ pub enum KeyRingError {
   /// A key id was empty.
   #[error("key id must not be empty")]
   EmptyKeyId,
+  /// A key id contained characters outside `[A-Za-z0-9_-]`.
+  #[error("invalid key id: {id}")]
+  InvalidKeyId {
+    /// The rejected value.
+    id: String,
+  },
   /// The same key id was supplied twice within one purpose chain.
   #[error("duplicate key id: {id}")]
   DuplicateKeyId {
@@ -239,6 +258,11 @@ fn build_chain(
   for (id, secret) in chain {
     if id.is_empty() {
       return Err(KeyRingError::EmptyKeyId);
+    }
+    if !is_valid_key_id(id.as_str()) {
+      return Err(KeyRingError::InvalidKeyId {
+        id: id.as_str().to_owned(),
+      });
     }
     if out.iter().any(|existing| existing.id() == &id) {
       return Err(KeyRingError::DuplicateKeyId {
@@ -364,6 +388,16 @@ mod tests {
     assert!(!debug.contains("new-pii-secret") && !debug.contains("old-pii-secret"));
     assert!(!debug.contains("pepper-secret") && !debug.contains("totp-secret"));
     Ok(())
+  }
+
+  #[test]
+  fn keyring_rejects_dotted_ids() {
+    let dotted = KeyRing::from_parts(
+      vec![pepper("v1.evil", "a")],
+      vec![pepper("v1", "b")],
+      vec![pepper("v1", "c")],
+    );
+    assert!(matches!(dotted, Err(KeyRingError::InvalidKeyId { .. })));
   }
 
   #[test]

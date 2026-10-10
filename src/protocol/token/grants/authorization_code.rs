@@ -102,11 +102,13 @@ pub struct CodeTokenResponse {
 
 /// Redeem an authorization code at the token endpoint (RFC 9700 §4.5.3).
 ///
-/// The client is authenticated, the code is consumed atomically (a missing
-/// record — wrong, expired, or already redeemed — fails with `invalid_grant`
-/// and is never re-consumed), and the consumed record is checked for client
-/// id, redirect URI, PKCE, and sender binding before anything is minted.
-/// Tokens join the code's `grant_id` chain.
+/// The client is authenticated, then the code is consumed atomically bound to
+/// the expected client id, redirect URI, and PKCE challenge: a foreign or
+/// mismatched presentation observes `Mismatched` and the victim record
+/// survives for its legitimate presenter, so a wrong, expired, or
+/// already-redeemed code fails with `invalid_grant` without ever burning a
+/// live value. The consumed record then feeds the sender-binding checks
+/// before anything is minted. Tokens join the code's `grant_id` chain.
 ///
 /// # Errors
 ///
@@ -146,21 +148,20 @@ pub async fn redeem_code(
     ));
   }
 
-  let record = consume_code(state, inputs.code.trim())
-    .await?
-    .ok_or_else(|| AppError::invalid_grant("authorization code is invalid or expired"))?;
-  if record.client_id != client.client_id {
-    return Err(AppError::invalid_grant(
-      "authorization code was issued to another client",
-    ));
-  }
-  if record.redirect_uri != inputs.redirect_uri {
-    return Err(AppError::invalid_grant(
-      "redirect_uri does not match the authorization request",
-    ));
-  }
-  pkce::verify(inputs.code_verifier, Some(record.code_challenge.as_str()))
+  let verifier = inputs
+    .code_verifier
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| AppError::invalid_grant("code_verifier does not match code_challenge"))?;
+  let expected_challenge = pkce::challenge_from_verifier(verifier)
     .map_err(|_| AppError::invalid_grant("code_verifier does not match code_challenge"))?;
+  let record = consume_code(
+    state,
+    inputs.code.trim(),
+    client.client_id.as_str(),
+    inputs.redirect_uri,
+    expected_challenge.as_str(),
+  )
+  .await?;
 
   let proofs = fresh_proofs(state, &client, inputs, used_basic).await?;
   require_dpop_binding(&client, &proofs)?;
@@ -238,40 +239,57 @@ fn candidate_client_id(inputs: &CodeGrantInputs<'_>) -> Option<String> {
   }
 }
 
-/// Atomically consume a code, retrying retained peppers newest-first.
+/// Atomically consume a code bound to its expected presenter values.
 ///
-/// Only the hash under the issuing generation names an existing key; consumes
-/// under the other generations observe absence (a no-op `None`) and never
-/// delete anything, so exactly one caller across all generations observes
-/// the record.
+/// The expected client id, redirect URI, and PKCE challenge travel inside the
+/// consume script: only the hash under the issuing generation names an
+/// existing key, and a generation holding the record but observing a binding
+/// mismatch reports `Mismatched` without deleting anything, so exactly one
+/// matching caller across all generations observes the record while a foreign
+/// presentation leaves the victim value live.
 async fn consume_code(
   state: &mut CodeGrantState<'_>,
   code: &str,
-) -> Result<Option<codes::CodeRecord>, AppError> {
+  expected_client_id: &str,
+  expected_redirect_uri: &str,
+  expected_challenge: &str,
+) -> Result<codes::CodeRecord, AppError> {
   for (id, secret) in state
     .keys
     .peppers_newest_first()
     .take(crypto_tokens::MAX_RETAINED_KEYS)
   {
-    let generation = id
-      .as_str()
-      .trim_start_matches('v')
-      .parse::<u32>()
-      .unwrap_or(1);
     let hash = crypto_tokens::token_hash(
-      &crypto_tokens::KeyId::new(generation),
+      &crypto_tokens::KeyId::new(id.as_str()),
       secret.expose_secret().as_bytes(),
       code,
     )
     .to_storage_string();
-    let consumed = codes::consume(state.conn, state.store, &hash)
-      .await
-      .map_err(AppError::from)?;
-    if consumed.is_some() {
-      return Ok(consumed);
+    match codes::consume_bound(
+      state.conn,
+      state.store,
+      &hash,
+      &[
+        ("client_id", expected_client_id),
+        ("redirect_uri", expected_redirect_uri),
+        ("code_challenge", expected_challenge),
+      ],
+    )
+    .await
+    .map_err(AppError::from)?
+    {
+      codes::ConsumeOutcome::Consumed(record) => return Ok(record),
+      codes::ConsumeOutcome::Mismatched => {
+        return Err(AppError::invalid_grant(
+          "authorization code is invalid or expired",
+        ));
+      }
+      codes::ConsumeOutcome::Absent => {}
     }
   }
-  Ok(None)
+  Err(AppError::invalid_grant(
+    "authorization code is invalid or expired",
+  ))
 }
 
 /// Public clients carry no secret; every other registered method is
@@ -886,20 +904,18 @@ mod tests {
         ));
       }
     }
-    // The code was consumed by the failed attempt: no second redemption.
+    // The mismatched attempt must not burn the victim value: the legitimate
+    // presenter redeems the same code on retry.
     let retry = CodeGrantInputs {
       redirect_uri: REDIRECT,
       ..inputs_clone(&inputs)
     };
-    match redeem_once(&mut h, &retry, now + 1).await {
-      Err(error) if is_invalid_grant(&error) => Ok(()),
-      Err(other) => Err(TestError::Unexpected(format!(
-        "consumed code must stay invalid_grant, got {other}"
-      ))),
-      Ok(_) => Err(TestError::Unexpected(
-        "a mismatched code must not redeem on retry".to_owned(),
-      )),
-    }
+    redeem_once(&mut h, &retry, now + 1)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("mismatched redirect burned the code: {error}"))
+      })?;
+    Ok(())
   }
 
   #[tokio::test]
@@ -943,6 +959,73 @@ mod tests {
         "a code must never redeem for another client".to_owned(),
       )),
     }
+  }
+
+  #[tokio::test]
+  async fn test_grant_code_foreign_client_does_not_consume_victim_code() -> TestResult {
+    let (_container, mut h) = harness().await?;
+    let client_a = unique("victim");
+    let client_b = unique("foreign");
+    for client_id in [&client_a, &client_b] {
+      insert_client(
+        &h,
+        client_id,
+        TokenEndpointAuthMethod::ClientSecretPost,
+        Some("shared-secret"),
+        &[
+          super::GRANT_TYPE_AUTHORIZATION_CODE,
+          GRANT_TYPE_REFRESH_TOKEN,
+        ],
+      )
+      .await?;
+    }
+    let issued = issue_code(&mut h, &client_a, CodeClientKind::Confidential, None).await?;
+    let now = now_unix();
+
+    let foreign = CodeGrantInputs {
+      code: issued.code.as_str(),
+      redirect_uri: REDIRECT,
+      code_verifier: Some(VERIFIER),
+      client_id: Some(client_b.as_str()),
+      basic_header: None,
+      body_secret: Some(secret("shared-secret")),
+      assertion_type: None,
+      assertion: None,
+      dpop_proof: None,
+      peer_certs: None,
+    };
+    match redeem_once(&mut h, &foreign, now).await {
+      Err(error) if is_invalid_grant(&error) => {}
+      Err(other) => {
+        return Err(TestError::Unexpected(format!(
+          "foreign client must be invalid_grant, got {other}"
+        )));
+      }
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "a code must never redeem for another client".to_owned(),
+        ));
+      }
+    }
+
+    let legitimate = CodeGrantInputs {
+      code: issued.code.as_str(),
+      redirect_uri: REDIRECT,
+      code_verifier: Some(VERIFIER),
+      client_id: Some(client_a.as_str()),
+      basic_header: None,
+      body_secret: Some(secret("shared-secret")),
+      assertion_type: None,
+      assertion: None,
+      dpop_proof: None,
+      peer_certs: None,
+    };
+    redeem_once(&mut h, &legitimate, now + 1)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("victim code burned by foreign use: {error}"))
+      })?;
+    Ok(())
   }
 
   #[tokio::test]
@@ -1145,13 +1228,8 @@ mod tests {
       .peppers_newest_first()
       .next()
       .ok_or_else(|| TestError::Unexpected("no pepper configured".to_owned()))?;
-    let generation = key_id
-      .as_str()
-      .trim_start_matches('v')
-      .parse::<u32>()
-      .unwrap_or(1);
     let hash = crypto_tokens::token_hash(
-      &crypto_tokens::KeyId::new(generation),
+      &crypto_tokens::KeyId::new(key_id.as_str()),
       secret.expose_secret().as_bytes(),
       raw,
     )

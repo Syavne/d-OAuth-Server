@@ -164,8 +164,8 @@ Reference: RFC 9126, RFC 9101.
 
 - A confidential client at `/authorize` must use a PAR `request_uri` or a signed
   `request` object. This is mandatory, not optional.
-- A JAR request object must be signed; `none` and symmetric algorithms are
-  rejected. `iss` must equal `client_id`, `aud` must be the issuer, and conflicts
+- A JAR request object must be signed with `RS256`, `PS256`, `ES256`, or `EdDSA`;
+  `none` and everything else are rejected before key selection. `iss` must equal `client_id`, `aud` must be the issuer, and conflicts
   with the query string are rejected.
 - A `request_uri` is one-time and client-bound, or exactly pre-registered, and
   is fetched only through the SSRF guard (https only, no redirects, global IPs
@@ -323,13 +323,17 @@ configure one as fail-open is a load-time error.
   `frame-ancestors 'none'`. They use server-side sessions, CSRF protection, and
   no open redirect.
 - `GET /logout` is a server-specific session endpoint (not OAuth 2.1/OIDC
-  defined). It destroys the session and clears the cookie, then renders a
-  neutral page or redirects to a `post_logout` URI. It accepts **no query
+  defined). It is read-only: it renders a confirm page and never destroys the
+  session or writes cookies, so a forced navigation cannot log a victim out.
+  Only `POST /logout` with the session-bound CSRF `form_token` destroys the
+  session and clears the cookie. It accepts **no query
   parameters**: the target is read only from session meta, frozen when the
   authorization flow was bound, and used only if the owning client is still
   active and still registers that exact URI (exact-string match + RFC 8252
-  loopback). A forced navigation to `/logout` can therefore only end a session
-  and, at most, send the browser to that client's own pre-registered URI — never
+  loopback). `GET /logout` issues no redirect; only `POST /logout` redirects,
+  and only to that bound URI. A forced navigation to `/logout` therefore only
+  renders the confirm page — it never ends the session and never leaves the
+  page, so it cannot log a victim out nor send the browser
   to an attacker target. There is no `post_logout_redirect_uri` parameter and no
   `id_token_hint`.
 - Failed-login and lockout counters live in Redis, not Postgres, so a login

@@ -48,16 +48,19 @@ is fixed in `build_router_with_options` in `src/routes.rs`:
 
 1. Request id: mints or propagates `X-Request-Id` and opens the redacted
    `http_request` tracing span. Tracing and redaction live here.
-2. CORS: answers preflights from the explicit allowlist. Absent when the
-   allowlist is empty, which is the default.
-3. Resilience: sheds excess load, caps concurrency, and times out slow
-   handlers before they reach rate limiting.
-4. Rate limit: enforces the per-IP and per-client budgets. Health and metadata
-   have no rule and pass through; those handlers fail closed on their own.
-5. Body limit: caps request bodies at 2 MiB.
-6. Security headers: adds `Referrer-Policy`, `X-Content-Type-Options`, a CSP
+2. Security headers: adds `Referrer-Policy`, `X-Content-Type-Options`, a CSP
    with `frame-ancestors 'none'`, HSTS on the TLS listener, and
    `Cache-Control: no-store` on every response except `/.well-known/…` metadata.
+   Sits just inside the request-id layer so short-circuiting layers below
+   (CORS preflights, resilience 503s, rate-limit 429/503s, body-limit 413s)
+   still carry the headers.
+3. CORS: answers preflights from the explicit allowlist. Absent when the
+   allowlist is empty, which is the default.
+4. Resilience: sheds excess load, caps concurrency, and times out slow
+   handlers before they reach rate limiting.
+5. Rate limit: enforces the per-IP and per-client budgets. Health and metadata
+   have no rule and pass through; those handlers fail closed on their own.
+6. Body limit: caps request bodies at 2 MiB.
 
 A handler that needs a dependency takes `AppState` and calls a repository or the
 store. Errors are converted to `AppError`, which maps to an OAuth error body and

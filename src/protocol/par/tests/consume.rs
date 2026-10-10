@@ -147,9 +147,8 @@ async fn par_authorize_binds_client_and_rejects_replay() -> Result<(), TestError
     Err(error) => expect_code(&error, OAuthErrorCode::InvalidRequest)?,
   }
 
-  // The failed foreign attempt consumed the record (single-use Lua): a fresh
-  // push is required for the legitimate first use.
-  let request_uri = push_public(&mut h, &endpoint, client_a, redirect_uri).await?;
+  // The foreign attempt must not burn the victim record: the legitimate
+  // first use resolves the same `request_uri`.
   let client_row_a = client_repo::find_active_by_client_id(&h.pool, &h.keys, client_a)
     .await?
     .ok_or_else(|| TestError::Unexpected("client A missing".to_owned()))?;
@@ -187,6 +186,146 @@ async fn par_authorize_binds_client_and_rejects_replay() -> Result<(), TestError
     Err(error) => expect_code(&error, OAuthErrorCode::InvalidRequest)?,
   }
   Ok(())
+}
+
+#[tokio::test]
+async fn par_foreign_presentation_does_not_consume_victim_record() -> Result<(), TestError> {
+  let (_guard, mut h) = harness().await?;
+  let client_a = "par-victim-client";
+  let client_b = "par-foreign-client";
+  let redirect_uri = "https://client.example.test/cb";
+  insert_client(
+    &h.pool,
+    &h.keys,
+    client_a,
+    TokenEndpointAuthMethod::None,
+    None,
+  )
+  .await?;
+  insert_client(
+    &h.pool,
+    &h.keys,
+    client_b,
+    TokenEndpointAuthMethod::None,
+    None,
+  )
+  .await?;
+  attach_redirect(&h.pool, &h.keys, client_a, redirect_uri).await?;
+  attach_redirect(&h.pool, &h.keys, client_b, redirect_uri).await?;
+
+  let endpoint = h.endpoint.clone();
+  let request_uri = push_public(&mut h, &endpoint, client_a, redirect_uri).await?;
+  let issuer = "https://auth.example.test";
+
+  let client_row_b = client_repo::find_active_by_client_id(&h.pool, &h.keys, client_b)
+    .await?
+    .ok_or_else(|| TestError::Unexpected("client B missing".to_owned()))?;
+  let query_b = HashMap::from([
+    ("client_id".to_owned(), client_b.to_owned()),
+    ("request_uri".to_owned(), request_uri.clone()),
+  ]);
+  let foreign = JarRequest {
+    client: &client_row_b,
+    issuer,
+    query: &query_b,
+    request: None,
+    request_uri: Some(request_uri.as_str()),
+  };
+  match resolve(&mut h.conn, &h.store, &foreign).await {
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "cross-client request_uri accepted".to_owned(),
+      ));
+    }
+    Err(error) => expect_code(&error, OAuthErrorCode::InvalidRequest)?,
+  }
+
+  let client_row_a = client_repo::find_active_by_client_id(&h.pool, &h.keys, client_a)
+    .await?
+    .ok_or_else(|| TestError::Unexpected("client A missing".to_owned()))?;
+  let query_a = HashMap::from([
+    ("client_id".to_owned(), client_a.to_owned()),
+    ("request_uri".to_owned(), request_uri.clone()),
+  ]);
+  let legitimate = JarRequest {
+    client: &client_row_a,
+    issuer,
+    query: &query_a,
+    request: None,
+    request_uri: Some(request_uri.as_str()),
+  };
+  resolve(&mut h.conn, &h.store, &legitimate)
+    .await
+    .map_err(|error| {
+      TestError::Unexpected(format!(
+        "victim record burned by foreign use: {}",
+        error.code()
+      ))
+    })?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn par_consume_bound_transport_error_recovery() -> Result<(), TestError> {
+  let (_guard, mut h) = harness().await?;
+  let client_id = "par-recovery-client";
+  let record = par::ParRecord {
+    client_id: client_id.to_owned(),
+    request: "{\"response_type\":\"code\"}".to_owned(),
+  };
+  par::put(
+    &mut h.conn,
+    &h.store,
+    "par-recovery-id",
+    &record,
+    Duration::from_secs(300),
+  )
+  .await
+  .map_err(|error| TestError::Unexpected(format!("{error}")))?;
+  // Poison the key type through the public key layout: the guarded `HGETALL`
+  // script fails indeterminately on a string key, the recovery re-read sees
+  // the surviving key, and the consume fails closed without deleting it.
+  let key = h.store.par_key("par-recovery-id");
+  let _: () = redis::cmd("DEL")
+    .arg(&key)
+    .query_async(&mut h.conn)
+    .await
+    .map_err(TestError::Redis)?;
+  let _: () = redis::cmd("SET")
+    .arg(&key)
+    .arg("poison")
+    .query_async(&mut h.conn)
+    .await
+    .map_err(TestError::Redis)?;
+  match par::consume_bound(&mut h.conn, &h.store, "par-recovery-id", client_id).await {
+    Err(_) => {}
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "indeterminate consume with a surviving key must fail closed".to_owned(),
+      ));
+    }
+  }
+  let present: i64 = redis::cmd("EXISTS")
+    .arg(&key)
+    .query_async(&mut h.conn)
+    .await
+    .map_err(TestError::Redis)?;
+  if present != 1 {
+    return Err(TestError::Unexpected(
+      "failed consume must leave the surviving key intact".to_owned(),
+    ));
+  }
+  // An absent key reports `Absent` through the same public API: no record,
+  // no error, never a replay.
+  match par::consume_bound(&mut h.conn, &h.store, "par-recovery-absent", client_id).await {
+    Ok(par::ConsumeOutcome::Absent) => Ok(()),
+    Ok(_) => Err(TestError::Unexpected(
+      "absent PAR record must report Absent".to_owned(),
+    )),
+    Err(error) => Err(TestError::Unexpected(format!(
+      "absent consume error: {error}"
+    ))),
+  }
 }
 
 #[tokio::test]

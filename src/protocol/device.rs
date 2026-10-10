@@ -157,19 +157,13 @@ pub fn binding_key(store: &Store, device_hash: &str) -> String {
 
 /// Versioned keyed hash of a raw code, for use as a store key.
 ///
-/// Mirrors the CLI hashing convention: the numeric generation comes from the
-/// active key id (`v1` → `1`, unparseable → `1`), so rotated peppers keep
-/// distinct storage strings.
+/// Mirrors the CLI hashing convention: the active key id is preserved verbatim,
+/// so rotated peppers keep distinct storage strings.
 pub fn hash_token(keys: &crate::keys::KeyRing, token: &str) -> Result<String, AppError> {
   let (id, pepper) = keys.active_pepper().ok_or_else(AppError::server_error)?;
-  let generation = id
-    .as_str()
-    .trim_start_matches('v')
-    .parse::<u32>()
-    .unwrap_or(1);
   Ok(
     tokens::token_hash(
-      &tokens::KeyId::new(generation),
+      &tokens::KeyId::new(id.as_str()),
       pepper.expose_secret().as_bytes(),
       token,
     )

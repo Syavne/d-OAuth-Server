@@ -6,6 +6,8 @@
 //! both were proven; an unconstrained confidential grant carries an empty
 //! `cnf`.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{crypto::tokens as crypto_tokens, error::AppError, store::StoreError};
@@ -160,7 +162,10 @@ pub struct MintRequest {
 
 /// Freshly minted pair: raw tokens (return to the caller once) plus their
 /// hash-at-rest identities and validity window.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` redacts the raw tokens (lengths only) and prints the storage
+/// identities, following the [`crate::protocol::code::IssuedCode`] pattern.
+#[derive(Clone, PartialEq, Eq)]
 pub struct MintedTokens {
   /// Raw access token (never stored).
   pub access_token: String,
@@ -180,8 +185,27 @@ pub struct MintedTokens {
   pub refresh_expires_at: i64,
 }
 
+impl fmt::Debug for MintedTokens {
+  /// Redacted [`fmt::Debug`]: raw tokens never reach logs or errors, only
+  /// their lengths plus the hash-at-rest identities.
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("MintedTokens")
+      .field("access_token", &"[REDACTED]")
+      .field("access_token_len", &self.access_token.len())
+      .field("refresh_token", &"[REDACTED]")
+      .field("refresh_token_len", &self.refresh_token.len())
+      .field("access_hash", &self.access_hash)
+      .field("refresh_hash", &self.refresh_hash)
+      .field("cnf", &self.cnf)
+      .field("issued_at", &self.issued_at)
+      .field("access_expires_at", &self.access_expires_at)
+      .field("refresh_expires_at", &self.refresh_expires_at)
+      .finish()
+  }
+}
+
 /// A located access token plus its hash-at-rest identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FoundAccess {
   /// The stored record.
   pub record: crate::store::tokens::AccessRecord,
@@ -191,8 +215,22 @@ pub struct FoundAccess {
   pub key_label: String,
 }
 
+impl fmt::Debug for FoundAccess {
+  /// Locked [`fmt::Debug`]: the struct carries no raw token, only the stored
+  /// record plus its hash-at-rest identity and pepper label. Transitive: the
+  /// record's derived `Debug` holds identifiers only (see
+  /// [`crate::store::tokens::AccessRecord`]), so nothing secret formats here.
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("FoundAccess")
+      .field("record", &self.record)
+      .field("hash", &self.hash)
+      .field("key_label", &self.key_label)
+      .finish()
+  }
+}
+
 /// A located refresh token plus its hash-at-rest identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FoundRefresh {
   /// The stored record.
   pub record: crate::store::tokens::RefreshRecord,
@@ -200,4 +238,18 @@ pub struct FoundRefresh {
   pub hash: String,
   /// Pepper label (`v<N>`) that produced the match.
   pub key_label: String,
+}
+
+impl fmt::Debug for FoundRefresh {
+  /// Locked [`fmt::Debug`]: the struct carries no raw token, only the stored
+  /// record plus its hash-at-rest identity and pepper label. Transitive: the
+  /// record's derived `Debug` holds identifiers only (see
+  /// [`crate::store::tokens::RefreshRecord`]), so nothing secret formats here.
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("FoundRefresh")
+      .field("record", &self.record)
+      .field("hash", &self.hash)
+      .field("key_label", &self.key_label)
+      .finish()
+  }
 }

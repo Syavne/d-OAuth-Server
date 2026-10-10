@@ -243,17 +243,54 @@ pub fn verify_window(
 
 /// Domain-separated fingerprint binding a used code to its owner and step.
 ///
-/// The fingerprint (never the code) becomes the Redis replay-marker key.
+/// HMAC-SHA256 under a token pepper over the domain-separated
+/// message, so the Redis replay marker reveals nothing to brute force: a
+/// dump of the marker key cannot be reversed into the 6-digit code within
+/// its TTL without the pepper. The fingerprint (never the code) becomes the
+/// Redis replay-marker key. Markers are stored under the active pepper;
+/// verification probes every retained pepper generation newest-first (see
+/// [`replay_fingerprints`] and [`verify_and_claim_with_ring`]), so a code
+/// claimed before a rotation still counts as a replay after it within the
+/// 180 s claim window.
+///
+/// The HMAC key schedule is RFC 2104 §2 verbatim (long peppers are hashed,
+/// short peppers zero-padded), infallible by construction, mirroring
+/// `store::hmac_sha256` without depending on `store`. It is byte-equivalent
+/// with `Hmac::<Sha256>::new_from_slice` over the same message.
 #[must_use]
-pub fn replay_fingerprint(user_id: &str, code: &str, step: u64) -> String {
-  let mut hasher = Sha256::new();
-  hasher.update(b"totp-replay-v1|");
-  hasher.update(user_id.as_bytes());
-  hasher.update(b"|");
-  hasher.update(code.as_bytes());
-  hasher.update(b"|");
-  hasher.update(step.to_be_bytes());
-  hex_bytes(&hasher.finalize())
+pub fn replay_fingerprint(pepper: &[u8], user_id: &str, code: &str, step: u64) -> String {
+  use hmac::digest::{KeyInit, Mac as _};
+  use sha2::digest::Key;
+  let mut block = Zeroizing::new([0u8; 64]);
+  if pepper.len() > block.len() {
+    let hashed = Sha256::digest(pepper);
+    block[..hashed.len()].copy_from_slice(&hashed);
+  } else {
+    block[..pepper.len()].copy_from_slice(pepper);
+  }
+  let key: &Key<hmac::Hmac<Sha256>> = (&*block).into();
+  let mut mac = <hmac::Hmac<Sha256> as KeyInit>::new(key);
+  mac.update(b"totp-replay-v1|");
+  mac.update(user_id.as_bytes());
+  mac.update(b"|");
+  mac.update(code.as_bytes());
+  mac.update(b"|");
+  mac.update(&step.to_be_bytes());
+  hex_bytes(&mac.finalize().into_bytes())
+}
+
+/// Fingerprints for one code under every retained pepper generation,
+/// newest-first (one entry per [`KeyRing::peppers_newest_first`] item).
+///
+/// Callers store new markers under the first entry (the active pepper) and
+/// treat any entry as a replay hit, so a pepper rotation inside the claim
+/// window cannot reopen a consumed code.
+#[must_use]
+pub fn replay_fingerprints(keys: &KeyRing, user_id: &str, code: &str, step: u64) -> Vec<String> {
+  keys
+    .peppers_newest_first()
+    .map(|(_, secret)| replay_fingerprint(secret.expose_secret().as_bytes(), user_id, code, step))
+    .collect()
 }
 
 /// Atomically claim a replay-marker key (`SET key 1 PX ttl NX`).
@@ -311,6 +348,73 @@ pub async fn verify_and_claim(
     return Ok(false);
   };
   match claim_code(conn, &replay_key_for_step(step), ttl).await? {
+    Claim::Fresh => Ok(true),
+    Claim::Replay => Ok(false),
+  }
+}
+
+/// One TOTP presentation to verify and claim across pepper generations.
+pub struct TotpClaim<'a> {
+  /// Owner label bound into the replay fingerprint (user id string).
+  pub user_id: &'a str,
+  /// Stored base32 secret to verify against.
+  pub secret_b32: &'a str,
+  /// Presented code (whitespace trimmed before fingerprinting).
+  pub code: &'a str,
+  /// Current Unix time selecting the ±1-step window.
+  pub now_unix: u64,
+  /// How long a consumed code stays claimed.
+  pub ttl: Duration,
+}
+
+/// Verify `code` and claim it across every retained pepper generation.
+///
+/// The matched step's fingerprint is computed under each pepper newest-first
+/// (see [`replay_fingerprints`]); any hit is a replay. New markers are stored
+/// under the active pepper only. `replay_key` maps a fingerprint hex to the
+/// full Redis key (store prefix). Returns `false` for a wrong code AND for a
+/// replayed one; callers must not distinguish the two.
+///
+/// Ordering (F7): older generations are probed read-only (`EXISTS`) before
+/// the active generation is claimed atomically (`SET key 1 PX ttl NX`). This
+/// order is deliberate. The only shared write is the single `SET NX` on the
+/// active key, so concurrent presentations of the same code collapse there:
+/// exactly one observes `Fresh`, every other observes `Replay`, and no
+/// interleaving can accept the same code twice. Probing older generations
+/// first also avoids writing a spurious active marker when the code was
+/// already claimed before a pepper rotation (the pre-rotation fingerprint
+/// still hits within the claim window). Reversing the order — claim first,
+/// then probe — would widen that race and leave junk markers on replays.
+///
+/// # Errors
+///
+/// Returns [`TotpError::InvalidSecret`] for a malformed stored secret,
+/// [`TotpError::Encrypt`] when the ring holds no pepper, and
+/// [`TotpError::Store`] when the replay store fails.
+pub async fn verify_and_claim_with_ring(
+  conn: &mut impl redis::aio::ConnectionLike,
+  keys: &KeyRing,
+  replay_key: impl Fn(&str) -> String,
+  claim: &TotpClaim<'_>,
+) -> Result<bool, TotpError> {
+  let Some(step) = verify_window(claim.secret_b32, claim.code, claim.now_unix)? else {
+    return Ok(false);
+  };
+  let trimmed = claim.code.trim();
+  let fingerprints = replay_fingerprints(keys, claim.user_id, trimmed, step);
+  let Some(active) = fingerprints.first() else {
+    return Err(TotpError::Encrypt);
+  };
+  for fingerprint in fingerprints.iter().skip(1) {
+    let exists: i64 = redis::cmd("EXISTS")
+      .arg(replay_key(fingerprint))
+      .query_async(conn)
+      .await?;
+    if exists != 0 {
+      return Ok(false);
+    }
+  }
+  match claim_code(conn, &replay_key(active), claim.ttl).await? {
     Claim::Fresh => Ok(true),
     Claim::Replay => Ok(false),
   }

@@ -178,9 +178,9 @@ fn build_key_ring(raw: &RawConfig) -> Result<KeyRing, ConfigError> {
     )?),
     "pii_previous_key",
   )?;
-  let pepper_id = key_id_or_default(raw.token_pepper_id.as_deref());
-  let totp_id = key_id_or_default(raw.totp_key_id.as_deref());
-  let pii_id = key_id_or_default(raw.pii_key_id.as_deref());
+  let pepper_id = key_id_or_default(raw.token_pepper_id.as_deref())?;
+  let totp_id = key_id_or_default(raw.totp_key_id.as_deref())?;
+  let pii_id = key_id_or_default(raw.pii_key_id.as_deref())?;
   let peppers = pepper
     .map(|secret| vec![(pepper_id, secret)])
     .unwrap_or_default();
@@ -219,7 +219,7 @@ fn active_first_chain(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or(ConfigError::MissingPreviousKeyId)?;
-      let id = KeyId::new(id_raw);
+      let id = validate_key_id(id_raw)?;
       if id == active_pair.0 {
         return Err(ConfigError::MissingPreviousKeyId);
       }
@@ -245,10 +245,23 @@ fn resolve_secret(
   }
 }
 
-fn key_id_or_default(raw: Option<&str>) -> KeyId {
+fn key_id_or_default(raw: Option<&str>) -> Result<KeyId, ConfigError> {
   match raw.map(str::trim).filter(|value| !value.is_empty()) {
-    Some(value) => KeyId::new(value),
-    None => KeyId::new(DEFAULT_KEY_ID),
+    Some(value) => validate_key_id(value),
+    None => Ok(KeyId::new(DEFAULT_KEY_ID)),
+  }
+}
+
+/// Reject a configured key id outside `[A-Za-z0-9_-]+`: `.` would collide
+/// with the `<kid>.<digest>` storage format, and empty/whitespace values are
+/// never valid ids (absent ids fall back to the default above).
+fn validate_key_id(value: &str) -> Result<KeyId, ConfigError> {
+  if crate::keys::is_valid_key_id(value) {
+    Ok(KeyId::new(value))
+  } else {
+    Err(ConfigError::InvalidKeyId {
+      id: value.to_owned(),
+    })
   }
 }
 

@@ -6,9 +6,9 @@
 //! indeterminate transport result the key is re-read instead of replaying the
 //! consume, so a surviving record stays available for the client's retry.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
-use redis::RedisError;
+use redis::{RedisError, Script};
 use serde::{Deserialize, Serialize};
 
 use super::{SCRIPT_CONSUME_HASH, Store, StoreError, flat_to_map, hset_record};
@@ -78,7 +78,123 @@ pub async fn issue(
   .map_err(StoreError::Redis)
 }
 
-/// Atomically consume a code record: exactly one caller observes `Some`.
+/// Guarded single-use consume: the record is deleted only when every
+/// expected field matches, otherwise it survives untouched.
+///
+/// KEYS: code record. ARGV: flattened expected field/value pairs. Returns the
+/// hash fields on a match, `{'MISMATCH'}` when a bound field differs (the key
+/// is left intact), or `false` when absent. Mirrors the refresh-rotation
+/// `client_id` compare-and-set.
+static SCRIPT_CONSUME_CODE_GUARDED: LazyLock<Script> = LazyLock::new(|| {
+  Script::new(
+    r"
+    local data = redis.call('HGETALL', KEYS[1])
+    if #data == 0 then
+      return false
+    end
+    local h = {}
+    for i = 1, #data, 2 do
+      h[data[i]] = data[i + 1]
+    end
+    for i = 1, #ARGV, 2 do
+      if h[ARGV[i]] ~= ARGV[i + 1] then
+        return {'MISMATCH'}
+      end
+    end
+    redis.call('DEL', KEYS[1])
+    return data
+    ",
+  )
+});
+
+/// Outcome of a guarded code consume.
+#[derive(Debug)]
+pub enum ConsumeOutcome {
+  /// Bindings matched; the record was deleted and is returned.
+  Consumed(CodeRecord),
+  /// Bindings differed; the record survives for the legitimate presenter.
+  Mismatched,
+  /// No record under this hash (wrong, expired, or already consumed).
+  Absent,
+}
+
+/// Atomically consume a code record bound to its expected values: exactly one
+/// matching presenter observes `Consumed`; a mismatched presenter observes
+/// `Mismatched` without deleting anything, so a foreign `client_id`,
+/// `redirect_uri`, or PKCE challenge cannot burn the victim single-use value.
+pub async fn consume_bound(
+  conn: &mut RedisConn,
+  store: &Store,
+  code_hash: &str,
+  expected: &[(&str, &str)],
+) -> Result<ConsumeOutcome, StoreError> {
+  let key = store.code_key(code_hash);
+  let mut invocation = SCRIPT_CONSUME_CODE_GUARDED.prepare_invoke();
+  invocation.key(key.as_str());
+  for (field, value) in expected {
+    invocation.arg(field).arg(value);
+  }
+  let outcome: Result<redis::Value, StoreError> = invocation
+    .invoke_async(conn)
+    .await
+    .map_err(StoreError::Redis);
+  match outcome {
+    Ok(redis::Value::Array(items)) => {
+      if is_mismatch(&items) {
+        Ok(ConsumeOutcome::Mismatched)
+      } else {
+        let flat = items
+          .into_iter()
+          .map(redis_string)
+          .collect::<Result<Vec<_>, _>>()?;
+        CodeRecord::from_map(&flat_to_map(flat)?).map(ConsumeOutcome::Consumed)
+      }
+    }
+    // Absent (nil or a `false` reply): no record.
+    Ok(_) => Ok(ConsumeOutcome::Absent),
+    // Indeterminate transport result: re-read, never replay.
+    Err(error) => recover_consume_bound(conn, store, code_hash, error).await,
+  }
+}
+
+/// Whether a script reply is the single-element `MISMATCH` tag rather than
+/// hash fields (field/value pairs always arrive in even length).
+fn is_mismatch(items: &[redis::Value]) -> bool {
+  match items {
+    [single] => {
+      matches!(
+        single,
+        redis::Value::BulkString(bytes) if bytes.as_slice() == b"MISMATCH"
+      ) || matches!(single, redis::Value::SimpleString(text) if text == "MISMATCH")
+    }
+    _ => false,
+  }
+}
+
+/// Re-read after an indeterminate guarded consume: a surviving key means the
+/// consume did not happen (fail closed, the record stays usable); an absent
+/// key means it did (report `Absent`, never replay).
+async fn recover_consume_bound(
+  conn: &mut RedisConn,
+  store: &Store,
+  code_hash: &str,
+  error: StoreError,
+) -> Result<ConsumeOutcome, StoreError> {
+  if !matches!(error, StoreError::Redis(_)) {
+    return Err(error);
+  }
+  let key = store.code_key(code_hash);
+  let present: bool = redis::cmd("EXISTS")
+    .arg(&key)
+    .query_async(conn)
+    .await
+    .map_err(StoreError::Redis)?;
+  if present {
+    Err(error)
+  } else {
+    Ok(ConsumeOutcome::Absent)
+  }
+}
 pub async fn consume(
   conn: &mut RedisConn,
   store: &Store,

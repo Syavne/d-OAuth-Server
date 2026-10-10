@@ -22,6 +22,7 @@ use std::{fmt, time::Duration};
 
 use secrecy::ExposeSecret;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
   config::TtlConfig,
@@ -141,22 +142,54 @@ impl From<CodeIssueError> for AppError {
 }
 
 /// One retained pepper generation, newest-first.
-#[derive(Debug, Clone)]
+///
+/// The raw pepper never reaches `Debug`: only the generation, label, and
+/// material length are printed (the [`KeyRing`] ids-only pattern).
+#[derive(Clone)]
 struct PepperKey {
-  /// Numeric generation for [`crypto_tokens::token_hash`].
+  /// Verbatim generation for [`crypto_tokens::token_hash`].
   generation: crypto_tokens::KeyId,
-  /// Raw pepper bytes.
-  secret: Vec<u8>,
+  /// String label (`v<N>`) for audit.
+  label: String,
+  /// Raw pepper bytes, wiped on drop.
+  secret: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for PepperKey {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("PepperKey")
+      .field("generation", &self.generation)
+      .field("label", &self.label)
+      .field("secret", &"[REDACTED]")
+      .field("secret_len", &self.secret.len())
+      .finish()
+  }
 }
 
 /// Authorization-code minting plus hash-at-rest persistence.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the lifetime plus the retained pepper ids and material
+/// lengths only, never raw pepper bytes.
+#[derive(Clone)]
 pub struct CodeIssuer {
   /// Code lifetime, capped at [`CODE_TTL_CAP`] at construction.
   ttl: Duration,
   /// Retained peppers, newest-first, bounded by
   /// [`crypto_tokens::MAX_RETAINED_KEYS`].
   keys: Vec<PepperKey>,
+}
+
+impl fmt::Debug for CodeIssuer {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let key_labels: Vec<&str> = self.keys.iter().map(|key| key.label.as_str()).collect();
+    let secret_lens: Vec<usize> = self.keys.iter().map(|key| key.secret.len()).collect();
+    f.debug_struct("CodeIssuer")
+      .field("ttl", &self.ttl)
+      .field("key_labels", &key_labels)
+      .field("secret", &"[REDACTED]")
+      .field("secret_lens", &secret_lens)
+      .finish()
+  }
 }
 
 impl CodeIssuer {
@@ -171,14 +204,10 @@ impl CodeIssuer {
       .peppers_newest_first()
       .take(crypto_tokens::MAX_RETAINED_KEYS)
     {
-      let generation = id
-        .as_str()
-        .trim_start_matches('v')
-        .parse::<u32>()
-        .unwrap_or(1);
       keys.push(PepperKey {
-        generation: crypto_tokens::KeyId::new(generation),
-        secret: secret.expose_secret().as_bytes().to_vec(),
+        generation: crypto_tokens::KeyId::new(id.as_str()),
+        label: id.as_str().to_owned(),
+        secret: Zeroizing::new(secret.expose_secret().as_bytes().to_vec()),
       });
     }
     if keys.is_empty() {
@@ -217,8 +246,8 @@ impl CodeIssuer {
     let cnf = resolve_cnf(request.client_kind, request.dpop_jkt)?;
     let raw = crypto_tokens::mint_token()?;
     let active = self.keys.first().ok_or(CodeIssueError::NoPepper)?;
-    let code_hash =
-      crypto_tokens::token_hash(&active.generation, &active.secret, &raw).to_storage_string();
+    let code_hash = crypto_tokens::token_hash(&active.generation, active.secret.as_slice(), &raw)
+      .to_storage_string();
     let grant_id = Uuid::new_v4().to_string();
     let record = codes::CodeRecord {
       client_id: request.client_id.to_owned(),

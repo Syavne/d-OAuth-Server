@@ -322,6 +322,12 @@ pub enum ConfigError {
   /// distinct previous key id.
   #[error("previous key requires an explicit distinct previous key id")]
   MissingPreviousKeyId,
+  /// A key id contained characters outside `[A-Za-z0-9_-]`.
+  #[error("invalid key id: {id}")]
+  InvalidKeyId {
+    /// The rejected value.
+    id: String,
+  },
 }
 
 /// Read an optional secret from a mounted file, trimming trailing newlines.

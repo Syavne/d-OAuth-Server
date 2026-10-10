@@ -8,7 +8,7 @@
 use uuid::Uuid;
 
 use super::super::super::{ClientKind, MintRequest, SenderProof, TokenService};
-use super::{DevicePollError, DeviceTokenResponse, PollState, interval::poll_key};
+use super::{DevicePollError, DeviceTokenResponse, PollState};
 use crate::{
   config::GrantKind,
   db::{scope_repo, user_scope_repo},
@@ -92,7 +92,7 @@ pub(super) async fn issue_approved(
     .map_err(AppError::from)?;
 
   let stale = [
-    poll_key(state.store, redemption.device_hash),
+    device_store::poll_key(state.store, redemption.device_hash),
     binding_key(state.store, redemption.device_hash),
   ];
   redis::cmd("DEL")

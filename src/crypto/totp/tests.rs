@@ -6,7 +6,8 @@ use secrecy::{ExposeSecret as _, SecretString};
 use super::{
   RECOVERY_CODE_COUNT, TOTP_BLOB_VERSION, TOTP_STEP_SECS, TotpError, build_totp, decrypt_secret,
   derive_key, derive_key_legacy, encrypt_secret, generate_recovery_codes, generate_secret,
-  normalize_recovery_code, otpauth_uri, qr_svg, replay_fingerprint, verify_window,
+  normalize_recovery_code, otpauth_uri, qr_svg, replay_fingerprint, replay_fingerprints,
+  verify_window,
 };
 use crate::{
   error::{AppError, OAuthErrorCode},
@@ -178,20 +179,38 @@ fn login_totp_recovery_codes_shape_and_normalize() -> Result<(), TotpError> {
 
 #[test]
 fn login_totp_replay_fingerprint_binds_owner_code_and_step() {
-  let base = replay_fingerprint("user-1", "287082", 1);
+  let pepper = b"test-pepper-0123456789abcdef";
+  let base = replay_fingerprint(pepper, "user-1", "287082", 1);
   assert_eq!(base.len(), 64, "fingerprint must be sha256 hex");
   let variants = [
-    replay_fingerprint("user-2", "287082", 1),
-    replay_fingerprint("user-1", "287083", 1),
-    replay_fingerprint("user-1", "287082", 2),
+    replay_fingerprint(pepper, "user-2", "287082", 1),
+    replay_fingerprint(pepper, "user-1", "287083", 1),
+    replay_fingerprint(pepper, "user-1", "287082", 2),
   ];
   for other in variants {
     assert_ne!(other, base, "fingerprint must bind owner, code, and step");
   }
   assert_eq!(
-    replay_fingerprint("user-1", "287082", 1),
+    replay_fingerprint(pepper, "user-1", "287082", 1),
     base,
     "fingerprint must be deterministic"
+  );
+}
+
+/// T3-A5: the replay fingerprint is HMAC-keyed under the token pepper, so a
+/// Redis dump cannot brute-force the 6-digit code within the marker TTL.
+#[test]
+fn login_totp_replay_fingerprint_is_keyed_by_pepper() {
+  let first = replay_fingerprint(b"pepper-one-0123456789abcdef", "user-1", "287082", 1);
+  let second = replay_fingerprint(b"pepper-two-0123456789abcdef", "user-1", "287082", 1);
+  assert_ne!(
+    first, second,
+    "different peppers must yield different fingerprints for the same user|code|step"
+  );
+  assert_eq!(
+    first,
+    replay_fingerprint(b"pepper-one-0123456789abcdef", "user-1", "287082", 1),
+    "fingerprint must be deterministic per pepper"
   );
 }
 
@@ -445,4 +464,112 @@ fn totp_error_maps_fail_closed() {
   let qr = AppError::from(TotpError::Qr);
   assert_eq!(qr.code(), OAuthErrorCode::ServerError);
   assert_eq!(qr.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// HMAC known-answer test: `replay_fingerprint` must equal
+/// `Hmac::<Sha256>::new_from_slice` over the same domain-separated message,
+/// for both a short pepper and a long (>64 B block) pepper exercising the
+/// RFC 2104 hashed-key branch.
+#[test]
+fn login_totp_replay_hmac_kat_matches_library() -> Result<(), TotpError> {
+  use hmac::{Hmac, Mac as _, digest::KeyInit};
+  use sha2::Sha256;
+  fn expected(pepper: &[u8], user_id: &str, code: &str, step: u64) -> Result<String, TotpError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(pepper).map_err(|_| TotpError::Encrypt)?;
+    mac.update(b"totp-replay-v1|");
+    mac.update(user_id.as_bytes());
+    mac.update(b"|");
+    mac.update(code.as_bytes());
+    mac.update(b"|");
+    mac.update(&step.to_be_bytes());
+    let out = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(64);
+    for b in out {
+      hex.push_str(&format!("{b:02x}"));
+    }
+    Ok(hex)
+  }
+  for pepper in [
+    b"short-pepper".as_slice(),
+    b"a-much-longer-pepper-than-sixty-four-bytes-for-sure-0123456789abcdef0123456789".as_slice(),
+  ] {
+    assert!(
+      pepper.len() != 64 || pepper.len() > 64,
+      "test must cover both key-schedule branches"
+    );
+    assert_eq!(
+      replay_fingerprint(pepper, "user-1", "287082", 1),
+      expected(pepper, "user-1", "287082", 1)?,
+      "fingerprint must match library HMAC"
+    );
+  }
+  // The long-pepper branch specifically (>64 B) must hash the key first.
+  let long =
+    b"a-much-longer-pepper-than-sixty-four-bytes-for-sure-0123456789abcdef0123456789".as_slice();
+  assert!(long.len() > 64, "long pepper must exceed the SHA-256 block");
+  assert_eq!(
+    replay_fingerprint(long, "user-1", "287082", 1),
+    expected(long, "user-1", "287082", 1)?,
+  );
+  Ok(())
+}
+
+/// Rotation replay: a marker stored under pepper N must be detected after the
+/// active rotates to N+1, because the check spans every retained generation
+/// while new markers are stored under the active pepper only.
+#[test]
+fn login_totp_replay_spans_pepper_generations() -> Result<(), TotpError> {
+  let old_ring = KeyRing::from_parts(
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("old-pepper-0123456789abcdef"),
+    )],
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("test-totp-key-0123456789abcdef"),
+    )],
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("test-pii-key-0123456789abcdef"),
+    )],
+  )
+  .map_err(|_| TotpError::Encrypt)?;
+  let new_ring = KeyRing::from_parts(
+    vec![
+      (
+        KeyId::new("v2"),
+        SecretString::from("new-pepper-0123456789abcdef"),
+      ),
+      (
+        KeyId::new("v1"),
+        SecretString::from("old-pepper-0123456789abcdef"),
+      ),
+    ],
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("test-totp-key-0123456789abcdef"),
+    )],
+    vec![(
+      KeyId::new("v1"),
+      SecretString::from("test-pii-key-0123456789abcdef"),
+    )],
+  )
+  .map_err(|_| TotpError::Encrypt)?;
+  let old_fp = replay_fingerprints(&old_ring, "user-1", "287082", 1);
+  let rotated = replay_fingerprints(&new_ring, "user-1", "287082", 1);
+  assert_eq!(
+    old_fp.len(),
+    1,
+    "single-generation ring yields one fingerprint"
+  );
+  assert_eq!(rotated.len(), 2, "rotated ring spans both generations");
+  assert!(
+    rotated.contains(&old_fp[0]),
+    "post-rotation check must still cover the pre-rotation fingerprint"
+  );
+  assert_ne!(
+    rotated[0], old_fp[0],
+    "active fingerprint must differ after rotation"
+  );
+  Ok(())
 }

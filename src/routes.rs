@@ -1,9 +1,9 @@
 //! Router assembly: public listener routes plus the middleware chain.
 //!
 //! [`build_router`] mounts every endpoint behind one [`tower::ServiceBuilder`]
-//! whose execution order (outer-to-inner) is exactly {request-id → CORS (when
-//! configured) → resilience (load-shed → concurrency-limit → timeout) →
-//! rate-limit → body limit → security headers}:
+//! whose execution order (outer-to-inner) is exactly {request-id → security
+//! headers → CORS (when configured) → resilience (load-shed →
+//! concurrency-limit → timeout) → rate-limit → body limit}:
 //!
 //! 1. [`middleware::request_id::RequestIdLayer`] mints/propagates
 //!    `X-Request-Id` and opens the redacted `http_request` tracing span
@@ -107,9 +107,12 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axu
   // Task 44 resilience insertion: timeout + concurrency-limit + load-shed sit
   // outside the rate limiter (so overload sheds 503 before it can queue into
   // `PoolTimedOut`) and inside request-id (so the span still covers them).
-  // Execution order outer-to-inner: load-shed → concurrency-limit → timeout →
-  // rate-limit → body-limit → security-headers; the `.layer` calls below read
-  // innermost-first.
+  // The security-headers layer sits just inside request-id (outside every
+  // short-circuiting layer: CORS preflights, resilience 503s, limiter
+  // 429/503s, body-limit 413s), so every rejection still carries the
+  // hardening headers. Execution order outer-to-inner: request-id →
+  // security-headers → load-shed → concurrency-limit → timeout → rate-limit
+  // → body-limit; the `.layer` calls below read innermost-first.
   let resilience = ResilienceConfig::from_policy(&state.config.failure_policy);
 
   let router = axum::Router::new()
@@ -153,7 +156,6 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axu
     .route("/revoke", post(revoke::revoke_handler))
     .with_state(state.clone())
     .merge(health_router(state.clone()))
-    .layer(SecurityHeadersLayer::new(options.hsts))
     .layer(RequestBodyLimitLayer::new(options.max_body_bytes))
     .layer(RateLimitLayer::new(state))
     .layer(ResilienceLayer::from_config(&resilience));
@@ -162,7 +164,9 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axu
     Some(layer) => router.layer(layer),
     None => router,
   };
-  router.layer(RequestIdLayer)
+  router
+    .layer(SecurityHeadersLayer::new(options.hsts))
+    .layer(RequestIdLayer)
 }
 
 /// Build the rustls server config for the public TLS listener.
@@ -733,6 +737,122 @@ mod router_tests {
       return Err(format!("GET /health/live must be 200, got {live_status}").into());
     }
     Ok(())
+  }
+
+  /// Short-circuit rejections (limiter, CORS preflight, body limit,
+  /// resilience shed) return before any handler, so they must still carry
+  /// the hardening headers: `Cache-Control: no-store` +
+  /// `X-Content-Type-Options: nosniff`.
+  fn assert_hardening_headers(headers: &HeaderMap) -> TestResult {
+    let no_store = headers
+      .get(header::CACHE_CONTROL)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or_default();
+    if no_store != "no-store" {
+      return Err(format!("short-circuit must be no-store, got {no_store:?}").into());
+    }
+    let nosniff = headers
+      .get(header::X_CONTENT_TYPE_OPTIONS)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or_default();
+    if nosniff != "nosniff" {
+      return Err("short-circuit must carry X-Content-Type-Options: nosniff".into());
+    }
+    Ok(())
+  }
+
+  /// Limiter short-circuits (429 over budget, 503 fail-closed) must still
+  /// carry the hardening headers: `Cache-Control: no-store` +
+  /// `X-Content-Type-Options: nosniff`. Both `too_many_requests` and
+  /// `service_unavailable` return before the inner security layer, so this
+  /// drives the deterministic fail-closed 503 path (same bypass as 429).
+  #[tokio::test]
+  async fn router_limiter_short_circuit_carries_security_headers() -> TestResult {
+    let form = [("content-type", "application/x-www-form-urlencoded")];
+    let (_, headers, body) = drive(
+      build_router(limited_state(Vec::new())?),
+      "POST",
+      "/token",
+      &form,
+      "",
+    )
+    .await?;
+    if !body.contains(LIMITER_MARKER) {
+      return Err("expected the limiter fail-closed marker".into());
+    }
+    assert_hardening_headers(&headers)
+  }
+
+  /// CORS preflights short-circuit at the CORS layer (outside the limiter),
+  /// but inside the security-headers layer, so an allowlisted preflight must
+  /// echo the origin and still carry the hardening headers.
+  #[tokio::test]
+  async fn router_cors_preflight_carries_security_headers() -> TestResult {
+    let router = build_router(limited_state(vec!["https://app.example.test"])?);
+    let preflight = [
+      ("origin", "https://app.example.test"),
+      ("access-control-request-method", "POST"),
+    ];
+    let (_, headers, _) = drive(router, "OPTIONS", "/token", &preflight, "").await?;
+    let allowed = headers
+      .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or_default();
+    if allowed != "https://app.example.test" {
+      return Err(format!("allowlisted origin must be echoed, got {allowed}").into());
+    }
+    assert_hardening_headers(&headers)
+  }
+
+  /// Body-limit 413s return before any handler, inside the security-headers
+  /// layer, so an oversized body must be rejected with the hardening headers.
+  #[tokio::test]
+  async fn router_body_limit_413_carries_security_headers() -> TestResult {
+    let options = RouterOptions {
+      max_body_bytes: 8,
+      ..RouterOptions::default()
+    };
+    let form = [
+      ("content-type", "application/x-www-form-urlencoded"),
+      ("content-length", "24"),
+    ];
+    let (status, headers, _) = drive(
+      build_router_with_options(passthrough_state()?, options),
+      "POST",
+      "/token",
+      &form,
+      "body-exceeds-eight-bytes",
+    )
+    .await?;
+    if status != StatusCode::PAYLOAD_TOO_LARGE {
+      return Err(format!("oversized body must be 413, got {status}").into());
+    }
+    assert_hardening_headers(&headers)
+  }
+
+  /// Resilience sheds (timeout/overload 503) return before any handler,
+  /// inside the security-headers layer, so a timed-out request must fail
+  /// closed with the hardening headers.
+  #[tokio::test]
+  async fn router_resilience_timeout_carries_security_headers() -> TestResult {
+    let hanging = axum::Router::new().route(
+      "/hang",
+      axum::routing::get(|| async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        "never"
+      }),
+    );
+    let router = hanging
+      .layer(crate::resilience::ResilienceLayer::new(
+        Duration::from_millis(1),
+        1024,
+      ))
+      .layer(crate::middleware::security_headers::SecurityHeadersLayer::new(false));
+    let (status, headers, _) = drive(router, "GET", "/hang", &[], "").await?;
+    if status != StatusCode::SERVICE_UNAVAILABLE {
+      return Err(format!("resilience timeout must fail closed 503, got {status}").into());
+    }
+    assert_hardening_headers(&headers)
   }
 
   /// Every mounted sensitive route is classified by `Rule::for_path`, and the

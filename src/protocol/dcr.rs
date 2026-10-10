@@ -693,13 +693,8 @@ fn keyed_hash(config: &Config, token: &str) -> Result<String, AppError> {
     .keys
     .active_pepper()
     .ok_or_else(AppError::server_error)?;
-  let generation = key_id
-    .as_str()
-    .trim_start_matches('v')
-    .parse::<u32>()
-    .unwrap_or(1);
   let hash = tokens_crypto::token_hash(
-    &tokens_crypto::KeyId::new(generation),
+    &tokens_crypto::KeyId::new(key_id.as_str()),
     pepper.expose_secret().as_bytes(),
     token,
   );

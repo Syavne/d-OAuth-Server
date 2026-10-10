@@ -86,18 +86,67 @@ pub enum StoreError {
 }
 
 impl From<StoreError> for crate::error::AppError {
-  /// Map a store failure to a client-safe error: transient Redis outages and
-  /// unmet durability barriers render `503 temporarily_unavailable` (fail
-  /// closed); everything else is masked as `server_error`.
+  /// Map a store failure to a client-safe error: genuine Redis infrastructure
+  /// failures (transient timeouts/connections, `OOM`, `READONLY`,
+  /// `CROSSSLOT`, auth, and connection-type errors) and unmet durability
+  /// barriers render `503 temporarily_unavailable` (fail closed);
+  /// programming-error classes (`Parse`, `UnexpectedReturnType`, `Client`,
+  /// `WRONGTYPE` type errors surfaced as `Extension` or `Server`, and generic
+  /// Lua-runtime `ERR`/`EXECABORT` server failures) are
+  /// masked as `server_error` (500) so 500-alerts still fire on real bugs.
+  /// Genuinely internal bugs (`InvalidData`, `Mismatch`) are likewise masked
+  /// as `server_error`.
   fn from(error: StoreError) -> Self {
     match error {
       StoreError::Durability => Self::temporarily_unavailable(),
-      StoreError::Redis(ref inner) if classify_redis(inner) == ErrorClass::Transient => {
-        Self::temporarily_unavailable()
-      }
+      StoreError::Redis(inner) if is_infra_redis_error(&inner) => Self::temporarily_unavailable(),
+      StoreError::Redis(inner) => Self::internal(inner),
       other => Self::internal(other),
     }
   }
+}
+
+/// Whether a Redis error is genuine infrastructure (503) rather than a
+/// programming error (500): transient errors plus `OOM`/`READONLY`/
+/// `CROSSSLOT`/auth/connection-type errors fail closed, while `Parse`,
+/// `UnexpectedReturnType`, `Client`, `WRONGTYPE` type errors, and generic
+/// Lua-runtime `ERR`/`EXECABORT` server failures stay visible as masked
+/// `server_error`.
+fn is_infra_redis_error(error: &RedisError) -> bool {
+  if is_wrongtype(error) {
+    return false;
+  }
+  // Generic Lua/script-runtime failures (`ERR` class, `EXECABORT`) are bugs
+  // in the script or its arguments, not sick infrastructure: report them as
+  // masked `server_error` (500) so 500-alerts fire. Transient kinds,
+  // `NOSCRIPT` (self-healed), `OOM`/`READONLY`/`CROSSSLOT`, auth, and
+  // connection errors keep their 503 fail-closed mapping below.
+  if matches!(
+    error.kind(),
+    ErrorKind::Server(ServerErrorKind::ResponseError | ServerErrorKind::ExecAbort)
+  ) {
+    return false;
+  }
+  !matches!(
+    error.kind(),
+    ErrorKind::Parse | ErrorKind::UnexpectedReturnType | ErrorKind::Client
+  )
+}
+
+/// Whether a Redis error is a `WRONGTYPE` type error: an `Extension` with code
+/// `WRONGTYPE`, or any server error whose code or detail carries it (the
+/// `WRONGTYPE ... wrong kind of value` detail on a generic `ERR`).
+fn is_wrongtype(error: &RedisError) -> bool {
+  if error
+    .code()
+    .is_some_and(|code| code.eq_ignore_ascii_case("WRONGTYPE"))
+  {
+    return true;
+  }
+  error.detail().is_some_and(|detail| {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("wrongtype") || lower.contains("wrong kind")
+  })
 }
 
 /// Whether a Redis error is worth retrying (idempotent ops only) or must fail
@@ -555,6 +604,31 @@ pub(crate) static HSET_TTL: LazyLock<Script> = LazyLock::new(|| {
   )
 });
 
+/// Atomic grant-member write: `HSET` the record fields, `PEXPIRE` the
+/// record, `SADD` the member into the grant set, then arm-or-extend the set
+/// TTL (never shorten), before the script returns.
+///
+/// KEYS: record, grant token set. ARGV: record TTL ms, member, then the
+/// flattened record field/value pairs. The record and its index entry land
+/// together, so a revoke drain cannot interleave between the record write and
+/// the index write and leave an orphan in either direction.
+pub(crate) static SCRIPT_PUT_MEMBER: LazyLock<Script> = LazyLock::new(|| {
+  Script::new(
+    r"
+    if #ARGV > 2 then
+      redis.call('HSET', KEYS[1], unpack(ARGV, 3))
+      redis.call('PEXPIRE', KEYS[1], ARGV[1])
+    end
+    redis.call('SADD', KEYS[2], ARGV[2])
+    local set_pttl = redis.call('PTTL', KEYS[2])
+    if set_pttl < 0 or set_pttl < tonumber(ARGV[1]) then
+      redis.call('PEXPIRE', KEYS[2], ARGV[1])
+    end
+    return 1
+    ",
+  )
+});
+
 /// Single-use consume with `GETDEL` semantics: return the hash fields and
 /// delete the key atomically, or `false` when absent.
 pub(crate) static SCRIPT_CONSUME_HASH: LazyLock<Script> = LazyLock::new(|| {
@@ -570,15 +644,82 @@ pub(crate) static SCRIPT_CONSUME_HASH: LazyLock<Script> = LazyLock::new(|| {
   )
 });
 
+/// Device verdict conditional write (RFC 8628 user decision).
+///
+/// KEYS: device record. ARGV: status, subject, grant id. Sets the verdict
+/// fields only when the record still exists, so a verdict racing the atomic
+/// consume can never resurrect a zombie record (no lost update). The key TTL
+/// is left untouched. Returns 1 when applied, 0 when the record is gone.
+pub(crate) static SCRIPT_DEVICE_DECIDE: LazyLock<Script> = LazyLock::new(|| {
+  Script::new(
+    r"
+    if redis.call('EXISTS', KEYS[1]) == 0 then
+      return 0
+    end
+    redis.call('HSET', KEYS[1], 'status', ARGV[1], 'subject', ARGV[2], 'grant_id', ARGV[3])
+    return 1
+    ",
+  )
+});
+
+/// Device poll-interval compare-and-set (RFC 8628 §3.5 `slow_down`).
+///
+/// KEYS: poll sidecar. ARGV: now (Unix seconds), interval (seconds), TTL ms.
+/// Reads the last attempt, compares, and stamps this attempt in one step, so
+/// concurrent polls cannot both pass the gate. The stamp advances on every
+/// path, so fast polls keep backing off instead of racing the window edge.
+/// Returns 0 when this attempt is allowed, the whole seconds to wait when it
+/// is too fast, or -1 when the stored marker is corrupt.
+pub(crate) static SCRIPT_DEVICE_POLL_CAS: LazyLock<Script> = LazyLock::new(|| {
+  Script::new(
+    r"
+    local last = redis.call('GET', KEYS[1])
+    if not last then
+      redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
+      return 0
+    end
+    local last_secs = tonumber(last)
+    if not last_secs then
+      return -1
+    end
+    local elapsed = tonumber(ARGV[1]) - last_secs
+    if elapsed < 0 then
+      elapsed = 0
+    end
+    local interval_secs = tonumber(ARGV[2])
+    if elapsed < interval_secs then
+      redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
+      local wait = interval_secs - elapsed
+      if wait < 1 then
+        wait = 1
+      end
+      return wait
+    end
+    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
+    return 0
+    ",
+  )
+});
+
 /// Refresh rotation compare-and-set.
 ///
-/// KEYS: old refresh, new refresh, new access, grant token set, request map.
-/// ARGV: expected client, new-refresh JSON, new-refresh TTL ms, new-access
-/// JSON, new-access TTL ms, request id, grant id, new refresh member,
-/// new access member, tombstone TTL ms, map TTL ms.
+/// KEYS: old refresh, new refresh, new access, grant token set, request map,
+/// grant record. ARGV: expected client, new-refresh JSON, new-refresh TTL ms,
+/// new-access JSON, new-access TTL ms, request id, grant id, new refresh
+/// member, new access member, tombstone TTL ms, map TTL ms.
 ///
 /// Returns `{TAG, ...}`: `ROTATED`, `REPLAY` (idempotent retry: same tokens),
-/// `REUSE` (tombstoned: rotated-to member), `ABSENT`, or `MISMATCH`.
+/// `REUSE` (tombstoned: rotated-to member), `NOGRANT` (grant record gone: a
+/// mint racing a cascade is fenced before writing, fail closed with no
+/// cascade), `ABSENT`, or `MISMATCH`.
+///
+/// Precedence is intentional: the idempotency-map `REPLAY` check runs before
+/// the `NOGRANT` grant-record fence, so a retried request whose grant was
+/// revoked mid-cascade still resolves to its already-minted pair instead of
+/// locking out. `REPLAY` mints nothing new — the re-resolved hashes name
+/// records the cascade already deleted, so the service layer safely discards
+/// them — and only map-miss rotations reach the fence, which writes nothing,
+/// indexes nothing, and cascades nothing.
 pub(crate) static SCRIPT_ROTATE_REFRESH: LazyLock<Script> = LazyLock::new(|| {
   Script::new(
     r"
@@ -586,6 +727,9 @@ pub(crate) static SCRIPT_ROTATE_REFRESH: LazyLock<Script> = LazyLock::new(|| {
     if mapped then
       local parts = cjson.decode(mapped)
       return {'REPLAY', parts['refresh'], parts['access']}
+    end
+    if redis.call('EXISTS', KEYS[6]) == 0 then
+      return {'NOGRANT'}
     end
     local old = redis.call('HGETALL', KEYS[1])
     if #old == 0 then

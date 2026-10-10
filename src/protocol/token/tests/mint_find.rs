@@ -192,3 +192,43 @@ async fn token_service_grant_set_holds_hashes_and_revoke_grant() -> TestResult {
   }
   Ok(())
 }
+
+/// A non-`vN` pepper id keeps its identity end to end: the stored hash carries
+/// the full string label and the minted token still resolves under it.
+#[tokio::test]
+async fn token_service_non_numeric_kid_preserved_end_to_end() -> TestResult {
+  let (_redis, mut conn, store) = test_redis().await?;
+  let service = service(&[("pepper-2026", "token-service-pepper-one")])?;
+  let grant = unique("grant");
+  let client = unique("client");
+
+  let minted = service
+    .mint(
+      &mut conn,
+      &store,
+      &mint_request(
+        &client,
+        ClientKind::Confidential,
+        &grant,
+        SenderProof::none(),
+      ),
+      now_unix(),
+    )
+    .await?;
+  if !minted.access_hash.starts_with("pepper-2026.")
+    || !minted.refresh_hash.starts_with("pepper-2026.")
+  {
+    return Err(TestError::Unexpected(
+      "non-numeric kid must survive in the stored hash".to_owned(),
+    ));
+  }
+  let found = service
+    .find_access(&mut conn, &store, &minted.access_token)
+    .await?;
+  match found {
+    Some(found) if found.hash == minted.access_hash && found.key_label == "pepper-2026" => Ok(()),
+    _ => Err(TestError::Unexpected(
+      "token minted under a non-numeric kid must resolve with its label".to_owned(),
+    )),
+  }
+}

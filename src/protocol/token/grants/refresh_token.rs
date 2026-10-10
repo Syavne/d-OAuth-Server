@@ -8,13 +8,17 @@
 //! request-id mapping).
 //!
 //! Ordering is the whole contract: the new raw pair is minted server-side
-//! FIRST, keyed by the deterministic `rotation_request_id`, and only then is
-//! the Lua script invoked. A lost post-`EXEC` reply is recovered by re-reading
-//! the request-id mapping (same hashes, never a double rotation); only a
-//! tombstone with no valid mapping triggers the grant-cascade reuse path. A
-//! retry that hits a live mapping is rejected WITHOUT cascading: the raw
-//! tokens of the first rotation are unrecoverable from hashes alone, so the
-//! retry cannot be served, but the grant family is left intact.
+//! FIRST (barrier deferred to the rotation, which covers the pre-mint writes
+//! on the same connection), keyed by the deterministic `rotation_request_id`,
+//! and only then is the Lua script invoked. A barrier failure after the
+//! originating write applied resolves to the minted pair
+//! (`RotatedUnbarriered`, returned as-is); a lost post-`EXEC` reply is
+//! recovered by re-reading the request-id mapping (same hashes, never a
+//! double rotation, still rejected without cascading); only a tombstone with
+//! no valid mapping triggers the grant-cascade reuse path. A retry that hits
+//! a live mapping is rejected WITHOUT cascading: the raw tokens of the first
+//! rotation are unrecoverable from hashes alone, so the retry cannot be
+//! served, but the grant family is left intact.
 
 #[cfg(test)]
 mod tests;
@@ -163,8 +167,12 @@ pub async fn refresh_with_subject_check(
 ///
 /// The stored `cnf` alone never mints: every bound component must equal its
 /// freshly verified counterpart. Scope may only narrow (`invalid_scope`
-/// otherwise). The replacement pair is minted BEFORE the Lua script runs, so
-/// every non-`Rotated` outcome revokes the orphaned pre-mint.
+/// otherwise). The replacement pair is minted BEFORE the Lua script runs
+/// (barrier deferred to the rotation, which gates the response), so every
+/// non-`Rotated`/`RotatedUnbarriered` outcome revokes the orphaned pre-mint.
+/// A barrier failure after the originating write applied returns the minted
+/// pair as tokens instead of locking out; a mapping replay still discards
+/// the orphans and rejects without cascading.
 ///
 /// # Errors
 ///
@@ -216,7 +224,7 @@ pub async fn refresh(
     user_term,
   )?;
   let minted = service
-    .mint(
+    .mint_for_rotation(
       conn,
       store,
       &MintRequest {
@@ -263,7 +271,7 @@ pub async fn refresh(
     .await
     .map_err(AppError::from)?
   {
-    RotateOutcome::Rotated { .. } => Ok(response(
+    RotateOutcome::Rotated { .. } | RotateOutcome::RotatedUnbarriered { .. } => Ok(response(
       service,
       &minted,
       &narrowed,

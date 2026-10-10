@@ -20,6 +20,7 @@ use d_oauth::{
   state::RedisConn,
   store::{
     Store, StoreError,
+    grants::{GrantRecord, create as create_grant},
     tokens::{
       AccessRecord, RefreshRecord, RotateOutcome, RotationInput, derive_rotation_id, put_refresh,
       rotate,
@@ -187,6 +188,20 @@ async fn rotation_apply_replay_absent_mismatch() -> TestResult {
     &store,
     &old_hash,
     &refresh_record(&client, &grant),
+    Duration::from_secs(600),
+  )
+  .await?;
+  // Production mint always writes the grant record before any rotation;
+  // the rotation fence requires it, so the harness mirrors mint here.
+  create_grant(
+    &mut conn,
+    &store,
+    &GrantRecord {
+      grant_id: grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "read".to_owned(),
+    },
     Duration::from_secs(600),
   )
   .await?;

@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use axum::{
-  Form, Json,
+  Extension, Form, Json,
   extract::State,
   http::{HeaderMap, StatusCode, header},
   response::{IntoResponse, Response},
@@ -42,6 +42,7 @@ use crate::{
   },
   state::{AppState, RedisConn},
   store::Store,
+  tls::PeerCertificates,
 };
 
 /// Supported `token_type_hint` value for access tokens (RFC 7009 §2.1).
@@ -236,8 +237,20 @@ struct ErrorBody {
 /// `POST /revoke` (RFC 7009 §2.1).
 ///
 /// Credentials come from the `Authorization` header and the form body only; a
-/// secret in the query string is never consulted. All well-formed requests
-/// answer `200 OK`, including unknown or foreign tokens.
+/// secret in the query string is never consulted. mTLS-registered clients
+/// (RFC 8705 §2) authenticate with `client_id` plus the verified peer chain
+/// injected by the TLS accept loop, exactly as the token and introspection
+/// endpoints do; a missing or unregistered chain fails closed as
+/// `invalid_client`. No forwarded header is ever trusted: only the in-process
+/// [`PeerCertificates`] extension counts as mTLS evidence.
+///
+/// Certificate revocation story: client certificates are expected to be
+/// short-lived, so expiry bounds exposure without any revocation list; a
+/// CRL/OCSP check at authentication time is the hook point if deployments
+/// later need explicit revocation (verify freshness there, fail closed on
+/// outage, never cache a good verdict past the response's validity window).
+/// All well-formed requests answer `200 OK`, including unknown or foreign
+/// tokens.
 ///
 /// # Errors
 ///
@@ -246,6 +259,7 @@ struct ErrorBody {
 /// `token_type_hint` is rendered as `400 unsupported_token_type`.
 pub async fn revoke_handler(
   State(state): State<AppState>,
+  peer_certs: Option<Extension<PeerCertificates>>,
   headers: HeaderMap,
   Form(form): Form<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
@@ -260,7 +274,7 @@ pub async fn revoke_handler(
       .map(|secret| SecretString::from(secret.as_str())),
     assertion_type: form.get("client_assertion_type").map(String::as_str),
     assertion: form.get("client_assertion").map(String::as_str),
-    peer_certs: None,
+    peer_certs: peer_certs.as_deref(),
   };
   let mut redis = state.redis.clone();
   let store = Store::from_config(&state.config.redis);

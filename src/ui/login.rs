@@ -198,13 +198,24 @@ pub fn session_cookie(config: &Config, session_id: &str) -> Cookie<'static> {
   builder.build()
 }
 
-/// Build an expired session cookie for logout.
+/// Build an expired session cookie for logout, mirroring every attribute of
+/// [`session_cookie`] (`Path`, `HttpOnly`, `SameSite`, `Secure`, `Domain`) so
+/// the clearing cookie overwrites the session cookie in the browser. A bare
+/// removal cookie without those attributes would leave the session cookie
+/// alive under the stricter attribute set.
 #[must_use]
-pub fn expired_session_cookie() -> Cookie<'static> {
-  Cookie::build((SESSION_COOKIE, String::new()))
+pub fn expired_session_cookie(config: &Config) -> Cookie<'static> {
+  let mut builder = Cookie::build((SESSION_COOKIE, String::new()))
     .path("/")
-    .removal()
-    .build()
+    .http_only(true)
+    .same_site(SameSite::Lax);
+  if config.cookie_secure {
+    builder = builder.secure(true);
+  }
+  if let Some(domain) = config.cookie_domain.clone() {
+    builder = builder.domain(domain);
+  }
+  builder.removal().build()
 }
 
 /// Mint the stateless pre-login CSRF token: HMAC under the active token
@@ -666,23 +677,17 @@ pub async fn confirm_totp(
   };
   let secret = totp::decrypt_secret(deps.keys, &blob)?;
   let now_unix = u64::try_from(deps.now.unix_timestamp().max(0)).unwrap_or(0);
-  let key_for = |step: u64| {
-    deps.store.totp_replay_key(&totp::replay_fingerprint(
-      &user.id.to_string(),
-      code.trim(),
-      step,
-    ))
-  };
-  if !totp::verify_and_claim(
-    deps.conn,
-    key_for,
-    &secret,
+  let user_label = user.id.to_string();
+  let store = deps.store;
+  let key_for = |fingerprint: &str| store.totp_replay_key(fingerprint);
+  let claim = totp::TotpClaim {
+    user_id: &user_label,
+    secret_b32: &secret,
     code,
     now_unix,
-    totp::USED_CODE_TTL,
-  )
-  .await?
-  {
+    ttl: totp::USED_CODE_TTL,
+  };
+  if !totp::verify_and_claim_with_ring(deps.conn, deps.keys, key_for, &claim).await? {
     user_repo::register_login_failure(deps.conn, deps.store, policy, &live.record.subject).await?;
     audit_failure(
       live.meta.pending_request_id.as_deref(),
@@ -734,21 +739,16 @@ async fn verify_second_factor(
   if let Some(blob) = user_repo::totp_secret_blob(deps.pool, user_id).await? {
     let secret = totp::decrypt_secret(deps.keys, &blob)?;
     let now_unix = u64::try_from(deps.now.unix_timestamp().max(0)).unwrap_or(0);
-    let key_for = |step: u64| {
-      deps
-        .store
-        .totp_replay_key(&totp::replay_fingerprint(&user_label, code.trim(), step))
-    };
-    if totp::verify_and_claim(
-      deps.conn,
-      key_for,
-      &secret,
+    let store = deps.store;
+    let key_for = |fingerprint: &str| store.totp_replay_key(fingerprint);
+    let claim = totp::TotpClaim {
+      user_id: &user_label,
+      secret_b32: &secret,
       code,
       now_unix,
-      totp::USED_CODE_TTL,
-    )
-    .await?
-    {
+      ttl: totp::USED_CODE_TTL,
+    };
+    if totp::verify_and_claim_with_ring(deps.conn, deps.keys, key_for, &claim).await? {
       return Ok(true);
     }
   }
@@ -1047,6 +1047,14 @@ pub struct ConfirmForm {
   pub csrf: String,
 }
 
+/// Form posted to `POST /logout`.
+#[derive(Debug, Deserialize)]
+pub struct LogoutForm {
+  /// Session-bound form token.
+  #[serde(default)]
+  pub csrf: String,
+}
+
 /// Login page.
 #[derive(Template)]
 #[template(
@@ -1164,10 +1172,35 @@ struct ConfirmTemplate {
   <title>Signed in</title></head><body>\
   <h1>Signed in</h1><p>You are signed in.</p>\
   <form method=\"post\" action=\"/logout\">\
+  <input type=\"hidden\" name=\"csrf\" value=\"{{ csrf }}\">\
   <button type=\"submit\">Sign out</button></form></body></html>",
   ext = "html"
 )]
-struct SuccessTemplate;
+struct SuccessTemplate {
+  csrf: String,
+}
+
+/// Sign-out confirmation page rendered by `GET /logout`.
+///
+/// Read-only: rendering this page never destroys the session. The embedded
+/// session-bound form token authorizes the `POST /logout` that ends it, so a
+/// forced navigation to `GET /logout` (for example an `<img src="/logout">`)
+/// cannot sign the user out.
+#[derive(Template)]
+#[template(
+  source = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+  <link rel=\"stylesheet\" href=\"/assets/app.css\">\
+  <title>Confirm sign out</title></head><body>\
+  <h1>Sign out?</h1><p>Use the button below to end your session.</p>\
+  <form method=\"post\" action=\"/logout\">\
+  <input type=\"hidden\" name=\"csrf\" value=\"{{ csrf }}\">\
+  <button type=\"submit\">Sign out</button></form></body></html>",
+  ext = "html"
+)]
+struct LogoutConfirmTemplate {
+  csrf: String,
+}
 
 /// Neutral landing page after an RP-initiated logout. Deliberately has no
 /// auto-redirect and no form post: a forced navigation to `GET /logout` (for
@@ -1458,34 +1491,18 @@ pub async fn post_totp_confirm(
   }
 }
 
-/// `POST /logout`: destroy the session and expire the cookie.
-pub async fn post_logout(State(state): State<AppState>, jar: CookieJar) -> Response {
-  let mut conn = state.redis.clone();
-  let store = Store::from_config(&state.config.redis);
-  let session_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
-  if logout(&mut conn, &store, &session_id).await.is_err() {
-    return AppError::server_error().into_response();
-  }
-  (jar.add(expired_session_cookie()), Redirect::to(LOGIN_PATH)).into_response()
-}
-
-/// `GET /logout`: destroy the session, expire the cookie, then render a neutral
-/// signed-out page or redirect to the flow's registered post-logout URI.
+/// `POST /logout`: verify the session-bound form token, then destroy the
+/// session and expire the cookie.
 ///
-/// No query parameter is ever honored, so the target cannot be supplied by the
-/// caller. The return URI was frozen in session meta when the authorization
-/// flow was bound, and it is used only if the owning client is still active and
-/// still registers that exact URI. If there is no session, no bound client, or
-/// the client/URI is no longer valid, the neutral page is rendered and no
-/// redirect is issued. The server session is destroyed idempotently; a missing
-/// session is a no-op.
-pub async fn get_logout(
+/// A missing or invalid token is rejected with `invalid_request` and the
+/// session is left intact, so a cross-site form post cannot sign the user
+/// out. With no session the call is idempotent: the cookie is still expired
+/// and the caller lands on login.
+pub async fn post_logout(
   State(state): State<AppState>,
   Extension(request_id): Extension<RequestId>,
   jar: CookieJar,
+  Form(form): Form<LogoutForm>,
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
@@ -1493,21 +1510,33 @@ pub async fn get_logout(
     .get(SESSION_COOKIE)
     .map(|cookie| cookie.value().to_owned())
     .unwrap_or_default();
-  let target = match load_session(&mut conn, &store, &session_id)
-    .await
-    .unwrap_or(None)
-  {
-    Some(live) => match resolve_post_logout_target(&state, &live).await {
-      Ok(target) => target,
-      Err(error) => {
-        emit_pii_decrypt(&request_id, &error);
-        if logout(&mut conn, &store, &session_id).await.is_err() {
-          return AppError::server_error().into_response();
-        }
-        return (jar.add(expired_session_cookie()), error.into_response()).into_response();
+  let live = match load_session(&mut conn, &store, &session_id).await {
+    Ok(Some(live)) => live,
+    Ok(None) => {
+      return (
+        jar.add(expired_session_cookie(&state.config)),
+        Redirect::to(LOGIN_PATH),
+      )
+        .into_response();
+    }
+    Err(error) => return error.into_response(),
+  };
+  if !verify_form_token(&live.meta.csrf_secret, LOGOUT_ACTION, &form.csrf) {
+    return AppError::invalid_request("invalid form submission").into_response();
+  }
+  let target = match resolve_post_logout_target(&state, &live).await {
+    Ok(target) => target,
+    Err(error) => {
+      emit_pii_decrypt(&request_id, &error);
+      if logout(&mut conn, &store, &session_id).await.is_err() {
+        return AppError::server_error().into_response();
       }
-    },
-    None => None,
+      return (
+        jar.add(expired_session_cookie(&state.config)),
+        error.into_response(),
+      )
+        .into_response();
+    }
   };
   if logout(&mut conn, &store, &session_id).await.is_err() {
     return AppError::server_error().into_response();
@@ -1516,7 +1545,36 @@ pub async fn get_logout(
     Some(uri) => Redirect::to(&uri).into_response(),
     None => render(SignedOutTemplate),
   };
-  (jar.add(expired_session_cookie()), response).into_response()
+  (jar.add(expired_session_cookie(&state.config)), response).into_response()
+}
+
+/// `GET /logout`: read-only sign-out confirmation.
+///
+/// This handler never destroys the session and never touches cookies: it
+/// renders the confirmation form (with a fresh session-bound token) for a
+/// live session, or the neutral signed-out page when anonymous. Only
+/// `POST /logout` with a valid form token ends the session, so a forced
+/// navigation to this URI cannot sign the user out.
+///
+/// No query parameter is ever honored, so the target cannot be supplied by the
+/// caller. The post-logout return URI is resolved only by `POST /logout` from
+/// the URI frozen in session meta when the authorization flow was bound, and
+/// it is used only if the owning client is still active and still registers
+/// that exact URI.
+pub async fn get_logout(State(state): State<AppState>, jar: CookieJar) -> Response {
+  let mut conn = state.redis.clone();
+  let store = Store::from_config(&state.config.redis);
+  let session_id = jar
+    .get(SESSION_COOKIE)
+    .map(|cookie| cookie.value().to_owned())
+    .unwrap_or_default();
+  match load_session(&mut conn, &store, &session_id).await {
+    Ok(Some(live)) => render(LogoutConfirmTemplate {
+      csrf: form_token(&live.meta.csrf_secret, LOGOUT_ACTION),
+    }),
+    Ok(None) => render(SignedOutTemplate),
+    Err(error) => error.into_response(),
+  }
 }
 
 /// Resolve the session's bound post-logout target, if it is still trustworthy.
@@ -1576,13 +1634,17 @@ pub async fn get_login_success(State(state): State<AppState>, jar: CookieJar) ->
     .unwrap_or_default();
   match load_session(&mut conn, &store, &session_id).await {
     Ok(Some(live)) if !live.record.subject.is_empty() && !live.record.restricted => {
-      render(SuccessTemplate)
+      render(SuccessTemplate {
+        csrf: form_token(&live.meta.csrf_secret, LOGOUT_ACTION),
+      })
     }
     Ok(_) => Redirect::to(LOGIN_PATH).into_response(),
     Err(error) => error.into_response(),
   }
 }
 
+/// Form-token action for the sign-out confirmation form.
+const LOGOUT_ACTION: &str = "logout";
 /// Form-token action for the password-change form.
 const CHANGE_PASSWORD_ACTION: &str = "change-password";
 /// Form-token action for the TOTP-confirmation form.

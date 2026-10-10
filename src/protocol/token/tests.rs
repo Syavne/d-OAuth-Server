@@ -7,6 +7,7 @@ mod matrix;
 mod mint_find;
 mod peppers;
 mod rotate;
+mod shape;
 
 use std::{
   sync::atomic::{AtomicU64, Ordering},

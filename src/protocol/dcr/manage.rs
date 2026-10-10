@@ -201,20 +201,15 @@ fn verify_registration_token(config: &Config, stored: &str, presented: &str) -> 
     .keys
     .peppers_newest_first()
     .map(|(id, secret)| {
-      let generation = id
-        .as_str()
-        .trim_start_matches('v')
-        .parse::<u32>()
-        .unwrap_or(1);
       (
-        tokens_crypto::KeyId::new(generation),
+        tokens_crypto::KeyId::new(id.as_str()),
         secret.expose_secret().as_bytes().to_vec(),
       )
     })
     .collect();
   let candidates: Vec<(tokens_crypto::KeyId, &[u8])> = owned
     .iter()
-    .map(|(id, secret)| (*id, secret.as_slice()))
+    .map(|(id, secret)| (id.clone(), secret.as_slice()))
     .collect();
   tokens_crypto::verify_token_hash(&parsed, &candidates, presented)
 }

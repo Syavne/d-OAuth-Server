@@ -26,6 +26,8 @@ use crate::{
 
 /// Allowed client-assertion signing algorithms (matches the metadata
 /// `token_endpoint_auth_signing_alg_values_supported` allowlist).
+/// Mirrored by `crate::jose::jar::verify` (`ALLOWED_ALGS`): keep the two
+/// allowlists in sync when adding or removing an algorithm.
 pub(crate) const ALLOWED_ALGS: [Algorithm; 4] = [
   Algorithm::RS256,
   Algorithm::PS256,

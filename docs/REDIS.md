@@ -39,7 +39,7 @@ differ.
 | `oauth:{state}:client_assertion_jti:<hash>` | `private_key_jwt` `jti` replay marker. | Remaining assertion validity (`exp + 30s skew - now`), clamped `[1s, 360s]` (300s max lifetime + 2×30s skew) |
 | `oauth:{state}:rotation:<request-id>` | Rotation idempotency mapping. | `min(900s, refresh TTL)` |
 | `oauth:{state}:loginfail:<sha256>` | Failed-login counter (hashed label). | `ui::login::LOCKOUT_WINDOW` (15 min) |
-| `oauth:{state}:totp_replay:<fingerprint>` | TOTP used-code replay marker. | Time step window |
+| `oauth:{state}:totp_replay:<fingerprint>` | TOTP used-code replay marker. The fingerprint is an HMAC under the token pepper (never the code itself), so a dump does not reveal the code. | Time step window |
 | `oauth:{rl}:ratelimit:<bucket-hash>` | Fixed-window rate-limit counter. | `rate_limit.window` (60s) |
 
 `<hash>` is always a keyed hash. Tokens are opaque, so the server can look a
@@ -81,11 +81,18 @@ token hash. The script returns one of:
   family.
 - `ABSENT`: unknown token.
 - `MISMATCH`: issued to a different client.
+- `NOGRANT`: the grant record is gone (a mint racing a cascade is fenced
+  before any write, so nothing is stored and no cascade runs).
 
 The old refresh record is not deleted. It becomes a tombstone with a `used`
 flag and a `rotated_to` member, kept for the refresh lifetime so reuse stays
 detectable. The new tokens are minted before the script runs, so a crash during
 the write cannot mint a token that was never stored.
+
+Grant cascade `revoke` drains in a bounded loop: one script pass is atomic but
+blind to a mint racing the cascade, so the pass repeats until the member set
+reads empty and a token minted mid-cascade is deleted by a later pass (or
+refused outright by the rotation `NOGRANT` fence) instead of surviving.
 
 ## The durability barrier
 
@@ -101,7 +108,10 @@ token is returned to the client. It is never run inside a Lua script or
 | `appendfsync_always` | Single node | Assert `CONFIG GET appendfsync` is `always`. This is instance-wide, not per-write-path. |
 
 A barrier below the required level fails closed with `503`, mapped from
-`StoreError::Durability`. The server-side wait leaves 500 ms of headroom under
+`StoreError::Durability`. Exception: a refresh rotation whose originating
+write already applied returns the minted pair as `RotatedUnbarriered` instead
+of `503` (any other caller, including a `Replay` hit, stays fail-closed).
+The server-side wait leaves 500 ms of headroom under
 the client response timeout so an expired barrier surfaces as a clean failure
 rather than an ambiguous timeout.
 

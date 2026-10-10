@@ -259,7 +259,7 @@ certificate.
 - Redirect URIs: `redirect-uri create|list|enable|disable|delete` and
   `client attach-redirect-uri|detach-redirect-uri|redirect-uris`. Each accepts
   `--kind authorize|post_logout` (default `authorize`); `post_logout` URIs are
-  the return targets for `GET /logout`.
+  the return targets for `POST /logout` (`GET /logout` is read-only).
 - Users and entitlements: `user create|enroll-totp|disable|grant-scope|revoke-scope|scopes`.
 - Admin: `admin bootstrap` (see [RUNBOOK.md](RUNBOOK.md)).
 - Declarative apply: `config sync --file` and `config check`.
