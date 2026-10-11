@@ -11,9 +11,18 @@
 .omo/
 .opencode/
 __pycache__/
-fuzz/
+# NOTE: only the fuzz build outputs are excluded. The fuzz sources
+# (`Cargo.toml`, `rust-toolchain.toml`, `fuzz_targets/`, `corpus/`) MUST stay
+# in the context: `.clusterfuzzlite/Dockerfile` builds from this same context
+# and needs them.
+fuzz/target/
+fuzz/build/
+fuzz/artifacts/
 scripts/__pycache__/
 target/
-.clusterfuzzlite/
+# NOTE: `build.sh` MUST stay in the context: `.clusterfuzzlite/Dockerfile`
+# copies it (`COPY .clusterfuzzlite/build.sh`) from this same context.
+.clusterfuzzlite/*
+!.clusterfuzzlite/build.sh
 lcov.info
 *.sarif
