@@ -530,8 +530,11 @@ on:
   only on master/scheduled builds, never on a tag.
 - A vulnerability scan that fails on HIGH and CRITICAL (job `merge`, steps
   `Scan (trivy, gate HIGH/CRITICAL)` writing `trivy.sarif` and
-  `Scan (grype, gate high/critical)`; the SBOM is committed as the
-  `sbom.spdx.json` artifact by step `SBOM (syft, committed as artifact)`).
+  `Scan (grype, gate high/critical)`), plus step
+  `Upload trivy SARIF to code scanning` publishing `trivy.sarif` to the
+  repository's code-scanning (Security) tab with category `trivy`; the SBOM is
+  committed as the `sbom.spdx.json` artifact by step
+  `SBOM (syft, committed as artifact)`.
 - Keyless signing with `cosign` (job `merge`, step
   `Keyless sign (cosign, OIDC)`: `cosign sign` on the merged index digest; the
   per-arch SBOM and SLSA provenance attestations are attached by the `build`
@@ -673,7 +676,8 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
   build (linux/amd64 on `ubuntu-24.04`, linux/arm64 on `ubuntu-24.04-arm`) with
   SBOM + provenance, a `merge` job that assembles the multi-arch manifest
   (`docker buildx imagetools create`) and runs the trivy/grype HIGH/CRITICAL
-  gates plus keyless cosign signing, digest pinning of
+  gates (uploading the trivy SARIF to code scanning) plus keyless cosign
+  signing, digest pinning of
   `deploy/k8s/kustomization.yaml`, and the weekly rebuild.
 - `deploy/k8s/` for the cluster manifests: `namespace.yaml`, `configmap.yaml`
   (non-secret settings only, including the passwordless DSNs), `secret.yaml`

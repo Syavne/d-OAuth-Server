@@ -116,6 +116,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
+      security-events: write
     outputs:
       digest: ${{ steps.merge.outputs.digest }}
     steps:
@@ -171,13 +172,21 @@ jobs:
           image: ${{ env.REGISTRY_IMAGE }}@${{ steps.merge.outputs.digest }}
           artifact-name: sbom.spdx.json
       - name: Scan (trivy, gate HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY_IMAGE }}@${{ steps.merge.outputs.digest }}
           format: sarif
           output: trivy.sarif
           severity: HIGH,CRITICAL
           exit-code: "1"
+      - name: Upload trivy SARIF to code scanning
+        # `if: always()` so the findings still reach the Security tab when the
+        # gate above fails the job (exit-code 1).
+        if: always()
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
       - name: Scan (grype, gate high/critical)
         uses: anchore/scan-action@64a33b277ea7a1215a3c142735a1091341939ff5 # v4
         with:
