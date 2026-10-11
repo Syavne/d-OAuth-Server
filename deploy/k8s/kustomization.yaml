@@ -24,8 +24,8 @@ resources:
   - pdb.yaml
   - networkpolicy.yaml
 images:
-  - name: ghcr.io/d-oauth/d-oauth-server
-    newName: ghcr.io/d-oauth/d-oauth-server
+  - name: ghcr.io/syavne/d-oauth-server
+    newName: ghcr.io/syavne/d-oauth-server
     # Placeholder (all zeroes), not a pullable reference: a rollout without
     # the pin step fails closed instead of silently floating on a tag. CI
     # replaces this with the released `sha256:<digest>` after signing.

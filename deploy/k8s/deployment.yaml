@@ -78,7 +78,7 @@ spec:
           # `.github/workflows/supply-chain.yml` writes the real signed-build
           # digest into the `images` entry of `kustomization.yaml`; kustomize
           # then applies that digest to this container and the migrate Job.
-          image: ghcr.io/d-oauth/d-oauth-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          image: ghcr.io/syavne/d-oauth-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           ports:
             - name: public-tls

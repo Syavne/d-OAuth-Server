@@ -50,6 +50,18 @@ docker buildx bake image
 docker buildx bake image --set image.platform=linux/amd64
 ```
 
+To emit several tags from one build, set `IMAGE_TAGS` to a comma-separated
+list. A `--set image.tags=` value is parsed as a single string, so a comma list
+there becomes one invalid tag rather than a tag set:
+
+```bash
+IMAGE_TAGS="ghcr.io/syavne/d-oauth-server:v1.2.3,ghcr.io/syavne/d-oauth-server:latest" \
+  docker buildx bake image
+```
+
+The release path in `.github/workflows/supply-chain.yml` drives this variable
+when a `v*` tag is pushed; see [Supply chain](#supply-chain).
+
 Building `linux/arm64` on an amd64 host requires QEMU binfmt emulation. Docker
 Desktop bundles it; a bare Docker Engine does not. When it is missing, the arm64
 leg fails fast with `exec /bin/sh: exec format error`, because BuildKit pulls
@@ -504,6 +516,13 @@ on:
 - Multi-arch build with an SBOM and provenance attestation (job `build`, step
   `Multi-arch bake with SBOM + provenance`: `docker buildx bake image` with
   `--sbom=true --provenance=mode=max`).
+- Release publishing on a `v*` tag (job `build`, then job `release`): the same
+  signed multi-arch image is tagged `<X.Y.Z>`, `<X.Y>`, `<X>`, and `latest` (a
+  pre-release such as `v1.2.3-rc1` gets only `<X.Y.Z>` plus its sha), and a
+  GitHub Release is created with generated notes. These tags are convenience
+  references only; a production rollout still pins the digest (see
+  [Deploy path](#deploy-path-use-the-signed-ghcrio-image)). `pin-digest` runs
+  only on master/scheduled builds, never on a tag.
 - A vulnerability scan that fails on HIGH and CRITICAL (job `build`, steps
   `Scan (trivy, gate HIGH/CRITICAL)` writing `trivy.sarif` and
   `Scan (grype, gate high/critical)`; the SBOM is committed as the
@@ -528,7 +547,7 @@ then records the exact digest it shipped:
 
 ```bash
 # 1. Read the pinned digest the `pin-digest` job committed.
-grep -A2 'name: ghcr.io/d-oauth/d-oauth-server' deploy/k8s/kustomization.yaml
+grep -A2 'name: ghcr.io/syavne/d-oauth-server' deploy/k8s/kustomization.yaml
 
 # 2. Verify the keyless cosign signature from the `build` job's
 #    `Keyless sign (cosign, OIDC)` step before pulling or applying.
@@ -537,7 +556,7 @@ grep -A2 'name: ghcr.io/d-oauth/d-oauth-server' deploy/k8s/kustomization.yaml
 cosign verify \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'supply-chain' \
-  'ghcr.io/d-oauth/d-oauth-server@sha256:<digest>'
+  'ghcr.io/syavne/d-oauth-server@sha256:<digest>'
 
 # 3. Confirm the manifests resolve to that digest and pass policy.
 kustomize build deploy/k8s

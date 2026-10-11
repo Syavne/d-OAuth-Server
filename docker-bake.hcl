@@ -5,6 +5,13 @@ variable "TAG" {
   default = "latest"
 }
 
+# Comma-separated tag list. Must be an env var, not `--set image.tags=`: bake
+# parses a `--set` value as one string, so a comma list becomes a single
+# invalid tag instead of several.
+variable "IMAGE_TAGS" {
+  default = ""
+}
+
 variable "SOURCE_DATE_EPOCH" {
   default = "0"
 }
@@ -17,7 +24,7 @@ target "image" {
   dockerfile = "Dockerfile"
   context    = "."
   platforms  = ["linux/amd64", "linux/arm64"]
-  tags       = ["d-oauth-server:${TAG}"]
+  tags       = IMAGE_TAGS != "" ? split(",", IMAGE_TAGS) : ["d-oauth-server:${TAG}"]
   args = {
     SOURCE_DATE_EPOCH = "${SOURCE_DATE_EPOCH}"
   }

@@ -77,6 +77,6 @@ ENTRYPOINT ["/d-oauth-server", "serve"]
 LABEL org.opencontainers.image.title="d-oauth-server" \
   org.opencontainers.image.description="OAuth 2.1-only authorization server (static musl, non-root, no shell)" \
   org.opencontainers.image.licenses="MIT OR Apache-2.0" \
-  org.opencontainers.image.source="https://github.com/d-oauth/d-oauth" \
+  org.opencontainers.image.source="https://github.com/Syavne/d-OAuth-Server" \
   org.opencontainers.image.revision="unknown" \
   org.opencontainers.image.vendor="d-oauth"

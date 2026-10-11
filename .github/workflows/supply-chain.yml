@@ -5,6 +5,10 @@
 # Per-push-to-master legs: multi-arch `docker buildx bake` with SBOM +
 # provenance, trivy/grype gating HIGH/CRITICAL, keyless cosign signing, and
 # digest pinning of `deploy/k8s/kustomization.yaml` (strict lint re-run).
+# Release tags (`v*`): the same signed multi-arch build is published under
+# semver tags (X.Y.Z, X.Y, X, `latest`; a pre-release tag gets only X.Y.Z) and
+# a GitHub Release is created. `pin-digest` does not run on a tag (it tracks
+# master).
 # Scheduled legs (weekly rebuild, Monday 04:00 UTC): rebuild + rescan + resign
 # so base-image digests advance even without code changes.
 #
@@ -16,6 +20,7 @@ name: supply-chain
 on:
   push:
     branches: ["master"]
+    tags: ["v*"]
   pull_request: {}
   schedule:
     # Weekly rebuild (Monday 04:00 UTC).
@@ -26,7 +31,7 @@ permissions:
   contents: read
 
 env:
-  REGISTRY_IMAGE: ghcr.io/d-oauth/d-oauth-server
+  REGISTRY_IMAGE: ghcr.io/syavne/d-oauth-server
   SQLX_OFFLINE: "true"
 
 jobs:
@@ -70,10 +75,25 @@ jobs:
       - name: Multi-arch bake with SBOM + provenance
         id: bake
         run: |
-          TAG="sha-${GITHUB_SHA::12}"
-          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-          docker buildx bake image \
-            --set "image.tags=${REGISTRY_IMAGE}:${TAG}" \
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::release tag '${GITHUB_REF_NAME}' is not semver (expected vX.Y.Z or vX.Y.Z-pre)"
+              exit 1
+            fi
+            tags="${REGISTRY_IMAGE}:${version}"
+            if [[ "${version}" != *-* ]]; then
+              major="${version%%.*}"
+              minor="${version#*.}"; minor="${minor%%.*}"
+              tags+=",${REGISTRY_IMAGE}:${major}.${minor},${REGISTRY_IMAGE}:${major},${REGISTRY_IMAGE}:latest"
+            fi
+            tags+=",${REGISTRY_IMAGE}:sha-${GITHUB_SHA::12}"
+          else
+            tags="${REGISTRY_IMAGE}:sha-${GITHUB_SHA::12}"
+          fi
+          echo "tags=${tags}" >> "${GITHUB_OUTPUT}"
+          IMAGE_TAGS="${tags}" docker buildx bake image \
             --set image.output="type=registry" \
             --sbom=true \
             --provenance=mode=max \
@@ -115,6 +135,9 @@ jobs:
   pin-digest:
     name: pin-digest
     needs: [build]
+    # Only master/scheduled builds advance the committed digest; a release tag
+    # must not rewrite kustomization.
+    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -135,9 +158,34 @@ jobs:
           path = Path("deploy/k8s/kustomization.yaml")
           doc = yaml.safe_load(path.read_text())
           for img in doc.get("images", []):
-              if img.get("name") == "ghcr.io/d-oauth/d-oauth-server":
+              if img.get("name") == "ghcr.io/syavne/d-oauth-server":
                   img.pop("newTag", None)
                   img["digest"] = digest
           path.write_text(yaml.safe_dump(doc, sort_keys=False))
           EOF
           python3 scripts/check_manifests.py --strict-digest
+
+  release:
+    name: release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          flags=()
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}" \
+            "${flags[@]}" \
+            --notes "Container image \`${REGISTRY_IMAGE}@${DIGEST}\` (linux/amd64 + linux/arm64), signed with cosign; the SBOM and provenance attestations are attached to the image."

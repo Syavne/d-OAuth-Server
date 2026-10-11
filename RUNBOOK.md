@@ -174,7 +174,7 @@ correlation. No step below writes a secret to a log.
 
 ## 6. Deploy provenance (signed image + digest record)
 
-Every rollout ships the signed `ghcr.io/d-oauth/d-oauth-server` image the
+Every rollout ships the signed `ghcr.io/syavne/d-oauth-server` image the
 `supply-chain.yml` `build` job signed (step `Keyless sign (cosign, OIDC)`)
 and the `pin-digest` job pinned into `deploy/k8s/kustomization.yaml`
 (step `Pin kustomization to the built digest + strict lint`). Nothing ships
@@ -182,7 +182,7 @@ from an unverified local tarball. The full path is in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#deploy-path-use-the-signed-ghcrio-image).
 
 - [ ] Read the digest the `pin-digest` job committed:
-  `grep -A2 'name: ghcr.io/d-oauth/d-oauth-server' deploy/k8s/kustomization.yaml`.
+  `grep -A2 'name: ghcr.io/syavne/d-oauth-server' deploy/k8s/kustomization.yaml`.
 - [ ] Verify it before applying (placeholder `sha256:<digest>` stands for the
   value from the previous step; no real digest is recorded here):
 
@@ -190,7 +190,7 @@ from an unverified local tarball. The full path is in
   cosign verify \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     --certificate-identity-regexp 'supply-chain' \
-    'ghcr.io/d-oauth/d-oauth-server@sha256:<digest>'
+    'ghcr.io/syavne/d-oauth-server@sha256:<digest>'
   kustomize build deploy/k8s
   python3 scripts/check_manifests.py --strict-digest
   kubectl apply --dry-run=server -k deploy/k8s

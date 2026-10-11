@@ -10,6 +10,10 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Added
 
+- Container release publishing on GHCR. A `v*` git tag builds and pushes the
+  signed multi-arch image under semver tags (`X.Y.Z`, `X.Y`, `X`, `latest`; a
+  pre-release gets only `X.Y.Z`) and creates a GitHub Release. The image path is
+  `ghcr.io/syavne/d-oauth-server`.
 - Application-level envelope encryption for the PII directory: emails, client
   names, contacts, redirect URIs, JAR request URIs, JWKS URLs, software ids, and
   mTLS subject DNs/thumbprints are sealed with versioned AES-256-GCM under a new

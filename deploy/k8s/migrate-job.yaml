@@ -48,7 +48,7 @@ spec:
         - name: migrate
           # Same pinning rule as the Deployment: placeholder digest, never a
           # shippable `:latest`; CI resolves it via `kustomization.yaml`.
-          image: ghcr.io/d-oauth/d-oauth-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          image: ghcr.io/syavne/d-oauth-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
           # Overrides the image ENTRYPOINT (["/d-oauth-server","serve"]).
           command: ["/d-oauth-server", "migrate"]
