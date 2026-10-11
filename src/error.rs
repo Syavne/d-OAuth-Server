@@ -495,8 +495,9 @@ impl IntoResponse for AppError {
 
 impl From<sqlx::Error> for AppError {
   /// Map a database error to a client-safe error: connectivity failures
-  /// (pool timeout/close, transport I/O) render `503 temporarily_unavailable`
-  /// (fail closed, matching the Redis mapping); a unique violation on the
+  /// (pool timeout/close, transport I/O, and an outage SQLSTATE such as a
+  /// server shutdown mid-query) render `503 temporarily_unavailable` (fail
+  /// closed, matching the Redis mapping); a unique violation on the
   /// user-email constraints renders the payload-free [`AppError::DuplicateEmail`];
   /// a unique violation on any client mTLS identity constraint (legacy
   /// plaintext or blind-index) renders the payload-free
@@ -505,6 +506,9 @@ impl From<sqlx::Error> for AppError {
   fn from(source: sqlx::Error) -> Self {
     match source {
       sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => {
+        Self::temporarily_unavailable()
+      }
+      sqlx::Error::Database(db) if is_dependency_outage(db.code().as_deref()) => {
         Self::temporarily_unavailable()
       }
       sqlx::Error::Database(db)
@@ -531,6 +535,23 @@ impl From<sqlx::Error> for AppError {
       other => Self::internal(other),
     }
   }
+}
+
+/// SQLSTATE codes proving the Postgres dependency is transiently unavailable
+/// (a failover, restart, or shutdown) rather than the statement being wrong.
+/// These must fail closed as `503 temporarily_unavailable`, never a masked
+/// `500`, matching the connectivity arms above and the Redis transient class.
+///
+/// - class `08` — Connection Exception (`08000`, `08003`, `08006`, `08P01`, …)
+/// - `57P01` admin_shutdown, `57P02` crash_shutdown, `57P03` cannot_connect_now,
+///   `57P04` database_dropped
+/// - `53300` too_many_connections
+fn is_dependency_outage(code: Option<&str>) -> bool {
+  let Some(code) = code else {
+    return false;
+  };
+  code.starts_with("08")
+    || matches!(code, "57P01" | "57P02" | "57P03" | "57P04" | "53300")
 }
 
 impl From<crate::crypto::field::FieldError> for AppError {
@@ -786,6 +807,22 @@ mod tests {
         Some("temporarily_unavailable")
       );
     }
+  }
+
+  #[test]
+  fn sqlx_outage_sqlstate_classification() {
+    for code in [
+      "08000", "08003", "08006", "08P01", "57P01", "57P02", "57P03", "57P04", "53300",
+    ] {
+      assert!(is_dependency_outage(Some(code)), "{code} must be an outage");
+    }
+    for code in ["23505", "42P01", "42601", "28P01", "57014", "40001"] {
+      assert!(
+        !is_dependency_outage(Some(code)),
+        "{code} must not be an outage"
+      );
+    }
+    assert!(!is_dependency_outage(None));
   }
 
   #[tokio::test]
