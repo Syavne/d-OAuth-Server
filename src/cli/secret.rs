@@ -125,14 +125,16 @@ fn encrypt_v2(config: &Config, plaintext: &str) -> Result<Vec<u8>, CliError> {
   if kid.len() > u8::MAX as usize {
     return Err(CliError::Crypto("TOTP key id is too long".to_owned()));
   }
-  let key = derive_key(secret.expose_secret().as_bytes())
-    .map_err(|_| CliError::Crypto("TOTP key derivation failed".to_owned()))?;
+  let key = Zeroizing::new(
+    derive_key(secret.expose_secret().as_bytes())
+      .map_err(|_| CliError::Crypto("TOTP key derivation failed".to_owned()))?,
+  );
   let mut nonce_bytes = [0u8; NONCE_LEN];
   SystemRandom::new()
     .fill(&mut nonce_bytes)
     .map_err(|_| CliError::Crypto("operating-system randomness unavailable".to_owned()))?;
 
-  let unbound = UnboundKey::new(&AES_256_GCM, &key)
+  let unbound = UnboundKey::new(&AES_256_GCM, &key[..])
     .map_err(|_| CliError::Crypto("TOTP key rejected by AEAD".to_owned()))?;
   let sealing = LessSafeKey::new(unbound);
   let mut in_out = plaintext.as_bytes().to_vec();
@@ -374,17 +376,19 @@ fn open_with_aad(
 
 /// Generate a fresh 160-bit TOTP secret, base32 (RFC 4648, no padding).
 ///
+/// The secret is held in [`Zeroizing`] so it is wiped on drop.
+///
 /// # Errors
 /// Returns [`CliError::Crypto`] when the OS RNG fails.
-pub fn generate_totp_secret() -> Result<String, CliError> {
-  let mut bytes = [0u8; 20];
+pub fn generate_totp_secret() -> Result<Zeroizing<String>, CliError> {
+  let mut bytes = Zeroizing::new([0u8; 20]);
   SystemRandom::new()
-    .fill(&mut bytes)
+    .fill(&mut bytes[..])
     .map_err(|_| CliError::Crypto("operating-system randomness unavailable".to_owned()))?;
-  Ok(base32::encode(
+  Ok(Zeroizing::new(base32::encode(
     base32::Alphabet::Rfc4648 { padding: false },
-    &bytes,
-  ))
+    &bytes[..],
+  )))
 }
 
 /// Build an `otpauth://` enrollment URI for a generated TOTP secret.

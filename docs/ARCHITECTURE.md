@@ -58,8 +58,12 @@ is fixed in `build_router_with_options` in `src/routes.rs`:
    allowlist is empty, which is the default.
 4. Resilience: sheds excess load, caps concurrency, and times out slow
    handlers before they reach rate limiting.
-5. Rate limit: enforces the per-IP and per-client budgets. Health and metadata
-   have no rule and pass through; those handlers fail closed on their own.
+5. Rate limit: enforces the per-IP and per-client budgets. The per-client
+   bucket is keyed by the `(peer_ip, client_id)` composite, because
+   `client_id` is read before client authentication and must never select a
+   global bucket on its own; the per-IP bucket is the primary control. Health
+   and metadata have no rule and pass through; those handlers fail closed on
+   their own.
 6. Body limit: caps request bodies at 2 MiB.
 
 A handler that needs a dependency takes `AppState` and calls a repository or the

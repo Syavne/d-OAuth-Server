@@ -474,6 +474,7 @@ pub fn hash_password(password: &str, params: &Argon2Params) -> Result<String, Ap
 mod lockout;
 
 pub use lockout::{
-  LockoutPolicy, clear_login_failures, is_locked_out, lockout_remaining, login_failure_count,
-  register_login_failure,
+  LockoutPolicy, clear_login_failures, ip_failure_count, is_locked_out, is_unknown_locked_out,
+  lockout_remaining, login_failure_count, register_login_failure, register_unknown_failure,
+  unknown_failure_count, unlock_login,
 };

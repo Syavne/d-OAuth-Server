@@ -101,8 +101,8 @@ async fn totp_rewrap_moves_v3_rows_to_active_key() -> Result<(), TestError> {
   let new_only = ring_with_totp(&[(NEW_ID, NEW_MATERIAL)])?;
 
   let plaintext = crate::cli::secret::generate_totp_secret()?;
-  let v3 = crypto_totp::encrypt_secret(&old, &plaintext, true)?;
-  let v2 = crypto_totp::encrypt_secret(&old, &plaintext, false)?;
+  let v3 = crypto_totp::encrypt_secret(&old, plaintext.as_str(), true)?;
+  let v2 = crypto_totp::encrypt_secret(&old, plaintext.as_str(), false)?;
   // A v3 header that names a key but carries no body: malformed, must be skipped.
   let malformed = vec![3u8, 3, b'o', b'l', b'd'];
 
@@ -140,7 +140,10 @@ async fn totp_rewrap_moves_v3_rows_to_active_key() -> Result<(), TestError> {
     now.wrapped_dek, before.wrapped_dek,
     "wrapped DEK must be re-sealed under the active key"
   );
-  assert_eq!(crypto_totp::decrypt_secret(&new_only, &after)?, plaintext);
+  assert_eq!(
+    crypto_totp::decrypt_secret(&new_only, &after)?.as_str(),
+    plaintext.as_str()
+  );
 
   // v1/v2 and malformed blobs are skipped and never overwritten.
   assert_eq!(stored_blob(&pool, v2_id).await?, v2);
@@ -158,7 +161,7 @@ async fn totp_rewrap_is_idempotent() -> Result<(), TestError> {
   let full = ring_with_totp(&[(NEW_ID, NEW_MATERIAL), (OLD_ID, OLD_MATERIAL)])?;
 
   let plaintext = crate::cli::secret::generate_totp_secret()?;
-  let v3 = crypto_totp::encrypt_secret(&old, &plaintext, true)?;
+  let v3 = crypto_totp::encrypt_secret(&old, plaintext.as_str(), true)?;
   let id = Uuid::new_v4();
   insert_user(&pool, id, &v3).await?;
 

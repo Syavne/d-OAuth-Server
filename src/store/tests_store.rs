@@ -1276,6 +1276,39 @@ async fn store_login_failure_counter_ttl_within_lockout_window() -> TestResult {
   assert_ttl_within(pttl_ms(&mut conn, &key).await?, window)
 }
 
+/// The composite helpers scope to one source: clearing one IP's bucket
+/// leaves the account counter and every other IP's bucket intact.
+#[tokio::test]
+async fn store_ip_failure_clear_is_scoped_to_source() -> TestResult {
+  let (_container, url) = redis_container(Vec::new()).await?;
+  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let window = crate::ui::login::LOCKOUT_WINDOW;
+  let account = unique("alice@example.test");
+
+  sessions::record_failed_login(&mut conn, &store, &account, window).await?;
+  sessions::record_ip_failure(&mut conn, &store, "ip-a", &account, window).await?;
+  sessions::record_ip_failure(&mut conn, &store, "ip-a", &account, window).await?;
+  sessions::record_ip_failure(&mut conn, &store, "ip-b", &account, window).await?;
+
+  sessions::clear_ip_failures(&mut conn, &store, "ip-a", &account).await?;
+  if sessions::ip_failure_count(&mut conn, &store, "ip-a", &account).await? != 0 {
+    return Err(TestError::Unexpected(
+      "the cleared source bucket must read zero".to_owned(),
+    ));
+  }
+  if sessions::ip_failure_count(&mut conn, &store, "ip-b", &account).await? != 1 {
+    return Err(TestError::Unexpected(
+      "the other source bucket must survive the clear".to_owned(),
+    ));
+  }
+  if sessions::failed_login_count(&mut conn, &store, &account).await? != 1 {
+    return Err(TestError::Unexpected(
+      "the account counter must survive a scoped clear".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
 /// docs/REDIS.md: the DPoP replay marker is bounded by the proof window
 /// ([`crate::jose::dpop::DPOP_JTI_TTL`]); the `private_key_jwt` marker is
 /// bounded by the assertion's remaining validity (at most 360 s).
@@ -1332,6 +1365,8 @@ fn store_keys_share_hash_tag_and_keyspaces_split() -> TestResult {
     store.client_assertion_jti_key("j"),
     store.rotation_map_key("r"),
     store.login_fail_key("l"),
+    store.login_fail_ip_key("i", "l"),
+    store.login_fail_unknown_key("i"),
   ] {
     if !key.contains("{state}") {
       return Err(TestError::Unexpected(

@@ -239,7 +239,7 @@ certificate.
 - Master keys (pepper, TOTP, and PII) must each be at least 32 bytes; shorter
   values are refused at load (`WeakKeyMaterial`).
 - `user disable` purges the account's Redis sessions, tokens, grants, codes,
-  device records, and lockout counter before flipping `users.disabled`; that
+  device records, and lockout counters before flipping `users.disabled`; that
   user's live tokens then introspect inactive and refuse refresh
   (`invalid_grant`).
 - Production requires `issuer` on `https` and a database URL with
@@ -260,12 +260,12 @@ certificate.
   `client attach-redirect-uri|detach-redirect-uri|redirect-uris`. Each accepts
   `--kind authorize|post_logout` (default `authorize`); `post_logout` URIs are
   the return targets for `POST /logout` (`GET /logout` is read-only).
-- Users and entitlements: `user create|enroll-totp|disable|grant-scope|revoke-scope|scopes`.
+- Users and entitlements: `user create|enroll-totp|disable|unlock|grant-scope|revoke-scope|scopes`.
 - Admin: `admin bootstrap` (see [RUNBOOK.md](RUNBOOK.md)).
 - Declarative apply: `config sync --file` and `config check`.
 - PII migration and rotation: `pii backfill`, `pii verify`, and `pii rotate`,
   plus `totp rewrap` for the TOTP key. See [docs/OPERATIONS.md](docs/OPERATIONS.md).
-- DCR initial access: `initial-access-token issue`.
+- DCR initial access: `initial-access-token issue [--show-secret]`.
 - Utilities: `keygen` and `healthcheck`.
 
 Full flags are in [docs/OPERATIONS.md](docs/OPERATIONS.md).

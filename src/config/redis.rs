@@ -266,10 +266,12 @@ impl RedisConfig {
 #[serde(default)]
 pub(crate) struct RawRedisConfig {
   pub url: Option<String>,
+  #[serde(default, deserialize_with = "crate::config::deserialize_string_or_vec")]
   pub nodes: Vec<String>,
   pub master_name: Option<String>,
   pub sentinel_auth: Option<String>,
   pub data_auth: Option<String>,
+  #[serde(default, deserialize_with = "crate::config::deserialize_string_or_vec")]
   pub seeds: Vec<String>,
   pub auth: Option<String>,
   pub tls: bool,

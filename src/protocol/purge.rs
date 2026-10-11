@@ -2,7 +2,8 @@
 //!
 //! [`purge_subject`] deletes every Redis record whose `subject` field names
 //! the user (canonical email or user-id string): login sessions (plus their
-//! `:meta` sidecars), the lockout counter, authorization codes, device records
+//! `:meta` sidecars), the lockout counters (the account key plus every
+//! per-IP composite key), authorization codes, device records
 //! (plus `:cnf`/`:poll` sidecars and `user_code` mappings), and token grants
 //! (cascade-revoked through [`grants::revoke`] so member token keys, the
 //! member set, and the barrier stay correct, plus standalone access/refresh
@@ -30,7 +31,7 @@ use crate::store::{Store, StoreError, grants, sha256_hex};
 pub struct PurgedSubject {
   /// Login session records deleted (each also removed its `:meta` sidecar).
   pub sessions: u64,
-  /// Lockout counters deleted (at most one: the email's `loginfail` key).
+  /// Lockout counters deleted (the account key plus every per-IP composite).
   pub lockouts: u64,
   /// Authorization-code records deleted.
   pub codes: u64,
@@ -88,6 +89,28 @@ pub async fn purge_subject(
     .map_err(store_mapped)?;
   if removed > 0 {
     summary.lockouts += 1;
+  }
+  let account_hash = sha256_hex(normalize_email(email).as_bytes());
+  let composite_pattern = format!("{}*:{account_hash}", store.login_fail_ip_prefix());
+  let mut cursor = "0".to_owned();
+  loop {
+    let (next, batch): (String, Vec<String>) = redis::cmd("SCAN")
+      .arg(&cursor)
+      .arg("MATCH")
+      .arg(&composite_pattern)
+      .arg("COUNT")
+      .arg(100)
+      .query_async(conn)
+      .await
+      .map_err(store_mapped)?;
+    for key in &batch {
+      del_key(conn, key).await?;
+      summary.lockouts += 1;
+    }
+    if next == "0" {
+      break;
+    }
+    cursor = next;
   }
 
   for key in scan_keys(conn, &store.code_key_prefix()).await? {
@@ -176,6 +199,47 @@ pub async fn purge_subject(
   Ok(summary)
 }
 
+/// Delete every login session (plus `:meta` sidecar) whose `subject` is
+/// `email` or `user_id`, except the session named by `keep_session_id`.
+///
+/// The credential-change path (`change_password` / `confirm_totp` in
+/// `src/ui/login.rs`) calls this before the database update and before
+/// re-issuing the current session, so a password or TOTP change revokes the
+/// subject's other sessions while the session in hand survives. The sweep
+/// runs first so a Redis outage fails before any credential is written (the
+/// password stays unchanged); a later database failure then costs only
+/// re-authentication. Tokens, codes,
+/// and grants are deliberately untouched: ending the login sessions forces
+/// re-authentication, while live OAuth tokens keep working until they expire
+/// or the account is disabled (which runs the full [`purge_subject`]).
+///
+/// # Errors
+///
+/// Returns a fail-closed store failure when Redis is unavailable; callers
+/// must surface the error instead of reporting success with siblings intact.
+pub async fn purge_sibling_sessions(
+  conn: &mut RedisConn,
+  store: &Store,
+  email: &str,
+  user_id: &str,
+  keep_session_id: &str,
+) -> Result<u64, AppError> {
+  let keep_key = store.session_key(keep_session_id);
+  let mut revoked = 0;
+  let session_prefix = store.session_key_prefix();
+  for key in scan_keys(conn, &session_prefix).await? {
+    if key.ends_with(":meta") || key == keep_key {
+      continue;
+    }
+    if is_subject(&read_fields(conn, &key).await?, email, user_id) {
+      del_key(conn, &key).await?;
+      del_key(conn, &format!("{key}:meta")).await?;
+      revoked += 1;
+    }
+  }
+  Ok(revoked)
+}
+
 /// Whether a record's `subject` field names this user by email or id.
 fn is_subject(fields: &HashMap<String, String>, email: &str, user_id: &str) -> bool {
   fields
@@ -245,8 +309,14 @@ mod tests {
     runners::AsyncRunner,
   };
 
-  use super::{PurgedSubject, purge_subject};
-  use crate::{config::DurabilityMode, state::RedisConn, store::Store, test_guard::ContainerGuard};
+  use super::{PurgedSubject, purge_sibling_sessions, purge_subject};
+  use crate::{
+    config::DurabilityMode,
+    error::{AppError, OAuthErrorCode},
+    state::RedisConn,
+    store::Store,
+    test_guard::ContainerGuard,
+  };
 
   #[derive(Debug, thiserror::Error)]
   enum TestError {
@@ -554,5 +624,184 @@ mod tests {
       )));
     }
     Ok(())
+  }
+
+  async fn dead_conn() -> Result<RedisConn, TestError> {
+    let client = redis::Client::open("redis://127.0.0.1:1")?;
+    let manager = redis::aio::ConnectionManager::new_lazy_with_config(
+      client,
+      redis::aio::ConnectionManagerConfig::new()
+        .set_number_of_retries(0)
+        .set_response_timeout(Some(Duration::from_millis(200)))
+        .set_connection_timeout(Some(Duration::from_millis(200))),
+    )?;
+    Ok(RedisConn::Single(manager))
+  }
+
+  fn require_unavailable(error: AppError) -> TestResult {
+    if error.code() != OAuthErrorCode::TemporarilyUnavailable {
+      return Err(TestError::Unexpected(format!(
+        "a store outage must be temporarily_unavailable, got {:?}",
+        error.code()
+      )));
+    }
+    if error.status().as_u16() != 503 {
+      return Err(TestError::Unexpected(format!(
+        "a store outage must render 503, got {}",
+        error.status()
+      )));
+    }
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn purge_sibling_sessions_deletes_meta_sidecar_and_keeps_current() -> TestResult {
+    let (_guard, mut conn, store) = harness().await?;
+    let email = "sibling-meta@example.test";
+    let user_id = uuid::Uuid::new_v4().to_string();
+    let current_key = store.session_key("sess-current");
+    hset(
+      &mut conn,
+      &current_key,
+      &[("subject", email), ("mfa_verified", "true")],
+    )
+    .await?;
+    hset(&mut conn, &format!("{current_key}:meta"), &[("csrf", "a")]).await?;
+    let sibling_key = store.session_key("sess-sibling");
+    hset(
+      &mut conn,
+      &sibling_key,
+      &[("subject", email), ("mfa_verified", "true")],
+    )
+    .await?;
+    hset(&mut conn, &format!("{sibling_key}:meta"), &[("csrf", "b")]).await?;
+
+    let revoked =
+      purge_sibling_sessions(&mut conn, &store, email, &user_id, "sess-current").await?;
+    if revoked != 1 {
+      return Err(TestError::Unexpected(format!(
+        "exactly one sibling must be revoked, got {revoked}"
+      )));
+    }
+    require_present(&mut conn, &current_key).await?;
+    require_present(&mut conn, &format!("{current_key}:meta")).await?;
+    require_gone(&mut conn, &sibling_key).await?;
+    require_gone(&mut conn, &format!("{sibling_key}:meta")).await?;
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn purge_sibling_sessions_leaves_other_subjects_tokens_and_grants() -> TestResult {
+    let (_guard, mut conn, store) = harness().await?;
+    let email = "sibling-scope@example.test";
+    let user_id = uuid::Uuid::new_v4().to_string();
+    let other = "stranger@example.test";
+    let victim_key = store.session_key("sess-victim");
+    hset(&mut conn, &victim_key, &[("subject", email)]).await?;
+    let other_key = store.session_key("sess-other");
+    hset(&mut conn, &other_key, &[("subject", other)]).await?;
+    hset(&mut conn, &format!("{other_key}:meta"), &[("csrf", "c")]).await?;
+    let grant_id = "grant-survivor";
+    hset(
+      &mut conn,
+      &store.grant_key(grant_id),
+      &[("subject", email), ("scope", "orders:read")],
+    )
+    .await?;
+    redis::cmd("SADD")
+      .arg(store.grant_tokens_key(grant_id))
+      .arg("memberhash")
+      .query_async::<()>(&mut conn)
+      .await?;
+    let access_key = store.access_key("survivoraccess");
+    hset(&mut conn, &access_key, &[("subject", email)]).await?;
+    set(&mut conn, &format!("{access_key}:act"), "jkt").await?;
+    let refresh_key = store.refresh_key("survivorrefresh");
+    hset(&mut conn, &refresh_key, &[("subject", email)]).await?;
+    let code_key = store.code_key("survivorcode");
+    hset(&mut conn, &code_key, &[("subject", email)]).await?;
+
+    let revoked = purge_sibling_sessions(&mut conn, &store, email, &user_id, "sess-victim").await?;
+    if revoked != 0 {
+      return Err(TestError::Unexpected(format!(
+        "keeping the only own session must revoke nothing, got {revoked}"
+      )));
+    }
+    for key in [
+      victim_key,
+      other_key.clone(),
+      format!("{other_key}:meta"),
+      store.grant_key(grant_id),
+      store.grant_tokens_key(grant_id),
+      access_key.clone(),
+      format!("{access_key}:act"),
+      refresh_key,
+      code_key,
+    ] {
+      require_present(&mut conn, &key).await?;
+    }
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn purge_sibling_sessions_matches_subject_by_user_id() -> TestResult {
+    let (_guard, mut conn, store) = harness().await?;
+    let email = "sibling-id@example.test";
+    let user_id = uuid::Uuid::new_v4().to_string();
+    let current_key = store.session_key("sess-id-current");
+    hset(&mut conn, &current_key, &[("subject", user_id.as_str())]).await?;
+    let sibling_key = store.session_key("sess-id-sibling");
+    hset(&mut conn, &sibling_key, &[("subject", user_id.as_str())]).await?;
+
+    let revoked =
+      purge_sibling_sessions(&mut conn, &store, email, &user_id, "sess-id-current").await?;
+    if revoked != 1 {
+      return Err(TestError::Unexpected(format!(
+        "a user-id-keyed sibling must be revoked, got {revoked}"
+      )));
+    }
+    require_present(&mut conn, &current_key).await?;
+    require_gone(&mut conn, &sibling_key).await?;
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn purge_subject_fails_closed_on_store_outage() -> TestResult {
+    let mut conn = dead_conn().await?;
+    let store = Store::from_parts(
+      "purge-outage:{state}:".to_owned(),
+      "oauth:{rl}:".to_owned(),
+      DurabilityMode::WaitAof,
+    );
+    match purge_subject(&mut conn, &store, "outage@example.test", "outage-id").await {
+      Err(error) => require_unavailable(error),
+      Ok(_) => Err(TestError::Unexpected(
+        "purge_subject on a dead store must fail, never report success".to_owned(),
+      )),
+    }
+  }
+
+  #[tokio::test]
+  async fn purge_sibling_sessions_fails_closed_on_store_outage() -> TestResult {
+    let mut conn = dead_conn().await?;
+    let store = Store::from_parts(
+      "purge-outage:{state}:".to_owned(),
+      "oauth:{rl}:".to_owned(),
+      DurabilityMode::WaitAof,
+    );
+    match purge_sibling_sessions(
+      &mut conn,
+      &store,
+      "outage@example.test",
+      "outage-id",
+      "sess-keep",
+    )
+    .await
+    {
+      Err(error) => require_unavailable(error),
+      Ok(_) => Err(TestError::Unexpected(
+        "purge_sibling_sessions on a dead store must fail, never report success".to_owned(),
+      )),
+    }
   }
 }

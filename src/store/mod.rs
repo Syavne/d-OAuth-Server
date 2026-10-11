@@ -419,6 +419,39 @@ impl Store {
     self.token_key("loginfail", account_hash)
   }
 
+  /// Composite failed-login counter key for one source IP and one account.
+  ///
+  /// Both halves are hashes (never a raw IP or email). The `ip:` infix keeps
+  /// these keys disjoint from the per-account `loginfail:<hash>` keys so an
+  /// admin sweep can match `loginfail:ip:*:<account-hash>`.
+  #[must_use]
+  pub fn login_fail_ip_key(&self, ip_hash: &str, account_hash: &str) -> String {
+    format!("{}ip:{ip_hash}:{account_hash}", self.login_fail_prefix())
+  }
+
+  /// Unknown-label failed-login bucket key for one source IP (never a label).
+  ///
+  /// Attempts for absent accounts share this single per-IP bucket instead of
+  /// minting one key per probed label, so label enumeration cannot spray the
+  /// keyspace.
+  #[must_use]
+  pub fn login_fail_unknown_key(&self, ip_hash: &str) -> String {
+    format!("{}unknown:{ip_hash}", self.login_fail_prefix())
+  }
+
+  /// Key prefix covering every failed-login counter (account, composite, and
+  /// unknown buckets).
+  #[must_use]
+  pub(crate) fn login_fail_prefix(&self) -> String {
+    format!("{}loginfail:", self.token_prefix)
+  }
+
+  /// Key prefix covering the composite per-IP counters.
+  #[must_use]
+  pub(crate) fn login_fail_ip_prefix(&self) -> String {
+    format!("{}ip:", self.login_fail_prefix())
+  }
+
   /// TOTP used-code replay-marker key for a fingerprint hash (task 25).
   ///
   /// Genuine gap noted by the login task: the replay cache needs a

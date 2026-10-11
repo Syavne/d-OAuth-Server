@@ -9,6 +9,7 @@
 use std::{io::Read as _, path::Path, sync::Arc};
 
 use sqlx::PgPool;
+use zeroize::Zeroizing;
 
 use crate::config::Config;
 
@@ -143,25 +144,62 @@ pub fn audit(operation: &str, subject: &str) {
 ///
 /// `from_stdin` and `file` are mutually exclusive. Trailing CR/LF is trimmed so
 /// `echo secret | ...` and a file with a trailing newline behave identically.
+/// The secret is held in [`Zeroizing`] so it is wiped on drop, and a password
+/// file that is world-readable (mode `o+r`) is rejected before it is read.
+/// Error messages never carry the secret itself.
 ///
 /// # Errors
-/// Returns [`CliError::Input`] when both sources are given and
-/// [`CliError::Io`] when reading fails.
-pub fn read_secret(from_stdin: bool, file: Option<&Path>) -> Result<String, CliError> {
+/// Returns [`CliError::Input`] when both sources are given, when the file is
+/// world-readable, or when the file is not valid UTF-8, and [`CliError::Io`]
+/// when reading fails.
+pub fn read_secret(from_stdin: bool, file: Option<&Path>) -> Result<Zeroizing<String>, CliError> {
   match (from_stdin, file) {
     (true, Some(_)) => Err(CliError::Input(
       "--password-stdin and --password-file are mutually exclusive".to_owned(),
     )),
-    (_, Some(path)) => {
-      let raw = std::fs::read_to_string(path)?;
-      Ok(trim_newline(&raw))
-    }
+    (_, Some(path)) => read_secret_file(path),
     (_, None) => {
-      let mut raw = String::new();
+      let mut raw = Zeroizing::new(String::new());
       std::io::stdin().read_to_string(&mut raw)?;
-      Ok(trim_newline(&raw))
+      Ok(trim_newline(raw))
     }
   }
+}
+
+/// Read a secret file after rejecting world-readable permissions.
+///
+/// The file bytes are held in [`Zeroizing`] and converted without retaining a
+/// second plaintext copy alongside the returned value.
+fn read_secret_file(path: &Path) -> Result<Zeroizing<String>, CliError> {
+  reject_world_readable(path)?;
+  let bytes = Zeroizing::new(std::fs::read(path)?);
+  let text = std::str::from_utf8(&bytes)
+    .map_err(|_| CliError::Input("password file is not valid UTF-8".to_owned()))?;
+  Ok(trim_newline(Zeroizing::new(text.to_owned())))
+}
+
+/// Reject a password file anyone on the system can read.
+///
+/// A world-readable (`o+r`) password file is refused before any byte is read;
+/// operator secret files must use a restrictive mode such as `0600`. The error
+/// names the path only, never the secret.
+#[cfg(unix)]
+fn reject_world_readable(path: &Path) -> Result<(), CliError> {
+  use std::os::unix::fs::PermissionsExt as _;
+  let mode = std::fs::metadata(path)?.permissions().mode();
+  if mode & 0o004 != 0 {
+    return Err(CliError::Input(format!(
+      "password file {} must not be world-readable (use mode 0600)",
+      path.display()
+    )));
+  }
+  Ok(())
+}
+
+/// Permission enforcement is Unix-only; other platforms accept the file.
+#[cfg(not(unix))]
+fn reject_world_readable(_path: &Path) -> Result<(), CliError> {
+  Ok(())
 }
 
 /// Reject an empty secret early with a clear message.
@@ -175,6 +213,10 @@ pub fn require_nonempty(secret: &str, what: &str) -> Result<(), CliError> {
   Ok(())
 }
 
-fn trim_newline(raw: &str) -> String {
-  raw.trim_end_matches(['\r', '\n']).to_owned()
+/// Trim trailing CR/LF in place so no second plaintext copy of the secret is
+/// ever allocated.
+fn trim_newline(mut raw: Zeroizing<String>) -> Zeroizing<String> {
+  let len = raw.trim_end_matches(['\r', '\n']).len();
+  raw.truncate(len);
+  raw
 }

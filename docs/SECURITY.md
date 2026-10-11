@@ -40,8 +40,13 @@ https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1).
 - The TLS public listener is the only route to OAuth handlers.
 - The plaintext health listener carries no OAuth routes.
 - Postgres holds durable domain state; Redis holds ephemeral state.
-- Forwarded client-cert and client-IP headers are never trusted: the listener
-  uses only the TLS peer address and the certificate chain it verified itself.
+- Forwarded client-cert headers are never trusted: the listener uses only
+  the certificate chain it verified itself. Forwarded client-IP headers are
+  never trusted either, except for the single narrow purpose of rate-limit
+  bucket selection, and then only when the TCP peer is a configured
+  `rate_limit.trusted_proxies` entry (rightmost-untrusted `X-Forwarded-For`
+  over bare-IP entries only, rightmost 32 entries capped, unparseable entries
+  skipped, fail-closed onto the peer).
 
 ## Attack surface
 
@@ -63,6 +68,7 @@ class, or runtime setting).
 | Operator `exec` into a running pod | No shell and a non-root, read-only-rootfs container limit what runs; every secret is a file the container user already reads, and no secret is in the environment | `pods/exec` (and `docker exec`) bypass the application's own authorization; restrict it with RBAC and audit it (`docs/OPERATIONS.md`). |
 | Kubernetes API access from the pod | `automountServiceAccountToken: false`; the binary never calls the API | A future feature that needs the API would have to re-enable it deliberately. |
 | Image/registry compromise | Digest pinning, cosign verification, and a committed digest reference with no shippable `:latest`; CI writes the signed build digest into `kustomization.yaml` | A registry compromise before the digest is recorded still ships; the pin step must run. |
+| Rate-limit evasion via spoofed `X-Forwarded-For` behind an L7 proxy | Default-empty   `rate_limit.trusted_proxies` (headers ignored unless the TCP peer is an allowlisted proxy IP/CIDR); rightmost-untrusted selection; malformed headers fall back to the verified peer; attribution is bucket selection only, never authentication | An allowlist entry that is too broad (or a compromised proxy) attributes attacker-chosen IPs; keep entries to the proxy peers and never a `/0` (rejected at load). Proxies must emit bare IPs (no port/brackets/`unknown`); anything else is skipped, and only the rightmost 32 entries are considered. |
 
 Last reviewed: 2026-10-09. File-mounted DB/Redis passwords, digest pinning,
 NetworkPolicy, `automountServiceAccountToken: false`, and scheduled fuzzing are
@@ -322,6 +328,27 @@ configure one as fail-open is a load-time error.
 - The login, consent, and device pages set a strict CSP with
   `frame-ancestors 'none'`. They use server-side sessions, CSRF protection, and
   no open redirect.
+- The session cookie is `__Host-session_id` (RFC 6265bis): `HttpOnly`,
+  `Path=/`, `SameSite=Lax`, host-only with no `Domain` ever emitted, and
+  `Secure` in every environment except a localhost development exception
+  (`cookie_secure = false`, which production rejects at load with
+  `InsecureSessionCookie`). The exception also drops the `__Host-` prefix
+  (the cookie is then plain `session_id` with the same `Path`/`HttpOnly`/
+  `SameSite`/no-`Domain` attributes), because browsers reject a `__Host-`
+   cookie without `Secure` and the session would otherwise never persist. Any non-blank `cookie_domain` is rejected at load
+   (`InvalidCookieDomain`) as incompatible with the `__Host-` prefix; blank
+   values are treated as absent. The
+  server-side session lives 12 h absolute (`ttl.session_secs`, pinned by test);
+  reads never re-arm the TTL, so there is no idle sliding — a live session
+   always dies 12 h after its last write. In production the session reader
+  honors `__Host-session_id` **alone**: a plain `session_id` cookie is never
+  read there, so a sibling subdomain cannot plant a session id and fixate a
+  victim's login onto the attacker's pending presession. The development
+  variant reads plain `session_id` and only additionally falls back to
+  `__Host-session_id` for a cookie left over from before a config flip. Only
+  `POST /logout` clears the session, emitting a clearing cookie for **every**
+  name the reader honors (the `__Host-` name in production; both names in
+  development), each mirroring the session-cookie name and every attribute.
 - `GET /logout` is a server-specific session endpoint (not OAuth 2.1/OIDC
   defined). It is read-only: it renders a confirm page and never destroys the
   session or writes cookies, so a forced navigation cannot log a victim out.
@@ -337,13 +364,38 @@ configure one as fail-open is a load-time error.
   to an attacker target. There is no `post_logout_redirect_uri` parameter and no
   `id_token_hint`.
 - Failed-login and lockout counters live in Redis, not Postgres, so a login
-  flood does not write rows.
+  flood does not write rows. Lockout is composite: 5 failures from one IP for
+  one account (`ui::login::LOCKOUT_THRESHOLD`) lock that IP's bucket only, so
+  a burst from an attacker IP never locks the victim from another IP; 20
+  failures from any IPs (`ui::login::ACCOUNT_LOCKOUT_THRESHOLD`) lock the
+  account globally as the distributed-burst cap. Attempts for absent labels
+  never mint per-label keys — they share the source IP's single
+  `loginfail:unknown` bucket — so label enumeration cannot spray the keyspace.
+   `user unlock --email` clears the account counter and every per-IP bucket
+   for the user instead of waiting out the 15-minute window. Lockout buckets
+   use the TCP peer address, never the rate-limit `trusted_proxies`
+   attribution: behind an L7 proxy every login shares the proxy's peer IP,
+   so the per-IP composites collapse into one bucket and the 20-failure
+   account cap becomes the effective control. Keep L4/TCP passthrough (see
+   `docs/DEPLOYMENT.md`) where per-IP lockout isolation matters.
 - Rate limiting classifies by full request path: `/token`,
   `/authorize`/`/consent`/`/device*`/`/introspect`/`/revoke`/`/par`,
-  `/login*`/`/logout`, and `/register*`; `/health`, `/.well-known`, and
-  `/assets` are unrated. Counters live in a Redis keyspace separated from token
-  state. A breach is `429` + `Retry-After`; a store outage or a missing peer
-  address fails closed `503`.
+   `/login*`/`/logout`, and `/register*`; `/health`, `/.well-known`, and
+   `/assets` are unrated. The per-client bucket is keyed by the
+   `(peer_ip, client_id)` composite, not by the raw `client_id`: the id is
+   read before client authentication, so a global per-id bucket would let an
+   attacker exhaust a victim client's budget or rotate fake ids to evade the
+    limit; the per-IP bucket remains the primary control. Counters live in a Redis keyspace separated from token
+    state. A breach is `429` + `Retry-After`; a store outage or a missing peer
+    address fails closed `503`. Behind an L7 proxy the IP bucket is attributed
+    from `X-Forwarded-For` only when the TCP peer is a configured
+    `rate_limit.trusted_proxies` entry (exact IP/CIDR, default empty): the
+    rightmost-untrusted chain entry is used over the rightmost 32 bare-IP
+    entries, a header from an untrusted peer
+    is ignored, and a header with no parseable bare-IP entry falls back to the verified peer, so a
+    spoofed header can neither evade the limit nor shift a victim's bucket.
+    This attribution never authenticates a client and never carries a client
+    certificate.
 - TOTP enrollment confirmation (`confirm_totp`) shares the login lockout counter
   and policy: a failed code increments it, success clears it, and a locked
   account rejects even a correct code — indistinguishably — until the window
@@ -351,12 +403,21 @@ configure one as fail-open is a load-time error.
 - A disabled subject is dead everywhere: introspection reports it inactive and
   refresh rejects it with `invalid_grant` before minting; `user disable` first
   purges every Redis record whose subject is the user (sessions + `:meta`, the
-  `loginfail` counter, authorization codes, device records + `:cnf`/`:poll` +
+  `loginfail` account counter plus every per-IP composite bucket, authorization codes, device records + `:cnf`/`:poll` +
   `user_code` mappings, grants via cascade revoke plus member `:act`, and
   standalone access/refresh records), then flips Postgres `disabled`. A Redis
   outage fails closed and leaves the user enabled. Records with no subject
   (`par:`, `pending:`, `dpop_jti:`, `client_assertion_jti:`, `rotation:`,
-  `totp_replay:`, rate-limit counters) are untouched.
+   `totp_replay:`, rate-limit counters) are untouched.
+- A password change (`change_password`) or TOTP re-enrollment
+  (`confirm_totp`) ends the subject's other login sessions (records plus
+  `:meta` sidecars) via the same session sweep, scoped to the subject minus
+  the session in hand, which survives and is re-issued full. The sweep runs
+  before the credential write, so a Redis outage fails the call with `503`
+  with the password unchanged (the caller retries); a later database failure
+  costs only re-authentication. OAuth tokens, codes, and grants are
+  untouched: ending the sessions forces re-authentication, while live tokens
+  keep working until they expire or the account is disabled.
 - CORS is empty by default and never a wildcard.
 - DCR is protected by a one-time initial-access token; open registration is off
   by default.

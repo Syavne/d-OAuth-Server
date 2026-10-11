@@ -38,7 +38,9 @@ differ.
 | `oauth:{state}:dpop_jti:<hash>` | DPoP `jti` replay marker. | Proof freshness window |
 | `oauth:{state}:client_assertion_jti:<hash>` | `private_key_jwt` `jti` replay marker. | Remaining assertion validity (`exp + 30s skew - now`), clamped `[1s, 360s]` (300s max lifetime + 2×30s skew) |
 | `oauth:{state}:rotation:<request-id>` | Rotation idempotency mapping. | `min(900s, refresh TTL)` |
-| `oauth:{state}:loginfail:<sha256>` | Failed-login counter (hashed label). | `ui::login::LOCKOUT_WINDOW` (15 min) |
+| `oauth:{state}:loginfail:<sha256>` | Failed-login counter (hashed label; the global per-account cap). | `ui::login::LOCKOUT_WINDOW` (15 min) |
+| `oauth:{state}:loginfail:ip:<sha256>:<sha256>` | Composite failed-login counter for one source IP and one account (both halves hashed; locks that IP only). | `ui::login::LOCKOUT_WINDOW` (15 min) |
+| `oauth:{state}:loginfail:unknown:<sha256>` | Unknown-label bucket for one source IP (hashed IP only; no per-label keys, so label enumeration cannot spray the keyspace). | `ui::login::LOCKOUT_WINDOW` (15 min) |
 | `oauth:{state}:totp_replay:<fingerprint>` | TOTP used-code replay marker. The fingerprint is an HMAC under the token pepper (never the code itself), so a dump does not reveal the code. | Time step window |
 | `oauth:{rl}:ratelimit:<bucket-hash>` | Fixed-window rate-limit counter. | `rate_limit.window` (60s) |
 
@@ -187,7 +189,9 @@ leaves the user enabled). The purge deletes every record whose `subject`
 field is the canonical email or the user-id string:
 
 - `session:<id>` records plus their `:meta` sidecars.
-- The `loginfail:<sha256>` lockout counter for the normalized email.
+- The `loginfail:<sha256>` account counter plus every `loginfail:ip:*:<sha256>`
+  composite bucket for the normalized email. The `loginfail:unknown:<sha256>`
+  buckets carry no account label and are never touched.
 - `code:<hash>` authorization-code records.
 - `device:<hash>` records plus their `:cnf`/`:poll` sidecars and the
   `user_code:<code-hash>` mappings that point at them.
@@ -202,6 +206,16 @@ Records without a `subject` field are never touched: `par:`, `pending:`,
 Like the DCR `DELETE` revocation, the purge scans with `SCAN MATCH <prefix>*
 COUNT 100` and filters on the raw hash field. On Cluster topologies a scan
 covers the contacted node only (Single and Sentinel scan fully).
+
+`user unlock --email` sweeps the same `loginfail` keyspace the same way
+(direct `DEL` of the account counter plus `SCAN MATCH` over the per-IP
+composite buckets), so the same Cluster caveat applies: buckets living on
+other nodes survive the sweep.
+
+A password change or TOTP re-enrollment reuses the same session sweep scoped
+to the subject minus the session in hand (`purge_sibling_sessions` in the
+same file): sibling `session:<id>` records plus their `:meta` sidecars are
+deleted, everything else is untouched, and no new key layout is introduced.
 
 ## Operational runbook
 

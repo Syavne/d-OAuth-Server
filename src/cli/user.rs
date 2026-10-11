@@ -1,6 +1,9 @@
 //! `user` subcommands: create, enroll TOTP, disable, and scope entitlements.
 
+use std::fmt;
+
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::{
   context::{CliError, Context, audit, require_nonempty},
@@ -9,11 +12,25 @@ use super::{
 use crate::{db::user_repo, error::AppError};
 
 /// The one-time TOTP enrollment material printed to the operator.
+///
+/// `Debug` is redacted: the secret and the `otpauth://` URI (which embeds the
+/// secret) print their lengths plus `[REDACTED]` only.
 pub struct Enrollment {
-  /// Base32 TOTP secret (shown once).
-  pub secret: String,
-  /// `otpauth://` URI for authenticator apps.
-  pub uri: String,
+  /// Base32 TOTP secret (shown once), wiped on drop.
+  pub secret: Zeroizing<String>,
+  /// `otpauth://` URI for authenticator apps (embeds the secret).
+  pub uri: Zeroizing<String>,
+}
+
+impl fmt::Debug for Enrollment {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Enrollment")
+      .field("secret", &"[REDACTED]")
+      .field("secret_len", &self.secret.len())
+      .field("uri", &"[REDACTED]")
+      .field("uri_len", &self.uri.len())
+      .finish()
+  }
 }
 
 /// Create an admin-provisioned user.
@@ -63,7 +80,7 @@ pub async fn enroll_totp(context: &Context, email: &str) -> Result<Enrollment, C
   let totp_secret = secret::generate_totp_secret()?;
   let blob = secret::encrypt_totp(
     context.config(),
-    &totp_secret,
+    totp_secret.as_str(),
     !context.config().pii_dual_write,
   )?;
 
@@ -76,7 +93,11 @@ pub async fn enroll_totp(context: &Context, email: &str) -> Result<Enrollment, C
 
   audit("user.enroll_totp", &email);
   Ok(Enrollment {
-    uri: secret::otpauth_uri(&context.config().issuer, &email, &totp_secret),
+    uri: Zeroizing::new(secret::otpauth_uri(
+      &context.config().issuer,
+      &email,
+      totp_secret.as_str(),
+    )),
     secret: totp_secret,
   })
 }
@@ -113,6 +134,36 @@ pub async fn disable(context: &Context, email: &str) -> Result<(), CliError> {
   audit("user.disable", &record.email);
   println!("disabled user {}", record.email);
   Ok(())
+}
+
+/// Clear a user's login lockout counters without touching the account.
+///
+/// The per-account counter and every per-IP composite bucket for the
+/// canonical email are deleted, so a lockout tripped by another source's
+/// failures (or a legitimate burst) releases immediately instead of waiting
+/// out the window.
+/// The unknown-label buckets carry no account label and are never touched.
+/// The user must exist; a Redis or connect failure fails closed and clears
+/// nothing.
+///
+/// # Errors
+/// Returns [`CliError`] when the user is missing or when Redis is
+/// unavailable.
+pub async fn unlock(context: &Context, email: &str) -> Result<u64, CliError> {
+  let email = email.trim();
+  require_nonempty(email, "email")?;
+  let record = user_repo::find_by_email(context.pool(), &context.config().keys, email)
+    .await
+    .map_err(map_user_repo_error)?
+    .ok_or_else(|| CliError::NotFound("user not found".to_owned()))?;
+  let state = crate::state::AppState::connect(context.config().clone()).await?;
+  let store = crate::store::Store::from_config(&context.config().redis);
+  let mut conn = state.redis.clone();
+  let removed = user_repo::unlock_login(&mut conn, &store, &record.email)
+    .await
+    .map_err(CliError::from)?;
+  audit("user.unlock", &record.email);
+  Ok(removed)
 }
 
 /// Grant a catalog scope entitlement to a user.

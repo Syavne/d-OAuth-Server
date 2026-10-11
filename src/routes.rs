@@ -15,6 +15,10 @@
 //! 3. [`middleware::ratelimit::RateLimitLayer`] enforces per-IP/per-client
 //!    budgets on every endpoint except health and metadata (those paths have
 //!    no rule and pass through to handlers that fail closed on their own).
+//!    The IP bucket uses the verified TCP peer unless the peer is a
+//!    configured `rate_limit.trusted_proxies` entry, in which case the
+//!    rightmost-untrusted `X-Forwarded-For` address is attributed instead
+//!    (rate-limit bucket selection only; never client authentication).
 //! 4. [`tower_http::limit::RequestBodyLimitLayer`] caps form bodies at
 //!    [`MAX_BODY_BYTES`].
 //! 5. [`middleware::security_headers::SecurityHeadersLayer`] decorates
@@ -44,11 +48,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::Form;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Extension, Form};
 use axum_extra::extract::CookieJar;
 use rustls::ServerConfig;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -66,6 +70,7 @@ use crate::state::{AppState, health_router};
 use crate::store::pending::PendingAuth;
 use crate::store::{Store, pending};
 use crate::ui::device::DeviceForm;
+use crate::ui::login::{ConfirmForm, LoginForm};
 use crate::ui::{assets, consent, device as device_page, login};
 
 /// Largest accepted request body (2 MiB; DCR may carry an inline `jwks`).
@@ -129,7 +134,7 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axu
       "/device",
       get(device_page::get_device).post(post_device_entry),
     )
-    .route("/login", get(login::get_login).post(login::post_login))
+    .route("/login", get(login::get_login).post(post_login_entry))
     .route("/login/success", get(login::get_login_success))
     .route(
       "/login/change-password",
@@ -138,7 +143,7 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axu
     .route("/login/totp/setup", get(login::get_totp_setup))
     .route(
       "/login/totp/confirm",
-      get(login::get_totp_confirm).post(login::post_totp_confirm),
+      get(login::get_totp_confirm).post(post_totp_confirm_entry),
     )
     .route("/logout", get(login::get_logout).post(login::post_logout))
     .route(
@@ -290,6 +295,48 @@ async fn post_device_entry(
   Form(form): Form<DeviceForm>,
 ) -> Response {
   device_page::post_device(State(state), jar, Some(peer), Form(form)).await
+}
+
+/// `POST /login` adapter: [`ui::login::post_login`] takes
+/// `Option<ConnectInfo<_>>` (not a handler extractor), so this thin entry
+/// takes the required extractor and forwards it as `Some` for composite
+/// lockout keying. Served with `into_make_service_with_connect_info` the
+/// peer is always present; without it the request is rejected before the
+/// handler runs.
+async fn post_login_entry(
+  State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
+  peer: ConnectInfo<SocketAddr>,
+  jar: CookieJar,
+  Form(form): Form<LoginForm>,
+) -> Response {
+  login::post_login(
+    State(state),
+    Extension(request_id),
+    jar,
+    Form(form),
+    Some(peer),
+  )
+  .await
+}
+
+/// `POST /login/totp/confirm` adapter: mirrors [`post_login_entry`] for the
+/// enrollment-confirmation lockout path.
+async fn post_totp_confirm_entry(
+  State(state): State<AppState>,
+  Extension(request_id): Extension<RequestId>,
+  peer: ConnectInfo<SocketAddr>,
+  jar: CookieJar,
+  Form(form): Form<ConfirmForm>,
+) -> Response {
+  login::post_totp_confirm(
+    State(state),
+    Extension(request_id),
+    jar,
+    Form(form),
+    Some(peer),
+  )
+  .await
 }
 
 #[cfg(test)]
@@ -884,7 +931,7 @@ mod router_tests {
       "/introspect",
       "/revoke",
     ] {
-      if crate::middleware::ratelimit::Rule::for_path(config.rate_limit, path).is_none() {
+      if crate::middleware::ratelimit::Rule::for_path(&config.rate_limit, path).is_none() {
         return Err(format!("sensitive route {path} must have a rate-limit rule").into());
       }
     }
@@ -894,7 +941,7 @@ mod router_tests {
       "/health/ready",
       "/assets/app.css",
     ] {
-      if crate::middleware::ratelimit::Rule::for_path(config.rate_limit, path).is_some() {
+      if crate::middleware::ratelimit::Rule::for_path(&config.rate_limit, path).is_some() {
         return Err(format!("exempt route {path} must not have a rate-limit rule").into());
       }
     }

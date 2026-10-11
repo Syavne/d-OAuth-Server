@@ -45,6 +45,7 @@ d-oauth-server config check
 d-oauth-server user create --email <email> [--admin] [--password-stdin] [--password-file <path>]
 d-oauth-server user enroll-totp --email <email>
 d-oauth-server user disable --email <email>
+d-oauth-server user unlock --email <email>
 d-oauth-server user grant-scope --email <email> --scope <scope>
 d-oauth-server user revoke-scope --email <email> --scope <scope>
 d-oauth-server user scopes --email <email>
@@ -52,16 +53,29 @@ d-oauth-server user scopes --email <email>
 
 - `create` reads the password from stdin by default or from `--password-file`.
   The two sources are mutually exclusive. `--admin` sets `is_admin`. A created
-  user always starts with `must_change_password = true`.
+  user always starts with `must_change_password = true`. A `--password-file`
+  must not be world-readable (use mode `0600`); a world-readable file is
+  rejected before it is read. Passwords are held in wiped-on-drop memory and
+  never appear in logs, errors, or audit events.
 - `enroll-totp` generates an encrypted TOTP secret and prints the secret and the
-  `otpauth://` URI exactly once. Register the secret in an authenticator now.
+  `otpauth://` URI exactly once. The secret prints only to an interactive
+  terminal; a redirected stdout (pipe, file, or job log) refuses unless
+  `--show-secret` is passed to acknowledge the disclosure. Register the secret
+  in an authenticator now.
 - `disable` first purges all of the user's Redis ephemeral state (login
   sessions and their `:meta` sidecars, access/refresh tokens and their grants,
   authorization codes, device records with their `:cnf`/`:poll` sidecars and
-  `user_code` mappings, and the lockout counter), then flips the Postgres
+  `user_code` mappings, and the lockout counters (account plus per-IP)), then flips the Postgres
   `disabled` flag. If Redis is unavailable the command fails and the user
   stays enabled (fail closed). Disabling alone does not touch PAR records,
   replay markers, or rate-limit counters, which carry no subject.
+- `unlock` clears the user's login lockout counters (the per-account counter
+  and every per-IP composite bucket) without touching the account. The user
+  must exist; a Redis outage fails closed and clears nothing. Unknown-label
+  buckets carry no account label and are never touched. The per-IP sweep uses
+  `SCAN`, so on Cluster topologies it covers the contacted node only and
+  buckets on other nodes may survive; re-run against each node or wait out
+  the window.
 - `grant-scope` requires the scope to exist in the catalog.
 - `revoke-scope` is idempotent.
 
@@ -123,16 +137,23 @@ d-oauth-server admin bootstrap --email <email> [--password-file <path>] [--force
 
 Creates the first admin under an advisory lock in one transaction. It refuses
 while any enabled admin exists unless `--force` is given (a loud warning and an
-audit event). The full replacement procedure is in `RUNBOOK.md`.
+audit event). The password comes from `--password-file`, from stdin, or — when
+neither yields a value — a generated 256-bit password that prints exactly once
+and only to a TTY (a non-TTY stdout with a generated password is an error, so
+the secret can never leak into job logs). A `--password-file` must not be
+world-readable (use mode `0600`). The full replacement procedure is in
+`RUNBOOK.md`.
 
 ### Initial access tokens (DCR)
 
 ```bash
-d-oauth-server initial-access-token issue --uses <n> --ttl <seconds> [--label <text>]
+d-oauth-server initial-access-token issue --uses <n> --ttl <seconds> [--label <text>] [--show-secret]
 ```
 
 Mints a one-time-use DCR initial-access token. The raw token is printed once;
-only its keyed hash and remaining-use budget are stored. The token is required
+only its keyed hash and remaining-use budget are stored. The token prints only
+to an interactive terminal; a redirected stdout refuses unless `--show-secret`
+is passed to acknowledge the disclosure. The token is required
 when `allow_open_registration` is false.
 
 ### Key generation and health
@@ -354,7 +375,12 @@ survives a Redis loss.
 - Rotating the token pepper without retaining the old key invalidates every
   live opaque token. Plan the overlap.
 - `admin bootstrap` with a non-TTY stdout and no password source refuses rather
-  than print a generated password into job logs.
+  than print a generated password into job logs. `user enroll-totp` and
+  `initial-access-token issue` refuse a redirected stdout the same way unless
+  `--show-secret` is passed.
+- A `--password-file` must use mode `0600` (or any mode without the
+  world-readable bit); a world-readable password file is rejected before it is
+  read.
 
 ## Operational runbook
 

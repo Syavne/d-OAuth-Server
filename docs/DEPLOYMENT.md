@@ -211,6 +211,28 @@ the address alone is not a verifiable name. Validate with
   `serve` has no hot reload. Rotate before expiry and check with
   `openssl x509 -in d-oauth.crt -noout -checkend 2592000`.
 
+### Rate-limit attribution behind the proxy
+
+Behind an L7 proxy every client arrives from the proxy's peer address, so the
+per-IP rate-limit bucket would collapse into one global chokepoint. Set
+`rate_limit.trusted_proxies` to the proxy peers (exact IPs or CIDRs, e.g.
+`["10.0.0.5", "10.0.1.0/24"]`, or
+`D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='["10.0.0.5"]'` (equivalently
+`D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='10.0.0.5,10.0.1.0/24'`)): when the TCP peer is
+  allowlisted, the limiter attributes the rightmost-untrusted `X-Forwarded-For`
+  entry instead of the peer. Only the rightmost 32 chain entries are
+  considered; unparseable entries are skipped and a chain with no parseable
+  entry falls back to the verified peer. Trusted proxies must emit bare IPs
+  only — no ports, brackets, or `unknown` tokens — so each entry parses as an
+  IP address. The default is empty, which ignores forwarded
+headers entirely and is correct for direct L4/TCP passthrough. Keep entries
+tight (proxy peers only; `/0` is rejected at load), and make the proxy strip
+any inbound `X-Forwarded-For` it did not set, so a client cannot plant a
+leftmost claim ahead of the trusted hops. This setting affects rate-limit
+bucket selection only: it never authenticates a client, and in-process mTLS
+still requires L4/TCP passthrough (see below), because forwarded
+client-certificate headers are never trusted.
+
 ## The cluster contract
 
 A correct Deployment has these properties:

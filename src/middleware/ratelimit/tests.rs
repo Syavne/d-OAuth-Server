@@ -11,7 +11,7 @@ use serde_json::json;
 use tower::Layer;
 
 use super::RateLimitLayer;
-use super::identity::counter_key;
+use super::identity::{client_bucket_raw, counter_key};
 use super::test_support::{
   Extras, Passthrough, TestResult, live_state, peer, redis_container, retry_after, scan_keys, send,
   send_with, test_config, unavailable_state,
@@ -60,10 +60,11 @@ async fn ratelimit_token_per_ip_rejects_over_budget_with_retry_after() -> TestRe
   Ok(())
 }
 
-/// The per-client budget is enforced across distinct source IPs, proving the
-/// client bucket (parsed from the form body) is keyed independently of the IP.
+/// The per-client budget is enforced per `(peer_ip, client_id)`: repeating
+/// the same client from the same peer past its budget is limited, while the
+/// same client from a different peer owns a separate bucket (T3-C2).
 #[tokio::test]
-async fn ratelimit_token_per_client_spans_source_ips() -> TestResult {
+async fn ratelimit_token_per_client_enforced_per_peer() -> TestResult {
   let (_redis, url) = redis_container().await?;
   let config = test_config(
     &url,
@@ -72,13 +73,13 @@ async fn ratelimit_token_per_client_spans_source_ips() -> TestResult {
   let state = live_state(config, &url).await?;
   let service = RateLimitLayer::new(state).layer(Passthrough);
 
-  for octet in [1_u8, 2_u8] {
+  for _ in 0..2 {
     let response = send(
       service.clone(),
       "POST",
       "/token",
       "grant_type=authorization_code&client_id=client-x",
-      peer(octet),
+      peer(1),
     )
     .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -89,13 +90,27 @@ async fn ratelimit_token_per_client_spans_source_ips() -> TestResult {
     "POST",
     "/token",
     "grant_type=authorization_code&client_id=client-x",
-    peer(3),
+    peer(1),
   )
   .await?;
   assert_eq!(
     blocked.status(),
     StatusCode::TOO_MANY_REQUESTS,
-    "third request for the same client from a new IP must be limited"
+    "third request for the same client from the same peer must be limited"
+  );
+
+  let other_peer = send(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code&client_id=client-x",
+    peer(2),
+  )
+  .await?;
+  assert_eq!(
+    other_peer.status(),
+    StatusCode::OK,
+    "the same client from a different peer must own a separate bucket"
   );
   Ok(())
 }
@@ -443,8 +458,16 @@ async fn ratelimit_per_ip_budget_blocks_fresh_client_from_same_ip() -> TestResul
   let keys = scan_keys(&url, "oauth:{rl}:*").await?;
   for expected in [
     counter_key(&prefix, "ip", "127.0.0.1"),
-    counter_key(&prefix, "client", "client-a"),
-    counter_key(&prefix, "client", "client-b"),
+    counter_key(
+      &prefix,
+      "client",
+      &client_bucket_raw(&peer(1).ip(), "client-a"),
+    ),
+    counter_key(
+      &prefix,
+      "client",
+      &client_bucket_raw(&peer(1).ip(), "client-b"),
+    ),
   ] {
     assert!(
       keys.contains(&expected),
@@ -531,6 +554,276 @@ async fn ratelimit_disabled_never_limits_and_writes_no_keys() -> TestResult {
   assert!(
     keys.is_empty(),
     "a disabled limiter must not write counter keys: {keys:?}"
+  );
+  Ok(())
+}
+
+/// T3-C2 (a): an unauthenticated `client_id` is not a global bucket. An
+/// attacker at one peer that floods a victim's `client_id` must not exhaust
+/// the victim's own bucket at a different peer: the client bucket is keyed by
+/// `(peer_ip, client_id)`, so the victim's request still passes.
+#[tokio::test]
+async fn ratelimit_client_bucket_is_scoped_to_peer_ip() -> TestResult {
+  let (_redis, url) = redis_container().await?;
+  let config = test_config(
+    &url,
+    json!({"enabled": true, "window_secs": 60, "per_ip": 1000, "token_per_client": 2}),
+  )?;
+  let state = live_state(config, &url).await?;
+  let service = RateLimitLayer::new(state).layer(Passthrough);
+
+  for _ in 0..2 {
+    let response = send(
+      service.clone(),
+      "POST",
+      "/token",
+      "grant_type=authorization_code&client_id=victim-client",
+      peer(9),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+  let attacker_blocked = send(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code&client_id=victim-client",
+    peer(9),
+  )
+  .await?;
+  assert_eq!(
+    attacker_blocked.status(),
+    StatusCode::TOO_MANY_REQUESTS,
+    "attacker peer must hit its own client budget"
+  );
+
+  let victim = send(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code&client_id=victim-client",
+    peer(1),
+  )
+  .await?;
+  assert_eq!(
+    victim.status(),
+    StatusCode::OK,
+    "victim peer with the same client_id must own a separate bucket"
+  );
+  Ok(())
+}
+
+/// T3-C2 (b): rotating fake `client_id` values from one peer must not evade
+/// the limit. The per-IP bucket is the primary control and counts every
+/// request regardless of the claimed client identity.
+#[tokio::test]
+async fn ratelimit_rotating_fake_client_ids_does_not_evade_ip_budget() -> TestResult {
+  let (_redis, url) = redis_container().await?;
+  let config = test_config(
+    &url,
+    json!({"enabled": true, "window_secs": 60, "per_ip": 2, "token_per_client": 1000}),
+  )?;
+  let state = live_state(config, &url).await?;
+  let service = RateLimitLayer::new(state).layer(Passthrough);
+
+  for (index, client_id) in ["fake-1", "fake-2"].iter().enumerate() {
+    let response = send(
+      service.clone(),
+      "POST",
+      "/token",
+      &format!("grant_type=authorization_code&client_id={client_id}"),
+      peer(1),
+    )
+    .await?;
+    assert_eq!(
+      response.status(),
+      StatusCode::OK,
+      "request {index} within the IP budget must pass"
+    );
+  }
+
+  let blocked = send(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code&client_id=fake-3",
+    peer(1),
+  )
+  .await?;
+  assert_eq!(
+    blocked.status(),
+    StatusCode::TOO_MANY_REQUESTS,
+    "a rotated fake client_id from an exhausted peer must hit the per-IP budget"
+  );
+  Ok(())
+}
+
+/// T3-C3 end to end: `trusted_proxies` flows from config through
+/// `RateLimitLayer` into Redis. Requests from the trusted proxy peer are
+/// attributed to their `X-Forwarded-For` client: repeating the same claimed
+/// client exhausts its bucket, while a different claimed client through the
+/// same proxy owns a fresh bucket, and no counter is ever keyed by the proxy
+/// peer itself.
+#[tokio::test]
+async fn ratelimit_trusted_proxy_end_to_end_attributes_xff_bucket() -> TestResult {
+  let (_redis, url) = redis_container().await?;
+  let config = test_config(
+    &url,
+    json!({
+      "enabled": true,
+      "window_secs": 60,
+      "per_ip": 1,
+      "token_per_client": 1000,
+      "trusted_proxies": ["10.0.0.1"],
+    }),
+  )?;
+  let state = live_state(config, &url).await?;
+  let prefix = state.config.redis.ratelimit_key_prefix.clone();
+  let service = RateLimitLayer::new(state).layer(Passthrough);
+  let proxy = SocketAddr::from(([10, 0, 0, 1], 40_000));
+
+  let first = send_with(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code",
+    Extras {
+      peer: Some(proxy),
+      headers: &[("x-forwarded-for", "198.51.100.7")],
+    },
+  )
+  .await?;
+  assert_eq!(first.status(), StatusCode::OK);
+
+  let blocked = send_with(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code",
+    Extras {
+      peer: Some(proxy),
+      headers: &[("x-forwarded-for", "198.51.100.7")],
+    },
+  )
+  .await?;
+  assert_eq!(
+    blocked.status(),
+    StatusCode::TOO_MANY_REQUESTS,
+    "repeating the same XFF client through the trusted proxy must exhaust its bucket"
+  );
+
+  let other_client = send_with(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code",
+    Extras {
+      peer: Some(proxy),
+      headers: &[("x-forwarded-for", "198.51.100.8")],
+    },
+  )
+  .await?;
+  assert_eq!(
+    other_client.status(),
+    StatusCode::OK,
+    "a different XFF client through the same proxy must own a fresh bucket"
+  );
+
+  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  for expected in [
+    counter_key(&prefix, "ip", "198.51.100.7"),
+    counter_key(&prefix, "ip", "198.51.100.8"),
+  ] {
+    assert!(
+      keys.contains(&expected),
+      "missing attributed client bucket {expected}: {keys:?}"
+    );
+  }
+  assert!(
+    !keys.contains(&counter_key(&prefix, "ip", "10.0.0.1")),
+    "the proxy peer itself must never own a bucket: {keys:?}"
+  );
+  assert_eq!(
+    keys.len(),
+    2,
+    "only the two attributed client buckets may exist: {keys:?}"
+  );
+  Ok(())
+}
+
+/// T3-C3 end to end: bracketed, port-suffixed, and `unknown` XFF entries are
+/// never bare IPs, so from a trusted peer they fall back to the verified peer
+/// bucket through the full layer instead of minting a foreign bucket.
+#[tokio::test]
+async fn ratelimit_trusted_proxy_unparseable_xff_falls_back_to_peer() -> TestResult {
+  let (_redis, url) = redis_container().await?;
+  let config = test_config(
+    &url,
+    json!({
+      "enabled": true,
+      "window_secs": 60,
+      "per_ip": 1,
+      "token_per_client": 1000,
+      "trusted_proxies": ["10.0.0.1"],
+    }),
+  )?;
+  let state = live_state(config, &url).await?;
+  let prefix = state.config.redis.ratelimit_key_prefix.clone();
+  let service = RateLimitLayer::new(state).layer(Passthrough);
+  let proxy = SocketAddr::from(([10, 0, 0, 1], 40_000));
+
+  let first = send_with(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code",
+    Extras {
+      peer: Some(proxy),
+      headers: &[("x-forwarded-for", "[2001:db8::1]")],
+    },
+  )
+  .await?;
+  assert_eq!(first.status(), StatusCode::OK);
+
+  let blocked = send_with(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code",
+    Extras {
+      peer: Some(proxy),
+      headers: &[("x-forwarded-for", "198.51.100.9:4123")],
+    },
+  )
+  .await?;
+  assert_eq!(
+    blocked.status(),
+    StatusCode::TOO_MANY_REQUESTS,
+    "an unparseable XFF entry must fall back to the peer bucket, not evade it"
+  );
+
+  let unknown = send_with(
+    service.clone(),
+    "POST",
+    "/token",
+    "grant_type=authorization_code",
+    Extras {
+      peer: Some(proxy),
+      headers: &[("x-forwarded-for", "unknown")],
+    },
+  )
+  .await?;
+  assert_eq!(
+    unknown.status(),
+    StatusCode::TOO_MANY_REQUESTS,
+    "`unknown` must likewise count against the peer bucket"
+  );
+
+  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  assert_eq!(
+    keys,
+    vec![counter_key(&prefix, "ip", "10.0.0.1")],
+    "only the verified peer bucket may exist: {keys:?}"
   );
   Ok(())
 }

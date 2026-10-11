@@ -48,6 +48,11 @@ impl Config {
       .into_iter()
       .map(ScopeDefinition::from_raw)
       .collect::<Result<Vec<_>, _>>()?;
+    let cookie_secure = raw.cookie_secure.unwrap_or(true);
+    if environment.is_production() && !cookie_secure {
+      return Err(ConfigError::InsecureSessionCookie);
+    }
+    let cookie_domain = validate_cookie_domain(raw.cookie_domain)?;
     let token_exchange_allowlist = raw
       .token_exchange_allowlist
       .into_iter()
@@ -67,8 +72,8 @@ impl Config {
       ttl,
       argon2,
       rate_limit,
-      cookie_domain: raw.cookie_domain,
-      cookie_secure: raw.cookie_secure.unwrap_or(true),
+      cookie_domain,
+      cookie_secure,
       allow_open_registration: raw.allow_open_registration,
       pii_dual_write: raw.pii_dual_write,
       dcr_redirect_policy: raw.dcr_redirect_policy,
@@ -275,4 +280,21 @@ fn validate_timeout_ladder(db: &DbConfig, policy: &FailurePolicy) -> Result<(), 
   } else {
     Err(ConfigError::InvalidTimeoutLadder)
   }
+}
+
+/// Validate `cookie_domain` against the issuer host (T3-D2).
+///
+/// Every non-blank value is rejected: the `__Host-` session-cookie prefix
+/// forbids `Domain`, so sessions stay host-only by design and the key remains
+/// reserved. Blank values are treated as absent, matching the other optional
+/// keys.
+fn validate_cookie_domain(raw: Option<String>) -> Result<Option<String>, ConfigError> {
+  let Some(domain) = raw else {
+    return Ok(None);
+  };
+  let normalized = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+  if normalized.is_empty() {
+    return Ok(None);
+  }
+  Err(ConfigError::InvalidCookieDomain { value: domain })
 }

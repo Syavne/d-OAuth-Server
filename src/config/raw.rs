@@ -59,6 +59,7 @@ pub(crate) struct RawConfig {
   pub cookie_secure: Option<bool>,
   pub allow_open_registration: bool,
   pub dcr_redirect_policy: DcrRedirectPolicy,
+  #[serde(default, deserialize_with = "crate::config::deserialize_string_or_vec")]
   pub cors_allowed_origins: Vec<String>,
   pub scope_registry: Vec<RawScopeDefinition>,
   pub allow_token_exchange: bool,

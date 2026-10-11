@@ -44,7 +44,7 @@ const SCOPE: &str = "read";
 /// `state` echoed from authorize to the code redirect (unreserved chars only).
 const STATE: &str = "e2e-flow-state";
 /// Session cookie name (production `src/ui/login.rs`: `SESSION_COOKIE`).
-const SESSION_COOKIE: &str = "session_id";
+const SESSION_COOKIE: &str = "__Host-session_id";
 /// Uniform credential-rejection page text (`INVALID_CREDENTIALS`).
 const INVALID_CREDENTIALS: &str = "Invalid email, password, or code.";
 

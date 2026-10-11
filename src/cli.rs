@@ -8,7 +8,9 @@
 //! stdin/env/file, **never argv**, and a secret is printed only when the
 //! operator explicitly asked for a one-time value (a new user's password must
 //! be supplied; `user enroll-totp` prints the enrollment secret once;
-//! `initial-access-token issue` prints the token once).
+//! `initial-access-token issue` prints the token once). One-time prints go
+//! only to an interactive terminal unless the explicit `--show-secret` flag
+//! acknowledges the disclosure, and password files must not be world-readable.
 //!
 //! `migrate` is forward-only and applies `sqlx::migrate!` under sqlx's own
 //! Postgres advisory lock; `serve` never migrates. Mutations are audited on the
@@ -167,9 +169,20 @@ pub enum UserCommand {
     /// User email.
     #[arg(long)]
     email: String,
+    /// Print the one-time secret even when stdout is not a TTY. Without this
+    /// flag the secret prints only to an interactive terminal, so it can
+    /// never leak into job logs or pipes by accident.
+    #[arg(long)]
+    show_secret: bool,
   },
   /// Disable a user account.
   Disable {
+    /// User email.
+    #[arg(long)]
+    email: String,
+  },
+  /// Clear a user's login lockout counters (account plus per-IP buckets).
+  Unlock {
     /// User email.
     #[arg(long)]
     email: String,
@@ -372,6 +385,11 @@ pub enum InitialAccessTokenCommand {
     /// Operator label for audit (never a secret).
     #[arg(long, default_value = "cli")]
     label: String,
+    /// Print the one-time token even when stdout is not a TTY. Without this
+    /// flag the token prints only to an interactive terminal, so it can
+    /// never leak into job logs or pipes by accident.
+    #[arg(long)]
+    show_secret: bool,
   },
 }
 
@@ -483,15 +501,21 @@ async fn run_user(context: &context::Context, command: UserCommand) -> Result<()
       password_file,
     } => {
       let password = context::read_secret(password_stdin, password_file.as_deref())?;
-      user::create(context, &email, admin, &password).await
+      user::create(context, &email, admin, password.as_str()).await
     }
-    UserCommand::EnrollTotp { email } => {
+    UserCommand::EnrollTotp { email, show_secret } => {
+      require_secret_output(show_secret)?;
       let enrollment = user::enroll_totp(context, &email).await?;
-      println!("totp secret (shown once): {}", enrollment.secret);
-      println!("otpauth uri: {}", enrollment.uri);
+      println!("totp secret (shown once): {}", enrollment.secret.as_str());
+      println!("otpauth uri: {}", enrollment.uri.as_str());
       Ok(())
     }
     UserCommand::Disable { email } => user::disable(context, &email).await,
+    UserCommand::Unlock { email } => {
+      let removed = user::unlock(context, &email).await?;
+      println!("unlocked user {email} (cleared {removed} lockout counter(s))");
+      Ok(())
+    }
     UserCommand::GrantScope { email, scope } => user::grant_scope(context, &email, &scope).await,
     UserCommand::RevokeScope { email, scope } => user::revoke_scope(context, &email, &scope).await,
     UserCommand::Scopes { email } => {
@@ -547,10 +571,45 @@ async fn run_pii(context: &context::Context, command: PiiCommand) -> Result<(), 
 
 async fn run_initial_access_token(command: InitialAccessTokenCommand) -> Result<(), CliError> {
   match command {
-    InitialAccessTokenCommand::Issue { uses, ttl, label } => {
+    InitialAccessTokenCommand::Issue {
+      uses,
+      ttl,
+      label,
+      show_secret,
+    } => {
+      require_secret_output(show_secret)?;
       let token = ops::issue_initial_access_token(uses, ttl, &label).await?;
-      println!("initial access token (shown once): {token}");
+      println!("initial access token (shown once): {}", token.as_str());
       Ok(())
     }
+  }
+}
+
+/// Refuse a one-time secret print that would land anywhere but an operator's
+/// terminal, unless the operator passed the explicit `--show-secret` flag.
+///
+/// A redirected stdout (pipe, file, or job log) without the flag is an error
+/// so enrollment secrets and initial-access tokens can never leak into logs
+/// by accident; the error carries no secret material.
+///
+/// # Errors
+/// Returns [`CliError::Input`] when stdout is not a TTY and `show_secret` is
+/// false.
+pub fn require_secret_output(show_secret: bool) -> Result<(), CliError> {
+  use std::io::IsTerminal as _;
+  check_secret_output(show_secret, std::io::stdout().is_terminal())
+}
+
+/// Flag logic behind [`require_secret_output`], with the TTY probe as an
+/// explicit parameter so the matrix is unit-testable without a terminal.
+fn check_secret_output(show_secret: bool, is_tty: bool) -> Result<(), CliError> {
+  if show_secret || is_tty {
+    Ok(())
+  } else {
+    Err(CliError::Input(
+      "refusing to print a one-time secret to a non-TTY stdout: re-run attached \
+       to a terminal or pass --show-secret to acknowledge the disclosure"
+        .to_owned(),
+    ))
   }
 }

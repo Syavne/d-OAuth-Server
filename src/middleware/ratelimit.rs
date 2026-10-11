@@ -2,7 +2,7 @@
 //!
 //! A fixed-window limiter over the sibling `RedisConn`: every request to a
 //! protected endpoint increments one counter per identity (peer IP and, when
-//! the request carries a `client_id`, the client). Counters live under the
+//! the request carries a `client_id`, the `(peer_ip, client_id)` composite). Counters live under the
 //! configured rate-limit prefix (`oauth:{rl}:`, enforced by config validation)
 //! so they never share the token-state keyspace and always carry the `{rl}`
 //! hash tag that keeps a multi-key write in one Cluster slot.
@@ -40,7 +40,7 @@ use tower::{Layer, Service};
 
 use crate::config::RateLimitConfig;
 use crate::state::AppState;
-use identity::{counter_key, extract_client_id, peer_ip};
+use identity::{client_bucket_raw, client_ip, counter_key, extract_client_id};
 
 #[cfg(test)]
 mod test_support;
@@ -90,7 +90,7 @@ impl Rule {
   /// segment such as `/register/{client_id}` is classified by its prefix and
   /// a sensitive route can never fall through to an unrated handler.
   /// `/health`, `/.well-known`, and `/assets` are deliberately unrated.
-  pub(crate) fn for_path(limits: RateLimitConfig, path: &str) -> Option<Self> {
+  pub(crate) fn for_path(limits: &RateLimitConfig, path: &str) -> Option<Self> {
     let normalized = path
       .split('?')
       .next()
@@ -203,7 +203,7 @@ where
 
     Box::pin(async move {
       let path = request.uri().path().to_owned();
-      let Some(rule) = Rule::for_path(state.config.rate_limit, &path) else {
+      let Some(rule) = Rule::for_path(&state.config.rate_limit, &path) else {
         return inner.call(request).await;
       };
 
@@ -212,9 +212,12 @@ where
         return inner.call(request).await;
       }
 
-      // Without a peer address there is no identity to count against; the
-      // endpoint is protected, so this is a misconfiguration, not a pass.
-      let Some(ip) = peer_ip(&request) else {
+      // The attributed client IP is the verified TCP peer unless the peer
+      // is a configured trusted proxy (T3-C3): only then is the
+      // rightmost-untrusted `X-Forwarded-For` entry honored, and only for
+      // rate-limit bucket selection. Without any identity the endpoint is
+      // protected, so this is a misconfiguration, not a pass.
+      let Some(ip) = client_ip(&request, &state.config.rate_limit.trusted_proxies) else {
         tracing::error!(%path, "rate limit: no peer address; failing closed");
         return Ok(service_unavailable(1));
       };
@@ -241,7 +244,12 @@ where
 /// The hashed counter keys and limits for one request, in evaluation order.
 ///
 /// `limit == 0` disables that bucket (a documented "off" switch); the IP
-/// bucket is always present because `peer_ip` already proved it.
+/// bucket is always present because `client_ip` already proved an identity. The client
+/// bucket is keyed by `(peer_ip, client_id)` (T3-C2): `client_id` arrives
+/// before client authentication, so a global per-`client_id` bucket would let
+/// an attacker exhaust a victim client's budget or rotate fake ids to evade
+/// the limit. Scoping the client bucket to the peer keeps the IP bucket as
+/// the primary control while preserving per-client accounting per peer.
 fn counter_keys(
   state: &AppState,
   rule: Rule,
@@ -256,7 +264,10 @@ fn counter_keys(
   if let Some(limit) = rule.per_client.filter(|limit| *limit > 0)
     && let Some(client_id) = client_id
   {
-    buckets.push((counter_key(prefix, "client", client_id), limit));
+    buckets.push((
+      counter_key(prefix, "client", &client_bucket_raw(&ip, client_id)),
+      limit,
+    ));
   }
   buckets
 }

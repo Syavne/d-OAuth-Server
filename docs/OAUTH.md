@@ -116,8 +116,15 @@ feature defined by OAuth 2.1 or OIDC. `GET /logout` is read-only: it renders
 a confirm page (live session) or a neutral signed-out page (anonymous) and
 never destroys the session or writes cookies. Only `POST /logout`, carrying
 the session-bound CSRF `form_token`, destroys the authorization-server
-session and expires the `session_id` cookie (the clearing cookie mirrors the
-session cookie's `Path`/`HttpOnly`/`SameSite`/`Secure`/`Domain`). `GET /logout` takes **no query
+session and expires the session cookie (`__Host-session_id`, or plain
+`session_id` when `cookie_secure = false`; the clearing cookie mirrors the
+session cookie's name and its `Path`/`HttpOnly`/`SameSite`/`Secure`; no `Domain` is ever
+emitted, so the cookie stays host-only in both variants). In production the
+session reader honors **only** `__Host-session_id`: a plain `session_id` cookie
+is never read, so a cookie planted by a sibling subdomain cannot fixate a
+victim's login onto an attacker presession. The development variant reads plain
+`session_id` and may additionally fall back to `__Host-session_id`; `POST
+/logout` clears every name the reader honors. `GET /logout` takes **no query
 parameters** and issues no redirect at all, so a forced navigation
 cannot cause an open redirect; only `POST /logout` may redirect, and only to a
 `post_logout` URI that was **registered for the client and frozen in session

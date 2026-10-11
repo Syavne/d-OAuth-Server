@@ -58,6 +58,9 @@ pub enum TestError {
   /// A Redis operation failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
+  /// A lockout-counter operation failed.
+  #[error("store error: {0}")]
+  Store(#[from] crate::store::StoreError),
   /// A required value was unexpectedly absent.
   #[error("missing value: {0}")]
   Missing(&'static str),

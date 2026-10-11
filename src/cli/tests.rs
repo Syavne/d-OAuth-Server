@@ -1,7 +1,7 @@
 //! `test(cli)` suite: config validation, user provisioning, token issuance,
 //! TOTP encryption, scope grants, idempotent config sync, and audit emission.
 
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use base64::Engine as _;
 use clap::Parser as _;
@@ -20,7 +20,8 @@ use testcontainers::{
 use time::OffsetDateTime;
 
 use super::{
-  Cli, ClientCommand, RedirectUriCommand, ScopeCommand, admin, ops, redirect, scope, secret,
+  Cli, ClientCommand, Command, RedirectUriCommand, ScopeCommand, UserCommand, admin, ops, redirect,
+  scope, secret,
   sync::{RedirectEntry, ScopeEntry, SyncFile},
   test_support::{self, TestError},
   user,
@@ -166,8 +167,8 @@ async fn cli_user_create_and_lookup() -> Result<(), TestError> {
 async fn cli_initial_access_token_stores_only_hash() -> Result<(), TestError> {
   let harness = test_support::harness().await?;
   let token = ops::issue_with(harness.config.clone(), 3, 600, "cli-test").await?;
-  let hash = secret::token_hash(&harness.config, &token)?;
-  assert_ne!(hash, token);
+  let hash = secret::token_hash(&harness.config, token.as_str())?;
+  assert_ne!(hash.as_str(), token.as_str());
 
   let store = crate::store::Store::from_config(&harness.config.redis);
   let mut conn = AppState::connect(harness.config.clone())
@@ -182,7 +183,7 @@ async fn cli_initial_access_token_stores_only_hash() -> Result<(), TestError> {
     .await?;
   assert_eq!(present, 1);
 
-  let raw_key = store.dcr_iat_key(&token);
+  let raw_key = store.dcr_iat_key(token.as_str());
   let raw_present: i64 = redis::cmd("EXISTS")
     .arg(&raw_key)
     .query_async(&mut conn)
@@ -193,7 +194,7 @@ async fn cli_initial_access_token_stores_only_hash() -> Result<(), TestError> {
     .arg(&key)
     .query_async(&mut conn)
     .await?;
-  assert!(fields.iter().all(|field| !field.contains(&token)));
+  assert!(fields.iter().all(|field| !field.contains(token.as_str())));
   Ok(())
 }
 
@@ -223,7 +224,7 @@ async fn cli_user_enroll_totp_stores_encrypted_secret() -> Result<(), TestError>
     "plaintext TOTP secret found in stored blob"
   );
   let decrypted = secret::decrypt_totp(context.config(), &blob)?;
-  assert_eq!(decrypted, enrollment.secret);
+  assert_eq!(decrypted.as_str(), enrollment.secret.as_str());
   assert!(enrollment.uri.starts_with("otpauth://totp/"));
   Ok(())
 }
@@ -235,31 +236,46 @@ async fn cli_totp_v3_cross_decrypts() -> Result<(), TestError> {
   let plaintext = secret::generate_totp_secret()?;
 
   // CLI -> crypto: a v3 envelope the CLI wrote opens under crypto::totp.
-  let cli_blob = secret::encrypt_totp(config, &plaintext, true)?;
+  let cli_blob = secret::encrypt_totp(config, plaintext.as_str(), true)?;
   assert_eq!(
     cli_blob.first().copied(),
     Some(3),
     "CLI envelope write must be v3"
   );
-  assert_eq!(totp::decrypt_secret(&config.keys, &cli_blob)?, plaintext);
+  assert_eq!(
+    totp::decrypt_secret(&config.keys, &cli_blob)?.as_str(),
+    plaintext.as_str()
+  );
 
   // CLI round-trips through its own reader.
-  assert_eq!(secret::decrypt_totp(config, &cli_blob)?, plaintext);
+  assert_eq!(
+    secret::decrypt_totp(config, &cli_blob)?.as_str(),
+    plaintext.as_str()
+  );
 
   // crypto -> CLI: a v3 envelope crypto wrote opens under the CLI.
-  let crypto_blob = totp::encrypt_secret(&config.keys, &plaintext, true)?;
+  let crypto_blob = totp::encrypt_secret(&config.keys, plaintext.as_str(), true)?;
   assert_eq!(crypto_blob.first().copied(), Some(3));
-  assert_eq!(secret::decrypt_totp(config, &crypto_blob)?, plaintext);
+  assert_eq!(
+    secret::decrypt_totp(config, &crypto_blob)?.as_str(),
+    plaintext.as_str()
+  );
 
   // The version gate keeps the legacy v2 write cross-compatible too.
-  let legacy = secret::encrypt_totp(config, &plaintext, false)?;
+  let legacy = secret::encrypt_totp(config, plaintext.as_str(), false)?;
   assert_eq!(
     legacy.first().copied(),
     Some(2),
     "gated CLI write must stay v2"
   );
-  assert_eq!(totp::decrypt_secret(&config.keys, &legacy)?, plaintext);
-  assert_eq!(secret::decrypt_totp(config, &legacy)?, plaintext);
+  assert_eq!(
+    totp::decrypt_secret(&config.keys, &legacy)?.as_str(),
+    plaintext.as_str()
+  );
+  assert_eq!(
+    secret::decrypt_totp(config, &legacy)?.as_str(),
+    plaintext.as_str()
+  );
 
   // Data AAD excludes the kid: re-wrap the DEK under a different kid (same key
   // material) leaving the data nonce and ciphertext byte-identical, and the
@@ -272,7 +288,10 @@ async fn cli_totp_v3_cross_decrypts() -> Result<(), TestError> {
   let target = KeyId::new("v99");
   let rewrapped = rewrap_v3(&cli_blob, kid.as_str(), material, target.as_str())?;
   let ring = key_ring_with_totp(&config.keys, target, material)?;
-  assert_eq!(totp::decrypt_secret(&ring, &rewrapped)?, plaintext);
+  assert_eq!(
+    totp::decrypt_secret(&ring, &rewrapped)?.as_str(),
+    plaintext.as_str()
+  );
 
   // A truncated blob fails closed without leaking plaintext.
   let truncated = &cli_blob[..12];
@@ -842,7 +861,7 @@ async fn admin_bootstrap_creates_first_admin_must_change() -> Result<(), TestErr
     &config,
     &pool,
     &email,
-    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned()),
+    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned().into()),
     false,
   )
   .await?;
@@ -898,7 +917,7 @@ async fn admin_bootstrap_concurrent_creates_exactly_one() -> Result<(), TestErro
         &config,
         &pool,
         &email,
-        admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned()),
+        admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned().into()),
         false,
       )
       .await
@@ -938,7 +957,7 @@ async fn admin_bootstrap_second_refuses_and_force_is_audited() -> Result<(), Tes
     &config,
     &pool,
     &first,
-    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned()),
+    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned().into()),
     false,
   )
   .await?;
@@ -948,7 +967,7 @@ async fn admin_bootstrap_second_refuses_and_force_is_audited() -> Result<(), Tes
     &config,
     &pool,
     &second,
-    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned()),
+    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned().into()),
     false,
   )
   .await;
@@ -972,7 +991,7 @@ async fn admin_bootstrap_second_refuses_and_force_is_audited() -> Result<(), Tes
     &config,
     &pool,
     &second,
-    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned()),
+    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned().into()),
     true,
   )
   .await?;
@@ -1010,16 +1029,16 @@ async fn admin_bootstrap_generated_password_is_256_bit_and_unlogged() -> Result<
     .generated_password
     .ok_or(TestError::Missing("generated password"))?;
   let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-    .decode(&generated)
+    .decode(generated.as_str())
     .map_err(|_| TestError::Missing("generated password must be base64"))?;
   assert_eq!(raw.len(), 32, "generated passwords are 256-bit");
 
-  let verdict = user_repo::verify_password(&pool, &config.keys, &email, &generated).await?;
+  let verdict = user_repo::verify_password(&pool, &config.keys, &email, generated.as_str()).await?;
   assert_eq!(verdict, user_repo::PasswordVerdict::Matched);
 
   let log = test_support::captured(&capture.buffer);
   assert!(
-    !log.contains(&generated),
+    !log.contains(generated.as_str()),
     "generated password leaked into logs"
   );
   assert!(
@@ -1053,7 +1072,7 @@ async fn admin_bootstrap_first_login_restricted_until_rotation() -> Result<(), T
     &config,
     &pool,
     &email,
-    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned()),
+    admin::BootstrapPassword::Provided(BOOTSTRAP_PASSWORD.to_owned().into()),
     false,
   )
   .await?;
@@ -1090,6 +1109,7 @@ async fn admin_bootstrap_first_login_restricted_until_rotation() -> Result<(), T
       password: BOOTSTRAP_PASSWORD.to_owned(),
       code: String::new(),
       csrf,
+      peer_ip: None,
     },
   )
   .await?
@@ -1148,7 +1168,7 @@ async fn admin_bootstrap_first_login_restricted_until_rotation() -> Result<(), T
   let code = totp::build_totp(&offer.secret)?
     .generate(counter * totp::TOTP_STEP_SECS)
     .to_string();
-  let full = match confirm_totp(&mut deps!(), &restricted, &code).await? {
+  let full = match confirm_totp(&mut deps!(), &restricted, &code, None).await? {
     ConfirmOutcome::Completed { session_id, .. } => session_id,
     _ => {
       return Err(TestError::Missing(
@@ -1192,6 +1212,155 @@ fn admin_bootstrap_has_no_password_argv_and_migrate_seeds_no_admin() {
     "hunter2",
   ]);
   assert!(rejected.is_err(), "passwords must never travel via argv");
+}
+
+#[test]
+fn user_unlock_parses_with_email() {
+  let parsed = Cli::try_parse_from([
+    "d-oauth-server",
+    "user",
+    "unlock",
+    "--email",
+    "ops@example.test",
+  ]);
+  assert!(parsed.is_ok(), "documented unlock flags must parse");
+  if let Ok(cli) = parsed {
+    assert!(
+      matches!(
+        cli.command,
+        Command::User {
+          command: UserCommand::Unlock { .. },
+        }
+      ),
+      "user unlock must parse to the unlock command"
+    );
+  }
+}
+
+/// `user unlock` clears the account counter and every composite bucket for
+/// the user, emits `user.unlock`, and leaves the label-less unknown buckets
+/// untouched.
+#[tokio::test]
+async fn user_unlock_clears_lockout_and_emits_audit() -> Result<(), TestError> {
+  let (_harness, context) = test_support::context().await?;
+  let email = test_support::unique_email("unlock");
+  user::create(&context, &email, false, PASSWORD).await?;
+
+  let store = crate::store::Store::from_config(&context.config().redis);
+  let mut conn = AppState::connect(context.config().clone())
+    .await?
+    .redis
+    .clone();
+  let policy = user_repo::LockoutPolicy::new(5, 20, std::time::Duration::from_secs(900))
+    .ok_or(TestError::Missing("lockout policy"))?;
+  let attacker: IpAddr = "192.0.2.77"
+    .parse()
+    .map_err(|_| TestError::Missing("attacker ip"))?;
+  for _ in 0..5 {
+    user_repo::register_login_failure(&mut conn, &store, policy, &email, Some(attacker)).await?;
+  }
+  user_repo::register_unknown_failure(&mut conn, &store, policy, Some(attacker)).await?;
+  if !user_repo::is_locked_out(&mut conn, &store, policy, &email, Some(attacker)).await? {
+    return Err(TestError::Missing("account must lock before unlock"));
+  }
+
+  let capture = test_support::install_capture()?;
+  let removed = user::unlock(&context, &email).await?;
+  drop(capture.guard);
+  if removed < 2 {
+    return Err(TestError::Harness(format!(
+      "unlock must remove the account and composite keys, removed {removed}"
+    )));
+  }
+  if user_repo::is_locked_out(&mut conn, &store, policy, &email, Some(attacker)).await? {
+    return Err(TestError::Harness(
+      "unlock must release the lockout".to_owned(),
+    ));
+  }
+  if user_repo::unknown_failure_count(&mut conn, &store, Some(attacker)).await? != 1 {
+    return Err(TestError::Harness(
+      "unlock must leave unknown buckets untouched".to_owned(),
+    ));
+  }
+  let log = test_support::captured(&capture.buffer);
+  if !log.contains("cli.mutation") {
+    return Err(TestError::Harness(format!("missing audit event: {log}")));
+  }
+  if !log.contains("user.unlock") {
+    return Err(TestError::Harness(format!("missing operation: {log}")));
+  }
+  Ok(())
+}
+
+/// `user unlock` on an absent address is a clean, payload-free not-found.
+#[tokio::test]
+async fn user_unlock_unknown_user_is_not_found() -> Result<(), TestError> {
+  let (_harness, context) = test_support::context().await?;
+  let missing = test_support::unique_email("unlock-missing");
+  match user::unlock(&context, &missing).await {
+    Err(super::context::CliError::NotFound(message)) => {
+      if message.contains(&missing) || message.contains('@') {
+        return Err(TestError::Harness(format!(
+          "not-found error leaked the email: {message}"
+        )));
+      }
+      Ok(())
+    }
+    Err(other) => Err(TestError::Harness(format!("unexpected error: {other:?}"))),
+    Ok(_) => Err(TestError::Missing("missing user must be NotFound")),
+  }
+}
+
+/// `user unlock` fails closed when Redis is unreachable: the command errors
+/// without an audit event and the account row stays exactly as it was.
+#[tokio::test]
+async fn user_unlock_redis_outage_fails_closed() -> Result<(), TestError> {
+  let (_postgres, pg_url) = test_support::postgres_container().await?;
+  let fixture = serde_json::json!({
+    "issuer": "https://auth.example.test",
+    "environment": "development",
+    "tls": {"cert_path": "/tmp/cli-test-cert.pem", "key_path": "/tmp/cli-test-key.pem"},
+    "database": {"url": pg_url},
+    "redis": {"url": "redis://127.0.0.1:1", "durability": "waitaof"},
+    "token_pepper": "cli-test-pepper-0123456789abcdef",
+    "totp_encryption_key": "cli-test-totp-key-0123456789abcdef",
+    "pii_encryption_key": "cli-test-pii-key-0123456789abcdef",
+  });
+  let source = ::config::Config::try_from(&fixture)?;
+  let config = Arc::new(Config::from_source(source)?);
+  let pool = super::context::open_pool(&config).await?;
+  crate::state::MIGRATOR.run(&pool).await?;
+  pool.close().await;
+  let context = super::context::Context::from_config(config).await?;
+  let email = test_support::unique_email("unlock-outage");
+  user::create(&context, &email, false, PASSWORD).await?;
+
+  let capture = test_support::install_capture()?;
+  let outcome = user::unlock(&context, &email).await;
+  drop(capture.guard);
+  match outcome {
+    Err(super::context::CliError::NotFound(_)) => {
+      return Err(TestError::Harness(
+        "a live user must not be NotFound".to_owned(),
+      ));
+    }
+    Err(_) => {}
+    Ok(_) => return Err(TestError::Missing("unlock over a dead Redis must fail")),
+  }
+  if test_support::captured(&capture.buffer).contains("user.unlock") {
+    return Err(TestError::Harness(
+      "a failed unlock must not emit user.unlock".to_owned(),
+    ));
+  }
+  let record = user_repo::find_by_email(context.pool(), &context.config().keys, &email)
+    .await?
+    .ok_or(TestError::Missing("created user"))?;
+  if record.disabled {
+    return Err(TestError::Harness(
+      "a failed unlock must not touch the account".to_owned(),
+    ));
+  }
+  Ok(())
 }
 
 #[tokio::test]
@@ -1469,5 +1638,169 @@ async fn user_disable_purges_ephemeral_state() -> Result<(), TestError> {
     .query_async(&mut conn)
     .await?;
   assert_eq!(decoy_present, 1, "disable must keep unrelated subjects");
+  Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `test(cli_secret_hygiene)` suite (T3-D1, red-first)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn cli_password_file_world_readable_rejected() -> Result<(), TestError> {
+  use std::os::unix::fs::PermissionsExt as _;
+  let path = std::env::temp_dir().join(format!(
+    "d-oauth-cli-secret-hygiene-{}",
+    uuid::Uuid::new_v4()
+  ));
+  std::fs::write(&path, "placeholder-secret-value\n")?;
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+  let result = super::context::read_secret(false, Some(&path));
+  let _ = std::fs::remove_file(&path);
+  assert!(
+    result.is_err(),
+    "a world-readable password file must be rejected"
+  );
+  Ok(())
+}
+
+#[test]
+fn cli_enroll_totp_accepts_show_secret_flag() {
+  let parsed = Cli::try_parse_from([
+    "d-oauth-server",
+    "user",
+    "enroll-totp",
+    "--email",
+    "ops@example.test",
+    "--show-secret",
+  ]);
+  assert!(
+    parsed.is_ok(),
+    "enroll-totp must accept an explicit --show-secret flag"
+  );
+}
+
+#[test]
+fn cli_iat_issue_accepts_show_secret_flag() {
+  let parsed = Cli::try_parse_from([
+    "d-oauth-server",
+    "initial-access-token",
+    "issue",
+    "--uses",
+    "3",
+    "--ttl",
+    "600",
+    "--show-secret",
+  ]);
+  assert!(
+    parsed.is_ok(),
+    "initial-access-token issue must accept an explicit --show-secret flag"
+  );
+}
+
+#[test]
+fn cli_bootstrap_debug_redacts_with_length() {
+  let debug = format!(
+    "{:?}",
+    admin::BootstrapPassword::Provided("placeholder-secret-value".to_owned().into())
+  );
+  assert!(
+    !debug.contains("placeholder-secret-value"),
+    "Debug must never carry the password: {debug}"
+  );
+  assert!(
+    debug.contains("[REDACTED]"),
+    "Debug must mark the password redacted: {debug}"
+  );
+  let outcome = admin::BootstrapOutcome {
+    id: uuid::Uuid::new_v4(),
+    email: "ops@example.test".to_owned(),
+    generated_password: Some("placeholder-secret-value".to_owned().into()),
+  };
+  let debug = format!("{outcome:?}");
+  assert!(
+    !debug.contains("placeholder-secret-value"),
+    "Debug must never carry the generated password: {debug}"
+  );
+  assert!(
+    debug.contains("[REDACTED]"),
+    "Debug must mark the generated password redacted: {debug}"
+  );
+}
+
+#[test]
+fn cli_secret_output_guard_refuses_without_flag() {
+  assert!(
+    super::check_secret_output(false, false).is_err(),
+    "one-time secret output to a non-TTY stdout without --show-secret must refuse"
+  );
+  assert!(
+    super::check_secret_output(false, true).is_ok(),
+    "one-time secret output to a TTY without --show-secret must allow"
+  );
+  assert!(
+    super::require_secret_output(true).is_ok(),
+    "an explicit --show-secret flag must allow the one-time print"
+  );
+  assert!(
+    super::check_secret_output(true, false).is_ok(),
+    "an explicit --show-secret flag must allow a non-TTY print"
+  );
+  assert!(
+    super::check_secret_output(true, true).is_ok(),
+    "an explicit --show-secret flag must allow a TTY print"
+  );
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_password_file_group_readable_accepted() -> Result<(), TestError> {
+  use std::os::unix::fs::PermissionsExt as _;
+  let path =
+    std::env::temp_dir().join(format!("d-oauth-cli-secret-group-{}", uuid::Uuid::new_v4()));
+  std::fs::write(&path, "placeholder-secret-value\n")?;
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+  let result = super::context::read_secret(false, Some(&path));
+  let _ = std::fs::remove_file(&path);
+  assert!(
+    result.is_ok(),
+    "a group-readable (non-world-readable) password file must be accepted"
+  );
+  Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_password_file_non_utf8_rejected() -> Result<(), TestError> {
+  use std::os::unix::fs::PermissionsExt as _;
+  let path = std::env::temp_dir().join(format!(
+    "d-oauth-cli-secret-nonutf8-{}",
+    uuid::Uuid::new_v4()
+  ));
+  std::fs::write(&path, [0xff, 0xfe, b'\n'])?; // invalid UTF-8, no secret material
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+  let result = super::context::read_secret(false, Some(&path));
+  let _ = std::fs::remove_file(&path);
+  assert!(
+    result.is_err(),
+    "a non-UTF-8 password file must be rejected"
+  );
+  Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_password_file_trims_trailing_newline() -> Result<(), TestError> {
+  use std::os::unix::fs::PermissionsExt as _;
+  let path = std::env::temp_dir().join(format!("d-oauth-cli-secret-trim-{}", uuid::Uuid::new_v4()));
+  std::fs::write(&path, "placeholder-secret-value\r\n")?;
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+  let secret = super::context::read_secret(false, Some(&path))?;
+  let _ = std::fs::remove_file(&path);
+  assert_eq!(
+    secret.as_str(),
+    "placeholder-secret-value",
+    "a trailing CR/LF must be trimmed in place"
+  );
   Ok(())
 }

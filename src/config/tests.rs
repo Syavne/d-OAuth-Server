@@ -589,3 +589,332 @@ fn read_secret_file_preserves_surrounding_spaces() -> Result<(), Box<dyn Error>>
   assert_eq!(secret.expose_secret(), "  spaced-secret  ");
   Ok(())
 }
+
+/// The trusted-proxy allowlist defaults to empty: headers are never honored
+/// unless the operator configures the proxy peers explicitly.
+#[test]
+fn config_trusted_proxies_default_empty() -> Result<(), Box<dyn Error>> {
+  let cfg = try_load(&base())?;
+  assert!(cfg.rate_limit.trusted_proxies.is_empty());
+  Ok(())
+}
+
+/// Exact IPs and CIDRs load into the allowlist and match only their range.
+#[test]
+fn config_accepts_trusted_proxy_allowlist() -> Result<(), Box<dyn Error>> {
+  use std::net::IpAddr;
+  use std::str::FromStr as _;
+  let mut map = base();
+  map.insert(
+    "rate_limit".to_owned(),
+    json!({ "trusted_proxies": ["10.0.0.1", "192.168.0.0/16", "2001:db8::/32"] }),
+  );
+  let cfg = try_load(&map)?;
+  assert_eq!(cfg.rate_limit.trusted_proxies.len(), 3);
+  let contains = |text: &str| {
+    cfg
+      .rate_limit
+      .trusted_proxies
+      .iter()
+      .any(|net| net.contains(IpAddr::from_str(text).unwrap_or(IpAddr::from([0, 0, 0, 0]))))
+  };
+  assert!(contains("10.0.0.1"));
+  assert!(!contains("10.0.0.2"));
+  assert!(contains("192.168.34.7"));
+  assert!(!contains("192.167.0.1"));
+  assert!(contains("2001:db8::1"));
+  assert!(!contains("2001:db9::1"));
+  Ok(())
+}
+
+/// T3-D2: the server-side session lifetime is pinned at 12 h. The review
+/// outcome is absolute expiry with no idle sliding: reads never re-arm the
+/// TTL, so a live session always dies 12 h after its last write.
+#[test]
+fn config_session_ttl_pinned_to_12h() -> Result<(), Box<dyn Error>> {
+  let cfg = try_load(&base())?;
+  assert_eq!(cfg.ttl.session, Duration::from_secs(43_200));
+  Ok(())
+}
+
+/// T3-D2: a zero session lifetime is rejected like every other zero TTL.
+#[test]
+fn config_rejects_zero_session_ttl() {
+  let mut map = base();
+  map.insert("ttl".to_owned(), json!({ "session_secs": 0 }));
+  assert!(matches!(try_load(&map), Err(ConfigError::InvalidTtl)));
+}
+
+/// T3-D2: production without the `Secure` cookie attribute is rejected at
+/// load; the `cookie_secure = false` gate is a development-only exception.
+#[test]
+fn config_rejects_production_cookie_without_secure() {
+  let mut map = base();
+  map.insert("cookie_secure".to_owned(), Value::Bool(false));
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::InsecureSessionCookie)
+  ));
+}
+
+/// T3-D2: development keeps the localhost exception (`Secure` off), and the
+/// session cookie drops the `__Host-` prefix there (browsers reject `__Host-`
+/// without `Secure`).
+#[test]
+fn config_allows_development_cookie_without_secure() -> Result<(), Box<dyn Error>> {
+  let mut map = base();
+  map.insert(
+    "environment".to_owned(),
+    Value::String("development".to_owned()),
+  );
+  map.insert("cookie_secure".to_owned(), Value::Bool(false));
+  let cfg = try_load(&map)?;
+  assert!(!cfg.cookie_secure);
+  assert_eq!(
+    crate::ui::login::session_cookie_name(&cfg),
+    crate::ui::login::INSECURE_SESSION_COOKIE
+  );
+  Ok(())
+}
+
+/// T3-D2: a `cookie_domain` outside the issuer host is rejected at load.
+#[test]
+fn config_rejects_cookie_domain_mismatch() {
+  let mut map = base();
+  map.insert(
+    "cookie_domain".to_owned(),
+    Value::String("evil.example".to_owned()),
+  );
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::InvalidCookieDomain { .. })
+  ));
+}
+
+/// T3-D2: even a matching `cookie_domain` is rejected: the `__Host-` session
+/// cookie forbids `Domain`, so sessions stay host-only by design.
+#[test]
+fn config_rejects_cookie_domain_even_when_suffix_of_issuer_host() {
+  for domain in ["auth.example.com", "example.com"] {
+    let mut map = base();
+    map.insert("cookie_domain".to_owned(), Value::String(domain.to_owned()));
+    assert!(
+      matches!(try_load(&map), Err(ConfigError::InvalidCookieDomain { .. })),
+      "cookie_domain {domain:?} must be rejected under the __Host- prefix"
+    );
+  }
+}
+
+/// T3-D2: a blank `cookie_domain` is treated as absent, matching the other
+/// optional keys — only a non-blank value is rejected.
+#[test]
+fn config_blank_cookie_domain_treated_as_absent() -> Result<(), Box<dyn Error>> {
+  for domain in ["", "   ", ".", " . "] {
+    let mut map = base();
+    map.insert("cookie_domain".to_owned(), Value::String(domain.to_owned()));
+    let cfg = try_load(&map)?;
+    assert!(
+      cfg.cookie_domain.is_none(),
+      "blank cookie_domain {domain:?} must be treated as absent"
+    );
+  }
+  Ok(())
+}
+
+/// The documented env form `D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='["10.0.0.5"]'`
+/// loads through `env_source()`: the JSON array string becomes one allowlist
+/// entry (config-rs 0.15 leaves env values as strings without this handling).
+#[test]
+fn config_trusted_proxies_env_array_loads() -> Result<(), Box<dyn Error>> {
+  use std::net::IpAddr;
+  use std::str::FromStr as _;
+  let mut env = std::collections::HashMap::new();
+  env.insert(
+    "D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES".to_owned(),
+    r#"["10.0.0.5"]"#.to_owned(),
+  );
+  let built = ::config::Config::builder()
+    .add_source(super::env_source().source(Some(env)))
+    .build()?;
+  let raw: super::raw::RawConfig = built.try_deserialize()?;
+  assert_eq!(raw.rate_limit.trusted_proxies, vec!["10.0.0.5"]);
+  let validated = super::types::RateLimitConfig::from_raw(raw.rate_limit)?;
+  assert_eq!(validated.trusted_proxies.len(), 1);
+  let probe = IpAddr::from_str("10.0.0.5").map_err(|_| "bad test ip")?;
+  assert!(
+    validated
+      .trusted_proxies
+      .iter()
+      .any(|net| net.contains(probe))
+  );
+  Ok(())
+}
+
+/// A malformed entry, an out-of-range prefix, or a trust-everything `/0`
+/// fails the load: an unparseable allowlist must never silently mean "trust
+/// nobody" or "trust everybody".
+#[test]
+fn config_rejects_invalid_trusted_proxy() {
+  for entry in [
+    "not-an-ip",
+    "",
+    "10.0.0.0/33",
+    "2001:db8::/129",
+    "10.0.0.1/-1",
+    "10.0.0.0/0",
+    "0.0.0.0/0",
+    "::/0",
+    "10.0.0.1/abc",
+    "10.0.0.256",
+  ] {
+    let mut map = base();
+    map.insert(
+      "rate_limit".to_owned(),
+      json!({ "trusted_proxies": [entry] }),
+    );
+    assert!(
+      matches!(try_load(&map), Err(ConfigError::InvalidTrustedProxy { .. })),
+      "entry {entry:?} must be rejected"
+    );
+  }
+}
+
+/// T3-C3: CIDR boundary prefixes match exactly their range. A `/32` (v4) or
+/// `/128` (v6) host route matches only its own address; a `/1` splits the
+/// address space in half.
+#[test]
+fn config_trusted_proxy_cidr_boundaries() -> Result<(), Box<dyn Error>> {
+  use std::net::IpAddr;
+  use std::str::FromStr as _;
+
+  use super::types::TrustedProxyNet;
+  let host_v4 = TrustedProxyNet::from_str("10.0.0.5/32")?;
+  assert!(host_v4.contains(IpAddr::from_str("10.0.0.5")?));
+  assert!(!host_v4.contains(IpAddr::from_str("10.0.0.6")?));
+  assert!(!host_v4.contains(IpAddr::from_str("10.0.0.4")?));
+  let host_v6 = TrustedProxyNet::from_str("2001:db8::1/128")?;
+  assert!(host_v6.contains(IpAddr::from_str("2001:db8::1")?));
+  assert!(!host_v6.contains(IpAddr::from_str("2001:db8::2")?));
+  let lower_half = TrustedProxyNet::from_str("0.0.0.0/1")?;
+  assert!(lower_half.contains(IpAddr::from_str("10.0.0.1")?));
+  assert!(lower_half.contains(IpAddr::from_str("127.0.0.1")?));
+  assert!(!lower_half.contains(IpAddr::from_str("128.0.0.1")?));
+  assert!(!lower_half.contains(IpAddr::from_str("200.0.0.1")?));
+  let upper_half = TrustedProxyNet::from_str("128.0.0.0/1")?;
+  assert!(upper_half.contains(IpAddr::from_str("200.0.0.1")?));
+  assert!(!upper_half.contains(IpAddr::from_str("10.0.0.1")?));
+  Ok(())
+}
+
+/// T3-C3: a CIDR base with host bits set is normalized to its network base,
+/// so `192.168.1.5/24` behaves exactly like `192.168.1.0/24`.
+#[test]
+fn config_trusted_proxy_prefix_normalization() -> Result<(), Box<dyn Error>> {
+  use std::net::IpAddr;
+  use std::str::FromStr as _;
+
+  use super::types::TrustedProxyNet;
+  let host_bits = TrustedProxyNet::from_str("192.168.1.5/24")?;
+  let canonical = TrustedProxyNet::from_str("192.168.1.0/24")?;
+  for address in ["192.168.1.1", "192.168.1.5", "192.168.1.254"] {
+    let ip = IpAddr::from_str(address)?;
+    assert!(
+      host_bits.contains(ip),
+      "{address} must be inside 192.168.1.5/24"
+    );
+    assert_eq!(host_bits.contains(ip), canonical.contains(ip));
+  }
+  for address in ["192.168.2.5", "192.168.0.5", "10.0.0.1"] {
+    let ip = IpAddr::from_str(address)?;
+    assert!(
+      !host_bits.contains(ip),
+      "{address} must be outside 192.168.1.5/24"
+    );
+  }
+  let host_bits_v6 = TrustedProxyNet::from_str("2001:db8::1/32")?;
+  assert!(host_bits_v6.contains(IpAddr::from_str("2001:db8::dead:beef")?));
+  assert!(!host_bits_v6.contains(IpAddr::from_str("2001:db9::1")?));
+  Ok(())
+}
+
+/// T3-C3: an entry never matches an address of the other family, so a v4
+/// allowlist cannot be satisfied by a v6 peer and vice versa.
+#[test]
+fn config_trusted_proxy_family_mismatch_never_matches() -> Result<(), Box<dyn Error>> {
+  use std::net::IpAddr;
+  use std::str::FromStr as _;
+
+  use super::types::TrustedProxyNet;
+  let v4_net = TrustedProxyNet::from_str("10.0.0.0/8")?;
+  assert!(!v4_net.contains(IpAddr::from_str("::1")?));
+  assert!(!v4_net.contains(IpAddr::from_str("::ffff:10.0.0.1")?));
+  assert!(!v4_net.contains(IpAddr::from_str("2001:db8::1")?));
+  let v6_net = TrustedProxyNet::from_str("2001:db8::/32")?;
+  assert!(!v6_net.contains(IpAddr::from_str("127.0.0.1")?));
+  assert!(!v6_net.contains(IpAddr::from_str("10.0.0.1")?));
+  let v4_host = TrustedProxyNet::from_str("10.0.0.1")?;
+  assert!(!v4_host.contains(IpAddr::from_str("::ffff:10.0.0.1")?));
+  Ok(())
+}
+
+/// T3-C3: the allowlist cap admits exactly 64 entries; the 65th fails the
+/// load instead of silently truncating the operator's intent.
+#[test]
+fn config_trusted_proxy_allowlist_cap_64_accepts_65_rejects() -> Result<(), Box<dyn Error>> {
+  let entries: Vec<Value> = (0..64)
+    .map(|index| Value::String(format!("10.0.{index}.1")))
+    .collect();
+  let mut map = base();
+  map.insert(
+    "rate_limit".to_owned(),
+    json!({ "trusted_proxies": entries }),
+  );
+  let cfg = try_load(&map)?;
+  assert_eq!(cfg.rate_limit.trusted_proxies.len(), 64);
+  let entries: Vec<Value> = (0..65)
+    .map(|index| Value::String(format!("10.0.{index}.1")))
+    .collect();
+  let mut map = base();
+  map.insert(
+    "rate_limit".to_owned(),
+    json!({ "trusted_proxies": entries }),
+  );
+  assert!(
+    matches!(try_load(&map), Err(ConfigError::InvalidTrustedProxy { .. })),
+    "65 trusted-proxy entries must exceed the allowlist cap"
+  );
+  Ok(())
+}
+
+/// T3-C3: surrounding whitespace is trimmed and duplicate entries load as
+/// written (no silent dedup, no silent drop).
+#[test]
+fn config_trusted_proxy_whitespace_and_duplicates() -> Result<(), Box<dyn Error>> {
+  use std::net::IpAddr;
+  use std::str::FromStr as _;
+
+  let mut map = base();
+  map.insert(
+    "rate_limit".to_owned(),
+    json!({ "trusted_proxies": ["  10.0.0.1  ", "10.0.0.1", "\t192.168.0.0/16\n"] }),
+  );
+  let cfg = try_load(&map)?;
+  assert_eq!(cfg.rate_limit.trusted_proxies.len(), 3);
+  let probe_v4 = IpAddr::from_str("10.0.0.1")?;
+  assert!(
+    cfg
+      .rate_limit
+      .trusted_proxies
+      .iter()
+      .any(|net| net.contains(probe_v4))
+  );
+  let probe_range = IpAddr::from_str("192.168.9.9")?;
+  assert!(
+    cfg
+      .rate_limit
+      .trusted_proxies
+      .iter()
+      .any(|net| net.contains(probe_range))
+  );
+  Ok(())
+}

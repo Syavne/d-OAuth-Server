@@ -1,15 +1,17 @@
 //! `test(login)` authentication suite: cookies, uniform rejects, replay, binding.
 
 use axum::Extension;
-use axum::extract::{Form, Query, State};
+use axum::extract::{ConnectInfo, Form, Query, State};
 use axum::http::{StatusCode, header};
-use axum_extra::extract::CookieJar;
+use axum_extra::extract::{CookieJar, cookie::Cookie};
 use sqlx::Row as _;
+use std::net::{IpAddr, Ipv4Addr};
 
 use super::super::LOGOUT_ACTION;
 use super::{
-  Harness, LoginAttempt, TestError, TestResult, TestUser, app_state, attempt, cookie_header,
-  create_user, current_code, deps_of, harness, pending_request, presession, wrong_code,
+  Harness, LoginAttempt, TEST_PEER_SOCK, TestError, TestResult, TestUser, app_state, attempt,
+  cookie_header, create_user, current_code, deps_of, harness, pending_request, presession,
+  wrong_code,
 };
 use crate::{
   db::{
@@ -21,9 +23,10 @@ use crate::{
   middleware::request_id::RequestId,
   store::{pending, sessions},
   ui::login::{
-    CONSENT_PATH, LOCKOUT_THRESHOLD, LOCKOUT_WINDOW, LOGIN_SUCCESS_PATH, LoginForm, LoginOutcome,
-    LoginPageQuery, LogoutForm, attempt_login, bind_pending_request, expired_session_cookie,
-    form_token, get_login, get_logout, load_session, post_login, post_logout, session_cookie,
+    ACCOUNT_LOCKOUT_THRESHOLD, CONSENT_PATH, LOCKOUT_THRESHOLD, LOCKOUT_WINDOW, LOGIN_SUCCESS_PATH,
+    LoginForm, LoginOutcome, LoginPageQuery, LogoutForm, attempt_login, bind_pending_request,
+    expired_session_cookies, form_token, get_login, get_logout, load_session, post_login,
+    post_logout, session_cookie, session_id_from_jar,
   },
 };
 
@@ -96,15 +99,20 @@ async fn login_success_sets_session_cookie_and_bound_redirect() -> TestResult {
   }
   let header = cookie_header(&h, &session_id);
   for needle in [
-    "session_id=",
+    "__Host-session_id=",
     "Path=/",
     "HttpOnly",
     "Secure",
     "SameSite=Lax",
   ] {
     if !header.contains(needle) {
-      return Err(unexpected("the session cookie must be HttpOnly/Secure/Lax"));
+      return Err(unexpected(
+        "the session cookie must be __Host-/HttpOnly/Secure/Lax",
+      ));
     }
+  }
+  if header.contains("Domain=") {
+    return Err(unexpected("the __Host- cookie must never carry Domain"));
   }
   if !header.contains(&session_id) {
     return Err(unexpected("the cookie must carry the session id"));
@@ -162,7 +170,7 @@ async fn post_logout_destroys_session_and_clears_cookie() -> TestResult {
     .get(header::SET_COOKIE)
     .and_then(|value| value.to_str().ok())
     .unwrap_or_default();
-  if !set_cookie.contains("session_id=") || !set_cookie.contains("Max-Age=0") {
+  if !set_cookie.contains("__Host-session_id=") || !set_cookie.contains("Max-Age=0") {
     return Err(unexpected("POST /logout must expire the session cookie"));
   }
   if cookie_attr_names(&cookie_header(&h, &session_id)) != cookie_attr_names(set_cookie) {
@@ -354,7 +362,7 @@ async fn post_logout_wrong_content_type_fails_closed() -> TestResult {
     .header(axum::http::header::CONTENT_TYPE, "application/json")
     .header(
       axum::http::header::COOKIE,
-      format!("session_id={session_id}"),
+      format!("__Host-session_id={session_id}"),
     )
     .body(axum::body::Body::from(body))
     .map_err(|_| unexpected("request build failed"))?;
@@ -399,7 +407,7 @@ async fn post_logout_without_session_is_idempotent() -> TestResult {
     .get(header::SET_COOKIE)
     .and_then(|value| value.to_str().ok())
     .unwrap_or_default();
-  if !set_cookie.contains("session_id=") || !set_cookie.contains("Max-Age=0") {
+  if !set_cookie.contains("__Host-session_id=") || !set_cookie.contains("Max-Age=0") {
     return Err(unexpected(
       "an anonymous sign-out must still expire the cookie",
     ));
@@ -725,9 +733,10 @@ async fn login_locked_account_rejected_uniformly() -> TestResult {
   }
   let policy = user_repo::LockoutPolicy {
     threshold: LOCKOUT_THRESHOLD,
+    account_threshold: LOCKOUT_THRESHOLD,
     lock_duration: LOCKOUT_WINDOW,
   };
-  if !user_repo::is_locked_out(&mut h.conn, &h.store, policy, &user.email).await? {
+  if !user_repo::is_locked_out(&mut h.conn, &h.store, policy, &user.email, None).await? {
     return Err(unexpected("the threshold must lock the account"));
   }
   let (pre, csrf) = presession(&mut h).await?;
@@ -868,26 +877,120 @@ async fn login_expired_pending_denied_without_redirect() -> TestResult {
 async fn login_cookie_secure_config_gated() -> TestResult {
   let mut h = harness().await?;
   let header = cookie_header(&h, "session-abc");
-  if !header.contains("Secure") {
-    return Err(unexpected("Secure must be set by default"));
+  if !header.contains("__Host-session_id=") || !header.contains("Secure") {
+    return Err(unexpected(
+      "Secure must be set by default on the __Host- cookie",
+    ));
   }
   let config = std::sync::Arc::get_mut(&mut h.config)
     .ok_or_else(|| unexpected("the harness config must be uniquely owned"))?;
   config.cookie_secure = false;
-  config.cookie_domain = Some("auth.example.test".to_owned());
   let header = cookie_header(&h, "session-abc");
   if header.contains("Secure") {
     return Err(unexpected("Secure must follow the config gate"));
   }
-  for needle in [
-    "HttpOnly",
-    "SameSite=Lax",
-    "Path=/",
-    "Domain=auth.example.test",
-  ] {
+  // Without `Secure` the `__Host-` prefix is unusable (browsers reject a
+  // `__Host-` cookie without `Secure`), so the insecure development variant
+  // drops the prefix and stays a plain host-only cookie.
+  if header.contains("__Host-") {
+    return Err(unexpected(
+      "the insecure cookie must drop the __Host- prefix",
+    ));
+  }
+  for needle in ["session_id=", "HttpOnly", "SameSite=Lax", "Path=/"] {
     if !header.contains(needle) {
-      return Err(unexpected("domain/HttpOnly/Lax/Path must survive"));
+      return Err(unexpected("HttpOnly/Lax/Path/name must survive"));
     }
+  }
+  if header.contains("Domain=") {
+    return Err(unexpected("the session cookie must never carry Domain"));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn session_id_from_jar_secure_honors_only_host_variant() -> TestResult {
+  let mut h = harness().await?;
+  // Production (`cookie_secure`) must read `__Host-session_id` alone. A plain
+  // `session_id` planted by a sibling subdomain must never be honored, or a
+  // victim's login could be bound to the attacker's pending presession.
+  let planted = CookieJar::new().add(Cookie::new("session_id", "attacker-planted"));
+  if !session_id_from_jar(&h.config, &planted).is_empty() {
+    return Err(unexpected(
+      "production must never read a plain session_id (session fixation)",
+    ));
+  }
+  let host = CookieJar::new().add(Cookie::new("__Host-session_id", "legit-host"));
+  if session_id_from_jar(&h.config, &host) != "legit-host" {
+    return Err(unexpected("the __Host- session cookie must resolve"));
+  }
+  let both = CookieJar::new()
+    .add(Cookie::new("session_id", "attacker-planted"))
+    .add(Cookie::new("__Host-session_id", "legit-host"));
+  if session_id_from_jar(&h.config, &both) != "legit-host" {
+    return Err(unexpected(
+      "the __Host- cookie must take precedence over the planted plain one",
+    ));
+  }
+  // The development variant (configured name is the plain `session_id`) may
+  // still fall back to `__Host-session_id` for a cookie left over from before
+  // a config flip; this fallback is harmless because it is read only here.
+  let config = std::sync::Arc::get_mut(&mut h.config)
+    .ok_or_else(|| unexpected("the harness config must be uniquely owned"))?;
+  config.cookie_secure = false;
+  if session_id_from_jar(&h.config, &host) != "legit-host" {
+    return Err(unexpected(
+      "the insecure variant may fall back to the __Host- name",
+    ));
+  }
+  let plain = CookieJar::new().add(Cookie::new("session_id", "legit-plain"));
+  if session_id_from_jar(&h.config, &plain) != "legit-plain" {
+    return Err(unexpected(
+      "the insecure variant must read its configured plain name",
+    ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn get_login_ignores_planted_plain_session_cookie() -> TestResult {
+  let mut h = harness().await?;
+  // The attacker owns a live pending presession and plants a plain, non-
+  // `__Host-` cookie naming it: the sibling-subdomain fixation vector.
+  let (planted, _) = presession(&mut h).await?;
+  let jar = CookieJar::new().add(Cookie::new("session_id", planted.clone()));
+  let response = get_login(
+    State(app_state(&h)),
+    jar,
+    Query(LoginPageQuery { request_id: None }),
+  )
+  .await;
+  // Production must ignore the planted cookie and mint a fresh presession, so
+  // the victim's login can never be bound to the attacker's pending request.
+  // The jar re-emits the request cookie as the first `Set-Cookie`; only a scan
+  // of every header can distinguish the freshly minted `__Host-` cookie from
+  // that echo, so a first-header-only read would assert on attacker bytes.
+  let cookies: Vec<String> = response
+    .headers()
+    .get_all(header::SET_COOKIE)
+    .iter()
+    .filter_map(|value| value.to_str().ok())
+    .map(str::to_owned)
+    .collect();
+  let fresh = cookies
+    .iter()
+    .find_map(|header| header.strip_prefix("__Host-session_id="))
+    .and_then(|rest| rest.split(';').next())
+    .unwrap_or_default();
+  if fresh.is_empty() {
+    return Err(unexpected(
+      "GET /login must mint a fresh __Host- presession, ignoring the planted cookie",
+    ));
+  }
+  if fresh == planted {
+    return Err(unexpected(
+      "GET /login must never adopt the attacker-planted presession",
+    ));
   }
   Ok(())
 }
@@ -1237,6 +1340,7 @@ async fn login_corrupt_totp_ciphertext_fails_closed_with_503() -> TestResult {
     Extension(RequestId::new()),
     jar,
     Form(form),
+    Some(ConnectInfo(TEST_PEER_SOCK)),
   )
   .await;
   if response.status() != StatusCode::SERVICE_UNAVAILABLE {
@@ -1315,7 +1419,11 @@ async fn get_logout_leaves_session_intact_and_renders_confirm() -> TestResult {
 async fn logout_clearing_cookie_mirrors_session_cookie_attrs() -> TestResult {
   let h = harness().await?;
   let session = session_cookie(&h.config, "logout-attr-session").to_string();
-  let clearing = expired_session_cookie(&h.config).to_string();
+  let clearing = expired_session_cookies(&h.config)
+    .into_iter()
+    .next()
+    .ok_or_else(|| unexpected("there must be a clearing cookie"))?
+    .to_string();
   if !clearing.contains("Max-Age=0") {
     return Err(unexpected("the clearing cookie must expire immediately"));
   }
@@ -1323,6 +1431,283 @@ async fn logout_clearing_cookie_mirrors_session_cookie_attrs() -> TestResult {
     return Err(unexpected(
       "the clearing cookie must mirror the session cookie attributes",
     ));
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn post_logout_without_session_clears_every_honored_name_in_development() -> TestResult {
+  let mut h = harness().await?;
+  {
+    let config = std::sync::Arc::get_mut(&mut h.config)
+      .ok_or_else(|| unexpected("the harness config must be uniquely owned"))?;
+    config.cookie_secure = false;
+  }
+  let response = post_logout(
+    State(app_state(&h)),
+    Extension(RequestId::new()),
+    CookieJar::new(),
+    Form(LogoutForm {
+      csrf: String::new(),
+    }),
+  )
+  .await;
+  // The development reader honors both the plain and `__Host-` names, so a
+  // logout must clear both or an injected cookie could survive it. Names are
+  // matched exactly: `__Host-session_id=` contains `session_id=` as a
+  // substring, so a substring check cannot prove the plain cookie is cleared.
+  let names = response
+    .headers()
+    .get_all(header::SET_COOKIE)
+    .iter()
+    .filter_map(|value| value.to_str().ok())
+    .filter_map(|header| header.split('=').next())
+    .collect::<Vec<_>>();
+  if !names.contains(&"session_id") || !names.contains(&"__Host-session_id") {
+    return Err(unexpected(
+      "logout must clear every session-cookie name the reader honors",
+    ));
+  }
+  let joined = response
+    .headers()
+    .get_all(header::SET_COOKIE)
+    .iter()
+    .filter_map(|value| value.to_str().ok())
+    .collect::<Vec<_>>()
+    .join("\n");
+  if !joined.contains("Max-Age=0") {
+    return Err(unexpected("every clearing cookie must expire immediately"));
+  }
+  Ok(())
+}
+
+/// T3-C1 (a) at the login layer: a burst of wrong passwords from an attacker
+/// IP locks that IP's composite bucket only; the victim's correct credentials
+/// from a different IP still authenticate.
+#[tokio::test]
+async fn login_attacker_ip_burst_does_not_lock_victim_from_other_ip() -> TestResult {
+  const ATTACKER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44));
+  const VICTIM_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 45));
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "victim-scope@example.test",
+    "correct-horse-90",
+    false,
+    true,
+  )
+  .await?;
+  let code = current_code(&user, &h)?;
+  for _ in 0..LOCKOUT_THRESHOLD {
+    let (pre, csrf) = presession(&mut h).await?;
+    let bad = LoginAttempt {
+      password: "wrong-password-xyz".to_owned(),
+      peer_ip: Some(ATTACKER),
+      ..attempt(&pre, &csrf, &user, &code)
+    };
+    match try_login(&mut h, bad).await? {
+      LoginOutcome::Rejected => {}
+      _ => return Err(unexpected("wrong passwords must be rejected")),
+    }
+  }
+  let (pre, csrf) = presession(&mut h).await?;
+  let good = LoginAttempt {
+    peer_ip: Some(VICTIM_ADDR),
+    ..attempt(&pre, &csrf, &user, &code)
+  };
+  match try_login(&mut h, good).await? {
+    LoginOutcome::Authenticated { .. } => Ok(()),
+    _ => Err(unexpected(
+      "a burst from an attacker IP must not lock the victim from another IP",
+    )),
+  }
+}
+
+/// T3-C1 (b) at the login layer: repeated unknown-email attempts from one IP
+/// stay rejected yet share a single bounded bucket instead of spraying one
+/// Redis key per label.
+#[tokio::test]
+async fn login_unknown_labels_do_not_spray_redis_keys() -> TestResult {
+  const PROBER: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 46));
+  let mut h = harness().await?;
+  for index in 0..10 {
+    let (pre, csrf) = presession(&mut h).await?;
+    let ghost = TestUser {
+      id: uuid::Uuid::new_v4(),
+      email: format!("ghost-spray-{index}@example.test"),
+      password: "some-password-01".to_owned(),
+      totp_secret: None,
+      recovery_codes: Vec::new(),
+    };
+    let probe = LoginAttempt {
+      peer_ip: Some(PROBER),
+      ..attempt(&pre, &csrf, &ghost, "000000")
+    };
+    match try_login(&mut h, probe).await? {
+      LoginOutcome::Rejected => {}
+      _ => {
+        return Err(unexpected(
+          "an unknown email must be rejected like a wrong password",
+        ));
+      }
+    }
+  }
+  let pattern = format!("{}*", h.store.login_fail_prefix());
+  let mut cursor = "0".to_owned();
+  let mut keys = Vec::new();
+  loop {
+    let (next, batch): (String, Vec<String>) = redis::cmd("SCAN")
+      .arg(&cursor)
+      .arg("MATCH")
+      .arg(&pattern)
+      .arg("COUNT")
+      .arg(100)
+      .query_async(&mut h.conn)
+      .await?;
+    keys.extend(batch);
+    if next == "0" {
+      break;
+    }
+    cursor = next;
+  }
+  if keys.len() > 2 {
+    return Err(unexpected(
+      "unknown labels must share bounded buckets instead of spraying keys",
+    ));
+  }
+  Ok(())
+}
+
+/// T3-C1 peer-less path at the login layer: attempts without a source IP
+/// count toward the account counter only, stay uniformly rejected below the
+/// cap, and a correct login still authenticates and resets the counter.
+#[tokio::test]
+async fn login_peerless_failures_count_toward_account_only() -> TestResult {
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "peerless-scope@example.test",
+    "correct-horse-91",
+    false,
+    true,
+  )
+  .await?;
+  let code = current_code(&user, &h)?;
+  for _ in 0..3 {
+    let (pre, csrf) = presession(&mut h).await?;
+    let bad = LoginAttempt {
+      password: "wrong-password-xyz".to_owned(),
+      peer_ip: None,
+      ..attempt(&pre, &csrf, &user, &code)
+    };
+    match try_login(&mut h, bad).await? {
+      LoginOutcome::Rejected => {}
+      _ => return Err(unexpected("wrong passwords must be rejected")),
+    }
+  }
+  if user_repo::login_failure_count(&mut h.conn, &h.store, &user.email).await? != 3 {
+    return Err(unexpected(
+      "peer-less failures must count toward the account counter",
+    ));
+  }
+  if user_repo::ip_failure_count(&mut h.conn, &h.store, &user.email, None).await? != 0 {
+    return Err(unexpected(
+      "peer-less failures must not mint a composite bucket",
+    ));
+  }
+  let (pre, csrf) = presession(&mut h).await?;
+  let good = LoginAttempt {
+    peer_ip: None,
+    ..attempt(&pre, &csrf, &user, &code)
+  };
+  match try_login(&mut h, good).await? {
+    LoginOutcome::Authenticated { .. } => {}
+    _ => {
+      return Err(unexpected(
+        "sub-threshold peer-less failures must not lock the account",
+      ));
+    }
+  }
+  if user_repo::login_failure_count(&mut h.conn, &h.store, &user.email).await? != 0 {
+    return Err(unexpected(
+      "a successful login must reset the account counter",
+    ));
+  }
+  Ok(())
+}
+
+/// T3-C1 scoped clear at the login layer: a successful login releases only
+/// the calling IP's bucket; an attacker's locked bucket for the same account
+/// survives.
+#[tokio::test]
+async fn login_success_releases_only_calling_ip_bucket() -> TestResult {
+  const ATTACKER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 47));
+  const VICTIM_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 48));
+  let mut h = harness().await?;
+  let user = create_user(
+    &mut h,
+    "scoped-clear@example.test",
+    "correct-horse-92",
+    false,
+    true,
+  )
+  .await?;
+  let code = current_code(&user, &h)?;
+  for _ in 0..LOCKOUT_THRESHOLD {
+    let (pre, csrf) = presession(&mut h).await?;
+    let bad = LoginAttempt {
+      password: "wrong-password-xyz".to_owned(),
+      peer_ip: Some(ATTACKER),
+      ..attempt(&pre, &csrf, &user, &code)
+    };
+    match try_login(&mut h, bad).await? {
+      LoginOutcome::Rejected => {}
+      _ => return Err(unexpected("wrong passwords must be rejected")),
+    }
+  }
+  let (pre, csrf) = presession(&mut h).await?;
+  let bad = LoginAttempt {
+    password: "wrong-password-xyz".to_owned(),
+    peer_ip: Some(VICTIM_ADDR),
+    ..attempt(&pre, &csrf, &user, &code)
+  };
+  match try_login(&mut h, bad).await? {
+    LoginOutcome::Rejected => {}
+    _ => return Err(unexpected("wrong passwords must be rejected")),
+  }
+  let (pre, csrf) = presession(&mut h).await?;
+  let good = LoginAttempt {
+    peer_ip: Some(VICTIM_ADDR),
+    ..attempt(&pre, &csrf, &user, &code)
+  };
+  match try_login(&mut h, good).await? {
+    LoginOutcome::Authenticated { .. } => {}
+    _ => {
+      return Err(unexpected(
+        "the victim IP must still authenticate below its own threshold",
+      ));
+    }
+  }
+  let policy = user_repo::LockoutPolicy {
+    threshold: LOCKOUT_THRESHOLD,
+    account_threshold: ACCOUNT_LOCKOUT_THRESHOLD,
+    lock_duration: LOCKOUT_WINDOW,
+  };
+  if !user_repo::is_locked_out(&mut h.conn, &h.store, policy, &user.email, Some(ATTACKER)).await? {
+    return Err(unexpected(
+      "a successful login must not release another IP bucket",
+    ));
+  }
+  if user_repo::is_locked_out(
+    &mut h.conn,
+    &h.store,
+    policy,
+    &user.email,
+    Some(VICTIM_ADDR),
+  )
+  .await?
+  {
+    return Err(unexpected("the calling IP bucket must be released"));
   }
   Ok(())
 }

@@ -171,6 +171,113 @@ pub async fn clear_failed_logins(
   Ok(())
 }
 
+/// Record a failed login for one source IP and account pair and return the
+/// in-window composite count.
+///
+/// The IP and the label are hashed before keying so neither raw value ever
+/// becomes a key. Like [`record_failed_login`] this is a single non-retried
+/// script invocation.
+pub async fn record_ip_failure(
+  conn: &mut RedisConn,
+  store: &Store,
+  ip_label: &str,
+  account_label: &str,
+  window: Duration,
+) -> Result<u64, StoreError> {
+  let key = store.login_fail_ip_key(
+    &sha256_hex(ip_label.as_bytes()),
+    &sha256_hex(account_label.as_bytes()),
+  );
+  let mut invocation = super::SCRIPT_RATELIMIT_INCR.prepare_invoke();
+  invocation.key(key.as_str());
+  invocation.arg(window.as_millis() as u64);
+  let count: u64 = invocation
+    .invoke_async(conn)
+    .await
+    .map_err(StoreError::Redis)?;
+  Ok(count)
+}
+
+/// Read the in-window composite count for one source IP and account pair.
+pub async fn ip_failure_count(
+  conn: &mut RedisConn,
+  store: &Store,
+  ip_label: &str,
+  account_label: &str,
+) -> Result<u64, StoreError> {
+  let key = store.login_fail_ip_key(
+    &sha256_hex(ip_label.as_bytes()),
+    &sha256_hex(account_label.as_bytes()),
+  );
+  let budget = store.retry_budget();
+  retry_op!(conn, budget, async {
+    redis::cmd("GET")
+      .arg(&key)
+      .query_async::<Option<u64>>(conn)
+      .await
+  })
+  .map(|count| count.unwrap_or(0))
+  .map_err(StoreError::Redis)
+}
+
+/// Clear the composite counter for one source IP and account pair; the
+/// per-account counter and other IPs' buckets are untouched.
+pub async fn clear_ip_failures(
+  conn: &mut RedisConn,
+  store: &Store,
+  ip_label: &str,
+  account_label: &str,
+) -> Result<(), StoreError> {
+  let key = store.login_fail_ip_key(
+    &sha256_hex(ip_label.as_bytes()),
+    &sha256_hex(account_label.as_bytes()),
+  );
+  let _: () = redis::cmd("DEL")
+    .arg(&key)
+    .query_async(conn)
+    .await
+    .map_err(StoreError::Redis)?;
+  Ok(())
+}
+
+/// Record a failed login for an absent account label without minting a
+/// per-label key: the attempt counts toward the source IP's single shared
+/// unknown bucket and returns its in-window count.
+pub async fn record_unknown_failure(
+  conn: &mut RedisConn,
+  store: &Store,
+  ip_label: &str,
+  window: Duration,
+) -> Result<u64, StoreError> {
+  let key = store.login_fail_unknown_key(&sha256_hex(ip_label.as_bytes()));
+  let mut invocation = super::SCRIPT_RATELIMIT_INCR.prepare_invoke();
+  invocation.key(key.as_str());
+  invocation.arg(window.as_millis() as u64);
+  let count: u64 = invocation
+    .invoke_async(conn)
+    .await
+    .map_err(StoreError::Redis)?;
+  Ok(count)
+}
+
+/// Read the in-window unknown-label count for one source IP.
+pub async fn unknown_failure_count(
+  conn: &mut RedisConn,
+  store: &Store,
+  ip_label: &str,
+) -> Result<u64, StoreError> {
+  let key = store.login_fail_unknown_key(&sha256_hex(ip_label.as_bytes()));
+  let budget = store.retry_budget();
+  retry_op!(conn, budget, async {
+    redis::cmd("GET")
+      .arg(&key)
+      .query_async::<Option<u64>>(conn)
+      .await
+  })
+  .map(|count| count.unwrap_or(0))
+  .map_err(StoreError::Redis)
+}
+
 fn sessions_redis(error: StoreError) -> redis::RedisError {
   match error {
     StoreError::Redis(inner) => inner,

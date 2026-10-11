@@ -290,13 +290,13 @@ async fn user_repo_scope_and_entitlement_round_trip() -> TestResult {
 #[tokio::test]
 async fn user_repo_lockout_locks_after_threshold_and_clears() -> TestResult {
   let (mut conn, store) = redis_store().await?;
-  let policy = LockoutPolicy::new(3, Duration::from_millis(600)).ok_or("invalid policy")?;
+  let policy = LockoutPolicy::new(3, 3, Duration::from_millis(600)).ok_or("invalid policy")?;
   let label = "Locked@Example.com";
 
   for _ in 0..3 {
-    user_repo::register_login_failure(&mut conn, &store, policy, label).await?;
+    user_repo::register_login_failure(&mut conn, &store, policy, label, None).await?;
   }
-  assert!(user_repo::is_locked_out(&mut conn, &store, policy, label).await?);
+  assert!(user_repo::is_locked_out(&mut conn, &store, policy, label, None).await?);
   assert_eq!(
     user_repo::login_failure_count(&mut conn, &store, "locked@example.com").await?,
     3,
@@ -309,24 +309,24 @@ async fn user_repo_lockout_locks_after_threshold_and_clears() -> TestResult {
   );
 
   // Clear-on-success unlocks immediately.
-  user_repo::clear_login_failures(&mut conn, &store, label).await?;
+  user_repo::clear_login_failures(&mut conn, &store, label, None).await?;
   assert_eq!(
     user_repo::login_failure_count(&mut conn, &store, label).await?,
     0
   );
-  assert!(!user_repo::is_locked_out(&mut conn, &store, policy, label).await?);
+  assert!(!user_repo::is_locked_out(&mut conn, &store, policy, label, None).await?);
 
   // TTL expiry (unlock policy) also releases the lock.
   for _ in 0..3 {
-    user_repo::register_login_failure(&mut conn, &store, policy, label).await?;
+    user_repo::register_login_failure(&mut conn, &store, policy, label, None).await?;
   }
-  assert!(user_repo::is_locked_out(&mut conn, &store, policy, label).await?);
+  assert!(user_repo::is_locked_out(&mut conn, &store, policy, label, None).await?);
   tokio::time::sleep(Duration::from_millis(800)).await;
   assert_eq!(
     user_repo::login_failure_count(&mut conn, &store, label).await?,
     0
   );
-  assert!(!user_repo::is_locked_out(&mut conn, &store, policy, label).await?);
+  assert!(!user_repo::is_locked_out(&mut conn, &store, policy, label, None).await?);
   Ok(())
 }
 
@@ -344,13 +344,14 @@ async fn user_repo_lockout_gate_rejects_correct_password() -> TestResult {
     &new_user("gina@example.com", "correct", false, false)?,
   )
   .await?;
-  let policy = LockoutPolicy::new(2, Duration::from_secs(60)).ok_or("invalid policy")?;
+  let policy = LockoutPolicy::new(2, 2, Duration::from_secs(60)).ok_or("invalid policy")?;
 
   for _ in 0..2 {
-    user_repo::register_login_failure(&mut conn, &store, policy, "gina@example.com").await?;
+    user_repo::register_login_failure(&mut conn, &store, policy, "gina@example.com", None).await?;
   }
 
-  let locked = user_repo::is_locked_out(&mut conn, &store, policy, "gina@example.com").await?;
+  let locked =
+    user_repo::is_locked_out(&mut conn, &store, policy, "gina@example.com", None).await?;
   let verdict = user_repo::verify_password(&pool, &keys, "gina@example.com", "correct").await?;
   assert_eq!(
     verdict,

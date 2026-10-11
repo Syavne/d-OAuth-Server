@@ -21,12 +21,15 @@
 //! pending `request_id` lives only in that sidecar after `GET /login`
 //! validates it, so `POST /login` cannot be steered off-record.
 
-use std::time::Duration;
+use std::{
+  net::{IpAddr, SocketAddr},
+  time::Duration,
+};
 
 use askama::Template;
 use axum::{
   Extension, Form,
-  extract::{Query, State},
+  extract::{ConnectInfo, Query, State},
   http::{StatusCode, header},
   response::{IntoResponse, Redirect, Response},
 };
@@ -56,13 +59,26 @@ use crate::{
   error::AppError,
   keys::KeyRing,
   middleware::{audit::AuditEvent, request_id::RequestId},
+  protocol::purge::purge_sibling_sessions,
   protocol::redirect_repo as redirect_match,
   state::{AppState, RedisConn},
   store::{self, Store, StoreError},
 };
 
-/// Session cookie name (also the rendezvous for task 26/29 readers).
-pub const SESSION_COOKIE: &str = "session_id";
+/// Secure session cookie name (also the rendezvous for task 26/29 readers).
+///
+/// The `__Host-` prefix (RFC 6265bis) binds the browser-side contract:
+/// `Secure`, `Path=/`, and no `Domain`. The builders below never emit
+/// `Domain`, and configuration rejects any `cookie_domain`, so the prefix
+/// guarantee holds for every response that sets or clears this cookie.
+pub const SESSION_COOKIE: &str = "__Host-session_id";
+/// Insecure development session cookie name, used only when
+/// [`Config::cookie_secure`] is disabled (development-only; production
+/// refuses to load without `Secure`). Browsers reject a `__Host-` cookie
+/// without `Secure`, so the prefix is dropped here and the cookie stays a
+/// plain host-only cookie (`Path=/`, `HttpOnly`, `SameSite=Lax`, no
+/// `Domain`).
+pub const INSECURE_SESSION_COOKIE: &str = "session_id";
 /// Login form page.
 pub const LOGIN_PATH: &str = "/login";
 /// Landing page for logins with no bound authorization request.
@@ -77,8 +93,12 @@ pub const TOTP_CONFIRM_PATH: &str = "/login/totp/confirm";
 pub const LOGOUT_PATH: &str = "/logout";
 /// Post-login target for a bound authorization request (owned by task 26).
 pub const CONSENT_PATH: &str = "/consent";
-/// Failed logins within [`LOCKOUT_WINDOW`] that lock an account.
+/// Failed logins from one IP for one account within [`LOCKOUT_WINDOW`] that
+/// lock that IP's composite bucket.
 pub const LOCKOUT_THRESHOLD: u64 = 5;
+/// Failed logins from any IPs within [`LOCKOUT_WINDOW`] that lock the account
+/// globally (the distributed-burst cap above the per-IP threshold).
+pub const ACCOUNT_LOCKOUT_THRESHOLD: u64 = 20;
 /// Window that doubles as the lock duration.
 pub const LOCKOUT_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Minimum accepted password length on change.
@@ -141,6 +161,19 @@ pub struct LoginAttempt {
   pub code: String,
   /// Presented login-CSRF token.
   pub csrf: String,
+  /// Source IP for composite lockout keying (`None` when the peer address is
+  /// absent; enforcement then degrades to the per-account counter only).
+  pub peer_ip: Option<IpAddr>,
+}
+
+/// The login lockout policy: a per-(IP, account) threshold plus the global
+/// per-account cap over the same window.
+fn lockout_policy() -> user_repo::LockoutPolicy {
+  user_repo::LockoutPolicy {
+    threshold: LOCKOUT_THRESHOLD,
+    account_threshold: ACCOUNT_LOCKOUT_THRESHOLD,
+    lock_duration: LOCKOUT_WINDOW,
+  }
 }
 
 /// Outcome of [`attempt_login`].
@@ -181,41 +214,99 @@ pub fn restricted_allows_path(path: &str) -> bool {
   )
 }
 
-/// Build the session cookie: `HttpOnly`, `SameSite=Lax`, `Secure` exactly
-/// when [`Config::cookie_secure`] is set (disabled for localhost development).
+/// Session cookie name for the runtime configuration: [`SESSION_COOKIE`]
+/// when [`Config::cookie_secure`] is set, [`INSECURE_SESSION_COOKIE`]
+/// otherwise (browsers reject `__Host-` without `Secure`).
+#[must_use]
+pub fn session_cookie_name(config: &Config) -> &'static str {
+  if config.cookie_secure {
+    SESSION_COOKIE
+  } else {
+    INSECURE_SESSION_COOKIE
+  }
+}
+
+/// Session id from the request cookies.
+///
+/// Production ([`Config::cookie_secure`]) honors [`SESSION_COOKIE`]
+/// (`__Host-session_id`) **alone**: a plain `session_id` set by a sibling
+/// subdomain is never read, so it cannot fixate a victim's login onto the
+/// attacker's pending presession. The insecure development variant additionally
+/// falls back to [`SESSION_COOKIE`] for a cookie left over from before a config
+/// flip (harmless: it is only read when the configured name is the plain one).
+#[must_use]
+pub fn session_id_from_jar(config: &Config, jar: &CookieJar) -> String {
+  jar
+    .get(session_cookie_name(config))
+    .or_else(|| {
+      if config.cookie_secure {
+        return None;
+      }
+      jar.get(SESSION_COOKIE)
+    })
+    .map(|cookie| cookie.value().to_owned())
+    .unwrap_or_default()
+}
+
+/// Build the session cookie: `__Host-` prefixed, `HttpOnly`, `Path=/`,
+/// `SameSite=Lax`, and `Secure` exactly when [`Config::cookie_secure`] is set
+/// (disabled for localhost development only; production refuses to load
+/// without `Secure`). No `Domain` is ever emitted in either variant, so the
+/// cookie stays host-only. Without `Secure` the name drops the `__Host-`
+/// prefix ([`INSECURE_SESSION_COOKIE`]): browsers reject a `__Host-` cookie
+/// without `Secure`, so the prefixed name would never persist the session.
 #[must_use]
 pub fn session_cookie(config: &Config, session_id: &str) -> Cookie<'static> {
-  let mut builder = Cookie::build((SESSION_COOKIE, session_id.to_owned()))
+  let mut builder = Cookie::build((session_cookie_name(config), session_id.to_owned()))
     .path("/")
     .http_only(true)
     .same_site(SameSite::Lax);
   if config.cookie_secure {
     builder = builder.secure(true);
-  }
-  if let Some(domain) = config.cookie_domain.clone() {
-    builder = builder.domain(domain);
   }
   builder.build()
 }
 
-/// Build an expired session cookie for logout, mirroring every attribute of
-/// [`session_cookie`] (`Path`, `HttpOnly`, `SameSite`, `Secure`, `Domain`) so
-/// the clearing cookie overwrites the session cookie in the browser. A bare
-/// removal cookie without those attributes would leave the session cookie
-/// alive under the stricter attribute set.
+/// Build a clearing cookie for one session-cookie name, mirroring every
+/// attribute of [`session_cookie`] (`Path`, `HttpOnly`, `SameSite`, `Secure`)
+/// so the clearing cookie overwrites the session cookie in the browser. A
+/// `__Host-` name always carries `Secure` (RFC 6265bis; the secure runtime uses
+/// exactly that name); the plain development name never does. No `Domain` is
+/// ever emitted, so the cookie stays host-only.
 #[must_use]
-pub fn expired_session_cookie(config: &Config) -> Cookie<'static> {
-  let mut builder = Cookie::build((SESSION_COOKIE, String::new()))
+fn clearing_cookie(name: &'static str) -> Cookie<'static> {
+  let mut builder = Cookie::build((name, String::new()))
     .path("/")
     .http_only(true)
     .same_site(SameSite::Lax);
-  if config.cookie_secure {
+  if name == SESSION_COOKIE {
     builder = builder.secure(true);
   }
-  if let Some(domain) = config.cookie_domain.clone() {
-    builder = builder.domain(domain);
-  }
   builder.removal().build()
+}
+
+/// Every clearing cookie for logout: one per session-cookie name the reader
+/// honors ([`session_id_from_jar`]), so a cookie the reader would accept cannot
+/// survive a sign-out. Production clears only `__Host-session_id`; the insecure
+/// development variant also clears the plain `session_id` fallback. Ordering
+/// puts the configured name first, so the first `Set-Cookie` mirrors
+/// [`session_cookie`].
+#[must_use]
+pub fn expired_session_cookies(config: &Config) -> Vec<Cookie<'static>> {
+  let mut cookies = vec![clearing_cookie(session_cookie_name(config))];
+  if !config.cookie_secure {
+    cookies.push(clearing_cookie(SESSION_COOKIE));
+  }
+  cookies
+}
+
+/// Add every clearing cookie the reader honors to `jar`.
+fn clear_session_cookies(jar: CookieJar, config: &Config) -> CookieJar {
+  let mut jar = jar;
+  for cookie in expired_session_cookies(config) {
+    jar = jar.add(cookie);
+  }
+  jar
 }
 
 /// Mint the stateless pre-login CSRF token: HMAC under the active token
@@ -386,11 +477,8 @@ pub async fn attempt_login(
     return Err(AppError::invalid_request("invalid form submission"));
   }
   let email = normalize_email(&attempt.email);
-  let policy = user_repo::LockoutPolicy {
-    threshold: LOCKOUT_THRESHOLD,
-    lock_duration: LOCKOUT_WINDOW,
-  };
-  if user_repo::is_locked_out(deps.conn, deps.store, policy, &email).await? {
+  let policy = lockout_policy();
+  if user_repo::is_locked_out(deps.conn, deps.store, policy, &email, attempt.peer_ip).await? {
     audit_failure(None, None, "locked");
     return Ok(LoginOutcome::Rejected);
   }
@@ -406,17 +494,26 @@ pub async fn attempt_login(
   match user_repo::verify_password(deps.pool, deps.keys, &email, &attempt.password).await? {
     user_repo::PasswordVerdict::Unknown => {
       burn_timing(deps.config, &attempt.password)?;
-      user_repo::register_login_failure(deps.conn, deps.store, policy, &email).await?;
-      audit_failure(pending_id.as_deref(), None, "bad_credentials");
+      // Absent labels share the source IP's single unknown bucket instead of
+      // minting one key per probed label; the rejection stays uniform either
+      // way, so enumeration learns nothing.
+      if user_repo::is_unknown_locked_out(deps.conn, deps.store, policy, attempt.peer_ip).await? {
+        audit_failure(pending_id.as_deref(), None, "locked");
+      } else {
+        user_repo::register_unknown_failure(deps.conn, deps.store, policy, attempt.peer_ip).await?;
+        audit_failure(pending_id.as_deref(), None, "bad_credentials");
+      }
       return Ok(LoginOutcome::Rejected);
     }
     user_repo::PasswordVerdict::Disabled => {
-      user_repo::register_login_failure(deps.conn, deps.store, policy, &email).await?;
+      user_repo::register_login_failure(deps.conn, deps.store, policy, &email, attempt.peer_ip)
+        .await?;
       audit_failure(pending_id.as_deref(), Some(&email), "disabled");
       return Ok(LoginOutcome::Rejected);
     }
     user_repo::PasswordVerdict::Mismatched => {
-      user_repo::register_login_failure(deps.conn, deps.store, policy, &email).await?;
+      user_repo::register_login_failure(deps.conn, deps.store, policy, &email, attempt.peer_ip)
+        .await?;
       audit_failure(pending_id.as_deref(), Some(&email), "bad_credentials");
       return Ok(LoginOutcome::Rejected);
     }
@@ -429,13 +526,14 @@ pub async fn attempt_login(
   let mut mfa_done = false;
   if user.totp_enabled {
     if !verify_second_factor(deps, user.id, &attempt.code).await? {
-      user_repo::register_login_failure(deps.conn, deps.store, policy, &email).await?;
+      user_repo::register_login_failure(deps.conn, deps.store, policy, &email, attempt.peer_ip)
+        .await?;
       audit_failure(pending_id.as_deref(), Some(&email), "bad_code");
       return Ok(LoginOutcome::Rejected);
     }
     mfa_done = true;
   }
-  user_repo::clear_login_failures(deps.conn, deps.store, &email).await?;
+  user_repo::clear_login_failures(deps.conn, deps.store, &email, attempt.peer_ip).await?;
   // Bind strictly: the pending record must still exist at login time, and the
   // redirect leaves from the stored record — never from client input.
   let redirect_to = match pending_id.as_deref() {
@@ -517,7 +615,9 @@ pub enum PasswordOutcome {
 ///
 /// Clears `must_change_password` in the database. When TOTP is already
 /// enrolled the session is re-issued as full and the caller redirects on;
-/// otherwise the session stays restricted for the enrollment step.
+/// otherwise the session stays restricted for the enrollment step. A
+/// successful change ends the subject's other sessions; the current one
+/// survives.
 ///
 /// # Errors
 ///
@@ -548,6 +648,18 @@ pub async fn change_password(
     return Err(AppError::invalid_request("the login session has expired"));
   };
   let params = secret_params(deps.config)?;
+  // The credential is about to change: end the subject's other sessions
+  // before writing the new password. A Redis outage fails the call (503)
+  // with the password untouched, so the caller retries; a later database
+  // failure costs only re-authentication (the siblings are already gone).
+  purge_sibling_sessions(
+    deps.conn,
+    deps.store,
+    &live.record.subject,
+    &user.id.to_string(),
+    session_id,
+  )
+  .await?;
   let hash = hash_secret(new_password, &params).map_err(AppError::internal)?;
   if !user_repo::set_password(deps.pool, user.id, &hash).await? {
     return Err(AppError::server_error());
@@ -637,7 +749,8 @@ pub enum ConfirmOutcome {
 
 /// Confirm TOTP enrollment with an authenticator code (TOTP only: recovery
 /// codes never confirm enrollment). Failed attempts increment the shared
-/// login lockout counter; a successful confirmation clears it.
+/// login lockout counter; a successful confirmation clears it. A successful
+/// confirmation ends the subject's other sessions; the current one survives.
 ///
 /// # Errors
 ///
@@ -649,6 +762,7 @@ pub async fn confirm_totp(
   deps: &mut LoginDeps<'_>,
   session_id: &str,
   code: &str,
+  peer_ip: Option<IpAddr>,
 ) -> Result<ConfirmOutcome, AppError> {
   let Some(live) = load_session(deps.conn, deps.store, session_id).await? else {
     return Err(AppError::invalid_request("the login session has expired"));
@@ -660,11 +774,8 @@ pub async fn confirm_totp(
   // uses, keyed by the session subject. Checked before verification so a
   // locked account rejects even a correct code, indistinguishably from a
   // wrong one, until the window expires.
-  let policy = user_repo::LockoutPolicy {
-    threshold: LOCKOUT_THRESHOLD,
-    lock_duration: LOCKOUT_WINDOW,
-  };
-  if user_repo::is_locked_out(deps.conn, deps.store, policy, &live.record.subject).await? {
+  let policy = lockout_policy();
+  if user_repo::is_locked_out(deps.conn, deps.store, policy, &live.record.subject, peer_ip).await? {
     return Ok(ConfirmOutcome::Rejected);
   }
   let Some(user) = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject).await?
@@ -672,7 +783,8 @@ pub async fn confirm_totp(
     return Err(AppError::invalid_request("the login session has expired"));
   };
   let Some(blob) = user_repo::totp_secret_blob(deps.pool, user.id).await? else {
-    user_repo::register_login_failure(deps.conn, deps.store, policy, &live.record.subject).await?;
+    user_repo::register_login_failure(deps.conn, deps.store, policy, &live.record.subject, peer_ip)
+      .await?;
     return Ok(ConfirmOutcome::Rejected);
   };
   let secret = totp::decrypt_secret(deps.keys, &blob)?;
@@ -688,7 +800,8 @@ pub async fn confirm_totp(
     ttl: totp::USED_CODE_TTL,
   };
   if !totp::verify_and_claim_with_ring(deps.conn, deps.keys, key_for, &claim).await? {
-    user_repo::register_login_failure(deps.conn, deps.store, policy, &live.record.subject).await?;
+    user_repo::register_login_failure(deps.conn, deps.store, policy, &live.record.subject, peer_ip)
+      .await?;
     audit_failure(
       live.meta.pending_request_id.as_deref(),
       Some(&live.record.subject),
@@ -696,7 +809,18 @@ pub async fn confirm_totp(
     );
     return Ok(ConfirmOutcome::Rejected);
   }
-  user_repo::clear_login_failures(deps.conn, deps.store, &live.record.subject).await?;
+  user_repo::clear_login_failures(deps.conn, deps.store, &live.record.subject, peer_ip).await?;
+  // The authenticator changed: end the subject's other sessions before
+  // promoting. A Redis outage fails the call (503) rather than reporting
+  // success with siblings intact.
+  purge_sibling_sessions(
+    deps.conn,
+    deps.store,
+    &live.record.subject,
+    &user.id.to_string(),
+    session_id,
+  )
+  .await?;
   let fresh = user_repo::find_by_email(deps.pool, deps.keys, &live.record.subject).await?;
   if fresh.is_some_and(|user| !user.must_change_password) {
     let promoted = promote_to_full(deps, session_id, &live).await?;
@@ -1229,9 +1353,12 @@ pub async fn get_login(
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let presented = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned());
+  let presented_id = session_id_from_jar(&state.config, &jar);
+  let presented = if presented_id.is_empty() {
+    None
+  } else {
+    Some(presented_id)
+  };
   let (presession_id, fresh) = {
     let mut deps = deps_of(&state, &mut conn, &store);
     match ensure_presession(&mut deps, presented.as_deref()).await {
@@ -1302,24 +1429,28 @@ pub async fn get_login(
 }
 
 /// `POST /login`: verify credentials, rotate the session, redirect strictly.
+///
+/// `Option<ConnectInfo<_>>` is not a handler extractor, so the route mounts a
+/// thin entry adapter (see `routes.rs`) that forwards the required peer as
+/// `Some`; a `None` peer degrades lockout enforcement to the per-account
+/// counter only.
 pub async fn post_login(
   State(state): State<AppState>,
   Extension(request_id): Extension<RequestId>,
   jar: CookieJar,
   Form(form): Form<LoginForm>,
+  peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let presession_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let presession_id = session_id_from_jar(&state.config, &jar);
   let attempt = LoginAttempt {
     presession_id,
     email: form.email.clone(),
     password: form.password,
     code: form.code,
     csrf: form.csrf,
+    peer_ip: peer.map(|info| info.0.ip()),
   };
   let mut deps = deps_of(&state, &mut conn, &store);
   match attempt_login(&mut deps, attempt).await {
@@ -1368,10 +1499,7 @@ pub async fn post_change_password(
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let session_id = session_id_from_jar(&state.config, &jar);
   let live = match load_session(&mut conn, &store, &session_id).await {
     Ok(Some(live)) => live,
     Ok(None) => return Redirect::to(LOGIN_PATH).into_response(),
@@ -1406,10 +1534,7 @@ pub async fn get_totp_setup(
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let session_id = session_id_from_jar(&state.config, &jar);
   let live = match load_session(&mut conn, &store, &session_id).await {
     Ok(Some(live)) => live,
     Ok(None) => return Redirect::to(LOGIN_PATH).into_response(),
@@ -1448,18 +1573,19 @@ pub async fn get_totp_confirm(State(state): State<AppState>, jar: CookieJar) -> 
 }
 
 /// `POST /login/totp/confirm`: verify the authenticator code, promote or stay.
+///
+/// Peer handling mirrors [`post_login`]: the route entry forwards the
+/// required peer as `Some`, and `None` degrades to the per-account counter.
 pub async fn post_totp_confirm(
   State(state): State<AppState>,
   Extension(request_id): Extension<RequestId>,
   jar: CookieJar,
   Form(form): Form<ConfirmForm>,
+  peer: Option<ConnectInfo<SocketAddr>>,
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let session_id = session_id_from_jar(&state.config, &jar);
   let live = match load_session(&mut conn, &store, &session_id).await {
     Ok(Some(live)) => live,
     Ok(None) => return Redirect::to(LOGIN_PATH).into_response(),
@@ -1469,7 +1595,14 @@ pub async fn post_totp_confirm(
     return AppError::invalid_request("invalid form submission").into_response();
   }
   let mut deps = deps_of(&state, &mut conn, &store);
-  match confirm_totp(&mut deps, &session_id, &form.code).await {
+  match confirm_totp(
+    &mut deps,
+    &session_id,
+    &form.code,
+    peer.map(|info| info.0.ip()),
+  )
+  .await
+  {
     Ok(ConfirmOutcome::Completed {
       session_id,
       redirect_to,
@@ -1492,12 +1625,12 @@ pub async fn post_totp_confirm(
 }
 
 /// `POST /logout`: verify the session-bound form token, then destroy the
-/// session and expire the cookie.
+/// session and expire every session cookie the reader honors.
 ///
 /// A missing or invalid token is rejected with `invalid_request` and the
 /// session is left intact, so a cross-site form post cannot sign the user
-/// out. With no session the call is idempotent: the cookie is still expired
-/// and the caller lands on login.
+/// out. With no session the call is idempotent: every honored cookie is still
+/// expired and the caller lands on login.
 pub async fn post_logout(
   State(state): State<AppState>,
   Extension(request_id): Extension<RequestId>,
@@ -1506,15 +1639,12 @@ pub async fn post_logout(
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let session_id = session_id_from_jar(&state.config, &jar);
   let live = match load_session(&mut conn, &store, &session_id).await {
     Ok(Some(live)) => live,
     Ok(None) => {
       return (
-        jar.add(expired_session_cookie(&state.config)),
+        clear_session_cookies(jar, &state.config),
         Redirect::to(LOGIN_PATH),
       )
         .into_response();
@@ -1532,7 +1662,7 @@ pub async fn post_logout(
         return AppError::server_error().into_response();
       }
       return (
-        jar.add(expired_session_cookie(&state.config)),
+        clear_session_cookies(jar, &state.config),
         error.into_response(),
       )
         .into_response();
@@ -1545,7 +1675,7 @@ pub async fn post_logout(
     Some(uri) => Redirect::to(&uri).into_response(),
     None => render(SignedOutTemplate),
   };
-  (jar.add(expired_session_cookie(&state.config)), response).into_response()
+  (clear_session_cookies(jar, &state.config), response).into_response()
 }
 
 /// `GET /logout`: read-only sign-out confirmation.
@@ -1564,10 +1694,7 @@ pub async fn post_logout(
 pub async fn get_logout(State(state): State<AppState>, jar: CookieJar) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let session_id = session_id_from_jar(&state.config, &jar);
   match load_session(&mut conn, &store, &session_id).await {
     Ok(Some(live)) => render(LogoutConfirmTemplate {
       csrf: form_token(&live.meta.csrf_secret, LOGOUT_ACTION),
@@ -1628,10 +1755,7 @@ async fn resolve_post_logout_target(
 pub async fn get_login_success(State(state): State<AppState>, jar: CookieJar) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let session_id = session_id_from_jar(&state.config, &jar);
   match load_session(&mut conn, &store, &session_id).await {
     Ok(Some(live)) if !live.record.subject.is_empty() && !live.record.restricted => {
       render(SuccessTemplate {
@@ -1667,10 +1791,7 @@ async fn gated_form(
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let session_id = session_id_from_jar(&state.config, jar);
   let live = match load_session(&mut conn, &store, &session_id).await {
     Ok(Some(live)) => live,
     Ok(None) => return Redirect::to(LOGIN_PATH).into_response(),

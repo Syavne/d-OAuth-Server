@@ -29,6 +29,7 @@ use base64::Engine as _;
 use ring::rand::{SecureRandom as _, SystemRandom};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::context::{CliError, audit, require_nonempty};
 use super::secret;
@@ -40,10 +41,11 @@ const GENERATED_BYTES: usize = 32;
 
 /// How the bootstrap password was supplied.
 ///
-/// `Debug` is redacted: a `Provided` password must never reach logs.
+/// `Debug` is redacted: a `Provided` password prints its length plus
+/// `[REDACTED]` only, never the password itself.
 pub enum BootstrapPassword {
-  /// Operator-supplied password (file or stdin).
-  Provided(String),
+  /// Operator-supplied password (file or stdin), wiped on drop.
+  Provided(Zeroizing<String>),
   /// Generate a fresh 256-bit password (printed once by the CLI wrapper).
   Generate,
 }
@@ -51,7 +53,11 @@ pub enum BootstrapPassword {
 impl fmt::Debug for BootstrapPassword {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Self::Provided(_) => f.write_str("Provided([REDACTED])"),
+      Self::Provided(password) => f
+        .debug_struct("BootstrapPassword")
+        .field("secret", &"[REDACTED]")
+        .field("secret_len", &password.len())
+        .finish(),
       Self::Generate => f.write_str("Generate"),
     }
   }
@@ -67,7 +73,7 @@ pub struct BootstrapOutcome {
   /// Canonical email.
   pub email: String,
   /// The generated password, when [`BootstrapPassword::Generate`] was used.
-  pub generated_password: Option<String>,
+  pub generated_password: Option<Zeroizing<String>>,
 }
 
 impl fmt::Debug for BootstrapOutcome {
@@ -75,9 +81,13 @@ impl fmt::Debug for BootstrapOutcome {
     f.debug_struct("BootstrapOutcome")
       .field("id", &self.id)
       .field("email", &self.email)
+      .field("generated_password", &"[REDACTED]")
       .field(
-        "generated_password",
-        &self.generated_password.as_ref().map(|_| "[REDACTED]"),
+        "generated_password_len",
+        &self
+          .generated_password
+          .as_ref()
+          .map(|password| password.len()),
       )
       .finish()
   }
@@ -94,14 +104,11 @@ impl fmt::Debug for BootstrapOutcome {
 /// Returns [`CliError::Io`] when the file/stdin read fails.
 pub fn resolve_password(password_file: Option<&Path>) -> Result<BootstrapPassword, CliError> {
   if let Some(path) = password_file {
-    let raw = std::fs::read_to_string(path)?;
-    let password = raw.trim_end_matches(['\r', '\n']).to_owned();
+    let password = super::context::read_secret(false, Some(path))?;
     return Ok(BootstrapPassword::Provided(password));
   }
-  let mut raw = String::new();
-  std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw)?;
-  let password = raw.trim_end_matches(['\r', '\n']).to_owned();
-  if password.is_empty() {
+  let password = super::context::read_secret(false, None)?;
+  if password.trim().is_empty() {
     Ok(BootstrapPassword::Generate)
   } else {
     Ok(BootstrapPassword::Provided(password))
@@ -110,14 +117,18 @@ pub fn resolve_password(password_file: Option<&Path>) -> Result<BootstrapPasswor
 
 /// Generate a fresh 256-bit password, base64-encoded (43 characters).
 ///
+/// The password is held in [`Zeroizing`] so it is wiped on drop.
+///
 /// # Errors
 /// Returns [`CliError::Crypto`] when OS randomness is unavailable.
-pub fn generate_password() -> Result<String, CliError> {
-  let mut bytes = [0u8; GENERATED_BYTES];
+pub fn generate_password() -> Result<Zeroizing<String>, CliError> {
+  let mut bytes = Zeroizing::new([0u8; GENERATED_BYTES]);
   SystemRandom::new()
-    .fill(&mut bytes)
+    .fill(&mut bytes[..])
     .map_err(|_| CliError::Crypto("operating-system randomness unavailable".to_owned()))?;
-  Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+  Ok(Zeroizing::new(
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes[..]),
+  ))
 }
 
 /// Create the first admin: advisory-locked existence gate plus a repository
@@ -152,7 +163,7 @@ pub async fn bootstrap(
   // Hash before taking the lock so the lock is held only for the check and the
   // insert. The plaintext below is never logged and never stored; only the
   // Argon2id hash reaches the database.
-  let password_hash = secret::hash_password(config, &plaintext)?;
+  let password_hash = secret::hash_password(config, plaintext.as_str())?;
 
   // Serialize within the process so a single process never parks multiple
   // pooled connections on the database lock while the winner still needs a
@@ -191,7 +202,7 @@ async fn bootstrap_locked(
   email: &str,
   password_hash: &str,
   force: bool,
-  generated_password: Option<String>,
+  generated_password: Option<Zeroizing<String>>,
 ) -> Result<BootstrapOutcome, CliError> {
   let existing: i64 =
     sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin AND NOT disabled")

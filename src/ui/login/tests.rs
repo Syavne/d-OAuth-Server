@@ -3,10 +3,12 @@
 //! Child suites (`auth`, `enroll`) drive the public [`super`] API through
 //! these helpers; every test owns a fresh database and Redis container.
 
-use std::time::Duration;
-
 use serde_json::json;
 use sqlx::PgPool;
+use std::{
+  net::{IpAddr, Ipv4Addr, SocketAddr},
+  time::Duration,
+};
 use testcontainers::{
   GenericImage, ImageExt,
   core::{IntoContainerPort, WaitFor},
@@ -31,6 +33,12 @@ use crate::{
 
 pub(super) mod auth;
 pub(super) mod enroll;
+
+/// Default source IP for harness login attempts: the composite lockout path
+/// keys on the peer, so attempts without an explicit IP share this one.
+pub(super) const TEST_PEER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+/// Socket form of [`TEST_PEER_IP`] for handler-level `ConnectInfo` values.
+pub(super) const TEST_PEER_SOCK: SocketAddr = SocketAddr::new(TEST_PEER_IP, 5000);
 
 /// Test body result (no `unwrap`/`expect` under the deny lints).
 pub(super) type TestResult = Result<(), TestError>;
@@ -295,6 +303,7 @@ pub(super) fn attempt(
     password: user.password.clone(),
     code: code.to_owned(),
     csrf: csrf.to_owned(),
+    peer_ip: Some(TEST_PEER_IP),
   }
 }
 

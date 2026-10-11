@@ -4,6 +4,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use zeroize::Zeroizing;
 
 use super::context::{CliError, audit, open_pool};
 use super::{KeyAlg, secret};
@@ -116,8 +117,8 @@ pub async fn healthcheck(url: &str) -> Result<i32, CliError> {
 
 /// `initial-access-token issue`: mint a token and store only its hash.
 ///
-/// The raw token is printed exactly once; Redis stores the keyed hash plus the
-/// bounded-use record and TTL.
+/// The raw token is held in [`Zeroizing`] and printed exactly once by the
+/// caller; Redis stores the keyed hash plus the bounded-use record and TTL.
 ///
 /// # Errors
 /// Returns [`CliError`] for invalid budgets, config/state failures, or a store
@@ -126,7 +127,7 @@ pub async fn issue_initial_access_token(
   uses: u64,
   ttl_secs: u64,
   label: &str,
-) -> Result<String, CliError> {
+) -> Result<Zeroizing<String>, CliError> {
   let config = Arc::new(Config::load()?);
   issue_with(config, uses, ttl_secs, label).await
 }
@@ -141,7 +142,7 @@ pub async fn issue_with(
   uses: u64,
   ttl_secs: u64,
   label: &str,
-) -> Result<String, CliError> {
+) -> Result<Zeroizing<String>, CliError> {
   if uses == 0 {
     return Err(CliError::Input("--uses must be at least 1".to_owned()));
   }
@@ -151,8 +152,8 @@ pub async fn issue_with(
     ));
   }
   let state = AppState::connect(config.clone()).await?;
-  let token = crate::crypto::tokens::mint_token()?;
-  let hash = secret::token_hash(&config, &token)?;
+  let token = Zeroizing::new(crate::crypto::tokens::mint_token()?);
+  let hash = secret::token_hash(&config, token.as_str())?;
   let store = crate::store::Store::from_config(&config.redis);
   let mut conn = state.redis.clone();
   let record = crate::store::dcr::InitialAccessRecord {
@@ -204,7 +205,10 @@ pub async fn admin_bootstrap(
   let outcome = super::admin::bootstrap(&config, &pool, email, password, force).await?;
   println!("bootstrapped admin {} (id {})", outcome.email, outcome.id);
   if let Some(generated) = outcome.generated_password {
-    println!("generated one-time bootstrap password (shown once): {generated}");
+    println!(
+      "generated one-time bootstrap password (shown once): {}",
+      generated.as_str()
+    );
   }
   println!("first login must change the password and enroll TOTP before full access");
   Ok(())

@@ -36,6 +36,15 @@ with every `.` replaced by `__`, uppercased. For example:
 A secret may be given inline or as a mounted file. Inline wins when both are
 set. Mounted files are read and trimmed of trailing newlines.
 
+String-list keys (`cors_allowed_origins`, `rate_limit.trusted_proxies`,
+`redis.nodes`, `redis.seeds`) accept a real array in the file and either a
+JSON array string or a comma-separated string from the environment, because
+config-rs 0.15 keeps env values as strings and never coerces arrays. Both
+`D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='["10.0.0.5"]'` and
+`D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='10.0.0.5,10.0.1.0/24'` load; a blank
+string loads as empty, and malformed JSON array text fails the load instead
+of silently meaning empty.
+
 The key ring follows the same pattern: `token_pepper_file`,
 `totp_encryption_key_file`, and `pii_encryption_key_file` (environment
 spellings `D_OAUTH_TOKEN_PEPPER_FILE`, `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, and
@@ -59,8 +68,8 @@ which names the offending key.
 | `bind_addr` | `0.0.0.0:8080` | A socket address. The TLS public listener. |
 | `health_addr` | `0.0.0.0:8081` | A socket address. `serve` refuses a loopback address; `config check` does not. The plaintext health listener. |
 | `environment` | `production` | `production` or `development`. Development relaxes the database TLS requirement. |
-| `cookie_domain` | none (host-only) | Optional cookie domain. |
-| `cookie_secure` | `true` | Adds the `Secure` attribute. Set `false` only for localhost testing. |
+| `cookie_domain` | none (host-only) | Reserved: any non-blank value is rejected at load (`InvalidCookieDomain`). The `__Host-` session cookie forbids `Domain`, so sessions stay host-only; blank values are treated as absent. |
+| `cookie_secure` | `true` | Adds the `Secure` attribute and uses the `__Host-session_id` cookie name. `false` is a development-only localhost exception (production refuses to load without `Secure` with `InsecureSessionCookie`); it drops `Secure` and the cookie name falls back to plain `session_id`, because browsers reject a `__Host-` cookie without `Secure`. Both variants are host-only (`Path=/`, `HttpOnly`, `SameSite=Lax`, no `Domain`). In production the server reads **only** `__Host-session_id`; the plain `session_id` cookie is never honored there, so a cookie planted by a sibling subdomain cannot fixate a login onto an attacker presession. The development variant reads plain `session_id` first and may additionally fall back to `__Host-session_id` for a cookie left over from before a config flip. `POST /logout` clears every name the reader honors. The `false` gate checks only `environment = production`: a non-production environment (for example staging) running `cookie_secure = false` re-opens plain-cookie sibling-subdomain fixation, so staging must use the production environment or keep secure cookies. |
 | `allow_open_registration` | `false` | When false, DCR requires a valid initial-access token. |
 | `dcr_redirect_policy` | `catalog` | `catalog`, `catalog_loopback`, or `open`. See below. |
 | `cors_allowed_origins` | empty | An explicit origin allowlist. Empty means no CORS layer. A lone `*` is silently dropped (no CORS layer, no error). |
@@ -242,8 +251,29 @@ iteration count and parallelism.
 | `rate_limit.per_client` | `300` |
 | `rate_limit.login_per_ip` | `20` |
 | `rate_limit.token_per_client` | `60` |
+| `rate_limit.trusted_proxies` | empty |
 
 The window must be non-zero.
+
+`rate_limit.trusted_proxies` (environment spelling
+`D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES`) is the L7 reverse-proxy allowlist for
+rate-limit IP attribution only. Each entry is an exact IP (`10.0.0.1`) or a
+CIDR (`10.0.0.0/8`, `2001:db8::/32`). From the environment use a JSON array
+string (`D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='["10.0.0.5"]'`) or a
+comma-separated string (`D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='10.0.0.5'`); in
+the file use a real array (`trusted_proxies = ["10.0.0.5"]`). Default empty means forwarded headers
+are never honored: the limiter keys the IP bucket off the verified TCP peer.
+When the peer belongs to the allowlist, the limiter attributes the
+rightmost-untrusted `X-Forwarded-For` entry instead; a header from an
+untrusted peer is ignored, and a malformed header falls back to the peer, so
+spoofing cannot evade or shift the bucket. A malformed entry, an out-of-range
+prefix, a trust-everything `/0`, or more than 64 entries fails the load with
+`InvalidTrustedProxy`. Entries are not deduplicated, so duplicates count
+toward the 64-entry cap. A value starting with `[` parses as a JSON array, so
+a bracketed IPv6 literal (`[2001:db8::1]`) fails the load — always use bare
+IPs, in entries and in arrays. This trust never authenticates a client and never
+carries a client certificate: in-process mTLS still requires L4/TCP
+passthrough (see [DEPLOYMENT.md](DEPLOYMENT.md#mtls-and-the-l7-constraint)).
 
 ## Scope registry and token exchange
 

@@ -44,8 +44,6 @@ use crate::{
   store::{self, Store},
 };
 
-/// Session cookie name (owned by the login flow; see module docs).
-pub const SESSION_COOKIE: &str = "session_id";
 /// Where anonymous users are sent to authenticate first.
 pub const LOGIN_PATH: &str = "/login";
 /// Guess window for the user-code brute-force counter.
@@ -139,16 +137,14 @@ pub async fn check_guess_budget(
 pub async fn authenticated_subject(
   conn: &mut RedisConn,
   store: &Store,
+  config: &crate::config::Config,
   jar: &CookieJar,
 ) -> Result<Option<String>, AppError> {
-  let Some(cookie) = jar.get(SESSION_COOKIE) else {
-    return Ok(None);
-  };
-  let session_id = cookie.value();
+  let session_id = crate::ui::login::session_id_from_jar(config, jar);
   if session_id.is_empty() {
     return Ok(None);
   }
-  let record = store::sessions::get(conn, store, session_id).await?;
+  let record = store::sessions::get(conn, store, &session_id).await?;
   Ok(
     record
       .filter(|session| !session.subject.is_empty() && session.mfa_verified && !session.restricted)
@@ -382,14 +378,11 @@ pub async fn post_device(
   peer: Option<ConnectInfo<SocketAddr>>,
   Form(form): Form<DeviceForm>,
 ) -> Response {
-  let session_cookie = jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default();
+  let session_cookie = crate::ui::login::session_id_from_jar(&state.config, &jar);
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
 
-  let subject = match authenticated_subject(&mut conn, &store, &jar).await {
+  let subject = match authenticated_subject(&mut conn, &store, &state.config, &jar).await {
     Ok(Some(subject)) => subject,
     Ok(None) => return Redirect::to(LOGIN_PATH).into_response(),
     Err(error) => return error.into_response(),

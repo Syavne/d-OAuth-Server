@@ -42,7 +42,9 @@ pub use db::DbConfig;
 pub use policy::{FailMode, FailurePolicy, RetryableClass};
 pub use redis::{DurabilityMode, RedisConfig, RedisTopology};
 pub use scope::{ClientClass, GrantKind, ScopeDefinition, TokenExchangeRule};
-pub use types::{Argon2Params, DcrRedirectPolicy, Environment, RateLimitConfig, TtlConfig};
+pub use types::{
+  Argon2Params, DcrRedirectPolicy, Environment, RateLimitConfig, TrustedProxyNet, TtlConfig,
+};
 
 /// Environment-variable prefix for layered settings (`D_OAUTH_*`).
 pub const ENV_PREFIX: &str = "D_OAUTH";
@@ -184,6 +186,68 @@ pub(crate) fn env_source() -> ::config::Environment {
     .try_parsing(true)
 }
 
+/// Deserialize a string list that arrives as a real sequence from a file or
+/// as a single string from `D_OAUTH_*` env vars (config-rs 0.15 keeps env
+/// values as strings: only bool/int/float are coerced, never arrays). A
+/// string starting with `[` parses as a JSON array (fail-closed on malformed
+/// JSON); any other string splits on `,` with surrounding whitespace trimmed
+/// and empty items dropped, so `10.0.0.5` and `a,b` both load. Blank strings
+/// load as empty.
+pub(crate) fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  struct StringOrVec;
+  impl<'de> serde::de::Visitor<'de> for StringOrVec {
+    type Value = Vec<String>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("a string list or a JSON array string")
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<Vec<String>, E> {
+      Ok(Vec::new())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Vec<String>, E> {
+      Ok(Vec::new())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+      let mut items = Vec::new();
+      while let Some(item) = seq.next_element::<String>()? {
+        items.push(item);
+      }
+      Ok(items)
+    }
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Vec<String>, E> {
+      parse_env_string_list(value).map_err(serde::de::Error::custom)
+    }
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Vec<String>, E> {
+      parse_env_string_list(&value).map_err(serde::de::Error::custom)
+    }
+  }
+  deserializer.deserialize_any(StringOrVec)
+}
+
+/// Split an env-provided string list: JSON array when it starts with `[`
+/// (malformed JSON is an error, never a silent empty), otherwise
+/// comma-separated with trimming.
+fn parse_env_string_list(value: &str) -> Result<Vec<String>, String> {
+  let trimmed = value.trim();
+  if trimmed.is_empty() {
+    return Ok(Vec::new());
+  }
+  if trimmed.starts_with('[') {
+    return serde_json::from_str::<Vec<String>>(trimmed)
+      .map_err(|err| format!("invalid string list {value:?}: {err}"));
+  }
+  Ok(
+    trimmed
+      .split(',')
+      .map(str::trim)
+      .filter(|item| !item.is_empty())
+      .map(str::to_owned)
+      .collect(),
+  )
+}
+
 /// Configuration loading/validation failures.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -300,6 +364,13 @@ pub enum ConfigError {
   /// The rate-limit window was zero.
   #[error("invalid rate-limit window")]
   InvalidRateLimit,
+  /// A `rate_limit.trusted_proxies` entry was not an exact IP or a valid
+  /// CIDR, was a trust-everything `/0`, or the allowlist exceeded its bound.
+  #[error("invalid trusted proxy entry: {value}")]
+  InvalidTrustedProxy {
+    /// The rejected value.
+    value: String,
+  },
   /// A TTL was zero.
   #[error("invalid token TTL: every lifetime must be non-zero")]
   InvalidTtl,
@@ -327,6 +398,18 @@ pub enum ConfigError {
   InvalidKeyId {
     /// The rejected value.
     id: String,
+  },
+  /// Production was configured without the `Secure` session-cookie
+  /// attribute (`cookie_secure = false` is a development-only exception).
+  #[error("production requires the Secure session-cookie attribute")]
+  InsecureSessionCookie,
+  /// `cookie_domain` was set: any non-blank value is rejected as
+  /// incompatible with the `__Host-` session-cookie prefix (which forbids
+  /// `Domain`; sessions stay host-only by design).
+  #[error("invalid cookie domain: {value}")]
+  InvalidCookieDomain {
+    /// The rejected value.
+    value: String,
   },
 }
 

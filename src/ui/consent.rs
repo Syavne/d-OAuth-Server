@@ -40,7 +40,7 @@ use crate::{
   },
   state::{AppState, RedisConn},
   store::{self, Store, pending::PendingAuth},
-  ui::login::{self, LiveSession, SESSION_COOKIE, form_token, load_session, verify_form_token},
+  ui::login::{self, LiveSession, form_token, load_session, verify_form_token},
 };
 
 /// Form-token action prefix; the bound `request_id` is appended so a token
@@ -432,7 +432,7 @@ pub async fn get_consent(
 ) -> Response {
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = session_id_of(&jar);
+  let session_id = login::session_id_from_jar(&state.config, &jar);
   let mut deps = ConsentDeps {
     pool: &state.pool,
     conn: &mut conn,
@@ -475,7 +475,7 @@ pub async fn post_consent(
   };
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
-  let session_id = session_id_of(&jar);
+  let session_id = login::session_id_from_jar(&state.config, &jar);
   let mut deps = ConsentDeps {
     pool: &state.pool,
     conn: &mut conn,
@@ -497,14 +497,6 @@ pub async fn post_consent(
       error.into_response()
     }
   }
-}
-
-/// Session id from the cookie, or `""` when absent.
-fn session_id_of(jar: &CookieJar) -> String {
-  jar
-    .get(SESSION_COOKIE)
-    .map(|cookie| cookie.value().to_owned())
-    .unwrap_or_default()
 }
 
 /// `302 Found` to `location`; an invalid header fails closed to a `500`.
