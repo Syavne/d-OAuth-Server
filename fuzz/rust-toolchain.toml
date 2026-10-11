@@ -3,5 +3,10 @@
 # overrides the toolchain for the `fuzz/` directory only (rustup applies the
 # nearest `rust-toolchain.toml` to the working directory). CI runs
 # `cargo fuzz build` with `fuzz/` as its working directory.
+#
+# Dated, not floating: `channel = "nightly"` reuses whatever nightly happens
+# to be preinstalled (the ClusterFuzzLite base image ships a stale one),
+# which broke the build once a dependency outgrew it (`sqlx 0.9` needs
+# rustc >= 1.94). A dated pin forces a fresh download everywhere.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-10-01"
