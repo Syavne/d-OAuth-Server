@@ -179,6 +179,10 @@ jobs:
           output: trivy.sarif
           severity: HIGH,CRITICAL
           exit-code: "1"
+          # v0.36.0 drops `--severity` for SARIF output unless this is true, so
+          # without it the exit-code gate fires on every severity (not just
+          # HIGH/CRITICAL); keep it true to preserve the gate.
+          limit-severities-for-sarif: "true"
       - name: Upload trivy SARIF to code scanning
         # `if: always()` so the findings still reach the Security tab when the
         # gate above fails the job (exit-code 1).
