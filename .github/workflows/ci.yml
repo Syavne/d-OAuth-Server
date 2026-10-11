@@ -73,7 +73,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-audit
       - name: Audit advisories
         run: cargo audit
 
@@ -84,7 +86,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-deny
       - name: Check supply chain (ring-only TLS enforced in deny.toml)
         run: cargo deny check
 
@@ -109,7 +113,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install sqlx-cli
-        run: cargo install sqlx-cli --locked --version 0.9.0 --no-default-features --features postgres,rustls
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: sqlx-cli@0.9.0
       - name: Apply migrations to the check database
         env:
           DATABASE_URL: postgres://postgres:sqlxcheck@127.0.0.1:5432/postgres
@@ -170,7 +176,9 @@ jobs:
       # The `fuzz/rust-toolchain.toml` in the working directory selects
       # nightly via rustup override; the root stable pin is untouched.
       - name: Install cargo-fuzz (nightly, per fuzz/rust-toolchain.toml)
-        run: cargo install cargo-fuzz --locked
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-fuzz
       - name: Build all fuzz targets
         run: cargo fuzz build
 
@@ -196,7 +204,9 @@ jobs:
       # `fuzz/rust-toolchain.toml` selects nightly; the root stable pin is
       # untouched, exactly as in `fuzz-build`.
       - name: Install cargo-fuzz (nightly)
-        run: cargo install cargo-fuzz --locked
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-fuzz
       # `uses` steps resolve paths from the workspace root, not the job's
       # `working-directory`; keep the fuzz/ prefix explicit.
       - name: Restore corpus for ${{ matrix.target }}
@@ -234,7 +244,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-mutants
       - name: Budgeted mutation run (see .cargo/mutants.toml)
         run: cargo mutants --timeout 1800 --test-tool nextest
 
