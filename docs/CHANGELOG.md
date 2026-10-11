@@ -57,7 +57,7 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   codecs); the text secret, URI, and one-time recovery codes are unchanged.
 - A full-database-disclosure response procedure: `docs/SECURITY.md` gains the
   dump blast-radius table and the ordered rotation (token pepper, TOTP key,
-  client secrets, DCR registration tokens), and `RUNBOOK.md` gains the
+  PII field-encryption key, client secrets, DCR registration tokens), and `RUNBOOK.md` gains the
   matching operator checklist with concrete commands.
 - Cluster hardening in `deploy/k8s`: the token pepper and TOTP key mount as
   `0400` tmpfs files under `/run/secrets` (read through
@@ -68,10 +68,12 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   rejects one), and `automountServiceAccountToken` is `false`. Remote JAR
   `request_uri` is documented as unsupported under the default-deny, with the
   Cilium FQDN opt-in path in `docs/DEPLOYMENT.md`.
-- `user disable` now purges all Redis state for the subject (sessions and their
+- `user disable` now purges all subject-scoped Redis state for the subject (sessions and their
   meta, codes, devices with their sidecars and mappings, grants via cascade
   revoke, standalone tokens, and the lockout counter) before flipping
-  `users.disabled`; a Redis failure aborts before the flag changes, so the
+  `users.disabled`; records without a subject (PAR, pending, DPoP and
+  `private_key_jwt` replay markers, rotation map, TOTP replay, rate-limit
+  counters) are untouched. A Redis failure aborts before the flag changes, so the
   command fails closed.
 - `POST /revoke` authenticates mTLS-registered clients (RFC 8705 §2) with the
   verified peer chain injected by the TLS accept loop, exactly as the token and
@@ -86,9 +88,11 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   previous key. `pii_dual_write` (default `false`, encrypt-only) turns on
   dual-write for the rolling-upgrade window; readiness fails closed while the
   switch is off and any blanked plaintext PII column still holds a value.
-- TOTP secrets now encrypt under HKDF-SHA256 (info `totp-gcm-v2`) instead of
-  bare `SHA256(totp_key)`. New blobs carry format version 2; version-1 blobs
-  keep decrypting through a legacy fallback, so no re-enrollment is needed.
+- TOTP secrets now use a per-row envelope (blob version 3): a random DEK
+  wrapped by AES-256-GCM under HKDF-SHA256 (info `totp-kek-v1`), so
+  `totp rewrap` re-wraps the DEK without re-encrypting the secret. Versions 1
+  (bare `SHA256(totp_key)`) and 2 (HKDF info `totp-gcm-v2`) keep decrypting
+  through a legacy fallback, so no re-enrollment is needed.
 
 - `GET /.well-known/oauth-authorization-server` now carries an explicit
   `Cache-Control: public, max-age=3600` instead of relying on browser

@@ -115,10 +115,11 @@ correlation. No step below writes a secret to a log.
 
 ### Rotation order and commands
 
-- [ ] Confirm whether the key store leaked with the dump. The token pepper and
-      the TOTP encryption key live outside the database
+- [ ] Confirm whether the key store leaked with the dump. The token pepper, the
+      TOTP encryption key, and the PII field-encryption key live outside the database
       (`D_OAUTH_TOKEN_PEPPER` / `D_OAUTH_TOKEN_PEPPER_FILE`,
-      `D_OAUTH_TOTP_ENCRYPTION_KEY` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`); if it
+      `D_OAUTH_TOTP_ENCRYPTION_KEY` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`,
+      `D_OAUTH_PII_ENCRYPTION_KEY` / `D_OAUTH_PII_ENCRYPTION_KEY_FILE`); if it
       is not provably untouched, assume it leaked and continue.
 - [ ] **1. Rotate the token pepper.** Point `D_OAUTH_TOKEN_PEPPER` (or
       `D_OAUTH_TOKEN_PEPPER_FILE`) at a new value, bump
@@ -134,7 +135,15 @@ correlation. No step below writes a secret to a log.
 - [ ] Re-enroll every TOTP user before dropping the old key:
       `d-oauth-server user enroll-totp --email <email>`
       (prints the secret and `otpauth://` URI exactly once).
-- [ ] **3. Rotate every confidential client secret.** Read the current metadata,
+- [ ] **3. Rotate the PII field-encryption key.** Point
+      `D_OAUTH_PII_ENCRYPTION_KEY` (or `D_OAUTH_PII_ENCRYPTION_KEY_FILE`) at a
+      new value, bump `D_OAUTH_PII_KEY_ID`, and roll the replicas with the old
+      key retained. Then, under a write freeze (app tier scaled to zero), run
+      `d-oauth-server pii rotate` to re-encrypt every `_enc` value and recompute
+      every blind index, verify with `d-oauth-server pii verify`, and only then
+      retire the old key. See
+      [docs/OPERATIONS.md](docs/OPERATIONS.md#pii-and-totp-key-rotation).
+- [ ] **4. Rotate every confidential client secret.** Read the current metadata,
       then re-submit it through RFC 7592 `PUT /register/{client_id}` to mint a
       new secret and a new registration token:
 
@@ -151,15 +160,17 @@ correlation. No step below writes a secret to a log.
       The `PUT` response carries `client_secret` and
       `registration_access_token` exactly once. Store both before the process
       exits; the previous registration token immediately answers `403`.
-- [ ] **4. Rotate every DCR registration token.** Every successful `PUT` above
+- [ ] **5. Rotate every DCR registration token.** Every successful `PUT` above
       already rotated the registration token. If you also need new
       registrations after the breach, issue a fresh single-use initial-access
       token:
       `d-oauth-server initial-access-token issue --uses <n> --ttl <seconds>`
       (the raw token is printed once).
-- [ ] **5. Verify fail-closed behavior.** Readiness must report ready only with
+- [ ] **6. Verify fail-closed behavior.** Readiness must report ready only with
       both dependencies up:
-      `d-oauth-server healthcheck --url http://127.0.0.1:8081/health/ready`.
+      `d-oauth-server healthcheck --url http://127.0.0.1:8081/health/ready`
+      (readiness; liveness is `/health/live` as in
+      [docs/OPERATIONS.md](docs/OPERATIONS.md)).
       A dependency outage during recovery must yield `503`, never a fail-open
       success.
 

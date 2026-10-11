@@ -281,9 +281,10 @@ on every use.
 `private_key_jwt` is client authentication only. It produces no confirmation and
 never satisfies sender constraint. For token exchange, the proof must match the
 subject token's confirmation. See [SECURITY.md](SECURITY.md) for the full matrix
-and the confirmation propagation rule. It accepts `RS256`, `PS256`, `ES256`, and
-`EdDSA` only (`none` and HMAC are rejected); `exp` may lie at most 300 s past
-`now` plus 30 s clock skew, and the single-use `jti` marker lives for the
+and the confirmation propagation rule. `private_key_jwt` accepts `RS256`, `PS256`, `ES256`, and
+`EdDSA` only (`none` and HMAC are rejected); DPoP proofs accept `ES256`, `EdDSA`, and `RS256` only (no `PS256`).
+`exp` may lie at most 300 s past `now` with 30 s clock-skew leeway on each side
+(360 s bound), and the single-use `jti` marker lives for the
 assertion's remaining validity, clamped to `[1 s, 360 s]`.
 
 ## Metadata

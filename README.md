@@ -47,7 +47,9 @@ cargo build --locked --release
 
 The server reads configuration from `D_OAUTH_*` environment variables. Export a
 development configuration (values here are placeholders; see
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every key).
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every key). The ports below
+are the local-dev defaults (Postgres `5432`, Redis `6379`); the shared test
+services use `5433`/`6380` (see Tests).
 
 ```bash
 export D_OAUTH_ISSUER=https://localhost:8080
@@ -146,8 +148,9 @@ full grant behavior.
 ## Tests
 
 The authoritative suite. The integration and end-to-end tests connect to the
-shared Postgres and Redis from `compose.test.yaml` (Postgres on
-`127.0.0.1:5433`, Redis on `127.0.0.1:6380`), so start the services first and
+shared test Postgres and Redis from `compose.test.yaml` (test defaults:
+Postgres on `127.0.0.1:5433`, Redis on `127.0.0.1:6380` — not the dev
+`5432`/`6379`), so start the services first and
 tear them down with `down -v`:
 
 ```bash
@@ -208,15 +211,14 @@ The container `HEALTHCHECK` uses the `healthcheck` subcommand, which probes the
 plaintext health listener without a shell or curl. See
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
-For a local multi-replica proof, the deployment assets provide a compose file
-that runs three app replicas against one Postgres and one Redis. It is the local
+For a local multi-replica proof, `compose.yaml` runs three app replicas
+against one Postgres and one Redis. It is the local
 analogue of the cluster manifests, and proves that a token issued by one replica
-is introspectable via another. If your checkout does not include the compose
-file yet, it ships with the cluster manifests; see
+is introspectable via another; see
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md):
 
 ```bash
-docker compose up --scale app=3
+docker compose -f compose.yaml up --scale app=3
 ```
 
 Cluster deployment uses a separate migration Job, a PodDisruptionBudget, and

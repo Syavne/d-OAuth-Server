@@ -371,6 +371,7 @@ manifest; verify the cluster CNI applies it.
 
 - Egress admits DNS to the `kube-system` namespace on port 53 (UDP and TCP) and
   Postgres (5432) and Redis (6379) scoped to the namespace that hosts them —
+  cluster-service defaults, not the shared-test `5433`/`6380` —
   `d-oauth` in the reference deployment, matching the ConfigMap DSNs
   (`*.d-oauth.svc.cluster.local`). It carries no `ipBlock: 0.0.0.0/0` peer, so
   neither port is an exfiltration channel to an arbitrary internet host;
