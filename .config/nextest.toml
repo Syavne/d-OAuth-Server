@@ -2,8 +2,8 @@
 heavy-e2e = { max-threads = 2 }
 
 # The topology tests spawn in-process `redis-server` fixtures through a racy
-# TOCTOU port allocator (redis-test), and the sentinel is never readiness-gated;
-# serialize them so concurrent fixtures cannot collide on a port.
+# TOCTOU port allocator (redis-test); serialize them so concurrent fixtures
+# cannot be handed the same port.
 redis-fixtures = { max-threads = 1 }
 
 [[profile.default.overrides]]

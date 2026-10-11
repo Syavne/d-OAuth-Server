@@ -151,6 +151,11 @@ async fn topology_sentinel_master_resolves() -> TestResult {
   if addrs.is_empty() {
     return Err(TestError::Unexpected("no sentinel addresses".to_owned()));
   }
+  if let Some(server) = cluster.iter_sentinel_servers().next()
+    && let Some((host, port)) = server.host_and_port()
+  {
+    wait_for_sentinel(host, port).await?;
+  }
   let mut sentinel =
     SentinelClientBuilder::new(addrs, "master0", SentinelServerType::Master)?.build()?;
   let master = sentinel.async_get_client().await?;
@@ -297,6 +302,26 @@ async fn sentinel_master_port(host: &str, port: u16) -> Result<u16, TestError> {
     .ok_or_else(|| TestError::Unexpected("sentinel has no master address".to_owned()))
 }
 
+/// Wait until the sentinel is reachable and resolves a master.
+///
+/// The `redis-test` fixture readiness-waits only the master and replica, never
+/// the sentinel, so under a loaded runner the sentinel can lag behind them and
+/// the first sentinel command fails with `Connection refused`.
+async fn wait_for_sentinel(host: &str, port: u16) -> TestResult {
+  let deadline = Instant::now() + Duration::from_secs(30);
+  loop {
+    if sentinel_master_port(host, port).await.is_ok() {
+      return Ok(());
+    }
+    if Instant::now() >= deadline {
+      return Err(TestError::Unexpected(
+        "sentinel never became reachable".to_owned(),
+      ));
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+  }
+}
+
 /// Whether Sentinel reports at least one replica with a live replication
 /// link (`master-link-status: ok`). `SENTINEL FAILOVER` refuses with
 /// `NOGOODSLAVE` while the only replica is still handshaking, so the
@@ -350,6 +375,7 @@ async fn topology_sentinel_failover_promotes_replica() -> TestResult {
     return Err(TestError::Unexpected("no sentinel addresses".to_owned()));
   };
 
+  wait_for_sentinel(&sentinel_host, sentinel_port).await?;
   let old_port = sentinel_master_port(&sentinel_host, sentinel_port).await?;
 
   // The replica link is still handshaking right after fixture boot on loaded
