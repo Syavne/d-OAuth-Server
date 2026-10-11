@@ -37,9 +37,10 @@ fn envelope_invariants(compact: &str) {
     return;
   };
   // Header and payload are JSON objects; a request object names its
-  // algorithm and carries claims. Presence (not validity) is the envelope
-  // property the fuzzer pins.
-  let _ = header.is_object() && payload.is_object();
+  // algorithm and carries claims. Parsing robustness (never panicking on
+  // hostile input) is the property under test; validity is decided by the
+  // verifier, not the envelope shape, so nothing is asserted here.
+  let _ = (header, payload);
 }
 
 fn client_with_method(method: &str) -> Client {
@@ -60,6 +61,7 @@ fn client_with_method(method: &str) -> Client {
     request_uris: None,
     contacts: None,
     software_id: None,
+    dpop_bound_access_tokens: false,
     active: true,
     created_at: time::OffsetDateTime::UNIX_EPOCH,
     updated_at: time::OffsetDateTime::UNIX_EPOCH,

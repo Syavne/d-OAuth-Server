@@ -1,20 +1,35 @@
 # Main quality gate (task 42).
 #
-# Per-PR legs (all must be green):
+# Per-PR legs (all must be green, except `coverage` which is report-only):
 #   fmt, clippy, audit, deny, sqlx-prepare-check, nextest, doc-tests,
+#   coverage (llvm-cov report upload over lib unit tests; non-blocking),
 #   fuzz-build (nightly leg inside `fuzz/`, so the pinned stable
 #   `rust-toolchain.toml` at the root is never violated).
 # Scheduled legs (not per-PR):
 #   mutants (weekly budgeted mutation run over the pure security modules),
-#   fuzz-run (bounded run of every fuzz target; the per-PR leg only builds).
+#   fuzz-run (bounded run of every fuzz target; the per-PR leg only builds),
+#   miri (scoped interpreter run over the sync crypto/JOSE helpers;
+#   allow-failure, never gates).
 #
 # Must NOT gate on miri for tokio/sqlx/redis; no lint suppressions anywhere.
+# The `miri` leg therefore runs only sync unit tests (`crypto::{ct, pkce,
+# tokens}` and the sync subset of `jose::jar` — the fetch-decode,
+# request-URI-membership, and alg-rejection tests, which short-circuit before
+# any crypto or I/O), excluding the argon2 KDF
+# (`crypto::secret`, cost prohibitive under the interpreter), the `ring`-backed
+# modules (`crypto::field`, `crypto::totp`, whose C/asm calls the interpreter
+# cannot execute), and every
+# `#[tokio::test]` / redis-backed test (DPoP replay store, async claim
+# paths, including the async `jose::jar::resolve` path itself — only its sync
+# unit tests are selected); the whole leg is `continue-on-error` so it can
+# never gate a PR. If a `#[tokio::test]` or a real-verification test is ever
+# added under `jose::jar`, narrow the filter to the explicit sync test paths.
 
 name: ci
 
 on:
   push:
-    branches: ["main"]
+    branches: ["master"]
   pull_request: {}
   schedule:
     # Weekly budgeted mutation run (Sunday 03:00 UTC).
@@ -33,8 +48,8 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: rustfmt
       - name: Check formatting
@@ -44,8 +59,8 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: clippy
       - name: Clippy (all targets, warnings denied)
@@ -55,8 +70,8 @@ jobs:
     name: audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit advisories
@@ -66,8 +81,8 @@ jobs:
     name: deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
       - name: Check supply chain (ring-only TLS enforced in deny.toml)
@@ -91,8 +106,8 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --locked --version 0.9.0 --no-default-features --features postgres,rustls
       - name: Apply migrations to the check database
@@ -108,8 +123,8 @@ jobs:
     name: doc-links
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.x"
       - name: Check documentation links (markdown-link-check equivalent)
@@ -119,10 +134,10 @@ jobs:
     name: nextest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: nextest
       - name: Install redis-server (in-process Sentinel/Cluster fixtures)
@@ -139,8 +154,8 @@ jobs:
     name: doc-tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Documentation tests
         run: cargo test --doc
 
@@ -151,7 +166,7 @@ jobs:
       run:
         working-directory: fuzz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The `fuzz/rust-toolchain.toml` in the working directory selects
       # nightly via rustup override; the root stable pin is untouched.
       - name: Install cargo-fuzz (nightly, per fuzz/rust-toolchain.toml)
@@ -164,19 +179,20 @@ jobs:
     # Scheduled bounded fuzzing. `fuzz-build` (above) only compiles the
     # targets per PR; this leg actually executes them, so a crash is found
     # without a human starting it. It is bounded and scheduled, not 24/7:
-    # continuous coverage is OSS-Fuzz/ClusterFuzzLite, tracked in docs/TODO.md.
+    # continuous coverage is ClusterFuzzLite (`.clusterfuzzlite/`, docs in
+    # `docs/CONTRIBUTING.md`); the remaining owner step is enabling it.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 70
     strategy:
       fail-fast: false
       matrix:
-        target: [token_form, dcr_json, jar_claims]
+        target: [token_form, dcr_json, jar_claims, dpop_proof, jar_verify, redirect_uri, scope_parse]
     defaults:
       run:
         working-directory: fuzz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # `fuzz/rust-toolchain.toml` selects nightly; the root stable pin is
       # untouched, exactly as in `fuzz-build`.
       - name: Install cargo-fuzz (nightly)
@@ -184,7 +200,7 @@ jobs:
       # `uses` steps resolve paths from the workspace root, not the job's
       # `working-directory`; keep the fuzz/ prefix explicit.
       - name: Restore corpus for ${{ matrix.target }}
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -196,13 +212,13 @@ jobs:
       # `restore-keys` always pick the newest entry.
       - name: Save corpus for ${{ matrix.target }}
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
@@ -215,9 +231,78 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
       - name: Budgeted mutation run (see .cargo/mutants.toml)
         run: cargo mutants --timeout 1800 --test-tool nextest
+
+  coverage:
+    name: coverage
+    # Report-only coverage signal (T4-4). Non-blocking by design: the upload
+    # is the deliverable; there is no `--fail-under-*` threshold yet.
+    # Services mirror `nextest` (shared Postgres/Redis plus redis-server),
+    # because several lib unit tests are testcontainers-backed.
+    # Follow-up: add a threshold and extend beyond `--lib` once
+    # the first reports land.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Install redis-server (in-process Sentinel/Cluster fixtures)
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Start shared test services (Postgres + Redis)
+        run: docker compose -f compose.test.yaml up -d
+      - name: Coverage report (lib unit tests only; integration tests stay in `nextest`)
+        run: cargo llvm-cov --lib --lcov --output-path lcov.info
+      - name: Stop shared test services
+        if: always()
+        run: docker compose -f compose.test.yaml down -v
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
+  miri:
+    name: miri
+    # Scoped miri leg (T4-4). Scheduled only: the interpreter is slow and
+    # nightly-only, so this never runs per-PR and never gates
+    # (`continue-on-error`). Nightly is confined to this job; the root
+    # `rust-toolchain.toml` stable pin is untouched.
+    # Scope is the sync unit tests of the dependency-free helpers, plus the
+    # sync subset of `jose::jar` (fetch-decode, request-URI-membership, and
+    # alg-rejection tests only — never the async `resolve` path).
+    # Explicitly excluded, per the header constraint: tokio (`#[tokio::test]`), sqlx, and redis
+    # (DPoP replay store, async claim paths), plus the argon2 KDF
+    # (`crypto::secret`, cost prohibitive under the interpreter) and the
+    # `ring`-backed modules (`crypto::field`, `crypto::totp`, whose C/asm
+    # calls Miri cannot interpret).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+        with:
+          components: miri
+      - name: Scoped miri run (sync crypto/JOSE helpers only)
+        env:
+          # Relaxed isolation for the first scheduled runs (wall-clock/env
+          # access); tighten in a follow-up once green.
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: >
+          cargo miri test --lib --
+          crypto::ct crypto::pkce crypto::tokens
+          jose::jar

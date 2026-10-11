@@ -171,3 +171,39 @@ correlation. No step below writes a secret to a log.
 - Do not relax the fail-closed policy to keep the security endpoints up.
 - Do not paste the leaked registration tokens, client secrets, or the pepper
   into a ticket, chat, or log.
+
+## 6. Deploy provenance (signed image + digest record)
+
+Every rollout ships the signed `ghcr.io/d-oauth/d-oauth-server` image the
+`supply-chain.yml` `build` job signed (step `Keyless sign (cosign, OIDC)`)
+and the `pin-digest` job pinned into `deploy/k8s/kustomization.yaml`
+(step `Pin kustomization to the built digest + strict lint`). Nothing ships
+from an unverified local tarball. The full path is in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#deploy-path-use-the-signed-ghcrio-image).
+
+- [ ] Read the digest the `pin-digest` job committed:
+  `grep -A2 'name: ghcr.io/d-oauth/d-oauth-server' deploy/k8s/kustomization.yaml`.
+- [ ] Verify it before applying (placeholder `sha256:<digest>` stands for the
+  value from the previous step; no real digest is recorded here):
+
+  ```sh
+  cosign verify \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp 'supply-chain' \
+    'ghcr.io/d-oauth/d-oauth-server@sha256:<digest>'
+  kustomize build deploy/k8s
+  python3 scripts/check_manifests.py --strict-digest
+  kubectl apply --dry-run=server -k deploy/k8s
+  kubectl apply -k deploy/k8s
+  ```
+
+- [ ] Record the rollout: the shipped `sha256:<digest>`, the `build` run that
+  produced the `sbom.spdx.json` artifact and `trivy.sarif`, and the
+  `cosign verify` result. A rollout with no matching record is unverified:
+  stop and re-verify.
+- [ ] Local-build fallback only (registry unreachable): build with
+  `docker buildx bake image --set image.platform=linux/amd64`, sign with
+  `cosign sign --key <local-key-ref>`, confirm with
+  `cosign verify --key <local-pub-ref>`, then record the local digest as an
+  explicitly local, non-`ghcr.io` deploy. Never
+  `docker save | docker load` an unsigned image onto a live host.

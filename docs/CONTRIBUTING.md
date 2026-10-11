@@ -102,6 +102,54 @@ spawns in-process `redis-test` Sentinel/Cluster fixtures, which need a real
 `testcontainers`. They need a working Docker daemon and, for the in-process
 topology fixtures, the `redis-server` binary.
 
+### Fuzzing
+
+Fuzz targets live in `fuzz/fuzz_targets/` (a standalone workspace under
+`fuzz/`, built only by the nightly leg — the root stable pin is untouched):
+
+| Target | Real entry point fuzzed |
+| --- | --- |
+| `token_form` | `crypto::tokens::TokenHash::parse_storage_string` |
+| `dcr_json` | `protocol::dcr::RegisterRequest` deserialization |
+| `jar_claims` | JWT-claims envelope shape + `jose::jar::require_par_or_jar` |
+| `dpop_proof` | `jose::jwk::{decoding_key, thumbprint}` (embedded-JWK gate) |
+| `jar_verify` | `protocol::client_auth::assertion::{unverified_iss, validate_assertion}` |
+| `redirect_uri` | `protocol::redirect_repo::match_redirect_uri` |
+| `scope_parse` | `protocol::scope::ScopeSet::{parse, render}` |
+
+Every target is small and hermetic (no network, Postgres, or Redis):
+signature verification that needs keys and replay claims that need the store
+stay under unit/proptest cover. Targets contain no `unwrap`/`expect`/`panic`/
+`unsafe`, so arbitrary input can only surface a genuine parser panic.
+
+```bash
+cd fuzz
+cargo fuzz build                       # every target must compile
+cargo fuzz run <target> -- -max_total_time=60 -rss_limit_mb=2048
+```
+
+Corpora persist across runs: `cargo fuzz run` reads and writes
+`fuzz/corpus/<target>/` (gitignored, but cached across CI runs by the
+`fuzz-run` leg), and crashes land in `fuzz/artifacts/<target>/`. To grow a
+local seed, drop an input in `fuzz/corpus/<target>/` and confirm the
+target still passes; keep seeds tiny and non-secret (never a real token, key,
+or password). Seeds stay local: `fuzz/.gitignore` excludes `corpus/`, so a
+seed is only shared by committing it with `git add -f` deliberately.
+
+Continuous coverage is ClusterFuzzLite (`.clusterfuzzlite/` plus
+`.github/workflows/cflite_pr.yml` for PRs and `cflite_batch.yml` for the
+daily batch run). One-time owner setup for Efren:
+
+1. Merge the `cflite_*.yml` workflows (PR fuzzing needs only the default
+   `GITHUB_TOKEN`).
+2. For batch fuzzing, follow the ClusterFuzzLite batch setup (Cloud Project +
+   filestore) at <https://google.github.io/clusterfuzzlite/> and point it at
+   this repository; no code change is needed — `.clusterfuzzlite/build.sh`
+   already builds every target.
+3. OSS-Fuzz enrollment (optional, stronger): propose the project at
+   <https://github.com/google/oss-fuzz> reusing the same `Dockerfile` and
+   `build.sh` layout.
+
 ## Module conventions
 
 The crate is one library (`src/lib.rs`) plus a thin binary (`src/main.rs`).

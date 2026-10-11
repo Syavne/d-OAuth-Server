@@ -13,6 +13,7 @@ state is in Redis, so replicas are interchangeable.
 
 - Protocol and deltas: [docs/OAUTH.md](docs/OAUTH.md)
 - Threat model and token design: [docs/SECURITY.md](docs/SECURITY.md)
+- Vulnerability reporting policy: [SECURITY.md](SECURITY.md)
 - Module layout and request flow: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Every configuration key: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
 - Schema and migrations: [docs/DATABASE.md](docs/DATABASE.md)

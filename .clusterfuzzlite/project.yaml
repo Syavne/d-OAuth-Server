@@ -1,0 +1,11 @@
+# ClusterFuzzLite project definition (T4-3).
+#
+# Continuous fuzzing for the cargo-fuzz targets under `fuzz/fuzz_targets/`.
+# The scheduled `fuzz-run` leg in `.github/workflows/ci.yml` stays as the
+# bounded fallback; this directory is what makes coverage continuous.
+# Owner step (needs no secret, but needs a repo owner): merging the
+# `cflite_*.yml` workflows is enough for PR fuzzing; batch (cron) fuzzing
+# additionally needs the Cloud Project dance in `docs/CONTRIBUTING.md`.
+language: rust
+sanitizers:
+  - address

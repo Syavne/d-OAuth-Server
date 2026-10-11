@@ -2,7 +2,9 @@
 
 This guide states the threat model, the token and key design, the sender
 constraint model, the fail-closed policy, and the admin replacement procedure.
-The implementation is the authority; the citations point at it.
+The implementation is the authority; the citations point at it. To report a
+vulnerability, see the separate [reporting policy](../SECURITY.md), not this
+guide.
 
 ## Purpose
 
@@ -58,7 +60,7 @@ class, or runtime setting).
 
 | Vector | Existing controls | Residual risk |
 | --- | --- | --- |
-| Application-level RCE in a parser (form bodies, DPoP/JAR/`private_key_jwt` JWTs, DCR JSON, `jwks_uri`/`request_uri` fetches) | `#![forbid(unsafe_code)]`, no `unwrap`/`panic` in request paths, rustls/ring (no OpenSSL), fuzz targets for token-form/DCR-JSON/JAR-claims | Fuzzing is not exhaustive. |
+| Application-level RCE in a parser (form bodies, DPoP/JAR/`private_key_jwt` JWTs, DCR JSON, `jwks_uri`/`request_uri` fetches) | `#![forbid(unsafe_code)]`, no `unwrap`/`panic` in request paths, rustls/ring (no OpenSSL), fuzz targets for token-form/DCR-JSON/JAR-claims plus DPoP-JWK/assertion-verify/redirect-URI/scope-parse, with continuous ClusterFuzzLite coverage (`.clusterfuzzlite/`, `cflite_*.yml`) | Fuzzing is not exhaustive. |
 | Dependency / supply-chain compromise | Committed `Cargo.lock`, `cargo deny`/`cargo audit` in CI, SBOM + provenance + keyless cosign, digest-pinned bases | A zero-day in a trusted crate. |
 | Container escape via kernel or runtime bug | Non-root UID 65532, read-only root filesystem, all capabilities dropped, `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault` | A kernel LPE or runc bug, mitigated but not eliminated. |
 | Secret exfiltration from the process environment | Secrets are injected at runtime, not baked into image layers; the pepper/TOTP/PII keys live outside the database; the Deployment mounts every secret — pepper, TOTP key, PII key, and the database/Redis passwords — as `0400` tmpfs files under `/run/secrets` (read through their `*_FILE` variables), and the passwordless DSNs come from the ConfigMap, so no secret enters the environment | An attacker with code execution can still read the mounted secret files under `/run/secrets`; that is the same capability the server has. |
@@ -67,12 +69,15 @@ class, or runtime setting).
 | Unrestricted pod egress (SSRF to metadata, exfiltration) | `networkpolicy.yaml` default-denies egress except DNS (53 to `kube-system`) and Postgres/Redis (5432/6379) scoped to the namespace hosting them — no internet-wide `0.0.0.0/0` peer; any `ipBlock` peer excludes `169.254.0.0/16`; ingress is limited to pod ports 8080/8081 | Enforcement depends on a NetworkPolicy-capable CNI; a cluster that ignores NetworkPolicy gets no benefit. A managed database outside the cluster needs a specific CIDR or a CNI FQDN policy. The default-deny also blocks the JAR `request_uri` HTTPS fetch — remote request objects are unsupported unless the deployment adds a scoped allowance (see `docs/DEPLOYMENT.md`). |
 | Operator `exec` into a running pod | No shell and a non-root, read-only-rootfs container limit what runs; every secret is a file the container user already reads, and no secret is in the environment | `pods/exec` (and `docker exec`) bypass the application's own authorization; restrict it with RBAC and audit it (`docs/OPERATIONS.md`). |
 | Kubernetes API access from the pod | `automountServiceAccountToken: false`; the binary never calls the API | A future feature that needs the API would have to re-enable it deliberately. |
-| Image/registry compromise | Digest pinning, cosign verification, and a committed digest reference with no shippable `:latest`; CI writes the signed build digest into `kustomization.yaml` | A registry compromise before the digest is recorded still ships; the pin step must run. |
+| Image/registry compromise | Digest pinning, keyless cosign signing in the `supply-chain.yml` `build` job (`Keyless sign (cosign, OIDC)`), verify-before-rollout with `cosign verify` on the pinned `ghcr.io/d-oauth/d-oauth-server@sha256:<digest>` (see `docs/DEPLOYMENT.md`), `pin-digest` writing the signed digest into `kustomization.yaml` with a `--strict-digest` lint, a committed digest reference with no shippable `:latest`, and a recorded digest per rollout in `RUNBOOK.md`; the local-build fallback still signs (`cosign sign`) and verifies (`cosign verify`) before loading | A registry compromise of an unpinned tag still ships if the operator skips the verify step; an unsigned `docker save \\| docker load` tarball bypasses every control, so it is forbidden except through the documented local sign/verify fallback. |
 | Rate-limit evasion via spoofed `X-Forwarded-For` behind an L7 proxy | Default-empty   `rate_limit.trusted_proxies` (headers ignored unless the TCP peer is an allowlisted proxy IP/CIDR); rightmost-untrusted selection; malformed headers fall back to the verified peer; attribution is bucket selection only, never authentication | An allowlist entry that is too broad (or a compromised proxy) attributes attacker-chosen IPs; keep entries to the proxy peers and never a `/0` (rejected at load). Proxies must emit bare IPs (no port/brackets/`unknown`); anything else is skipped, and only the rightmost 32 entries are considered. |
 
 Last reviewed: 2026-10-09. File-mounted DB/Redis passwords, digest pinning,
 NetworkPolicy, `automountServiceAccountToken: false`, and scheduled fuzzing are
-implemented in the shipped manifests and workflows.
+implemented in the shipped manifests and workflows. Deploy provenance is a
+documented verify-before-rollout path (`docs/DEPLOYMENT.md`, `RUNBOOK.md`):
+the signed `ghcr.io` image with `cosign verify` and a recorded digest, with
+local builds kept only as a signed fallback.
 
 ## Toplevel rules
 

@@ -495,16 +495,87 @@ on, see the TLS-terminating reverse proxy section above.
 
 ## Supply chain
 
-The image pipeline is gated on:
+The image pipeline lives in `.github/workflows/supply-chain.yml` and is gated
+on:
 
-- Multi-arch build with an SBOM and provenance attestation.
-- A vulnerability scan (`trivy` or `grype`) that fails on HIGH and CRITICAL.
-- Keyless signing with `cosign`.
-- Digest pinning, with a periodic rebuild so base digests advance.
+- Multi-arch build with an SBOM and provenance attestation (job `build`, step
+  `Multi-arch bake with SBOM + provenance`: `docker buildx bake image` with
+  `--sbom=true --provenance=mode=max`).
+- A vulnerability scan that fails on HIGH and CRITICAL (job `build`, steps
+  `Scan (trivy, gate HIGH/CRITICAL)` writing `trivy.sarif` and
+  `Scan (grype, gate high/critical)`; the SBOM is committed as the
+  `sbom.spdx.json` artifact by step `SBOM (syft, committed as artifact)`).
+- Keyless signing with `cosign` (job `build`, step
+  `Keyless sign (cosign, OIDC)`: `cosign sign` plus `cosign attest`).
+- Digest pinning (job `pin-digest`, step
+  `Pin kustomization to the built digest + strict lint`): the signed build
+  digest overwrites `images[].digest` in `deploy/k8s/kustomization.yaml`,
+  then re-runs `python3 scripts/check_manifests.py --strict-digest`, with a
+  periodic rebuild so base digests advance.
 - `cargo deny check` in CI, which enforces the ring-only TLS policy in
   `deny.toml`.
 - A per-PR fuzz build plus a scheduled bounded run of every fuzz target
   (`.github/workflows/ci.yml`); a crash uploads its artifact and fails the run.
+
+### Deploy path: use the signed `ghcr.io` image
+
+The only shippable artifact is the signed registry image, never a locally
+built tarball. Every rollout verifies provenance before applying anything,
+then records the exact digest it shipped:
+
+```bash
+# 1. Read the pinned digest the `pin-digest` job committed.
+grep -A2 'name: ghcr.io/d-oauth/d-oauth-server' deploy/k8s/kustomization.yaml
+
+# 2. Verify the keyless cosign signature from the `build` job's
+#    `Keyless sign (cosign, OIDC)` step before pulling or applying.
+#    Match the identity to the signing workflow; the placeholder below
+#    stands for the real digest from step 1 (no real digest is recorded here).
+cosign verify \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'supply-chain' \
+  'ghcr.io/d-oauth/d-oauth-server@sha256:<digest>'
+
+# 3. Confirm the manifests resolve to that digest and pass policy.
+kustomize build deploy/k8s
+python3 scripts/check_manifests.py --strict-digest
+
+# 4. Roll out (migration Job first; the Deployment readiness gate waits for it).
+kubectl apply --dry-run=server -k deploy/k8s
+kubectl apply -k deploy/k8s
+```
+
+Record the shipped `sha256:<digest>` in [RUNBOOK.md](../RUNBOOK.md)
+(deploy provenance entry: digest, `sbom.spdx.json` / `trivy.sarif` run, and
+the `cosign verify` result). A rollout with no matching record is an
+unverified deploy: stop and re-verify. `:latest` is never a shippable
+reference.
+
+### Fallback: local build (unsigned host, sign and verify locally)
+
+When the registry is unreachable, build locally with the same bake target the
+`build` job uses, sign with a local key, verify the signature, and only then
+load the image. Do not `docker save | docker load` an unsigned image onto a
+live host:
+
+```bash
+# 1. Build the same target CI signs.
+docker buildx bake image --set image.platform=linux/amd64
+docker images --digests d-oauth-server
+
+# 2. Sign the local digest and verify it before loading or running.
+#    (Keyless OIDC is unavailable off CI, so a local key stands in;
+#    keep the private key off the target host.)
+cosign sign --key <local-key-ref> 'd-oauth-server@sha256:<digest>'
+cosign verify --key <local-pub-ref> 'd-oauth-server@sha256:<digest>'
+
+# 3. Record the local `sha256:<digest>` and the verify result in RUNBOOK.md
+#    as an explicitly local, non-`ghcr.io` deploy.
+```
+
+Prefer the signed `ghcr.io` path for every production rollout; the fallback
+exists so an air-gapped host still gets a sign/verify step and a recorded
+digest, not an anonymous tarball.
 
 ## Security properties
 

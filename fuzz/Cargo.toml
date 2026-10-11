@@ -14,6 +14,7 @@ cargo-fuzz = true
 
 [dependencies]
 base64 = "0.23"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 libfuzzer-sys = "0.4"
 serde_json = "1"
 time = "0.3"
@@ -35,3 +36,19 @@ path = "fuzz_targets/dcr_json.rs"
 [[bin]]
 name = "jar_claims"
 path = "fuzz_targets/jar_claims.rs"
+
+[[bin]]
+name = "dpop_proof"
+path = "fuzz_targets/dpop_proof.rs"
+
+[[bin]]
+name = "jar_verify"
+path = "fuzz_targets/jar_verify.rs"
+
+[[bin]]
+name = "redirect_uri"
+path = "fuzz_targets/redirect_uri.rs"
+
+[[bin]]
+name = "scope_parse"
+path = "fuzz_targets/scope_parse.rs"

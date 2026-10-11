@@ -1,0 +1,36 @@
+# ClusterFuzzLite batch fuzzing (T4-3): continuous coverage of every target
+# in `fuzz/fuzz_targets/` on a schedule, independent of PRs. This is the leg
+# that discharges the `ci.yml` promise of continuous OSS-Fuzz/ClusterFuzzLite
+# coverage (see `docs/CONTRIBUTING.md` for the one-time owner setup).
+
+name: cflite-batch
+
+on:
+  schedule:
+    # Daily 04:00 UTC batch run; the weekly `fuzz-run` leg in `ci.yml`
+    # remains as the bounded fallback.
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  batch:
+    name: batch-fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          project-src-path: .
+      - name: Run fuzzers (batch, bounded)
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 3600
+          mode: "batch"
+          report-unreproducible-crashes: false

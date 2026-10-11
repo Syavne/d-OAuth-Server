@@ -1,0 +1,4 @@
+Contact: mailto:REPLACE-ME--security-contact@example.invalid
+Expires: 2027-12-31T00:00:00.000Z
+Preferred-Languages: en
+Policy: https://REPLACE-ME--server-origin.example.invalid/SECURITY.md
