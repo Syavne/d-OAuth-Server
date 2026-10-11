@@ -28,7 +28,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
   SQLX_OFFLINE=true \
   CARGO_INCREMENTAL=0 \
   CARGO_NET_RETRY=10
-RUN cargo install cargo-chef --locked --version 0.1.71 \
+RUN cargo install cargo-chef --locked --version 0.1.78 \
   && apt-get update \
   && apt-get install -y --no-install-recommends musl-tools \
   && rm -rf /var/lib/apt/lists/* \
