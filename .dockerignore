@@ -20,6 +20,7 @@ fuzz/build/
 fuzz/artifacts/
 scripts/__pycache__/
 target/
+.sccache/
 # NOTE: `build.sh` MUST stay in the context: `.clusterfuzzlite/Dockerfile`
 # copies it (`COPY .clusterfuzzlite/build.sh`) from this same context.
 .clusterfuzzlite/*

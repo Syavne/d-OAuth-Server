@@ -4,6 +4,7 @@
 .omo/
 .opencode/
 /target
+.sccache/
 __pycache__/
 scripts/__pycache__/
 lcov.info
