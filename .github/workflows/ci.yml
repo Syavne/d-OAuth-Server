@@ -42,6 +42,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
+  # Shared compilation cache (each compiling job below starts it via
+  # sccache-action, except `miri`: cargo-miri overrides RUSTC_WRAPPER
+  # itself). Incremental is useless on ephemeral runners, and disabling it
+  # maximizes cache hits.
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   fmt:
@@ -58,11 +64,17 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: clippy
+      - name: Start sccache (shared compilation cache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.18.0"
       - name: Clippy (all targets, warnings denied)
         run: cargo clippy --all-targets -- -D warnings
 
@@ -95,6 +107,8 @@ jobs:
   sqlx-prepare-check:
     name: sqlx-prepare-check
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
     services:
       postgres:
         image: postgres:16
@@ -112,6 +126,10 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Start sccache (shared compilation cache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.18.0"
       - name: Install sqlx-cli
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
@@ -139,9 +157,15 @@ jobs:
   nextest:
     name: nextest
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Start sccache (shared compilation cache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.18.0"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
@@ -159,15 +183,23 @@ jobs:
   doc-tests:
     name: doc-tests
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Start sccache (shared compilation cache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.18.0"
       - name: Documentation tests
         run: cargo test --doc
 
   fuzz-build:
     name: fuzz-build
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
     defaults:
       run:
         working-directory: fuzz
@@ -179,6 +211,10 @@ jobs:
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-fuzz
+      - name: Start sccache (shared compilation cache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.18.0"
       # Explicit gnu target: the prebuilt cargo-fuzz binary is musl-static,
       # so its default target is musl (ASan-incompatible, and musl std is
       # not installed). Never drop this flag without checking the default.
@@ -194,6 +230,8 @@ jobs:
     # `docs/CONTRIBUTING.md`); the remaining owner step is enabling it.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
     timeout-minutes: 70
     strategy:
       fail-fast: false
@@ -210,6 +248,10 @@ jobs:
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-fuzz
+      - name: Start sccache (shared compilation cache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.18.0"
       # `uses` steps resolve paths from the workspace root, not the job's
       # `working-directory`; keep the fuzz/ prefix explicit.
       - name: Restore corpus for ${{ matrix.target }}
@@ -244,10 +286,16 @@ jobs:
     # Scheduled budgeted job only: never blocks a PR.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Start sccache (shared compilation cache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.18.0"
       - name: Install cargo-mutants
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
@@ -264,12 +312,18 @@ jobs:
     # Follow-up: add a threshold and extend beyond `--lib` once
     # the first reports land.
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
     continue-on-error: true
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: llvm-tools-preview
+      - name: Start sccache (shared compilation cache)
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.18.0"
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
