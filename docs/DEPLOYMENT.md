@@ -59,8 +59,10 @@ IMAGE_TAGS="ghcr.io/syavne/d-oauth-server:v1.2.3,ghcr.io/syavne/d-oauth-server:l
   docker buildx bake image
 ```
 
-The release path in `.github/workflows/supply-chain.yml` drives this variable
-when a `v*` tag is pushed; see [Supply chain](#supply-chain).
+The CI release path does not use `IMAGE_TAGS` for its tag set: each build leg
+sets it to the image name and pushes that architecture by digest, and the
+`merge` job applies the release tags with `docker buildx imagetools create`;
+see [Supply chain](#supply-chain).
 
 Building `linux/arm64` on an amd64 host requires QEMU binfmt emulation. Docker
 Desktop bundles it; a bare Docker Engine does not. When it is missing, the arm64
@@ -513,24 +515,29 @@ on, see the TLS-terminating reverse proxy section above.
 The image pipeline lives in `.github/workflows/supply-chain.yml` and is gated
 on:
 
-- Multi-arch build with an SBOM and provenance attestation (job `build`, step
-  `Multi-arch bake with SBOM + provenance`: `docker buildx bake image` with
-  `--sbom=true --provenance=mode=max`).
-- Release publishing on a `v*` tag (job `build`, then job `release`): the same
-  signed multi-arch image is tagged `<X.Y.Z>`, `<X.Y>`, `<X>`, and `latest` (a
-  pre-release such as `v1.2.3-rc1` gets only `<X.Y.Z>` plus its sha), and a
+- Multi-arch build with SBOM and provenance (job `build`): each architecture is
+  built on a **native** runner (`linux/amd64` on `ubuntu-24.04`, `linux/arm64`
+  on `ubuntu-24.04-arm`, no QEMU) and pushed by digest with `--sbom=true
+  --provenance=mode=max`; job `merge` then assembles the multi-arch manifest
+  with `docker buildx imagetools create`. The per-arch attestations attach to
+  each platform manifest; the merged index itself carries no attestation.
+- Release publishing on a `v*` tag (jobs `build` + `merge`, then job `release`):
+  the merged multi-arch image is tagged `<X.Y.Z>`, `<X.Y>`, `<X>`, and `latest`
+  (a pre-release such as `v1.2.3-rc1` gets only `<X.Y.Z>` plus its sha), and a
   GitHub Release is created with generated notes. These tags are convenience
   references only; a production rollout still pins the digest (see
   [Deploy path](#deploy-path-use-the-signed-ghcrio-image)). `pin-digest` runs
   only on master/scheduled builds, never on a tag.
-- A vulnerability scan that fails on HIGH and CRITICAL (job `build`, steps
+- A vulnerability scan that fails on HIGH and CRITICAL (job `merge`, steps
   `Scan (trivy, gate HIGH/CRITICAL)` writing `trivy.sarif` and
   `Scan (grype, gate high/critical)`; the SBOM is committed as the
   `sbom.spdx.json` artifact by step `SBOM (syft, committed as artifact)`).
-- Keyless signing with `cosign` (job `build`, step
-  `Keyless sign (cosign, OIDC)`: `cosign sign` plus `cosign attest`).
+- Keyless signing with `cosign` (job `merge`, step
+  `Keyless sign (cosign, OIDC)`: `cosign sign` on the merged index digest; the
+  per-arch SBOM and SLSA provenance attestations are attached by the `build`
+  legs).
 - Digest pinning (job `pin-digest`, step
-  `Pin kustomization to the built digest + strict lint`): the signed build
+  `Pin kustomization to the built digest + strict lint`): the signed merge
   digest overwrites `images[].digest` in `deploy/k8s/kustomization.yaml`,
   then re-runs `python3 scripts/check_manifests.py --strict-digest`, with a
   periodic rebuild so base digests advance.
@@ -549,7 +556,7 @@ then records the exact digest it shipped:
 # 1. Read the pinned digest the `pin-digest` job committed.
 grep -A2 'name: ghcr.io/syavne/d-oauth-server' deploy/k8s/kustomization.yaml
 
-# 2. Verify the keyless cosign signature from the `build` job's
+# 2. Verify the keyless cosign signature from the `merge` job's
 #    `Keyless sign (cosign, OIDC)` step before pulling or applying.
 #    Match the identity to the signing workflow; the placeholder below
 #    stands for the real digest from step 1 (no real digest is recorded here).
@@ -662,10 +669,12 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
 - `deny.toml` for the supply-chain policy.
 - `RUNBOOK.md` for the admin bootstrap Job.
 - `.github/workflows/ci.yml` for the quality and documentation gates.
-- `.github/workflows/supply-chain.yml` for the image pipeline: multi-arch
-  bake with SBOM + provenance, trivy/grype HIGH/CRITICAL gates, keyless
-  cosign signing, digest pinning of `deploy/k8s/kustomization.yaml`, and the
-  weekly rebuild.
+- `.github/workflows/supply-chain.yml` for the image pipeline: per-arch native
+  build (linux/amd64 on `ubuntu-24.04`, linux/arm64 on `ubuntu-24.04-arm`) with
+  SBOM + provenance, a `merge` job that assembles the multi-arch manifest
+  (`docker buildx imagetools create`) and runs the trivy/grype HIGH/CRITICAL
+  gates plus keyless cosign signing, digest pinning of
+  `deploy/k8s/kustomization.yaml`, and the weekly rebuild.
 - `deploy/k8s/` for the cluster manifests: `namespace.yaml`, `configmap.yaml`
   (non-secret settings only, including the passwordless DSNs), `secret.yaml`
   (placeholder secrets — pepper, TOTP key, PII key, database and Redis

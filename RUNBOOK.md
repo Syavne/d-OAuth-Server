@@ -175,7 +175,7 @@ correlation. No step below writes a secret to a log.
 ## 6. Deploy provenance (signed image + digest record)
 
 Every rollout ships the signed `ghcr.io/syavne/d-oauth-server` image the
-`supply-chain.yml` `build` job signed (step `Keyless sign (cosign, OIDC)`)
+`supply-chain.yml` `merge` job signed (step `Keyless sign (cosign, OIDC)`)
 and the `pin-digest` job pinned into `deploy/k8s/kustomization.yaml`
 (step `Pin kustomization to the built digest + strict lint`). Nothing ships
 from an unverified local tarball. The full path is in

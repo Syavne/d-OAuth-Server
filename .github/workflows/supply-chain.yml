@@ -2,13 +2,16 @@
 #
 # Per-PR legs: `manifest-lint` (kustomize build + scripts/check_manifests.py,
 # including the L7-vs-L4 mTLS pairing check).
-# Per-push-to-master legs: multi-arch `docker buildx bake` with SBOM +
-# provenance, trivy/grype gating HIGH/CRITICAL, keyless cosign signing, and
-# digest pinning of `deploy/k8s/kustomization.yaml` (strict lint re-run).
-# Release tags (`v*`): the same signed multi-arch build is published under
-# semver tags (X.Y.Z, X.Y, X, `latest`; a pre-release tag gets only X.Y.Z) and
-# a GitHub Release is created. `pin-digest` does not run on a tag (it tracks
-# master).
+# Per-push-to-master legs: the image is built per-arch on native runners
+# (`build` matrix: linux/amd64 on ubuntu-24.04, linux/arm64 on ubuntu-24.04-arm,
+# no QEMU), each pushed by digest with SBOM + provenance; the `merge` job then
+# assembles the multi-arch manifest (`imagetools create`), scans it
+# (trivy/grype gate HIGH/CRITICAL, syft SBOM artifact), keyless-signs the index
+# with cosign, and `pin-digest` writes the index digest into
+# `deploy/k8s/kustomization.yaml` (strict lint re-run).
+# Release tags (`v*`): the merged multi-arch image is published under semver
+# tags (X.Y.Z, X.Y, X, `latest`; a pre-release tag gets only X.Y.Z) and a GitHub
+# Release is created. `pin-digest` does not run on a tag (it tracks master).
 # Scheduled legs (weekly rebuild, Monday 04:00 UTC): rebuild + rescan + resign
 # so base-image digests advance even without code changes.
 #
@@ -54,7 +57,59 @@ jobs:
         run: python3 scripts/check_manifests.py
 
   build:
-    name: build
+    name: build (${{ matrix.arch }})
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build ${{ matrix.arch }} natively and push by digest
+        id: bake
+        run: |
+          set -euo pipefail
+          IMAGE_TAGS="${REGISTRY_IMAGE}" docker buildx bake image \
+            --set "image.platform=${{ matrix.platform }}" \
+            --set "image.output=type=image,push=true,push-by-digest=true,name-canonical=true" \
+            --sbom=true \
+            --provenance=mode=max \
+            --metadata-file /tmp/bake-metadata.json
+          digest=$(python3 -c "
+          import json
+          meta = json.load(open('/tmp/bake-metadata.json'))
+          print(meta['image']['containerimage.digest'])
+          ")
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+      - name: Upload ${{ matrix.arch }} digest
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge
+    needs: [build]
     if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
@@ -62,18 +117,22 @@ jobs:
       packages: write
       id-token: write
     outputs:
-      digest: ${{ steps.bake.outputs.digest }}
+      digest: ${{ steps.merge.outputs.digest }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Multi-arch bake with SBOM + provenance
-        id: bake
+      - name: Download per-arch digests
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Resolve publish tags
+        id: tags
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
@@ -93,26 +152,28 @@ jobs:
             tags="${REGISTRY_IMAGE}:sha-${GITHUB_SHA::12}"
           fi
           echo "tags=${tags}" >> "${GITHUB_OUTPUT}"
-          IMAGE_TAGS="${tags}" docker buildx bake image \
-            --set image.output="type=registry" \
-            --sbom=true \
-            --provenance=mode=max \
-            --metadata-file /tmp/bake-metadata.json
-          python3 -c "
-          import json
-          meta = json.load(open('/tmp/bake-metadata.json'))
-          node = meta['image']['containerimage.digest']
-          open('${GITHUB_OUTPUT}', 'a').write(f'digest={node}\n')
-          "
+      - name: Create multi-arch manifest (imagetools create)
+        id: merge
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          tag_args=()
+          IFS=',' read -ra tags <<< "${{ steps.tags.outputs.tags }}"
+          for tag in "${tags[@]}"; do tag_args+=(-t "${tag}"); done
+          docker buildx imagetools create "${tag_args[@]}" \
+            $(printf "${REGISTRY_IMAGE}@sha256:%s " *)
+          digest=$(docker buildx imagetools inspect "${tags[0]}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
       - name: SBOM (syft, committed as artifact)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          image: ${{ env.REGISTRY_IMAGE }}@${{ steps.bake.outputs.digest }}
+          image: ${{ env.REGISTRY_IMAGE }}@${{ steps.merge.outputs.digest }}
           artifact-name: sbom.spdx.json
       - name: Scan (trivy, gate HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
         with:
-          image-ref: ${{ env.REGISTRY_IMAGE }}@${{ steps.bake.outputs.digest }}
+          image-ref: ${{ env.REGISTRY_IMAGE }}@${{ steps.merge.outputs.digest }}
           format: sarif
           output: trivy.sarif
           severity: HIGH,CRITICAL
@@ -120,7 +181,7 @@ jobs:
       - name: Scan (grype, gate high/critical)
         uses: anchore/scan-action@64a33b277ea7a1215a3c142735a1091341939ff5 # v4
         with:
-          image: ${{ env.REGISTRY_IMAGE }}@${{ steps.bake.outputs.digest }}
+          image: ${{ env.REGISTRY_IMAGE }}@${{ steps.merge.outputs.digest }}
           fail-build: true
           severity-cutoff: high
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
@@ -128,13 +189,11 @@ jobs:
         env:
           COSIGN_YES: "true"
         run: |
-          cosign sign "${REGISTRY_IMAGE}@${{ steps.bake.outputs.digest }}"
-          cosign attest --predicate /tmp/bake-metadata.json \
-            "${REGISTRY_IMAGE}@${{ steps.bake.outputs.digest }}"
+          cosign sign "${REGISTRY_IMAGE}@${{ steps.merge.outputs.digest }}"
 
   pin-digest:
     name: pin-digest
-    needs: [build]
+    needs: [merge]
     # Only master/scheduled builds advance the committed digest; a release tag
     # must not rewrite kustomization.
     if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
@@ -146,7 +205,7 @@ jobs:
           python-version: "3.x"
       - name: Pin kustomization to the built digest + strict lint
         env:
-          DIGEST: ${{ needs.build.outputs.digest }}
+          DIGEST: ${{ needs.merge.outputs.digest }}
         run: |
           pip install pyyaml
           python3 - "${DIGEST}" <<'EOF'
@@ -167,7 +226,7 @@ jobs:
 
   release:
     name: release
-    needs: [build]
+    needs: [merge]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -177,7 +236,7 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DIGEST: ${{ needs.build.outputs.digest }}
+          DIGEST: ${{ needs.merge.outputs.digest }}
         run: |
           flags=()
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
