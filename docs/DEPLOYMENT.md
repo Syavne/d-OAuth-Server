@@ -521,10 +521,11 @@ on:
   --provenance=mode=max`; job `merge` then assembles the multi-arch manifest
   with `docker buildx imagetools create`. The per-arch attestations attach to
   each platform manifest; the merged index itself carries no attestation.
-- Release publishing on a `v*` tag (jobs `build` + `merge`, then job `release`):
-  the merged multi-arch image is tagged `<X.Y.Z>`, `<X.Y>`, `<X>`, and `latest`
-  (a pre-release such as `v1.2.3-rc1` gets only `<X.Y.Z>` plus its sha), and a
-  GitHub Release is created with generated notes. These tags are convenience
+- Publishing: every push to master (and the weekly scheduled rebuild) moves the
+  mutable `latest` tag; a `v*` tag (jobs `build` + `merge`, then job `release`)
+  publishes `<X.Y.Z>`, `<X.Y>`, `<X>`, and `latest`, and creates a GitHub
+  Release with generated notes (a pre-release such as `v1.2.3-rc1` gets only
+  `<X.Y.Z>`). No `sha-<commit>` tags are published. These tags are convenience
   references only; a production rollout still pins the digest (see
   [Deploy path](#deploy-path-use-the-signed-ghcrio-image)). `pin-digest` runs
   only on master/scheduled builds, never on a tag.

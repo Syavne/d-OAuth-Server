@@ -5,13 +5,15 @@
 # Per-push-to-master legs: the image is built per-arch on native runners
 # (`build` matrix: linux/amd64 on ubuntu-24.04, linux/arm64 on ubuntu-24.04-arm,
 # no QEMU), each pushed by digest with SBOM + provenance; the `merge` job then
-# assembles the multi-arch manifest (`imagetools create`), scans it
-# (trivy/grype gate HIGH/CRITICAL, syft SBOM artifact), keyless-signs the index
-# with cosign, and `pin-digest` writes the index digest into
-# `deploy/k8s/kustomization.yaml` (strict lint re-run).
+# assembles the multi-arch manifest (`imagetools create`), publishes it under
+# the mutable `latest` tag, scans it (trivy/grype gate HIGH/CRITICAL, syft SBOM
+# artifact), keyless-signs the index with cosign, and `pin-digest` writes the
+# index digest into `deploy/k8s/kustomization.yaml` (strict lint re-run).
 # Release tags (`v*`): the merged multi-arch image is published under semver
 # tags (X.Y.Z, X.Y, X, `latest`; a pre-release tag gets only X.Y.Z) and a GitHub
 # Release is created. `pin-digest` does not run on a tag (it tracks master).
+# No `sha-<commit>` tag is published: a master push only moves `latest`, and
+# GHCR keeps the superseded (now-untagged) manifests until they are pruned.
 # Scheduled legs (weekly rebuild, Monday 04:00 UTC): rebuild + rescan + resign
 # so base-image digests advance even without code changes.
 #
@@ -148,9 +150,8 @@ jobs:
               minor="${version#*.}"; minor="${minor%%.*}"
               tags+=",${REGISTRY_IMAGE}:${major}.${minor},${REGISTRY_IMAGE}:${major},${REGISTRY_IMAGE}:latest"
             fi
-            tags+=",${REGISTRY_IMAGE}:sha-${GITHUB_SHA::12}"
           else
-            tags="${REGISTRY_IMAGE}:sha-${GITHUB_SHA::12}"
+            tags="${REGISTRY_IMAGE}:latest"
           fi
           echo "tags=${tags}" >> "${GITHUB_OUTPUT}"
       - name: Create multi-arch manifest (imagetools create)
