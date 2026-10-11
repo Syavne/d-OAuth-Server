@@ -713,7 +713,7 @@ mod put_member_tests {
   /// shortens the set TTL.
   #[tokio::test]
   async fn put_member_writes_record_and_index_atomically() -> TestResult {
-    let container = GenericImage::new("redis", "7.2-alpine")
+    let container = GenericImage::new("redis", "8-alpine")
       .with_exposed_port(6379.tcp())
       .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
       .with_cmd(vec!["redis-server", "--appendonly", "yes"])

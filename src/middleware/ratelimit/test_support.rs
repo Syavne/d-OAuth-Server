@@ -50,7 +50,7 @@ impl Service<Request<Body>> for Passthrough {
 ///
 /// The guard removes the container synchronously when the test drops it.
 pub(super) async fn redis_container() -> Result<(ContainerGuard, String), Box<dyn Error>> {
-  let container = GenericImage::new("redis", "7.2-alpine")
+  let container = GenericImage::new("redis", "8-alpine")
     .with_exposed_port(6379.tcp())
     .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
     .with_cmd(["redis-server", "--appendonly", "yes"])

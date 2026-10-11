@@ -27,8 +27,8 @@ state is in Redis, so replicas are interchangeable.
 ## Prerequisites
 
 - Rust stable, as pinned by `rust-toolchain.toml`.
-- PostgreSQL 14 or newer with the `citext` extension available.
-- Redis 7.2 or newer, with persistence enabled and eviction off.
+- PostgreSQL 18 or newer with the `citext` extension available.
+- Redis 8 or newer, with persistence enabled and eviction off.
 - A TLS certificate and key for the public listener.
 - Docker, for the container image, for the shared test Postgres and Redis in
   `compose.test.yaml`, and for the tests that still use testcontainers (the

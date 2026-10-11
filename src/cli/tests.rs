@@ -1088,7 +1088,7 @@ async fn admin_bootstrap_generated_password_is_256_bit_and_unlogged() -> Result<
 #[tokio::test]
 async fn admin_bootstrap_first_login_restricted_until_rotation() -> Result<(), TestError> {
   let (_db, pool, config) = bootstrap_setup("redis://127.0.0.1:9").await?;
-  let container = GenericImage::new("redis", "7.2-alpine")
+  let container = GenericImage::new("redis", "8-alpine")
     .with_exposed_port(6379.tcp())
     .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
     .with_cmd(vec!["redis-server", "--appendonly", "yes"])

@@ -1,6 +1,6 @@
 //! `test(token_service)` suite: mint, hash-store, sender-constraint matrix.
 //!
-//! Shared Redis 7.2 container (AOF on) plus per-test connections; unique
+//! Shared Redis 8 container (AOF on) plus per-test connections; unique
 //! grant/client labels keep the shared keyspace collision-free.
 
 mod matrix;
@@ -56,7 +56,7 @@ enum TestError {
   Unexpected(String),
 }
 
-/// One shared Redis 7.2 container for the whole suite.
+/// One shared Redis 8 container for the whole suite.
 static REDIS: Shared<ContainerGuard> = Shared::new();
 
 /// Fresh connection plus store handle against the shared container.
@@ -65,7 +65,7 @@ static REDIS: Shared<ContainerGuard> = Shared::new();
 async fn test_redis() -> Result<(Lease<ContainerGuard>, RedisConn, Store), TestError> {
   let container = REDIS
     .lease::<TestError>(async {
-      let started = GenericImage::new("redis", "7.2-alpine")
+      let started = GenericImage::new("redis", "8-alpine")
         .with_exposed_port(6379.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
         .with_cmd(["redis-server", "--appendonly", "yes"])

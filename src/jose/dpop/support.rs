@@ -65,7 +65,7 @@ pub(super) const TEST_HTM: &str = "POST";
 /// URI every test proof is bound to.
 pub(super) const TEST_HTU: &str = "https://as.example.test/token";
 
-/// One shared Redis 7.2 container for the whole `dpop` suite.
+/// One shared Redis 8 container for the whole `dpop` suite.
 ///
 /// The slot holds a [`ContainerGuard`], so the last test releasing it removes
 /// the container synchronously instead of orphaning it at process exit.
@@ -81,7 +81,7 @@ static REDIS: Shared<ContainerGuard> = Shared::new();
 pub(super) async fn test_redis() -> Result<(Lease<ContainerGuard>, RedisConn, Store), TestError> {
   let container = REDIS
     .lease::<TestError>(async {
-      let started = GenericImage::new("redis", "7.2-alpine")
+      let started = GenericImage::new("redis", "8-alpine")
         .with_exposed_port(6379.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
         .with_cmd(["redis-server", "--appendonly", "yes"])

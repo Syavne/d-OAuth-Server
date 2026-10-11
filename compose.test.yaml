@@ -20,7 +20,7 @@ name: d-oauth-test
 
 services:
   test-db:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_PASSWORD: oauth-test-only
     ports:
@@ -32,7 +32,7 @@ services:
       retries: 20
 
   test-redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     # Mirrors the server's durability contract: AOF on, eviction off.
     command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
     ports:

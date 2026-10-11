@@ -1,7 +1,7 @@
 //! Shared testcontainers scaffolding for the `test(health)` suite.
 //!
-//! Postgres and Redis run from locally cached images (`postgres:16-alpine`,
-//! `redis:7.2-alpine`); no pulls, no `redis-server` binary needed.
+//! Postgres and Redis run from locally cached images (`postgres:18-alpine`,
+//! `redis:8-alpine`); no pulls, no `redis-server` binary needed.
 //! Sentinel and Cluster topologies talk over container bridge IPs, which are
 //! directly routable from the Linux host, so Sentinel-advertised and
 //! cluster-gossiped addresses stay valid without port-mapping tricks.
@@ -32,7 +32,7 @@ pub type TestResult = Result<(), TestError>;
 ///
 /// The guard removes the container synchronously when the test drops it.
 pub async fn postgres_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("postgres", "16-alpine")
+  let container = GenericImage::new("postgres", "18-alpine")
     .with_exposed_port(5432.tcp())
     .with_wait_for(WaitFor::message_on_stderr(
       "database system is ready to accept connections",
@@ -65,7 +65,7 @@ pub async fn redis_single_container(
     ],
     None => vec!["redis-server", "--appendonly", "yes"],
   };
-  let container = GenericImage::new("redis", "7.2-alpine")
+  let container = GenericImage::new("redis", "8-alpine")
     .with_exposed_port(6379.tcp())
     .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
     .with_cmd(args)

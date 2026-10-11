@@ -310,9 +310,9 @@ mod tests {
     }
   }
 
-  /// Start a single-node Redis 7.2 with AOF on.
+  /// Start a single-node Redis 8 with AOF on.
   async fn redis_container() -> Result<(ContainerGuard, String), TestError> {
-    let container = GenericImage::new("redis", "7.2-alpine")
+    let container = GenericImage::new("redis", "8-alpine")
       .with_exposed_port(6379.tcp())
       .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
       .with_cmd(vec!["redis-server", "--appendonly", "yes"])

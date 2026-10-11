@@ -338,7 +338,7 @@ mod tests {
 
   async fn harness() -> Result<(ContainerGuard, RedisConn, Store), TestError> {
     let n = NONCE.fetch_add(1, Ordering::Relaxed);
-    let container = GenericImage::new("redis", "7.2-alpine")
+    let container = GenericImage::new("redis", "8-alpine")
       .with_exposed_port(6379.tcp())
       .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
       .with_cmd(["redis-server", "--appendonly", "yes"])

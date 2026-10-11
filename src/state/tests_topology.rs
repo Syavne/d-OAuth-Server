@@ -157,7 +157,7 @@ async fn health_redis_single_password_userinfo_url_connects() -> TestResult {
 /// Returns the guards plus the sentinel bridge address.
 async fn sentinel_pair() -> Result<(ContainerGuard, ContainerGuard, String), TestError> {
   let master = ContainerGuard::new(
-    GenericImage::new("redis", "7.2-alpine")
+    GenericImage::new("redis", "8-alpine")
       .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
       .with_cmd(["redis-server", "--port", "6379", "--appendonly", "yes"])
       .start()
@@ -173,7 +173,7 @@ async fn sentinel_pair() -> Result<(ContainerGuard, ContainerGuard, String), Tes
     "printf '%s' '{sentinel_conf}' > /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"
   );
   let sentinel = ContainerGuard::new(
-    GenericImage::new("redis", "7.2-alpine")
+    GenericImage::new("redis", "8-alpine")
       .with_wait_for(WaitFor::message_on_stdout("+monitor master"))
       .with_cmd(vec!["sh".to_owned(), "-c".to_owned(), script])
       .start()
@@ -214,7 +214,7 @@ async fn health_ready_sentinel_reports_ready() -> TestResult {
 /// gossips an empty address), assign all slots, meet self.
 async fn clustered_container() -> Result<(ContainerGuard, String), TestError> {
   let node = ContainerGuard::new(
-    GenericImage::new("redis", "7.2-alpine")
+    GenericImage::new("redis", "8-alpine")
       .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
       .with_cmd([
         "redis-server",

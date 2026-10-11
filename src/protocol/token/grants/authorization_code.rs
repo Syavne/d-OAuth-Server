@@ -424,7 +424,7 @@ async fn authenticate_confidential(
 mod tests {
   //! `test(grant_code)` suite: happy paths, single-use, and binding checks.
   //!
-  //! Live Postgres (client registry) plus a per-test Redis 7.2 container.
+  //! Live Postgres (client registry) plus a per-test Redis 8 container.
   //! Codes are issued through [`crate::protocol::code::CodeIssuer`] so the
   //! keyed-hash path is exercised end to end; every negative test issues a
   //! fresh code because redemption consumes exactly once.
@@ -539,7 +539,7 @@ mod tests {
     let (db, pool) = crate::db::test_support::migrated_pool()
       .await
       .map_err(|error| TestError::Unexpected(format!("pg: {error}")))?;
-    let container = GenericImage::new("redis", "7.2-alpine")
+    let container = GenericImage::new("redis", "8-alpine")
       .with_exposed_port(6379.tcp())
       .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
       .with_cmd(["redis-server", "--appendonly", "yes"])

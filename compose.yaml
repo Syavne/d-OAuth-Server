@@ -34,7 +34,7 @@ name: d-oauth
 
 services:
   db:
-    image: postgres:16
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: oauth
       POSTGRES_PASSWORD: oauth-dev-only
@@ -48,7 +48,7 @@ services:
       retries: 20
 
   redis:
-    image: redis:7
+    image: redis:8-alpine
     # The server asserts this contract at startup: noeviction + AOF.
     command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
     volumes:

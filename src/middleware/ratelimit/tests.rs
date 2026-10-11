@@ -1,6 +1,6 @@
 //! `test(ratelimit)` suite: fixed-window enforcement against real Redis.
 //!
-//! Each test owns a throwaway `redis:7.2-alpine` container (AOF on), so
+//! Each test owns a throwaway `redis:8-alpine` container (AOF on), so
 //! counter keys never leak across tests. Fixtures live in [`super::test_support`].
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};

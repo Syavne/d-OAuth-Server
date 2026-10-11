@@ -172,7 +172,7 @@ async fn build() -> Result<Harness, TestError> {
 }
 
 pub(crate) async fn postgres_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("postgres", "16-alpine")
+  let container = GenericImage::new("postgres", "18-alpine")
     .with_exposed_port(5432.tcp())
     .with_wait_for(WaitFor::message_on_stderr(
       "database system is ready to accept connections",
@@ -190,7 +190,7 @@ pub(crate) async fn postgres_container() -> Result<(ContainerGuard, String), Tes
 }
 
 async fn redis_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("redis", "7.2-alpine")
+  let container = GenericImage::new("redis", "8-alpine")
     .with_exposed_port(6379.tcp())
     .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
     .with_cmd(vec!["redis-server", "--appendonly", "yes"])

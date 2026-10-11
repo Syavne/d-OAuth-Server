@@ -22,7 +22,7 @@ use crate::{
 /// and the current pair stays live.
 #[tokio::test]
 async fn grant_refresh_failover_no_double_rotation() -> TestResult {
-  let container = GenericImage::new("redis", "7.2-alpine")
+  let container = GenericImage::new("redis", "8-alpine")
     .with_exposed_port(6379.tcp())
     .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
     .with_cmd([

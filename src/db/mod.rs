@@ -15,7 +15,7 @@ pub use redirect_repo::{NewRedirectUri, RedirectKind, RedirectUri, UpsertOutcome
 
 /// Test-only scaffolding shared by the repository suites.
 ///
-/// One `postgres:16-alpine` container is started lazily and reused by every test
+/// One `postgres:18-alpine` container is started lazily and reused by every test
 /// in the lib test binary; each test gets a freshly created database with all
 /// embedded migrations applied, so parallel tests stay isolated at one
 /// container cost. Integration tests under `tests/` cannot reach this
@@ -54,7 +54,7 @@ pub(crate) mod test_support {
   /// dropping the last lease removes the shared container deterministically.
   async fn shared_db() -> Result<Lease<Db>, TestError> {
     DB.lease::<TestError>(async {
-      let container = GenericImage::new("postgres", "16-alpine")
+      let container = GenericImage::new("postgres", "18-alpine")
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
           "database system is ready to accept connections",

@@ -1,6 +1,6 @@
 //! `test(revoke)` suite: ownership-scoped revocation and grant cascade.
 //!
-//! A shared Redis 7.2 container (AOF on) backs the token/grant stores; unique
+//! A shared Redis 8 container (AOF on) backs the token/grant stores; unique
 //! grant/client labels keep the keyspace collision-free. Authentication-scoped
 //! behaviour that needs no database is exercised against a lazy Postgres pool
 //! that is never dialed.
@@ -74,14 +74,14 @@ enum TestError {
   Unexpected(String),
 }
 
-/// One shared Redis 7.2 container for the whole suite.
+/// One shared Redis 8 container for the whole suite.
 static REDIS: Shared<ContainerGuard> = Shared::new();
 
 /// Fresh connection plus store handle against the shared container.
 async fn test_redis() -> Result<(Lease<ContainerGuard>, RedisConn, Store), TestError> {
   let container = REDIS
     .lease::<TestError>(async {
-      let started = GenericImage::new("redis", "7.2-alpine")
+      let started = GenericImage::new("redis", "8-alpine")
         .with_exposed_port(6379.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
         .with_cmd(["redis-server", "--appendonly", "yes"])

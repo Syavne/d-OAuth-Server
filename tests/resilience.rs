@@ -75,7 +75,7 @@ fn pg_url_for(port: u16) -> String {
 
 /// Start Postgres and return the guard plus a plaintext URL.
 async fn postgres_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("postgres", "16-alpine")
+  let container = GenericImage::new("postgres", "18-alpine")
     .with_exposed_port(5432.tcp())
     .with_wait_for(WaitFor::message_on_stderr(
       "database system is ready to accept connections",
@@ -98,7 +98,7 @@ async fn postgres_container() -> Result<(ContainerGuard, String), TestError> {
 /// its reply, so the `WAITAOF` barrier (and the SIGKILL test below) exercises
 /// real fsync durability instead of the `everysec` background window.
 async fn redis_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("redis", "7.2-alpine")
+  let container = GenericImage::new("redis", "8-alpine")
     .with_exposed_port(6379.tcp())
     .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
     .with_cmd(vec![

@@ -1,6 +1,6 @@
 //! `test(store)` suite: atomic Lua, tombstones, grant index, durability.
 //!
-//! Every test here spins its own single-node Redis 7.2 container with AOF
+//! Every test here spins its own single-node Redis 8 container with AOF
 //! enabled (mirroring `state::test_support`), so persistence, barriers, and
 //! concurrent compare-and-set run against a real server.
 
@@ -65,7 +65,7 @@ fn unique(label: &str) -> String {
 async fn redis_container(extra: Vec<&str>) -> Result<(ContainerGuard, String), TestError> {
   let mut args = vec!["redis-server", "--appendonly", "yes"];
   args.extend(extra);
-  let container = GenericImage::new("redis", "7.2-alpine")
+  let container = GenericImage::new("redis", "8-alpine")
     .with_exposed_port(6379.tcp())
     .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
     .with_cmd(args)
