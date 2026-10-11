@@ -529,6 +529,9 @@ on:
   references only; a production rollout still pins the digest (see
   [Deploy path](#deploy-path-use-the-signed-ghcrio-image)). `pin-digest` runs
   only on master/scheduled builds, never on a tag.
+- Registry cleanup (job `cleanup`, weekly + manual): GHCR has no retention and
+  keeps superseded manifests as untagged versions, so the job deletes untagged
+  manifests and the legacy `sha-*` tags, keeping `latest` and every release tag.
 - A vulnerability scan that fails on HIGH and CRITICAL (job `merge`, steps
   `Scan (trivy, gate HIGH/CRITICAL)` writing `trivy.sarif` and
   `Scan (grype, gate high/critical)`), plus step

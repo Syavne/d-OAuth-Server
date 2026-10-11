@@ -15,7 +15,8 @@
 # No `sha-<commit>` tag is published: a master push only moves `latest`, and
 # GHCR keeps the superseded (now-untagged) manifests until they are pruned.
 # Scheduled legs (weekly rebuild, Monday 04:00 UTC): rebuild + rescan + resign
-# so base-image digests advance even without code changes.
+# (advancing base-image digests), and `cleanup` prunes superseded untagged
+# manifests and the legacy `sha-*` tags, keeping `latest` and release tags.
 #
 # The L7 mTLS constraint is DOCUMENTED (docs/DEPLOYMENT.md) and lint-checked
 # here; it is explicitly NOT exercised end-to-end in CI.
@@ -273,3 +274,24 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             "${flags[@]}" \
             --notes "Container image \`${REGISTRY_IMAGE}@${DIGEST}\` (linux/amd64 + linux/arm64), signed with cosign; the SBOM and provenance attestations are attached to the image."
+
+  cleanup:
+    name: cleanup
+    needs: [merge]
+    # GHCR has no retention and keeps untagged manifests, so every `latest` move
+    # leaves the previous one behind. Delete untagged manifests and the legacy
+    # `sha-*` tags (keeping `latest` and every release tag); `needs: [merge]`
+    # avoids racing the in-progress per-arch (untagged) pushes.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          package: d-oauth-server
+          exclude-tags: latest
+          delete-tags: "sha-*"
+          delete-untagged: true
