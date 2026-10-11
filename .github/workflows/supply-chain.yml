@@ -98,7 +98,7 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
       - name: Scan (grype, gate high/critical)
-        uses: anchore/scan-action@64a33b277ea7a1215a3c142735a1091341939ff5 # v4
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: ${{ env.REGISTRY_IMAGE }}@${{ steps.bake.outputs.digest }}
           fail-build: true
