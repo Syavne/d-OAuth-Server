@@ -47,48 +47,67 @@ practice in RFC 9700. This server enforces every one of these:
 | `state` is supported and echoed | The value is returned on the success and error redirects. | RFC 6749 §4.1.2.1 |
 | No open redirect | The redirect URI must be registered, attached, and enabled. | RFC 9700 §4.1.3 |
 
-## Known gaps against draft-ietf-oauth-v2-1-16
+## Resolved gaps against draft-ietf-oauth-v2-1-16
 
-An internal audit found the gaps below against the draft cited above. They are
-listed as work "to revise", not as defects that make the server unusable. Each
-entry names the draft section, what the implementation does today, and the
-change to make.
+An internal audit raised the seven findings below against the draft cited
+above. All seven are resolved in the current implementation; there are no
+open gaps. Findings 1, 4, and 7 are also recorded under `[Unreleased]` Fixed
+in [CHANGELOG.md](CHANGELOG.md). Each entry names the draft section, the
+previous behavior, and the current behavior.
 
-1. **Token endpoint requires `redirect_uri`**: draft-16 §4.1.3 removed
-   `redirect_uri` from the token request, and §10.2 says the back-compat mode
-   must allow it, not require it. The implementation rejects a token request
-   with an empty `redirect_uri` (`invalid_request`), which can break pure-2.1
-   clients. To revise: accept-but-ignore it (or make it a per-client opt-in),
-   never require it.
+1. **Token endpoint accepts a missing or empty `redirect_uri`** (draft-16
+   §4.1.3, §10.2): the back-compat mode must allow `redirect_uri`, not
+   require it, but the implementation used to reject a token request with an
+   empty `redirect_uri` (`invalid_request`), which could break pure-2.1
+   clients. **Resolved**: the token endpoint accepts a missing or empty
+   `redirect_uri` and skips the binding check; a supplied value must still
+   match exactly or redemption fails `invalid_grant`.
 
-2. **Authorization error redirects omit `iss`**: draft-16 §4.1.2.1 and
-   §7.15.1 make `iss` required on the authorization response, including errors.
-   The success redirect includes `iss`, but the error redirect (`error`,
-   `error_description`, `state`) does not. To revise: add `iss` to the error
-   redirect.
+2. **Authorization error redirects carry `iss`** (draft-16 §4.1.2.1,
+   §7.15.1): `iss` is required on the authorization response, including
+   errors, but the error redirect (`error`, `error_description`, `state`)
+   used to omit it while the success redirect included it. **Resolved**:
+   every error redirect issued after `client_id` and `redirect_uri` are
+   validated now carries the percent-encoded `iss` alongside `error`,
+   `error_description`, and the echoed `state`.
 
-3. **Missing `response_type` returns a direct error page instead of a redirect**:
-   once `client_id` and `redirect_uri` are validated, draft-16 §4.1.1 and
-   §4.1.2.1 require the error to be delivered via redirect. To revise: move the
-   absent-`response_type` case to the redirect path.
+3. **Missing `response_type` redirects once the client is validated**
+   (draft-16 §4.1.1, §4.1.2.1): the absent-`response_type` case used to
+   return a direct error page even after `client_id` and `redirect_uri` were
+   validated, where the draft requires delivery via redirect. **Resolved**:
+   the absent-`response_type` case now redirects (`invalid_request` with
+   `error_description` + `state`) once `client_id` and `redirect_uri` are
+   validated; before that it still renders the direct `400` page.
 
-4. **Rotated refresh-token scope narrows instead of staying identical**:
-   draft-16 §4.3.3 requires the new refresh token's scope to be identical to the
-   presented one, while §4.3.1 permits requesting a narrower scope. To revise:
-   keep the new refresh token's scope identical and narrow only the access
-   token, or document the deviation explicitly.
+4. **Rotated refresh-token scope splits retained from access scope**
+   (draft-16 §4.3.3, §4.3.1): the new refresh token's scope must stay
+   identical to the presented one while a narrower scope may be requested,
+   but rotation used to narrow the replacement refresh token itself.
+   **Resolved**: the replacement refresh token keeps the presented scope
+   re-checked against the current `enabled` catalog, client registration,
+   and user entitlements (revoked entries drop silently), while an explicit
+   narrower `scope` narrows only the access token and the response `scope`.
 
-5. **No pinned TLS 1.2 minimum**: draft-16 §1.5 and §7.14 require TLS 1.2 or
-   above. The server relies on rustls defaults rather than asserting a minimum
-   protocol version. To revise: assert the minimum version explicitly and test
-   it.
+5. **Pinned TLS 1.2 minimum** (draft-16 §1.5, §7.14): TLS 1.2 or above is
+   required. **Resolved**: the server pins the minimum explicitly in
+   `src/protocol/mtls/verifier.rs` (`TLS_PROTOCOL_VERSIONS`: exactly TLS 1.2
+   + TLS 1.3, wired via `ServerConfig::builder_with_protocol_versions`
+   instead of rustls defaults), covered by the `tls_version_*` tests in
+   `src/routes.rs` (pinned set is exactly 1.2/1.3; version-pinned clients
+   negotiate the expected version).
 
-Two lower-priority SHOULD-level notes:
+6. **Consent success redirect uses `303`** (draft-16 §7.5.4, SHOULD): the
+   consent success redirect used `302` where the draft prefers `303`.
+   **Resolved**: `POST /consent` success (approval and denial) now returns
+   `303 See Other` with `Location`, so browsers continue with `GET`;
+   cookies, CSRF, and CSP handling are unchanged.
 
-- The consent success redirect uses `302` where the draft prefers `303`
-  (draft-16 §7.5.4).
-- There is no reverse-DNS `.` check for a private-use URI scheme
-  (draft-16 §2.3.1).
+7. **Private-use URI schemes require reverse-DNS `.` notation** (draft-16
+   §2.3.1, SHOULD): there was no reverse-DNS `.` check for private-use URI
+   schemes. **Resolved**: a private-use scheme must contain a `.`
+   (`com.example.app:/` is accepted, `myapp:/` is rejected with
+   `invalid_redirect_uri` on DCR and `invalid input` on the CLI); `https`
+   and the loopback `http` exception are unchanged.
 
 ## Endpoints
 
@@ -164,12 +183,15 @@ is never registered for a dynamically created client.
 
 Reference: RFC 6749 §4.1.3, RFC 9700 §4.5.3, RFC 7636, RFC 9449 §6.
 
-Parameters: `code`, `redirect_uri`, `code_verifier`, `client_id`,
+Parameters: `code`, `code_verifier`, `client_id`, optional `redirect_uri`,
 `client_secret` or `client_assertion_type` with `client_assertion`, and a DPoP
 proof when the code is DPoP-bound.
 
-Behavior: the code is consumed exactly once. The client, redirect URI, PKCE
-verifier, and sender proof are all checked before minting. The token is minted
+Behavior: the code is consumed exactly once. `redirect_uri` is accept-but-ignore
+(draft-16 §4.1.3, §10.2): a missing or empty value skips the binding check; a
+supplied value must still match exactly or redemption fails `invalid_grant`.
+The client, PKCE verifier, and sender proof are all checked before minting. The
+token is minted
 under the code's grant chain. A refresh token is issued only if the client is
 registered for the refresh grant.
 
@@ -178,10 +200,13 @@ registered for the refresh grant.
 Reference: RFC 6749 §6, RFC 9700 §2.2.2 and §4.14, RFC 9449 §5.
 
 Parameters: `client_id`, `refresh_token`, optional `requested_scope` (which may
-narrow but never widen), and a freshly verified sender proof. The effective
-scope is re-checked against the current `enabled` catalog and the client's
-current registration and the user's current entitlements (fresh Postgres
-reads), so a revoked scope or entitlement drops on refresh.
+narrow but never widen), and a freshly verified sender proof. The replacement
+refresh token keeps the presented scope re-checked against the current
+`enabled` catalog and the client's current registration and the user's current
+entitlements (fresh Postgres reads), so a revoked scope or entitlement drops
+from the retained refresh scope on refresh; an explicit narrower `scope`
+(§4.3.1) narrows only the access token and the response `scope`, and the next
+rotation from the retained refresh token can still use the full scope.
 
 Behavior: rotation on every use. The presented token is tombstoned with a
 `rotated_to` member. Presenting a rotated token again is reuse: the whole grant
@@ -255,19 +280,28 @@ Reference: RFC 3986 §6.2.1, RFC 8252 §7.3, RFC 9700 §2.1.
   `http://127.0.0.1` or `http://[::1]` matches the same scheme, host, and path
   on any port, and the request must carry no userinfo, query, or fragment.
 - `localhost` is never treated as a loopback host.
+- A private-use URI scheme must contain reverse-DNS dot notation (draft-16
+  §2.3.1): `com.example.app:/cb` is accepted, `myapp:/cb` is rejected.
+  `https` and the loopback `http` exception are unaffected.
 - A registered URI with userinfo, query, or fragment is never eligible for the
   loopback exception.
 
 ### Error-delivery matrix
 
 Before a redirect URI is validated, the server must not redirect anywhere. It
-returns a `400` HTML page with no `Location` header for: absent or unknown
+returns an HTML page with no `Location` header for: absent or unknown
 `client_id`, a JAR/PAR resolution failure, a `client_id` binding mismatch, and a
-missing or unregistered `redirect_uri`.
+missing or unregistered `redirect_uri`. The page carries the error's HTTP
+status: client errors render `400`, a fail-closed Postgres/PII outage
+(`temporarily_unavailable`) renders `503` with `Retry-After: 1`, and a masked
+internal failure renders `500`.
 
 After the redirect URI is validated, errors are delivered on the redirect as
-`302` with `error`, `error_description`, and the echoed `state`. This covers
-`unsupported_response_type`, `invalid_scope`, and the PKCE failures.
+`302` with `error`, `error_description`, the echoed `state`, and the RFC 9207
+`iss`. This covers
+a missing or unsupported `response_type` (`invalid_request` when absent,
+`unsupported_response_type` otherwise), `invalid_scope`, the PKCE failures,
+and a `post_logout` catalog outage (`temporarily_unavailable`/`server_error`).
 
 ## Error codes
 
@@ -275,7 +309,7 @@ Errors use the RFC 6749 §5.2 body `{error, error_description}`.
 
 | Code | HTTP | Typical causes |
 | --- | --- | --- |
-| `invalid_request` | 400 | Missing or duplicated parameter; PAR misuse; JAR misuse. |
+| `invalid_request` | 400, or 302 on the `/authorize` error redirect once `client_id` and `redirect_uri` are validated | Missing or duplicated parameter; PAR misuse; JAR misuse. |
 | `invalid_client` | 401 with `WWW-Authenticate` for Basic or Bearer, else 400 | Bad client authentication; ambiguous mTLS certificate. |
 | `invalid_grant` | 400 | Unknown, consumed, or foreign code; rotation reuse; PKCE mismatch; proof against the wrong grant. |
 | `invalid_scope` | 400 | Unknown, disabled, over-registered, or non-entitled scope; refresh widening. |
@@ -362,11 +396,14 @@ Reference: RFC 9101 §4.1 and §5.2, RFC 9126 §2 and §3.
 
 ## Edge cases
 
-- A refresh request that omits `scope` keeps the prior grant only while still
-  enabled, then narrows to the still-registered ∩ still-entitled intersection
-  (possibly empty, from fresh Postgres reads of the client registration, the
-  user entitlements, and the `enabled` catalog); an explicit `scope` must be a
-  subset of the prior grant and all three current sets.
+- A refresh request that omits `scope` keeps the prior grant on both new tokens
+  after re-checking against the current `enabled` catalog, client registration,
+  and user entitlements (fresh Postgres reads), with revoked entries dropped
+  silently from the retained scope (possibly to empty); an explicit `scope`
+  must be a subset of the prior grant and all three current sets, and narrows
+  only the access token and the response `scope` — the replacement refresh
+  token retains the full re-checked scope (draft-16 §4.3.1 + §4.3.3), so a
+  later rotation with an omitted `scope` restores the full retained scope.
 - A second authorization code made from the same request is a distinct code;
   each is single-use.
 - A DPoP proof outside the `iat` freshness window, or with a replayed `jti`, is

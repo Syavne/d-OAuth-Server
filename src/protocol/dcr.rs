@@ -443,6 +443,13 @@ async fn validate_metadata(
       "redirect_uris must not be empty",
     ));
   }
+  for uri in &redirect_uris {
+    if !crate::protocol::redirect_repo::is_valid_redirect_scheme(uri) {
+      return Err(AppError::invalid_redirect_uri(
+        "private-use URI scheme must contain reverse-DNS dot notation",
+      ));
+    }
+  }
 
   Ok(ValidatedRegistration {
     method,

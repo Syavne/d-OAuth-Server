@@ -97,6 +97,10 @@ async fn e2e_redirect_fail_closed_vs_redirect_with_error() -> Result<(), TestErr
     location.contains("error=") && location.starts_with(REDIRECT_URI),
     "error must ride the validated redirect",
   )?;
+  ensure(
+    location.contains("iss=https%3A%2F%2Fauth.example.test"),
+    "error redirect must carry RFC 9207 iss",
+  )?;
 
   let (status, _, _) = world
     .get(
@@ -258,8 +262,50 @@ async fn e2e_state_csrf_echo_isolated() -> Result<(), TestError> {
     "second error must echo its own state",
   )?;
   ensure(
+    first.contains("iss=https%3A%2F%2Fauth.example.test"),
+    "first error must carry RFC 9207 iss",
+  )?;
+  ensure(
+    second.contains("iss=https%3A%2F%2Fauth.example.test"),
+    "second error must carry RFC 9207 iss",
+  )?;
+  ensure(
     !first.contains("bbb-csrf-2") && !second.contains("aaa-csrf-1"),
     "states must not cross",
+  )?;
+  Ok(())
+}
+
+/// A missing `response_type` rides the validated redirect as `invalid_request`
+/// with RFC 9207 `iss` (unit coverage exists; this is the e2e wire proof).
+#[tokio::test]
+async fn e2e_missing_response_type_redirects_with_iss() -> Result<(), TestError> {
+  let world = setup().await?;
+  let (status, headers, _) = world
+    .get(
+      &format!(
+        "/authorize?client_id={PUBLIC_ID}&redirect_uri={}&state=missing-rt-state",
+        urlencoding(REDIRECT_URI)
+      ),
+      &[],
+    )
+    .await?;
+  ensure(
+    status == reqwest::StatusCode::FOUND,
+    "missing response_type must 302",
+  )?;
+  let location = header_str(&headers, "location")?;
+  ensure(
+    location.starts_with(REDIRECT_URI),
+    "error must ride the validated redirect",
+  )?;
+  ensure(
+    location.contains("error=invalid_request"),
+    "missing response_type must be invalid_request",
+  )?;
+  ensure(
+    location.contains("iss=https%3A%2F%2Fauth.example.test"),
+    "error redirect must carry RFC 9207 iss",
   )?;
   Ok(())
 }

@@ -180,6 +180,19 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   (`consume_bound` over `client_id`, plus `redirect_uri`/PKCE challenge for
   codes): a foreign-client or wrong-verifier presentation leaves the single-use
   record intact instead of burning the victim's value.
+- The token endpoint accepts a missing or empty `redirect_uri` on
+  `grant_type=authorization_code` and skips the binding check
+  (draft-ietf-oauth-v2-1-16 §4.1.3, §10.2); a supplied value must still match
+  exactly or redemption fails `invalid_grant`.
+- A private-use redirect-URI scheme must contain reverse-DNS dot notation
+  (draft-ietf-oauth-v2-1-16 §2.3.1): `com.example.app:/` is accepted and
+  `myapp:/` is rejected with `invalid_redirect_uri` on DCR and `invalid input`
+  on the CLI; `https` and the RFC 8252 loopback exception are unchanged.
+- Refresh rotation splits the scope (draft-ietf-oauth-v2-1-16 §4.3.1 +
+  §4.3.3): the replacement refresh token retains the presented scope re-checked
+  against the current `enabled` catalog, client registration, and user
+  entitlements (revoked entries drop silently), while an explicit narrower
+  `scope` narrows only the access token and the response `scope`.
 - Grant cascade `revoke` drains in a bounded loop until the member set reads
   empty, and the rotation script carries a grant-record fence (`NOGRANT`
   before any write), so a token minted mid-cascade is deleted by a later pass

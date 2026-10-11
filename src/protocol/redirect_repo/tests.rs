@@ -1,6 +1,6 @@
 //! Tests for `redirect_uri` matching (RFC 3986 §6.2.1 / RFC 8252 §7.3).
 
-use super::{RedirectDecision, match_redirect_uri};
+use super::{RedirectDecision, is_valid_redirect_scheme, match_redirect_uri};
 
 #[test]
 fn redirect_uri_exact_string_match_is_accepted() {
@@ -153,4 +153,47 @@ fn redirect_uri_exact_takes_precedence_over_loopback() {
     match_redirect_uri(&registered, "http://127.0.0.1:49152/cb"),
     RedirectDecision::Exact
   );
+}
+
+#[test]
+fn redirect_uri_private_scheme_without_dot_is_rejected() {
+  // draft-ietf-oauth-v2-1-16 §2.3.1 SHOULD: a private-use scheme is
+  // reverse-DNS based, so it must contain a `.`.
+  let registered = ["myapp:/cb"];
+  assert_eq!(
+    match_redirect_uri(&registered, "myapp:/cb"),
+    RedirectDecision::Reject
+  );
+
+  let registered = ["myapp:/"];
+  assert_eq!(
+    match_redirect_uri(&registered, "myapp:/"),
+    RedirectDecision::Reject
+  );
+}
+
+#[test]
+fn redirect_uri_private_scheme_with_dot_is_accepted() {
+  let registered = ["com.example.app:/cb"];
+  assert_eq!(
+    match_redirect_uri(&registered, "com.example.app:/cb"),
+    RedirectDecision::Exact
+  );
+
+  let registered = ["com.example.app:/"];
+  assert_eq!(
+    match_redirect_uri(&registered, "com.example.app:/"),
+    RedirectDecision::Exact
+  );
+}
+
+#[test]
+fn redirect_uri_private_scheme_dot_check_leaves_https_and_loopback_unchanged() {
+  assert!(is_valid_redirect_scheme("https://client.example.test/cb"));
+  assert!(is_valid_redirect_scheme("http://127.0.0.1:5173/cb"));
+  assert!(is_valid_redirect_scheme("http://[::1]:5173/cb"));
+  assert!(is_valid_redirect_scheme("com.example.app:/"));
+  assert!(is_valid_redirect_scheme("com.example.app:/cb"));
+  assert!(!is_valid_redirect_scheme("myapp:/"));
+  assert!(!is_valid_redirect_scheme("myapp:/cb"));
 }

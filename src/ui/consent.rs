@@ -499,11 +499,13 @@ pub async fn post_consent(
   }
 }
 
-/// `302 Found` to `location`; an invalid header fails closed to a `500`.
+/// `303 See Other` to `location` (draft-ietf-oauth-v2-1-16 §7.5.4 SHOULD:
+/// POST success redirects to a `GET`); an invalid header fails closed to a
+/// `500`.
 fn redirect(location: &str) -> Response {
   match header::HeaderValue::from_str(location) {
     Ok(value) => Response::builder()
-      .status(StatusCode::FOUND)
+      .status(StatusCode::SEE_OTHER)
       .header(header::LOCATION, value)
       .body(Body::empty())
       .unwrap_or_else(|_| AppError::server_error().into_response()),

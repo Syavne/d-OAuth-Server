@@ -80,6 +80,9 @@ so a read-only root filesystem is expected.
 ## TLS-terminating reverse proxy (HAProxy, Caddy)
 
 The server always terminates TLS on `bind_addr`; there is no plaintext mode.
+The server pins a TLS 1.2 minimum (exactly TLS 1.2 + TLS 1.3, per
+draft-ietf-oauth-v2-1-16 §1.5 and §7.14), so clients and proxies must offer
+1.2 or above.
 When a reverse proxy already holds the public certificate and terminates client
 TLS (L7), point the proxy's HTTPS upstream at the server's TLS listener. The
 server keeps its own certificate for the proxy-to-app hop, but that certificate

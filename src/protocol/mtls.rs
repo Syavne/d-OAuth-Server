@@ -14,7 +14,9 @@ mod verifier;
 
 pub use cert::{subject_dn, thumbprint_b64url};
 pub use select::{authenticate, authenticate_by_id, select_by_subject_dn, select_by_thumbprint};
-pub use verifier::{pki_verifier, pki_verifier_from_file, self_signed_verifier, server_config};
+pub use verifier::{
+  TLS_PROTOCOL_VERSIONS, pki_verifier, pki_verifier_from_file, self_signed_verifier, server_config,
+};
 
 use crate::error::{AppError, OAuthErrorCode};
 

@@ -267,14 +267,17 @@ async fn authorize_validate_token_response_type_redirects() -> TestResult {
       target,
       error,
       state,
+      iss,
     }) => {
       assert_eq!(target, REDIRECT);
       assert_eq!(error.code(), OAuthErrorCode::UnsupportedResponseType);
       assert_eq!(state.as_deref(), Some("xyz-state"));
+      assert_eq!(iss, ISSUER);
       let response = AuthorizeFailure::Redirect {
         target,
         error,
         state,
+        iss,
       }
       .into_response();
       assert_eq!(response.status(), StatusCode::FOUND);
@@ -286,6 +289,10 @@ async fn authorize_validate_token_response_type_redirects() -> TestResult {
         .to_owned();
       assert!(location.contains("error=unsupported_response_type"));
       assert!(location.contains("state=xyz-state"));
+      assert!(
+        location.contains("iss=https%3A%2F%2Fauth.example.test"),
+        "error redirect missing iss: {location}"
+      );
       Ok(())
     }
     Err(other) => Err(format!("expected a redirect, got {}", other.code()).into()),
@@ -319,14 +326,17 @@ async fn authorize_validate_unknown_scope_redirects() -> TestResult {
       target,
       error,
       state,
+      iss,
     }) => {
       assert_eq!(target, REDIRECT);
       assert_eq!(error.code(), OAuthErrorCode::InvalidScope);
       assert_eq!(state.as_deref(), Some("xyz-state"));
+      assert_eq!(iss, ISSUER);
       let response = AuthorizeFailure::Redirect {
         target,
         error,
         state,
+        iss,
       }
       .into_response();
       assert_eq!(response.status(), StatusCode::FOUND);
@@ -338,6 +348,10 @@ async fn authorize_validate_unknown_scope_redirects() -> TestResult {
         .to_owned();
       assert!(location.contains("error=invalid_scope"));
       assert!(location.contains("state=xyz-state"));
+      assert!(
+        location.contains("iss=https%3A%2F%2Fauth.example.test"),
+        "error redirect missing iss: {location}"
+      );
       Ok(())
     }
     Err(other) => Err(format!("expected a redirect, got {}", other.code()).into()),
@@ -532,12 +546,235 @@ async fn authorize_validate_missing_challenge_redirects() -> TestResult {
       target,
       error,
       state,
+      iss,
     }) => {
       assert_eq!(target, REDIRECT);
       assert_eq!(error.code(), OAuthErrorCode::InvalidRequest);
       assert_eq!(state.as_deref(), Some("xyz-state"));
+      assert_eq!(iss, ISSUER);
       Ok(())
     }
     Err(other) => Err(format!("expected a redirect, got {}", other.code()).into()),
   }
+}
+
+/// A direct `Page(temporarily_unavailable)` renders 503 + `Retry-After`
+/// (fail-closed Postgres/PII outage pre-validation); `Page(server_error)`
+/// renders 500. Client-error pages stay 400.
+#[tokio::test]
+async fn authorize_page_outage_renders_503_with_retry_after() -> TestResult {
+  let response = AuthorizeFailure::Page(AppError::temporarily_unavailable()).into_response();
+  assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+  assert_eq!(
+    response
+      .headers()
+      .get(header::RETRY_AFTER)
+      .and_then(|value| value.to_str().ok()),
+    Some("1")
+  );
+  assert!(response.headers().get(header::LOCATION).is_none());
+
+  let response = AuthorizeFailure::Page(AppError::server_error()).into_response();
+  assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+  assert!(response.headers().get(header::LOCATION).is_none());
+
+  let response = AuthorizeFailure::Page(AppError::invalid_request("bad")).into_response();
+  assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+  assert!(response.headers().get(header::LOCATION).is_none());
+  Ok(())
+}
+
+/// A `post_logout` catalog outage after `redirect_uri` validation redirects
+/// (302) with `temporarily_unavailable`, per the error-delivery matrix.
+#[tokio::test]
+async fn authorize_post_logout_outage_redirects() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-post-logout", true).await?;
+  let (row, _) = redirect_repo::upsert(
+    &pool,
+    &keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: Uuid::new_v4(),
+      uri: "https://app.example.test/signed-out",
+      kind: redirect_repo::RedirectKind::PostLogout,
+      description: "post-logout test",
+      created_by: None,
+    },
+  )
+  .await
+  .map_err(|error| format!("post-logout fixture failed: {error}"))?;
+  redirect_repo::attach(&pool, "authz-post-logout", row.id, None)
+    .await
+    .map_err(|error| format!("post-logout attach failed: {error}"))?;
+  sqlx::query("UPDATE redirect_uris SET uri_enc = $1 WHERE kind = 'post_logout'")
+    .bind(b"corrupt-blob".as_slice())
+    .execute(&pool)
+    .await
+    .map_err(|error| format!("corrupt fixture failed: {error}"))?;
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let params = valid_query("authz-post-logout", &challenge);
+  let mut conn = offline_redis()?;
+  let store = test_store();
+
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    query: &params,
+  })
+  .await
+  {
+    Ok(_) => Err("post-logout outage was accepted".into()),
+    Err(AuthorizeFailure::Redirect { target, error, .. }) => {
+      assert_eq!(target, REDIRECT);
+      assert_eq!(error.code(), OAuthErrorCode::TemporarilyUnavailable);
+      assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+      let response = AuthorizeFailure::Redirect {
+        target,
+        error,
+        state: None,
+        iss: ISSUER.to_owned(),
+      }
+      .into_response();
+      assert_eq!(response.status(), StatusCode::FOUND);
+      Ok(())
+    }
+    Err(other) => Err(format!("expected a redirect, got {}", other.code()).into()),
+  }
+}
+/// draft-ietf-oauth-v2-1-16 §4.1.2.1 and §7.15.1.
+#[tokio::test]
+async fn authorize_error_iss() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-err-iss", true).await?;
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let mut params = valid_query("authz-err-iss", &challenge);
+  params.insert("response_type".to_owned(), "token".to_owned());
+  let mut conn = offline_redis()?;
+  let store = test_store();
+
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    query: &params,
+  })
+  .await
+  {
+    Ok(_) => Err("response_type=token was accepted".into()),
+    Err(AuthorizeFailure::Redirect {
+      target,
+      error,
+      state,
+      iss,
+    }) => {
+      assert_eq!(target, REDIRECT);
+      assert_eq!(error.code(), OAuthErrorCode::UnsupportedResponseType);
+      assert_eq!(state.as_deref(), Some("xyz-state"));
+      assert_eq!(iss, ISSUER);
+      let response = AuthorizeFailure::Redirect {
+        target,
+        error,
+        state,
+        iss,
+      }
+      .into_response();
+      assert_eq!(response.status(), StatusCode::FOUND);
+      let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+      assert!(location.contains("error=unsupported_response_type"));
+      assert!(location.contains("state=xyz-state"));
+      assert!(
+        location.contains("iss=https%3A%2F%2Fauth.example.test"),
+        "error redirect missing iss: {location}"
+      );
+      Ok(())
+    }
+    Err(other) => Err(format!("expected a redirect, got {}", other.code()).into()),
+  }
+}
+/// A missing `response_type` redirects with `invalid_request` (+ `state`):
+/// `client_id` and `redirect_uri` are already validated here, so per
+/// draft-ietf-oauth-v2-1-16 §4.1.1 and §4.1.2.1 the error rides the redirect.
+#[tokio::test]
+async fn authorize_validate_missing_response_type_redirects() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-missing-rt", true).await?;
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let mut conn = offline_redis()?;
+  let store = test_store();
+
+  for params in [
+    {
+      let mut q = valid_query("authz-missing-rt", &challenge);
+      q.remove("response_type");
+      q
+    },
+    {
+      let mut q = valid_query("authz-missing-rt", &challenge);
+      q.insert("response_type".to_owned(), String::new());
+      q
+    },
+  ] {
+    match validate(AuthorizeInput {
+      pool: &pool,
+      keys: &keys,
+      conn: &mut conn,
+      store: &store,
+      issuer: ISSUER,
+      query: &params,
+    })
+    .await
+    {
+      Ok(_) => return Err("missing response_type was accepted".into()),
+      Err(AuthorizeFailure::Redirect {
+        target,
+        error,
+        state,
+        iss,
+      }) => {
+        assert_eq!(target, REDIRECT);
+        assert_eq!(error.code(), OAuthErrorCode::InvalidRequest);
+        assert_eq!(state.as_deref(), Some("xyz-state"));
+        assert_eq!(iss, ISSUER);
+        let response = AuthorizeFailure::Redirect {
+          target,
+          error,
+          state,
+          iss,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response
+          .headers()
+          .get(header::LOCATION)
+          .and_then(|value| value.to_str().ok())
+          .unwrap_or_default()
+          .to_owned();
+        assert!(location.contains("error=invalid_request"));
+        assert!(location.contains("error_description="));
+        assert!(location.contains("state=xyz-state"));
+        assert!(
+          location.contains("iss=https%3A%2F%2Fauth.example.test"),
+          "error redirect missing iss: {location}"
+        );
+      }
+      Err(other) => {
+        return Err(format!("expected a redirect, got {}", other.code()).into());
+      }
+    }
+  }
+  Ok(())
 }

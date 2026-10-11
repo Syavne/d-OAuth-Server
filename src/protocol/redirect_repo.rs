@@ -39,13 +39,23 @@ pub enum RedirectDecision {
 /// single exception is the RFC 8252 §7.3 loopback rule. [`RedirectDecision::Exact`]
 /// takes precedence over [`RedirectDecision::Loopback`] when several
 /// registrations could apply.
+///
+/// A requested or registered URI whose private-use scheme lacks reverse-DNS
+/// dot notation (draft-ietf-oauth-v2-1-16 §2.3.1, SHOULD-level) never
+/// matches: the request is rejected without redirecting the user agent.
 #[must_use]
 pub fn match_redirect_uri<S: AsRef<str>>(registered: &[S], requested: &str) -> RedirectDecision {
+  if !is_valid_redirect_scheme(requested) {
+    return RedirectDecision::Reject;
+  }
   let requested_parts = parse_uri(requested);
   let mut loopback = false;
 
   for candidate in registered {
     let candidate = candidate.as_ref();
+    if !is_valid_redirect_scheme(candidate) {
+      continue;
+    }
     let Some(reg) = parse_uri(candidate) else {
       continue;
     };
@@ -173,6 +183,40 @@ fn parse_host(hostport: &str) -> Option<&str> {
 /// True when the scheme is HTTP (case-insensitively, RFC 3986 §3.1).
 fn is_http(scheme: &str) -> bool {
   scheme.eq_ignore_ascii_case("http")
+}
+
+/// True when the scheme is HTTPS (case-insensitively, RFC 3986 §3.1).
+fn is_https(scheme: &str) -> bool {
+  scheme.eq_ignore_ascii_case("https")
+}
+
+/// Whether `uri` satisfies the draft-ietf-oauth-v2-1-16 §2.3.1 SHOULD-level
+/// reverse-DNS rule for private-use URI schemes: any scheme other than
+/// `http`/`https` must contain a `.` (for example `com.example.app:/` is
+/// acceptable while `myapp:/` is not). `http`/`https` URIs — including the
+/// RFC 8252 §7.3 loopback exception — are unaffected. URIs without a
+/// syntactically valid scheme fail closed.
+#[must_use]
+pub fn is_valid_redirect_scheme(uri: &str) -> bool {
+  let before_fragment = match uri.split_once('#') {
+    Some((before, _)) => before,
+    None => uri,
+  };
+  let before_query = match before_fragment.split_once('?') {
+    Some((before, _)) => before,
+    None => before_fragment,
+  };
+  let (scheme, _) = match before_query.split_once(':') {
+    Some(parts) => parts,
+    None => return false,
+  };
+  if !is_valid_scheme(scheme) {
+    return false;
+  }
+  if is_http(scheme) || is_https(scheme) {
+    return true;
+  }
+  scheme.contains('.')
 }
 
 /// The only hosts eligible for the RFC 8252 §7.3 loopback exception.

@@ -2,10 +2,12 @@
 //!
 //! The caller authenticates the client (task 18) and verifies the sender
 //! proofs fresh on this request (tasks 20/21) before calling [`refresh`];
-//! this grant matches those proofs against the stored `cnf` binding, narrows
-//! the scope, mints the replacement pair, and rotates atomically through
-//! [`TokenService::rotate`] (task-12 Lua compare-and-set with tombstone and
-//! request-id mapping).
+//! this grant matches those proofs against the stored `cnf` binding, splits
+//! the scope (the replacement refresh token retains the presented scope per
+//! draft-ietf-oauth-v2-1-16 §4.3.3 while an explicit request narrows only the
+//! access token per §4.3.1), mints the replacement pair, and rotates
+//! atomically through [`TokenService::rotate`] (task-12 Lua compare-and-set
+//! with tombstone and request-id mapping).
 //!
 //! Ordering is the whole contract: the new raw pair is minted server-side
 //! FIRST (barrier deferred to the rotation, which covers the pre-mint writes
@@ -31,7 +33,7 @@ use crate::{
   },
   error::AppError,
   keys::KeyRing,
-  protocol::scope::{ScopeSet, narrow_on_refresh},
+  protocol::scope::{ScopeSet, refresh_scopes},
   state::RedisConn,
   store::{
     Store,
@@ -105,10 +107,12 @@ pub struct RefreshUserStores<'a> {
 /// for a retry after re-enable. Otherwise the current user entitlements are
 /// read fresh from Postgres (a subject that maps to no user — empty
 /// client-credentials subjects, synthetic principals — carries no user term)
-/// and the rotation narrows against the current `client_registered`,
-/// `user_entitled`, and `enabled` sets, so a revoked entitlement or a removed
-/// client scope drops out on refresh instead of surviving for the token's
-/// whole lifetime. The disabled check preserves unknown-token,
+/// and the rotation re-checks the presented scope against the current
+/// `client_registered`, `user_entitled`, and `enabled` sets for the
+/// replacement refresh token (draft-ietf-oauth-v2-1-16 §4.3.3), so a revoked
+/// entitlement or a removed client scope drops out on refresh instead of
+/// surviving for the token's whole lifetime while an explicit narrower
+/// request narrows only the access token (§4.3.1). The disabled check preserves unknown-token,
 /// tombstone-cascade, and proof-check behavior. A datastore failure propagates
 /// as an error.
 ///
@@ -162,12 +166,16 @@ pub async fn refresh_with_subject_check(
   refresh(conn, store, service, &fresh).await
 }
 
-/// Rotate a refresh token: fresh proof-of-possession, scope narrowing, then
+/// Rotate a refresh token: fresh proof-of-possession, scope split, then
 /// mint-first atomic rotation with tombstone reuse detection.
 ///
 /// The stored `cnf` alone never mints: every bound component must equal its
 /// freshly verified counterpart. Scope may only narrow (`invalid_scope`
-/// otherwise). The replacement pair is minted BEFORE the Lua script runs
+/// otherwise): the replacement refresh token retains the presented scope
+/// re-checked against the current catalog, client registration, and user
+/// entitlements (draft-ietf-oauth-v2-1-16 §4.3.3; revoked entries drop), while
+/// an explicit request narrows only the access token (§4.3.1). The
+/// replacement pair is minted BEFORE the Lua script runs
 /// (barrier deferred to the rotation, which gates the response), so every
 /// non-`Rotated`/`RotatedUnbarriered` outcome revokes the orphaned pre-mint.
 /// A barrier failure after the originating write applied returns the minted
@@ -216,13 +224,15 @@ pub async fn refresh(
   } else {
     input.user_entitled
   };
-  let narrowed = narrow_on_refresh(
+  let scopes = refresh_scopes(
     &previous,
     input.requested_scope,
     input.enabled,
     input.client_registered,
     user_term,
   )?;
+  let retained = scopes.retained;
+  let access = scopes.access;
   let minted = service
     .mint_for_rotation(
       conn,
@@ -231,7 +241,7 @@ pub async fn refresh(
         client_id: client_id.to_owned(),
         client_kind: input.client_kind,
         subject: found.record.subject.clone(),
-        scope: narrowed.render(),
+        scope: retained.render(),
         grant_id: found.record.grant_id.clone(),
         proof: input.proof.clone(),
       },
@@ -251,14 +261,14 @@ pub async fn refresh(
     new_refresh: RefreshRecord {
       client_id: client_id.to_owned(),
       grant_id: found.record.grant_id.clone(),
-      scope: narrowed.render(),
+      scope: retained.render(),
       subject: found.record.subject.clone(),
       cnf: cnf_json.clone(),
     },
     new_access: AccessRecord {
       client_id: client_id.to_owned(),
       grant_id: found.record.grant_id.clone(),
-      scope: narrowed.render(),
+      scope: access.render(),
       subject: found.record.subject.clone(),
       cnf: cnf_json,
     },
@@ -271,12 +281,9 @@ pub async fn refresh(
     .await
     .map_err(AppError::from)?
   {
-    RotateOutcome::Rotated { .. } | RotateOutcome::RotatedUnbarriered { .. } => Ok(response(
-      service,
-      &minted,
-      &narrowed,
-      &found.record.grant_id,
-    )),
+    RotateOutcome::Rotated { .. } | RotateOutcome::RotatedUnbarriered { .. } => {
+      Ok(response(service, &minted, &access, &found.record.grant_id))
+    }
     RotateOutcome::Replay { .. } => {
       discard_orphan(conn, store, service, &minted).await?;
       Err(AppError::invalid_grant("refresh token was already rotated"))

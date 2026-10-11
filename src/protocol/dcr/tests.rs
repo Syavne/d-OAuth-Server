@@ -698,6 +698,34 @@ async fn dcr_register_open_policy_rejects_custom_scheme() -> TestResult {
 }
 
 #[tokio::test]
+async fn dcr_catalog_policy_private_scheme_dot_rule() -> TestResult {
+  // Isolated catalog-policy cover for the private-use dot rule in
+  // `validate_metadata` (draft-ietf-oauth-v2-1-16 §2.3.1): the dotted scheme
+  // registers via its catalog hit, while the dotless scheme is rejected by
+  // `is_valid_redirect_scheme` even though it is also seeded in the catalog
+  // (so the failure cannot be a catalog miss).
+  let (_guard, mut harness) = harness(false, "catalog").await?;
+  seed_redirect(&harness.pool, &harness.config.keys, "com.example.app:/cb").await?;
+  seed_redirect(&harness.pool, &harness.config.keys, "myapp:/cb").await?;
+  let iat = issue_iat(&mut harness, 3).await?;
+  let dotted = dpop_request("com.example.app:/cb", None);
+  {
+    let (mut stores, ctx) = parts_of(&mut harness);
+    register_client(&mut stores, &ctx, Some(&iat), &dotted)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("dotted scheme failed: {error}")))?;
+  }
+  let dotless = dpop_request("myapp:/cb", None);
+  let (mut stores, ctx) = parts_of(&mut harness);
+  match register_client(&mut stores, &ctx, Some(&iat), &dotless).await {
+    Ok(_) => Err(TestError::Unexpected(
+      "dotless private-use scheme accepted under catalog".to_owned(),
+    )),
+    Err(error) => expect_error(error, OAuthErrorCode::InvalidRedirectUri, 400),
+  }
+}
+
+#[tokio::test]
 async fn dcr_register_open_policy_rejects_fragment() -> TestResult {
   let (_guard, mut harness) = harness(false, "open").await?;
   let iat = issue_iat(&mut harness, 3).await?;

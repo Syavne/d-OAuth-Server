@@ -120,11 +120,17 @@ pub async fn redeem_code(
   state: &mut CodeGrantState<'_>,
   inputs: &CodeGrantInputs<'_>,
 ) -> Result<CodeTokenResponse, AppError> {
-  if inputs.code.trim().is_empty() || inputs.redirect_uri.trim().is_empty() {
-    return Err(AppError::invalid_request(
-      "code and redirect_uri are required",
-    ));
+  if inputs.code.trim().is_empty() {
+    return Err(AppError::invalid_request("code is required"));
   }
+  // draft-ietf-oauth-v2-1-16 §4.1.3 and §10.2: `redirect_uri` is
+  // accept-but-ignore at the token endpoint. An absent or empty value skips
+  // the binding check; a supplied value must still match exactly.
+  let redirect_binding = if inputs.redirect_uri.trim().is_empty() {
+    None
+  } else {
+    Some(inputs.redirect_uri)
+  };
   let used_basic = inputs.basic_header.is_some();
   let unknown_client = || {
     if used_basic {
@@ -158,7 +164,7 @@ pub async fn redeem_code(
     state,
     inputs.code.trim(),
     client.client_id.as_str(),
-    inputs.redirect_uri,
+    redirect_binding,
     expected_challenge.as_str(),
   )
   .await?;
@@ -251,7 +257,7 @@ async fn consume_code(
   state: &mut CodeGrantState<'_>,
   code: &str,
   expected_client_id: &str,
-  expected_redirect_uri: &str,
+  expected_redirect_uri: Option<&str>,
   expected_challenge: &str,
 ) -> Result<codes::CodeRecord, AppError> {
   for (id, secret) in state
@@ -265,18 +271,16 @@ async fn consume_code(
       code,
     )
     .to_storage_string();
-    match codes::consume_bound(
-      state.conn,
-      state.store,
-      &hash,
-      &[
-        ("client_id", expected_client_id),
-        ("redirect_uri", expected_redirect_uri),
-        ("code_challenge", expected_challenge),
-      ],
-    )
-    .await
-    .map_err(AppError::from)?
+    let mut expected = vec![
+      ("client_id", expected_client_id),
+      ("code_challenge", expected_challenge),
+    ];
+    if let Some(redirect_uri) = expected_redirect_uri {
+      expected.push(("redirect_uri", redirect_uri));
+    }
+    match codes::consume_bound(state.conn, state.store, &hash, &expected)
+      .await
+      .map_err(AppError::from)?
     {
       codes::ConsumeOutcome::Consumed(record) => return Ok(record),
       codes::ConsumeOutcome::Mismatched => {
@@ -915,6 +919,44 @@ mod tests {
       .map_err(|error| {
         TestError::Unexpected(format!("mismatched redirect burned the code: {error}"))
       })?;
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_grant_code_missing_redirect_accepted() -> TestResult {
+    let (_container, mut h) = harness().await?;
+    let client_id = unique("no-redirect");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::ClientSecretPost,
+      Some("code-secret"),
+      &[
+        super::GRANT_TYPE_AUTHORIZATION_CODE,
+        GRANT_TYPE_REFRESH_TOKEN,
+      ],
+    )
+    .await?;
+    for redirect_uri in ["", "   "] {
+      let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None).await?;
+      let inputs = CodeGrantInputs {
+        code: issued.code.as_str(),
+        redirect_uri,
+        code_verifier: Some(VERIFIER),
+        client_id: Some(client_id.as_str()),
+        basic_header: None,
+        body_secret: Some(secret("code-secret")),
+        assertion_type: None,
+        assertion: None,
+        dpop_proof: None,
+        peer_certs: None,
+      };
+      redeem_once(&mut h, &inputs, now_unix())
+        .await
+        .map_err(|error| {
+          TestError::Unexpected(format!("missing redirect_uri must redeem, got {error}"))
+        })?;
+    }
     Ok(())
   }
 

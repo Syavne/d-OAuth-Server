@@ -1149,4 +1149,71 @@ mod router_tests {
     }
     Ok(())
   }
+
+  /// draft-ietf-oauth-v2-1-16 §1.5 + §7.14: the public listener pins a
+  /// TLS 1.2 minimum explicitly (not rustls defaults). The pinned set is
+  /// exactly TLS 1.2 + TLS 1.3, so nothing older can be negotiated.
+  #[test]
+  fn tls_version_minimum_is_tls12() -> TestResult {
+    use rustls::ProtocolVersion;
+    let versions: Vec<ProtocolVersion> = crate::protocol::mtls::TLS_PROTOCOL_VERSIONS
+      .iter()
+      .map(|supported| supported.version)
+      .collect();
+    if !versions.contains(&ProtocolVersion::TLSv1_2) {
+      return Err("pinned TLS versions must include TLS 1.2".into());
+    }
+    if !versions.contains(&ProtocolVersion::TLSv1_3) {
+      return Err("pinned TLS versions must include TLS 1.3".into());
+    }
+    for version in &versions {
+      if *version != ProtocolVersion::TLSv1_2 && *version != ProtocolVersion::TLSv1_3 {
+        return Err("no protocol version below TLS 1.2 may be enabled".into());
+      }
+    }
+    Ok(())
+  }
+
+  /// The pinned server config accepts TLS 1.3-only and TLS 1.2-only
+  /// clients, negotiating the offered version each time.
+  #[tokio::test]
+  async fn tls_version_accepts_tls12_and_tls13() -> TestResult {
+    use rustls::ProtocolVersion;
+    use rustls::pki_types::pem::PemObject as _;
+    for (pinned, expected) in [
+      (&rustls::version::TLS13, ProtocolVersion::TLSv1_3),
+      (&rustls::version::TLS12, ProtocolVersion::TLSv1_2),
+    ] {
+      let server_config =
+        build_server_config(TEST_CERT_PEM.as_bytes(), TEST_KEY_PEM.as_bytes(), None)?;
+      let chain = rustls::pki_types::CertificateDer::pem_slice_iter(TEST_CERT_PEM.as_bytes())
+        .collect::<Result<Vec<_>, _>>()?;
+      let Some(leaf) = chain.into_iter().next() else {
+        return Err("test certificate must parse".into());
+      };
+      let mut roots = rustls::RootCertStore::empty();
+      roots.add(leaf)?;
+      let client_config = rustls::ClientConfig::builder_with_protocol_versions(&[pinned])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+      let (client_io, server_io) = tokio::io::duplex(65_536);
+      let server = tokio_rustls::TlsAcceptor::from(Arc::new(server_config)).accept(server_io);
+      let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+      let server_name = rustls::pki_types::ServerName::try_from("localhost")?.to_owned();
+      let client = connector.connect(server_name, client_io);
+      let (server_out, client_out) = tokio::join!(server, client);
+      let server_tls = server_out.map_err(|err| format!("server handshake failed: {err:?}"))?;
+      client_out.map_err(|err| format!("client handshake failed: {err:?}"))?;
+      if server_tls.get_ref().1.protocol_version() != Some(expected) {
+        return Err(
+          format!(
+            "expected negotiated {expected:?}, got {:?}",
+            server_tls.get_ref().1.protocol_version()
+          )
+          .into(),
+        );
+      }
+    }
+    Ok(())
+  }
 }

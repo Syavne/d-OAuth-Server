@@ -12,7 +12,7 @@ use std::{path::Path, sync::Arc};
 // `HandshakeSignatureValid` is only re-exported through `client::danger`;
 use rustls::{
   DigitallySignedStruct, DistinguishedName, Error as RustlsError, RootCertStore, ServerConfig,
-  SignatureScheme,
+  SignatureScheme, SupportedProtocolVersion,
   client::danger::HandshakeSignatureValid,
   crypto::{
     WebPkiSupportedAlgorithms, ring::default_provider, verify_tls12_signature,
@@ -23,6 +23,7 @@ use rustls::{
     ParsedCertificate, WebPkiClientVerifier,
     danger::{ClientCertVerified, ClientCertVerifier},
   },
+  version::{TLS12, TLS13},
 };
 
 use super::MtlsError;
@@ -116,6 +117,13 @@ pub fn pki_verifier_from_file(path: &Path) -> Result<Arc<dyn ClientCertVerifier>
   pki_verifier(&std::fs::read(path).map_err(|err| MtlsError::TrustBundle(err.to_string()))?)
 }
 
+/// Explicit TLS floor for the public listener: TLS 1.2 minimum, per
+/// draft-ietf-oauth-v2-1-16 §1.5 and §7.14.
+///
+/// Pinned explicitly instead of relying on rustls defaults, so a future
+/// default change cannot silently re-enable an older protocol version.
+pub static TLS_PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&TLS13, &TLS12];
+
 /// Build a TLS server config pairing the server identity with either mTLS
 /// verifier. Wired into the accept loop by the TLS listener task.
 pub fn server_config(
@@ -134,7 +142,7 @@ pub fn server_config(
   }
   let key = PrivateKeyDer::from_pem_slice(key_pem)
     .map_err(|_| MtlsError::TrustBundle("server private key is not valid PEM".to_owned()))?;
-  ServerConfig::builder()
+  ServerConfig::builder_with_protocol_versions(TLS_PROTOCOL_VERSIONS)
     .with_client_cert_verifier(client_verifier)
     .with_single_cert(chain, key)
     .map_err(|_| MtlsError::TrustBundle("server certificate and key do not match".to_owned()))

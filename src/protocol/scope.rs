@@ -154,6 +154,54 @@ pub fn effective_scope(input: &ScopeInput<'_>) -> Result<ScopeSet, AppError> {
   }
 }
 
+/// The refresh scope split (draft-ietf-oauth-v2-1-16 §4.3.1 + §4.3.3):
+/// `retained` feeds the replacement refresh token, `access` feeds the
+/// access token and the response `scope`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshScopes {
+  /// Presented scope re-checked against the current catalog, client
+  /// registration, and user entitlements; revoked entries drop silently.
+  pub retained: ScopeSet,
+  /// `retained` narrowed by an explicit request, or `retained` itself.
+  pub access: ScopeSet,
+}
+
+/// Refresh may narrow but never widen (draft-ietf-oauth-v2-1-16 §4.3.1 +
+/// §4.3.3): the replacement refresh token keeps the presented scope
+/// re-checked against the current sets (revoked entries drop silently, which
+/// may leave it empty), while an explicit `Some` request narrows only the
+/// access token and must be a subset of the presented scope and of every
+/// current set (`invalid_scope` otherwise). `None` leaves both at the
+/// retained scope.
+pub fn refresh_scopes(
+  previous: &ScopeSet,
+  requested: Option<&str>,
+  enabled: &ScopeSet,
+  client_registered: &ScopeSet,
+  user_entitled: &ScopeSet,
+) -> Result<RefreshScopes, AppError> {
+  let retained = previous
+    .intersect(enabled)
+    .intersect(client_registered)
+    .intersect(user_entitled);
+  let access = match requested {
+    None => retained.clone(),
+    Some(raw) => {
+      let candidate = ScopeSet::parse(raw)?;
+      require_subset(&candidate, enabled, "unknown or disabled scope")?;
+      require_subset(&candidate, previous, "refresh must not widen scope")?;
+      require_subset(
+        &candidate,
+        client_registered,
+        "scope exceeds client registration",
+      )?;
+      require_subset(&candidate, user_entitled, "scope not granted to user")?;
+      candidate
+    }
+  };
+  Ok(RefreshScopes { retained, access })
+}
+
 /// Refresh may narrow but never widen: `None` keeps the previous grant
 /// (re-checked against the current catalog, then silently narrowed to the
 /// still-registered and still-entitled intersection, which may be empty),
@@ -165,28 +213,16 @@ pub fn narrow_on_refresh(
   client_registered: &ScopeSet,
   user_entitled: &ScopeSet,
 ) -> Result<ScopeSet, AppError> {
-  match requested {
-    None => {
-      require_subset(previous, enabled, "granted scope no longer enabled")?;
-      Ok(
-        previous
-          .intersect(client_registered)
-          .intersect(user_entitled),
-      )
-    }
-    Some(raw) => {
-      let candidate = ScopeSet::parse(raw)?;
-      require_subset(&candidate, enabled, "unknown or disabled scope")?;
-      require_subset(&candidate, previous, "refresh must not widen scope")?;
-      require_subset(
-        &candidate,
-        client_registered,
-        "scope exceeds client registration",
-      )?;
-      require_subset(&candidate, user_entitled, "scope not granted to user")?;
-      Ok(candidate)
-    }
-  }
+  Ok(
+    refresh_scopes(
+      previous,
+      requested,
+      enabled,
+      client_registered,
+      user_entitled,
+    )?
+    .access,
+  )
 }
 
 fn enforce_grant_term(candidate: &ScopeSet, input: &ScopeInput<'_>) -> Result<(), AppError> {

@@ -6,12 +6,15 @@
 //! (`S256`, required), then `state` passthrough. No code is issued here;
 //! a [`ValidatedRequest`] only authorizes the login/consent stages to run.
 //!
-//! Error-delivery matrix: [`AuthorizeFailure::Page`] (HTTP 400, no redirect)
-//! only for an absent/unknown `client_id`, an invalid or unregistered
-//! `redirect_uri`, or a malformed request (including every PAR/JAR
-//! resolution failure, which precedes `redirect_uri` validation and therefore
-//! cannot redirect safely). Every later failure redirects to the validated
-//! `redirect_uri` with `error` (+ `state`).
+//! Error-delivery matrix: [`AuthorizeFailure::Page`] (no redirect) only for
+//! an absent/unknown `client_id`, an invalid or unregistered `redirect_uri`,
+//! or a malformed request (including every PAR/JAR resolution failure, which
+//! precedes `redirect_uri` validation and therefore cannot redirect safely).
+//! A page renders the error's HTTP status: client errors render 400, a
+//! fail-closed outage (`temporarily_unavailable`, Postgres/PII) renders 503
+//! with `Retry-After`, and a masked internal failure renders 500. Every later
+//! failure redirects to the validated `redirect_uri` with `error` (+ `error_description`, + `state`, + RFC 9207
+//! `iss`).
 
 use std::collections::HashMap;
 
@@ -75,9 +78,12 @@ pub struct ValidatedRequest {
 
 /// How an authorize failure reaches the user agent.
 ///
-/// A [`AuthorizeFailure::Page`] renders HTTP 400 with no `Location`; a
+/// A [`AuthorizeFailure::Page`] renders the error's HTTP status with no
+/// `Location` (400 for client errors, 503 + `Retry-After` for a fail-closed
+/// outage, 500 for a masked internal failure); a
 /// [`AuthorizeFailure::Redirect`] renders HTTP 302 to the validated
-/// `redirect_uri` carrying `error` (+ `error_description`, + `state`).
+/// `redirect_uri` carrying `error` (+ `error_description`, + `state`, + `iss`
+/// per RFC 9207).
 #[derive(Debug)]
 pub enum AuthorizeFailure {
   /// Direct error page: unknown client, bad redirect, or malformed request.
@@ -90,6 +96,8 @@ pub enum AuthorizeFailure {
     error: AppError,
     /// The `state` to echo, if the request supplied one.
     state: Option<String>,
+    /// The server issuer echoed as the RFC 9207 `iss` parameter.
+    iss: String,
   },
 }
 
@@ -125,7 +133,8 @@ impl AuthorizeFailure {
         target,
         error,
         state,
-      } => error_redirect(&target, &error, state.as_deref()),
+        iss,
+      } => error_redirect(&target, &error, state.as_deref(), &iss),
     }
   }
 }
@@ -188,6 +197,7 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
     target: redirect.clone(),
     error,
     state: merged.get("state").cloned(),
+    iss: input.issuer.to_owned(),
   };
 
   match present(merged.get("response_type")) {
@@ -198,7 +208,9 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
       )));
     }
     None => {
-      return Err(page(AppError::invalid_request("response_type is required")));
+      return Err(redirect_err(AppError::invalid_request(
+        "response_type is required",
+      )));
     }
   }
 
@@ -206,7 +218,7 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
     .await
     .map_err(redirect_err)?;
   let enabled_names: Vec<String> = enabled.iter().map(|record| record.name.clone()).collect();
-  let enabled_set = scope_set_of(&enabled_names, &redirect, &merged)?;
+  let enabled_set = scope_set_of(&enabled_names, &redirect, &merged, input.issuer)?;
   let client_registered =
     scope::ScopeSet::parse(&client.scope).map_err(|_| redirect_err(AppError::server_error()))?;
   let scope_input = scope::ScopeInput {
@@ -240,7 +252,7 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
   let post_logout_uri =
     redirect_repo::post_logout_for_client(input.pool, input.keys, &client.client_id)
       .await
-      .map_err(AuthorizeFailure::Page)?;
+      .map_err(redirect_err)?;
 
   Ok(ValidatedRequest {
     client_id: client.client_id,
@@ -268,11 +280,13 @@ fn scope_set_of(
   names: &[String],
   redirect: &str,
   merged: &HashMap<String, String>,
+  issuer: &str,
 ) -> Result<scope::ScopeSet, AuthorizeFailure> {
   scope::ScopeSet::from_names(names).map_err(|_| AuthorizeFailure::Redirect {
     target: redirect.to_owned(),
     error: AppError::server_error(),
     state: merged.get("state").cloned(),
+    iss: issuer.to_owned(),
   })
 }
 
@@ -289,7 +303,10 @@ fn check_challenge_shape(challenge: &str) -> Result<(), AppError> {
   }
 }
 
-/// Render a direct error page: HTTP 400 HTML, no `Location`.
+/// Render a direct error page: HTML with the error's HTTP status and no
+/// `Location`. Client errors render 400; a fail-closed outage
+/// (`temporarily_unavailable`) renders 503 with `Retry-After: 1`, and a masked
+/// internal failure renders 500 (RFC 6749 §4.1.2.1, RFC 9700 §4.1.3).
 fn error_page(error: &AppError) -> Response {
   let body = format!(
     "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -300,12 +317,18 @@ fn error_page(error: &AppError) -> Response {
     description = escape_html(error.description()),
   );
   let mut response = Html(body).into_response();
-  *response.status_mut() = StatusCode::BAD_REQUEST;
+  *response.status_mut() = error.status();
+  if error.code() == OAuthErrorCode::TemporarilyUnavailable {
+    response
+      .headers_mut()
+      .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+  }
   response
 }
 
-/// Render an authorize error redirect: HTTP 302 with `error` (+ `state`).
-fn error_redirect(target: &str, error: &AppError, state: Option<&str>) -> Response {
+/// Render an authorize error redirect: HTTP 302 with `error` (+ `state`, + RFC
+/// 9207 `iss`).
+fn error_redirect(target: &str, error: &AppError, state: Option<&str>, issuer: &str) -> Response {
   let separator = if target.contains('?') { '&' } else { '?' };
   let mut location = String::with_capacity(target.len() + 128);
   location.push_str(target);
@@ -318,6 +341,8 @@ fn error_redirect(target: &str, error: &AppError, state: Option<&str>) -> Respon
     location.push_str("&state=");
     push_percent_encoded(&mut location, state);
   }
+  location.push_str("&iss=");
+  push_percent_encoded(&mut location, issuer);
   match header::HeaderValue::from_str(&location) {
     Ok(value) => Response::builder()
       .status(StatusCode::FOUND)

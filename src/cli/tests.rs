@@ -794,6 +794,43 @@ async fn cli_redirect_upsert_and_attach() -> Result<(), TestError> {
       .is_err()
   );
 
+  // Draft-ietf-oauth-v2-1-16 §2.3.1: a dotless private-use scheme must be
+  // rejected with `CliError::Input`, while reverse-DNS dotted schemes upsert.
+  let dotless = redirect::run_uri(
+    &context,
+    RedirectUriCommand::Create {
+      uri: "myapp:/cb".to_owned(),
+      kind: "authorize".to_owned(),
+      description: None,
+    },
+  )
+  .await;
+  assert!(
+    matches!(dotless, Err(super::context::CliError::Input(_))),
+    "dotless private-use scheme must be rejected"
+  );
+  if let Err(super::context::CliError::Input(message)) = dotless {
+    assert!(
+      message.contains("§2.3.1"),
+      "rejection must cite §2.3.1, got: {message}"
+    );
+  }
+  redirect::run_uri(
+    &context,
+    RedirectUriCommand::Create {
+      uri: "com.example.app:/cb".to_owned(),
+      kind: "authorize".to_owned(),
+      description: None,
+    },
+  )
+  .await?;
+  assert!(
+    redirect::find_redirect_id(&context, "com.example.app:/cb", "authorize")
+      .await
+      .is_ok(),
+    "dotted reverse-DNS scheme must still upsert"
+  );
+
   // An unknown URI is a clean not-found, not a database error.
   let missing =
     redirect::find_redirect_id(&context, "https://unknown.example.test/x", "authorize").await;

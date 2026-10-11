@@ -321,15 +321,18 @@ configure one as fail-open is a load-time error.
 ## Input and output safety
 
 - Redirect URI matching is exact, with the RFC 8252 loopback exception only.
-  There are no wildcards and no prefix matches.
+  There are no wildcards and no prefix matches. A private-use scheme must
+  contain reverse-DNS dot notation (draft-16 §2.3.1): `com.example.app:/` is
+  accepted, `myapp:/` is rejected; `https` and loopback are unaffected.
 - PKCE is `S256` only. A verifier cannot be omitted to downgrade.
 - Scope is intersected: `requested ∩ client-registered ∩ user-entitled ∩
-  enabled`. Refresh can only narrow and re-checks the current `enabled` catalog
-  plus the current client-registered and user-entitled sets (fresh Postgres
-  reads): an omitted `scope` keeps the prior grant only while still enabled,
-  then silently narrows to the still-registered ∩ still-entitled intersection
-  (possibly empty); an explicit `scope` must be a subset of the prior grant and
-  of all three current sets.
+  enabled`. Refresh re-checks the current `enabled` catalog, the client's
+  current registration, and the user's current entitlements (fresh Postgres
+  reads) and splits the result (draft-16 §4.3.1 + §4.3.3): the replacement
+  refresh token retains the presented scope minus revoked entries (dropped
+  silently, possibly to empty), while an explicit narrower `scope` narrows only
+  the access token and the response `scope` — the next rotation from the
+  retained refresh token can still use the full retained scope.
 - The login, consent, and device pages set a strict CSP with
   `frame-ancestors 'none'`. They use server-side sessions, CSRF protection, and
   no open redirect.

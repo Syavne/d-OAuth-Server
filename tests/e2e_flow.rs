@@ -285,8 +285,8 @@ async fn e2e_flow_browser_authorize_login_consent_token() -> Result<(), TestErro
   let (status, headers, _) =
     post_consent(&browser, &session, &bound, &consent_csrf, "approve").await?;
   ensure(
-    status == reqwest::StatusCode::FOUND,
-    format!("consent approval must 302 to the redirect: {status}"),
+    status == reqwest::StatusCode::SEE_OTHER,
+    format!("consent approval must 303 to the redirect: {status}"),
   )?;
   let location = location_of(&headers)?;
   ensure(
@@ -437,8 +437,8 @@ async fn e2e_flow_consent_deny_redirects_access_denied() -> Result<(), TestError
   let (status, headers, _) =
     post_consent(&browser, &session, &bound, &consent_csrf, "deny").await?;
   ensure(
-    status == reqwest::StatusCode::FOUND,
-    format!("consent denial must 302 to the redirect: {status}"),
+    status == reqwest::StatusCode::SEE_OTHER,
+    format!("consent denial must 303 to the redirect: {status}"),
   )?;
   let location = location_of(&headers)?;
   ensure(

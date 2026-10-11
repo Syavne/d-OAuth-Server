@@ -148,7 +148,8 @@ once every `uri` is NULL.
 authorization-response callbacks (they carry `code`/`state`); `post_logout` URIs
 are bare navigation targets used only by `POST /logout` (`GET /logout` is
 read-only and issues no redirect). Both kinds are matched
-with the same exact-string + RFC 8252 loopback rule.
+with the same exact-string + RFC 8252 loopback rule, plus the draft-16 §2.3.1
+private-use dot rule (`com.example.app:/` is accepted, `myapp:/` is rejected).
 
 ### client_redirect_uris
 

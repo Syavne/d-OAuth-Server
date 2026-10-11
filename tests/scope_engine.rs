@@ -16,7 +16,7 @@ use d_oauth::{
   error::{AppError, OAuthErrorCode},
   protocol::scope::{
     MAX_SCOPE_COUNT, MAX_SCOPE_NAME_LEN, MAX_SCOPE_TOTAL_LEN, ScopeInput, ScopeSet,
-    effective_scope, narrow_on_refresh,
+    effective_scope, narrow_on_refresh, refresh_scopes,
   },
 };
 use proptest::prelude::*;
@@ -178,12 +178,65 @@ fn scope_refresh_narrows_only_and_rechecks_catalog() -> TestResult {
     &enabled,
     &enabled
   )));
-  assert!(is_invalid_scope(narrow_on_refresh(
-    &previous,
+  assert_eq!(
+    narrow_on_refresh(&previous, None, &names(&["read"]), &enabled, &enabled)?.render(),
+    "read"
+  );
+  Ok(())
+}
+
+#[test]
+fn refresh_scopes_retained_vs_access() -> TestResult {
+  let full = names(&["read", "write"]);
+  let read = names(&["read"]);
+  // Explicit narrow: retained keeps the re-checked previous intersection,
+  // access narrows to the candidate.
+  let split = refresh_scopes(
+    &names(&["read", "write"]),
+    Some("read"),
+    &full,
+    &full,
+    &full,
+  )?;
+  assert_eq!(split.retained.render(), "read write");
+  assert_eq!(split.access.render(), "read");
+  // Omitted scope: retained and access agree.
+  let kept = refresh_scopes(&names(&["read", "write"]), None, &full, &full, &full)?;
+  assert_eq!(kept.retained.render(), "read write");
+  assert_eq!(kept.access.render(), "read write");
+  assert_eq!(kept.retained, kept.access);
+  // Revoked entries drop silently from retained (catalog, registration, and
+  // entitlement terms each narrow); an explicit narrow of the survivor still
+  // applies only to access.
+  let catalog_revoked = refresh_scopes(&names(&["read", "write"]), None, &read, &full, &full)?;
+  assert_eq!(catalog_revoked.retained.render(), "read");
+  assert_eq!(catalog_revoked.access.render(), "read");
+  let entitled_revoked = refresh_scopes(
+    &names(&["read", "write"]),
+    Some("read"),
+    &full,
+    &full,
+    &read,
+  )?;
+  assert_eq!(entitled_revoked.retained.render(), "read");
+  assert_eq!(entitled_revoked.access.render(), "read");
+  // A fully revoked grant retains (and grants) nothing rather than failing.
+  let emptied = refresh_scopes(
+    &names(&["read", "write"]),
     None,
-    &names(&["read"]),
-    &enabled,
-    &enabled
+    &full,
+    &full,
+    &ScopeSet::empty(),
+  )?;
+  assert!(emptied.retained.is_empty());
+  assert!(emptied.access.is_empty());
+  // Widening via an explicit request is still `invalid_scope`.
+  assert!(is_invalid_scope(refresh_scopes(
+    &read,
+    Some("read write"),
+    &full,
+    &full,
+    &full
   )));
   Ok(())
 }

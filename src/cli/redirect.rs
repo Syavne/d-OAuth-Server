@@ -167,6 +167,13 @@ pub async fn upsert(
   description: Option<&str>,
   enabled: bool,
 ) -> Result<Upsert, CliError> {
+  if !crate::protocol::redirect_repo::is_valid_redirect_scheme(uri) {
+    return Err(CliError::Input(
+      "redirect URI private-use scheme must contain reverse-DNS dot notation \
+       (draft-ietf-oauth-v2-1-16 §2.3.1)"
+        .to_owned(),
+    ));
+  }
   let keys = &context.config().keys;
   if find_existing(context, uri, kind)
     .await?

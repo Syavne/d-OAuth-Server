@@ -108,9 +108,19 @@ d-oauth-server client redirect-uris --client-id <id>
 ```
 
 A redirect URI is a global catalog entry; a client attaches to it. `/authorize`
-matches only the client's attached and enabled `authorize` set. Detaching or
-disabling a URI stops future redirects to it; already issued tokens are
-unaffected. Deleting a referenced URI disables it instead.
+matches only the client's attached and enabled `authorize` set. A private-use
+URI scheme must contain reverse-DNS dot notation (draft-16 §2.3.1):
+`com.example.app:/` is accepted and `myapp:/` is rejected at creation.
+Detaching or disabling a URI stops future redirects to it; already issued
+tokens are unaffected. Deleting a referenced URI disables it instead.
+
+Legacy rows predate the §2.3.1 dot check, so a catalog that still holds a
+dotless private-use URI (for example `myapp:/cb`) makes `config sync` fail:
+`redirect::upsert` validates the scheme (`src/cli/redirect.rs:170`) before the
+idempotency short-circuit (`src/cli/redirect.rs:178`, via `src/cli/sync.rs:168`),
+so the sync aborts with `invalid input` instead of reporting no changes.
+`redirect-uri disable` and `redirect-uri delete` bypass the upsert check, so
+disable or delete the legacy row first, then re-run the sync.
 
 `kind` selects the URI's role. `authorize` (the default) is an
 authorization-response callback. `post_logout` is a bare return target used only
