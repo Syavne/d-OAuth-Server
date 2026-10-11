@@ -47,68 +47,6 @@ practice in RFC 9700. This server enforces every one of these:
 | `state` is supported and echoed | The value is returned on the success and error redirects. | RFC 6749 §4.1.2.1 |
 | No open redirect | The redirect URI must be registered, attached, and enabled. | RFC 9700 §4.1.3 |
 
-## Resolved gaps against draft-ietf-oauth-v2-1-16
-
-An internal audit raised the seven findings below against the draft cited
-above. All seven are resolved in the current implementation; there are no
-open gaps. Findings 1, 4, and 7 are also recorded under `[Unreleased]` Fixed
-in [CHANGELOG.md](CHANGELOG.md). Each entry names the draft section, the
-previous behavior, and the current behavior.
-
-1. **Token endpoint accepts a missing or empty `redirect_uri`** (draft-16
-   §4.1.3, §10.2): the back-compat mode must allow `redirect_uri`, not
-   require it, but the implementation used to reject a token request with an
-   empty `redirect_uri` (`invalid_request`), which could break pure-2.1
-   clients. **Resolved**: the token endpoint accepts a missing or empty
-   `redirect_uri` and skips the binding check; a supplied value must still
-   match exactly or redemption fails `invalid_grant`.
-
-2. **Authorization error redirects carry `iss`** (draft-16 §4.1.2.1,
-   §7.15.1): `iss` is required on the authorization response, including
-   errors, but the error redirect (`error`, `error_description`, `state`)
-   used to omit it while the success redirect included it. **Resolved**:
-   every error redirect issued after `client_id` and `redirect_uri` are
-   validated now carries the percent-encoded `iss` alongside `error`,
-   `error_description`, and the echoed `state`.
-
-3. **Missing `response_type` redirects once the client is validated**
-   (draft-16 §4.1.1, §4.1.2.1): the absent-`response_type` case used to
-   return a direct error page even after `client_id` and `redirect_uri` were
-   validated, where the draft requires delivery via redirect. **Resolved**:
-   the absent-`response_type` case now redirects (`invalid_request` with
-   `error_description` + `state`) once `client_id` and `redirect_uri` are
-   validated; before that it still renders the direct `400` page.
-
-4. **Rotated refresh-token scope splits retained from access scope**
-   (draft-16 §4.3.3, §4.3.1): the new refresh token's scope must stay
-   identical to the presented one while a narrower scope may be requested,
-   but rotation used to narrow the replacement refresh token itself.
-   **Resolved**: the replacement refresh token keeps the presented scope
-   re-checked against the current `enabled` catalog, client registration,
-   and user entitlements (revoked entries drop silently), while an explicit
-   narrower `scope` narrows only the access token and the response `scope`.
-
-5. **Pinned TLS 1.2 minimum** (draft-16 §1.5, §7.14): TLS 1.2 or above is
-   required. **Resolved**: the server pins the minimum explicitly in
-   `src/protocol/mtls/verifier.rs` (`TLS_PROTOCOL_VERSIONS`: exactly TLS 1.2
-   + TLS 1.3, wired via `ServerConfig::builder_with_protocol_versions`
-   instead of rustls defaults), covered by the `tls_version_*` tests in
-   `src/routes.rs` (pinned set is exactly 1.2/1.3; version-pinned clients
-   negotiate the expected version).
-
-6. **Consent success redirect uses `303`** (draft-16 §7.5.4, SHOULD): the
-   consent success redirect used `302` where the draft prefers `303`.
-   **Resolved**: `POST /consent` success (approval and denial) now returns
-   `303 See Other` with `Location`, so browsers continue with `GET`;
-   cookies, CSRF, and CSP handling are unchanged.
-
-7. **Private-use URI schemes require reverse-DNS `.` notation** (draft-16
-   §2.3.1, SHOULD): there was no reverse-DNS `.` check for private-use URI
-   schemes. **Resolved**: a private-use scheme must contain a `.`
-   (`com.example.app:/` is accepted, `myapp:/` is rejected with
-   `invalid_redirect_uri` on DCR and `invalid input` on the CLI); `https`
-   and the loopback `http` exception are unchanged.
-
 ## Endpoints
 
 All endpoints are on the TLS public listener. The plaintext health listener

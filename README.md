@@ -230,8 +230,8 @@ certificate.
   password grant at this server.
 - The server targets `draft-ietf-oauth-v2-1-16` (published 3 September 2026;
   an Internet-Draft, not an RFC):
-  https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1. Known gaps
-  against that draft are listed in [docs/OAUTH.md](docs/OAUTH.md).
+  https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1. There are no
+  open gaps against that draft; see [docs/OAUTH.md](docs/OAUTH.md).
 - There is no default credential and no HTTP admin API. Provision through the
   CLI.
 - The token pepper, TOTP encryption key, and PII field-encryption key are
