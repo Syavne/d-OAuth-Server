@@ -1,8 +1,10 @@
-# Dependabot keeps crates, Actions, and container base images current between
-# the `cargo audit` / `cargo deny` gates on push (see docs/TODO.md T4-2).
-# The `docker` entry aligns with the SHA-pinned bases in T4-1; the
-# `github-actions` entry tracks the SHA-pinned `uses:` refs the same way.
-# Conservative on purpose: one weekly run, few concurrent PRs.
+# Dependabot posture: alerts only, no pull requests.
+# Vulnerability and version alerts still surface under the Security tab (plus
+# the `cargo audit` / `cargo deny` gates on push), but Dependabot opens no
+# PRs: every `updates:` block below carries `open-pull-requests-limit: 0`.
+# (Automated *security-update* PRs are a separate toggle in repo Settings →
+# Code security, not this file.) To re-enable version PRs, restore the
+# limits (they were 5/5/3/1, weekly Monday 06:00 UTC, grouped minor+patch).
 version: 2
 updates:
   - package-ecosystem: "cargo"
@@ -12,7 +14,7 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "UTC"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
     commit-message:
@@ -31,7 +33,7 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "UTC"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
     commit-message:
@@ -50,7 +52,7 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "UTC"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
     commit-message:
@@ -69,7 +71,7 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "UTC"
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
     commit-message:
