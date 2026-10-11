@@ -21,6 +21,7 @@
 //! `.github/workflows/ci.yml`). Bodies use `Result` + `?`
 //! (`unwrap`/`expect`/`panic` are denied workspace-wide).
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use d_oauth::{
@@ -296,6 +297,32 @@ async fn sentinel_master_port(host: &str, port: u16) -> Result<u16, TestError> {
     .ok_or_else(|| TestError::Unexpected("sentinel has no master address".to_owned()))
 }
 
+/// Whether Sentinel reports at least one replica with a live replication
+/// link (`master-link-status: ok`). `SENTINEL FAILOVER` refuses with
+/// `NOGOODSLAVE` while the only replica is still handshaking, so the
+/// failover harness gates on this before issuing the failover.
+async fn sentinel_replica_synced(host: &str, port: u16) -> bool {
+  let Ok(client) = redis::Client::open(format!("redis://{host}:{port}")) else {
+    return false;
+  };
+  let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+    return false;
+  };
+  let Ok(replicas): Result<Vec<HashMap<String, String>>, _> = redis::cmd("SENTINEL")
+    .arg("REPLICAS")
+    .arg("master0")
+    .query_async(&mut conn)
+    .await
+  else {
+    return false;
+  };
+  replicas.iter().any(|replica| {
+    replica
+      .get("master-link-status")
+      .is_some_and(|status| status == "ok")
+  })
+}
+
 /// A real `SENTINEL FAILOVER master0` promotes the replica: the resolved
 /// master changes and a write round-trips through the promoted node.
 #[tokio::test]
@@ -324,6 +351,22 @@ async fn topology_sentinel_failover_promotes_replica() -> TestResult {
   };
 
   let old_port = sentinel_master_port(&sentinel_host, sentinel_port).await?;
+
+  // The replica link is still handshaking right after fixture boot on loaded
+  // runners; Sentinel refuses the failover with `NOGOODSLAVE` until the link
+  // is up, so wait for a synced replica first.
+  let sync_deadline = Instant::now() + Duration::from_secs(30);
+  loop {
+    if sentinel_replica_synced(&sentinel_host, sentinel_port).await {
+      break;
+    }
+    if Instant::now() >= sync_deadline {
+      return Err(TestError::Unexpected(
+        "sentinel replica never finished syncing".to_owned(),
+      ));
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+  }
 
   let admin = redis::Client::open(format!("redis://{sentinel_host}:{sentinel_port}"))?;
   let mut admin_conn = admin.get_multiplexed_async_connection().await?;
