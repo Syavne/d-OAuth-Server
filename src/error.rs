@@ -550,8 +550,7 @@ fn is_dependency_outage(code: Option<&str>) -> bool {
   let Some(code) = code else {
     return false;
   };
-  code.starts_with("08")
-    || matches!(code, "57P01" | "57P02" | "57P03" | "57P04" | "53300")
+  code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03" | "57P04" | "53300")
 }
 
 impl From<crate::crypto::field::FieldError> for AppError {
