@@ -17,7 +17,7 @@
 # Pinned bases (multi-arch index digests; buildx selects per-platform):
 # - rust 1.99-bookworm (matches rust-toolchain.toml stable; rustc 1.99.0)
 # - distroless static-debian12:nonroot (UID:GID 65532, no shell)
-ARG RUST_BASE=docker.io/library/rust:1.99-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0
+ARG RUST_BASE=docker.io/library/rust:1.99-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
 ARG RUNTIME_BASE=gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 FROM ${RUST_BASE} AS chef

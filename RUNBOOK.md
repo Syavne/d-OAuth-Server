@@ -184,7 +184,8 @@ from an unverified local tarball. The full path is in
 - [ ] Read the digest the `pin-digest` job committed:
   `grep -A2 'name: ghcr.io/syavne/d-oauth-server' deploy/k8s/kustomization.yaml`.
 - [ ] Verify it before applying (placeholder `sha256:<digest>` stands for the
-  value from the previous step; no real digest is recorded here):
+  value from the previous step; no real digest is recorded here; signatures are
+  cosign v3 OCI 1.1 referrers, so use a cosign v3+ client):
 
   ```sh
   cosign verify \

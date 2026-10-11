@@ -535,10 +535,10 @@ on:
   repository's code-scanning (Security) tab with category `trivy`; the SBOM is
   committed as the `sbom.spdx.json` artifact by step
   `SBOM (syft, committed as artifact)`.
-- Keyless signing with `cosign` (job `merge`, step
-  `Keyless sign (cosign, OIDC)`: `cosign sign` on the merged index digest; the
-  per-arch SBOM and SLSA provenance attestations are attached by the `build`
-  legs).
+- Keyless signing with `cosign` v3 (job `merge`, step
+  `Keyless sign (cosign, OIDC)`: `cosign sign` on the merged index digest,
+  stored as an OCI 1.1 referrer/bundle; the per-arch SBOM and SLSA provenance
+  attestations are attached by the `build` legs).
 - Digest pinning (job `pin-digest`, step
   `Pin kustomization to the built digest + strict lint`): the signed merge
   digest overwrites `images[].digest` in `deploy/k8s/kustomization.yaml`,
@@ -576,6 +576,11 @@ python3 scripts/check_manifests.py --strict-digest
 kubectl apply --dry-run=server -k deploy/k8s
 kubectl apply -k deploy/k8s
 ```
+
+Signatures and attestations are written with cosign v3 as OCI 1.1 referrers and
+Sigstore bundles, not the legacy `sha256-<digest>.sig` tag; verify with a
+cosign v3+ client (cosign v2.6+ can read them with `--new-bundle-format`). The
+`cosign verify` flags above are unchanged from v2.
 
 Record the shipped `sha256:<digest>` in [RUNBOOK.md](../RUNBOOK.md)
 (deploy provenance entry: digest, `sbom.spdx.json` / `trivy.sarif` run, and
