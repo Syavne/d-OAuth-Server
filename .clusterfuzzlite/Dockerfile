@@ -1,12 +1,18 @@
 # ClusterFuzzLite builder image (T4-3).
 #
-# Pinned to the Rust base builder; the nightly selection comes from
-# `fuzz/rust-toolchain.toml` (nearest toolchain file to the working
-# directory), so the root stable pin is never violated. `cargo-fuzz` is
-# installed here so `build.sh` stays a plain build script.
+# Pinned to the Rust base builder. The base image bakes `RUSTUP_TOOLCHAIN`
+# as an environment variable, which overrides any `rust-toolchain.toml`,
+# so the nightly is selected here explicitly (it must match
+# `fuzz/rust-toolchain.toml`, which governs the CI and local fuzz legs).
+# The root stable pin is never violated. `cargo-fuzz` is installed here so
+# `build.sh` stays a plain build script.
 FROM gcr.io/oss-fuzz-base/base-builder-rust:v1
 
-RUN cargo install cargo-fuzz --locked
+# Must match `fuzz/rust-toolchain.toml`: dated, not floating, so a
+# dependency can never again outgrow a stale preinstalled nightly
+# (`sqlx 0.9` needs rustc >= 1.94; the base image ships 1.91).
+ENV RUSTUP_TOOLCHAIN=nightly-2026-10-01
+RUN rustup toolchain install nightly-2026-10-01 && cargo install cargo-fuzz --locked
 
 COPY . "$SRC/d-oauth-server"
 WORKDIR "$SRC/d-oauth-server"
