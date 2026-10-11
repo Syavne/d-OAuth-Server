@@ -179,8 +179,11 @@ jobs:
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-fuzz
+      # Explicit gnu target: the prebuilt cargo-fuzz binary is musl-static,
+      # so its default target is musl (ASan-incompatible, and musl std is
+      # not installed). Never drop this flag without checking the default.
       - name: Build all fuzz targets
-        run: cargo fuzz build
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
   fuzz-run:
     name: fuzz-run
@@ -216,8 +219,10 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
+      # Same explicit target as `fuzz-build`: cargo-fuzz defaults to the
+      # installer binary's own platform (musl), not the runner's (gnu).
       - name: Fuzz ${{ matrix.target }} (bounded)
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=600 -rss_limit_mb=2048
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=600 -rss_limit_mb=2048
       # Save only on success; a per-run key grows the corpus while the prefix
       # `restore-keys` always pick the newest entry.
       - name: Save corpus for ${{ matrix.target }}
