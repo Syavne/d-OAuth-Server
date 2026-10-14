@@ -530,7 +530,7 @@ on:
   `<X.Y.Z>`). No `sha-<commit>` tags are published. These tags are convenience
   references; the deploy path applies the mutable `latest` tag (see
   [Deploy path](#deploy-path-use-the-ghcrio-image)).
-- Registry cleanup (job `cleanup`, weekly + manual): GHCR has no retention and
+- Registry cleanup (job `cleanup`, after every push plus weekly + manual): GHCR has no retention and
   keeps superseded manifests as untagged versions, so the job deletes untagged
   manifests and the legacy `sha-*` tags, keeping `latest` and every release tag.
 - A vulnerability scan that fails on HIGH and CRITICAL (job `merge`, steps

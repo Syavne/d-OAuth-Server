@@ -12,10 +12,11 @@
 # tags (X.Y.Z, X.Y, X, `latest`; a pre-release tag gets only X.Y.Z) and a GitHub
 # Release is created.
 # No `sha-<commit>` tag is published: a master push only moves `latest`, and
-# GHCR keeps the superseded (now-untagged) manifests until they are pruned.
+# `cleanup` prunes the superseded (now-untagged) manifests right after.
 # Scheduled legs (weekly rebuild, Monday 04:00 UTC): rebuild + rescan + resign
-# (advancing base-image digests), and `cleanup` prunes superseded untagged
-# manifests and the legacy `sha-*` tags, keeping `latest` and release tags.
+# (advancing base-image digests). `cleanup` prunes superseded untagged
+# manifests and the legacy `sha-*` tags after every push (plus weekly + manual),
+# keeping `latest` and release tags.
 #
 # The L7 mTLS constraint is DOCUMENTED (docs/DEPLOYMENT.md) and lint-checked
 # here; it is explicitly NOT exercised end-to-end in CI.
@@ -246,9 +247,9 @@ jobs:
     needs: [merge]
     # GHCR has no retention and keeps untagged manifests, so every `latest` move
     # leaves the previous one behind. Delete untagged manifests and the legacy
-    # `sha-*` tags (keeping `latest` and every release tag); `needs: [merge]`
-    # avoids racing the in-progress per-arch (untagged) pushes.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # `sha-*` tags (keeping `latest` and every release tag) after every push;
+    # `needs: [merge]` avoids racing the in-progress per-arch (untagged) pushes.
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
