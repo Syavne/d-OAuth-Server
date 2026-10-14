@@ -246,9 +246,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
+          key: sccache-${{ runner.os }}-fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
           restore-keys: |
-            sccache-${{ runner.os }}-
+            sccache-${{ runner.os }}-fuzz-
       - name: Start sccache (shared compilation cache)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -290,9 +290,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
+          key: sccache-${{ runner.os }}-fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
           restore-keys: |
-            sccache-${{ runner.os }}-
+            sccache-${{ runner.os }}-fuzz-
       - name: Start sccache (shared compilation cache)
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
