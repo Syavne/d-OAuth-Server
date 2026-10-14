@@ -11,7 +11,7 @@ use crate::protocol::client_auth::authenticate_client;
 
 #[tokio::test]
 async fn client_auth_assertion_wrong_aud_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-ct-wrong-aud";
   let key = ContainerKey::generate("k1")?;
@@ -35,7 +35,7 @@ async fn client_auth_assertion_wrong_aud_rejected() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_assertion_replayed_jti_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-ct-replay";
   let key = ContainerKey::generate("k1")?;
@@ -97,7 +97,7 @@ fn client_auth_assertion_aud_array_membership() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_jwks_uri_private_ip_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-ct-ssrf";
   insert_client(
@@ -122,7 +122,7 @@ async fn client_auth_jwks_uri_private_ip_rejected() -> TestResult {
 /// plaintext); a corrupt `jwks_uri_enc` fails as 503 `PiiDecrypt`.
 #[tokio::test]
 async fn private_key_jwt_jwks_uri_fetch() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-ct-jwks-fetch";
   insert_client(

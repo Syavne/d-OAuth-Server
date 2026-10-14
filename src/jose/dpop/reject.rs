@@ -15,7 +15,7 @@ use super::{
 /// A proof bound to one method does not verify for another.
 #[tokio::test]
 async fn dpop_tampered_htm_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let proof = mint_proof(&valid_params(
@@ -38,7 +38,7 @@ async fn dpop_tampered_htm_rejected() -> TestResult {
 /// A proof bound to one URI does not verify for another.
 #[tokio::test]
 async fn dpop_htu_mismatch_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let proof = mint_proof(&valid_params(
@@ -61,7 +61,7 @@ async fn dpop_htu_mismatch_rejected() -> TestResult {
 /// A proof `htu` carrying a query string is malformed (RFC 9449 §4.2).
 #[tokio::test]
 async fn dpop_htu_with_query_in_proof_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let jti = unique_jti();
@@ -84,7 +84,7 @@ async fn dpop_htu_with_query_in_proof_rejected() -> TestResult {
 /// A long-dead proof is rejected by the freshness window.
 #[tokio::test]
 async fn dpop_stale_iat_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let proof = mint_proof(&valid_params(
@@ -107,7 +107,7 @@ async fn dpop_stale_iat_rejected() -> TestResult {
 /// A proof from the far future is rejected despite clock-skew tolerance.
 #[tokio::test]
 async fn dpop_future_iat_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let proof = mint_proof(&valid_params(
@@ -130,7 +130,7 @@ async fn dpop_future_iat_rejected() -> TestResult {
 /// A missing proof (no `DPoP` header) is `invalid_dpop_proof`, not silent.
 #[tokio::test]
 async fn dpop_missing_proof_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let request = DpopRequest {
     proof: None,
     htm: TEST_HTM,
@@ -145,7 +145,7 @@ async fn dpop_missing_proof_rejected() -> TestResult {
 /// Only the exact `dpop+jwt` type is accepted.
 #[tokio::test]
 async fn dpop_wrong_or_missing_typ_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   for typ in [Some("jwt"), Some("dpop"), None] {
@@ -167,7 +167,7 @@ async fn dpop_wrong_or_missing_typ_rejected() -> TestResult {
 /// A proof without an embedded JWK leaves nothing to verify against.
 #[tokio::test]
 async fn dpop_missing_jwk_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let jti = unique_jti();
@@ -187,7 +187,7 @@ async fn dpop_missing_jwk_rejected() -> TestResult {
 /// Oversized and misshapen inputs are rejected before any crypto runs.
 #[tokio::test]
 async fn dpop_malformed_shape_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let now = now_unix();
   let big = "p".repeat(super::MAX_PROOF_LEN + 1);
   for proof in ["not-a-jwt", "a.b", "a.b.c.d", "", big.as_str()] {

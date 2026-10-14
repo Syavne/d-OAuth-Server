@@ -1,15 +1,13 @@
 //! `test(introspect)` suite: active shape, inactive misses, 401, ownership.
 //!
-//! Each test runs against a real Redis container plus a migrated Postgres
-//! database on the shared test server, through the public [`super`] API and a
-//! one-route router for the HTTP status assertions.
+//! Each test runs against the shared compose Redis (a per-test key-prefix
+//! pair isolates parallel runs) plus a migrated Postgres database on the shared
+//! test server, through the public [`super`] API and a one-route router for the
+//! HTTP status assertions.
 
-use std::{
-  sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-  },
-  time::Duration,
+use std::sync::{
+  Arc,
+  atomic::{AtomicU64, Ordering},
 };
 
 use axum::{
@@ -23,11 +21,6 @@ use http_body_util::BodyExt as _;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use time::OffsetDateTime;
 use tower::ServiceExt as _;
 use uuid::Uuid;
@@ -51,7 +44,7 @@ use crate::{
   },
   state::{AppState, Clock, RedisConn},
   store::Store,
-  test_guard::{ContainerGuard, Lease},
+  test_guard::Lease,
 };
 
 /// Boxed test error (no `unwrap`/`expect` under the crate deny lints).
@@ -77,25 +70,14 @@ struct Harness {
   config: Arc<Config>,
 }
 
-async fn harness() -> TestResult<(ContainerGuard, Harness)> {
+async fn harness() -> TestResult<Harness> {
   let (db, pool) = migrated_pool().await?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let redis_url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(redis_url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  let redis_url = crate::test_support::test_redis_url();
+  let manager = crate::test_support::redis_manager().await?;
+  let (token_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
   let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    token_prefix.clone(),
+    ratelimit_prefix.clone(),
     crate::config::DurabilityMode::WaitAof,
   );
   let fixture = json!({
@@ -103,23 +85,25 @@ async fn harness() -> TestResult<(ContainerGuard, Harness)> {
     "environment": "development",
     "tls": {"cert_path": "/tmp/introspect-test-cert.pem", "key_path": "/tmp/introspect-test-key.pem"},
     "database": {"url": "postgres://127.0.0.1:1/introspect"},
-    "redis": {"url": redis_url, "durability": "waitaof"},
+    "redis": {
+      "url": redis_url,
+      "durability": "waitaof",
+      "token_key_prefix": token_prefix,
+      "ratelimit_key_prefix": ratelimit_prefix,
+    },
     "token_pepper": "introspect-test-pepper-0123456789abcdef",
     "totp_encryption_key": "introspect-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "introspect-test-pii-key-0123456789abcdef",
   });
   let source = ::config::Config::try_from(&fixture)?;
   let config = Config::from_source(source)?;
-  Ok((
-    guarded,
-    Harness {
-      _db: db,
-      pool,
-      conn: RedisConn::Single(manager),
-      store,
-      config: Arc::new(config),
-    },
-  ))
+  Ok(Harness {
+    _db: db,
+    pool,
+    conn: RedisConn::Single(manager),
+    store,
+    config: Arc::new(config),
+  })
 }
 
 async fn insert_client(
@@ -284,7 +268,7 @@ fn router(h: &Harness) -> Router {
 
 #[tokio::test]
 async fn test_introspect_active_access_token_reports_shape() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("owner");
   insert_client(
     &h.pool,
@@ -336,7 +320,7 @@ async fn test_introspect_active_access_token_reports_shape() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_unknown_token_is_inactive_200() -> TestResult {
-  let (_container, h) = harness().await?;
+  let h = harness().await?;
   let client_id = unique("unknown");
   insert_client(
     &h.pool,
@@ -362,7 +346,7 @@ async fn test_introspect_unknown_token_is_inactive_200() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_unauthenticated_is_401() -> TestResult {
-  let (_container, h) = harness().await?;
+  let h = harness().await?;
   let (status, body) = post_form(router(&h), None, "token=whatever").await?;
 
   assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -375,7 +359,7 @@ async fn test_introspect_unauthenticated_is_401() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_foreign_client_token_is_inactive_200() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let owner = unique("owner");
   insert_client(
     &h.pool,
@@ -412,7 +396,7 @@ async fn test_introspect_foreign_client_token_is_inactive_200() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_revoked_token_is_inactive() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("revoked");
   insert_client(
     &h.pool,
@@ -445,7 +429,7 @@ async fn test_introspect_revoked_token_is_inactive() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_missing_token_form_is_400_invalid_request() -> TestResult {
-  let (_container, h) = harness().await?;
+  let h = harness().await?;
   let client_id = unique("missing-token");
   insert_client(
     &h.pool,
@@ -481,7 +465,7 @@ async fn test_introspect_missing_token_form_is_400_invalid_request() -> TestResu
 
 #[tokio::test]
 async fn test_introspect_empty_token_is_400_invalid_request() -> TestResult {
-  let (_container, h) = harness().await?;
+  let h = harness().await?;
   let client_id = unique("empty-token");
   insert_client(
     &h.pool,
@@ -517,7 +501,7 @@ async fn test_introspect_empty_token_is_400_invalid_request() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_refresh_token_reports_active_shape() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("refresh-shape");
   insert_client(
     &h.pool,
@@ -558,7 +542,7 @@ async fn test_introspect_refresh_token_reports_active_shape() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_dpop_bound_token_reports_jkt_only() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("dpop-bound");
   insert_client(
     &h.pool,
@@ -609,7 +593,7 @@ async fn test_introspect_dpop_bound_token_reports_jkt_only() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_mtls_bound_token_reports_x5t_only() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("mtls-bound");
   insert_client(
     &h.pool,
@@ -661,7 +645,7 @@ async fn test_introspect_mtls_bound_token_reports_x5t_only() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_unknown_hint_is_advisory() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("unknown-hint");
   insert_client(
     &h.pool,
@@ -695,7 +679,7 @@ async fn test_introspect_unknown_hint_is_advisory() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_wrong_hint_still_resolves_refresh() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("wrong-hint");
   insert_client(
     &h.pool,
@@ -726,7 +710,7 @@ async fn test_introspect_wrong_hint_still_resolves_refresh() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_active_response_leaks_no_token_or_secret() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("no-leak");
   insert_client(
     &h.pool,
@@ -769,7 +753,7 @@ async fn test_introspect_active_response_leaks_no_token_or_secret() -> TestResul
 
 #[tokio::test]
 async fn test_introspect_after_revoke_endpoint_is_inactive() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("revoke-then-introspect");
   insert_client(
     &h.pool,
@@ -899,7 +883,7 @@ async fn introspect_client(h: &mut Harness, label: &str, secret: &str) -> TestRe
 
 #[tokio::test]
 async fn test_introspect_disabled_email_subject_is_inactive() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = introspect_client(&mut h, "disabled-email", "secret-de").await?;
   let user = provision_user(&h, "disabled-introspect@example.test").await?;
   let minted = mint_subject(&mut h, &client_id, &user.email).await?;
@@ -920,7 +904,7 @@ async fn test_introspect_disabled_email_subject_is_inactive() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_disabled_uuid_subject_is_inactive() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = introspect_client(&mut h, "disabled-uuid", "secret-du").await?;
   let user = provision_user(&h, "disabled-uuid@example.test").await?;
   // Device-code tokens carry the user UUID string as subject.
@@ -942,7 +926,7 @@ async fn test_introspect_disabled_uuid_subject_is_inactive() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_enabled_email_subject_stays_active() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = introspect_client(&mut h, "enabled-email", "secret-ee").await?;
   let user = provision_user(&h, "enabled-introspect@example.test").await?;
   let minted = mint_subject(&mut h, &client_id, &user.email).await?;
@@ -962,7 +946,7 @@ async fn test_introspect_enabled_email_subject_stays_active() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_reenabled_subject_is_active_again() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = introspect_client(&mut h, "reenabled", "secret-re").await?;
   let user = provision_user(&h, "reenabled-introspect@example.test").await?;
   let minted = mint_subject(&mut h, &client_id, &user.email).await?;
@@ -998,7 +982,7 @@ async fn test_introspect_reenabled_subject_is_active_again() -> TestResult {
 
 #[tokio::test]
 async fn test_introspect_empty_and_unknown_subjects_stay_active() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = introspect_client(&mut h, "non-user-sub", "secret-nu").await?;
   // Client-credentials tokens carry an empty subject.
   let empty = mint_subject(&mut h, &client_id, "").await?;

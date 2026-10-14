@@ -9,7 +9,7 @@ use crate::db::client_repo;
 
 #[tokio::test]
 async fn dcr_manage_read_returns_metadata() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", Some("read")).await?;
 
   let response = {
@@ -80,7 +80,7 @@ async fn dcr_manage_read_returns_metadata() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_get() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", Some("read")).await?;
 
   let response = {
@@ -129,7 +129,7 @@ async fn dcr_manage_get() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_read_missing_token_401() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   let (mut stores, ctx) = manage_parts(&mut harness);
@@ -143,7 +143,7 @@ async fn dcr_manage_read_missing_token_401() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_read_unknown_client_401() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   let (mut stores, ctx) = manage_parts(&mut harness);
@@ -164,7 +164,7 @@ async fn dcr_manage_read_unknown_client_401() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_read_wrong_token_403() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   let (mut stores, ctx) = manage_parts(&mut harness);
@@ -218,7 +218,7 @@ async fn dcr_manage_register_request_uris_stored_verbatim() -> TestResult {
   // (docs/OAUTH.md "JAR and PAR", docs/SECURITY.md "PAR and JAR": https only,
   // no redirects, global IPs only). A plaintext scheme, a loopback literal,
   // and a non-https scheme must therefore register cleanly and stay inert.
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let redirect = "https://app.example.test/cb";
   seed_redirect(&harness.pool, &harness.config.keys, redirect).await?;
   let request_uris = serde_json::json!([
@@ -261,7 +261,7 @@ async fn dcr_manage_register_request_uris_stored_verbatim() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_update_bad_redirect_rejected() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   let request = crate::protocol::dcr::RegisterRequest {

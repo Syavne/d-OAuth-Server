@@ -10,7 +10,7 @@ use crate::protocol::token::ClientKind;
 
 #[tokio::test]
 async fn grant_client_credentials_valid_issue() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read api:write")?;
@@ -72,7 +72,7 @@ async fn grant_client_credentials_valid_issue() -> TestResult {
 
 #[tokio::test]
 async fn grant_client_credentials_default_scope_narrows_to_registry() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read api:write")?;
@@ -98,7 +98,7 @@ async fn grant_client_credentials_default_scope_narrows_to_registry() -> TestRes
 
 #[tokio::test]
 async fn grant_client_credentials_public_client_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("public");
   let registered = ScopeSet::parse("api:read")?;
@@ -137,7 +137,7 @@ async fn grant_client_credentials_public_client_rejected() -> TestResult {
 
 #[tokio::test]
 async fn grant_client_credentials_over_scope_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;
@@ -176,7 +176,7 @@ async fn grant_client_credentials_over_scope_rejected() -> TestResult {
 
 #[tokio::test]
 async fn grant_client_credentials_no_refresh_token() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;

@@ -5,11 +5,6 @@
 use std::time::Duration;
 
 use sqlx::PgPool;
-use testcontainers::{
-  GenericImage,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -24,7 +19,7 @@ use crate::{
   error::{AppError, OAuthErrorCode},
   state::RedisConn,
   store::{Store, dcr as dcr_store},
-  test_guard::{ContainerGuard, Lease},
+  test_guard::Lease,
 };
 
 /// This suite's error type (no `unwrap`/`expect` under the deny lints).
@@ -33,9 +28,6 @@ type TestResult = Result<(), TestError>;
 /// Test scaffolding failures.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -68,24 +60,17 @@ struct Harness {
   config: Config,
 }
 
-/// Fresh Postgres database plus a throwaway Redis for one test.
+/// Fresh Postgres database plus the shared compose Redis for one test.
 ///
-/// The guard removes the Redis container synchronously when the test drops
-/// it; the Postgres container is owned by the shared `db` lease.
-async fn harness(open: bool, policy: &str) -> Result<(ContainerGuard, Harness), TestError> {
+/// The Postgres container is owned by the shared `db` lease; Redis comes from
+/// the shared compose service, isolated per test by [`unique_prefixes`].
+async fn harness(open: bool, policy: &str) -> Result<Harness, TestError> {
   let (_db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("{error}")))?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let redis_url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(redis_url.as_str())?;
-  let manager = redis::aio::ConnectionManager::new(client).await?;
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
   // The config fixture is never connected through: the pool and Redis
   // connection above are used directly, so its URLs only need to pass
   // syntactic validation.
@@ -95,21 +80,15 @@ async fn harness(open: bool, policy: &str) -> Result<(ContainerGuard, Harness), 
     open,
     policy,
   )?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
-  Ok((
-    guarded,
-    Harness {
-      _db,
-      pool,
-      conn: RedisConn::Single(manager),
-      store,
-      config,
-    },
-  ))
+  let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let store = Store::from_parts(state_prefix, rl_prefix, DurabilityMode::WaitAof);
+  Ok(Harness {
+    _db,
+    pool,
+    conn: RedisConn::Single(manager),
+    store,
+    config,
+  })
 }
 
 /// Build a validated [`Config`] over fixture URLs.
@@ -236,7 +215,7 @@ fn expect_error(error: AppError, code: OAuthErrorCode, status: u16) -> TestResul
 
 #[tokio::test]
 async fn dcr_register_valid_201() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,
@@ -326,7 +305,7 @@ async fn dcr_register_valid_201() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_round_trip() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,
@@ -414,7 +393,7 @@ async fn dcr_register_round_trip() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_duplicate_mtls_identity_is_400() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,
@@ -488,7 +467,7 @@ async fn dcr_register_duplicate_mtls_identity_is_400() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_missing_iat_401() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   let request = dpop_request("https://app.example.test/cb", None);
   let (mut stores, ctx) = parts_of(&mut harness);
   match register_client(&mut stores, &ctx, None, &request).await {
@@ -501,7 +480,7 @@ async fn dcr_register_missing_iat_401() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_invalid_iat_401() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   let request = dpop_request("https://app.example.test/cb", None);
   let (mut stores, ctx) = parts_of(&mut harness);
   match register_client(&mut stores, &ctx, Some("no-such-token"), &request).await {
@@ -514,7 +493,7 @@ async fn dcr_register_invalid_iat_401() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_bad_redirect_rejected() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = dpop_request("https://evil.example.test/cb", None);
   let (mut stores, ctx) = parts_of(&mut harness);
@@ -528,7 +507,7 @@ async fn dcr_register_bad_redirect_rejected() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_bad_auth_method_rejected() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,
@@ -549,7 +528,7 @@ async fn dcr_register_bad_auth_method_rejected() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_bad_grant_rejected() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,
@@ -570,7 +549,7 @@ async fn dcr_register_bad_grant_rejected() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_bad_scope_rejected() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,
@@ -589,7 +568,7 @@ async fn dcr_register_bad_scope_rejected() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_confidential_without_binding_rejected() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,
@@ -629,7 +608,7 @@ async fn dcr_register_confidential_without_binding_rejected() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_open_anonymous_201() -> TestResult {
-  let (_guard, mut harness) = harness(true, "catalog_loopback").await?;
+  let mut harness = harness(true, "catalog_loopback").await?;
   let request = RegisterRequest {
     redirect_uris: Some(vec!["http://127.0.0.1:6420/cb".to_owned()]),
     client_name: Some("native app".to_owned()),
@@ -671,7 +650,7 @@ async fn dcr_register_open_anonymous_201() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_open_policy_rejects_plaintext_non_loopback() -> TestResult {
-  let (_guard, mut harness) = harness(false, "open").await?;
+  let mut harness = harness(false, "open").await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = dpop_request("http://evil.example.com/cb", None);
   let (mut stores, ctx) = parts_of(&mut harness);
@@ -685,7 +664,7 @@ async fn dcr_register_open_policy_rejects_plaintext_non_loopback() -> TestResult
 
 #[tokio::test]
 async fn dcr_register_open_policy_rejects_custom_scheme() -> TestResult {
-  let (_guard, mut harness) = harness(false, "open").await?;
+  let mut harness = harness(false, "open").await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = dpop_request("myapp://cb", None);
   let (mut stores, ctx) = parts_of(&mut harness);
@@ -704,7 +683,7 @@ async fn dcr_catalog_policy_private_scheme_dot_rule() -> TestResult {
   // registers via its catalog hit, while the dotless scheme is rejected by
   // `is_valid_redirect_scheme` even though it is also seeded in the catalog
   // (so the failure cannot be a catalog miss).
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(&harness.pool, &harness.config.keys, "com.example.app:/cb").await?;
   seed_redirect(&harness.pool, &harness.config.keys, "myapp:/cb").await?;
   let iat = issue_iat(&mut harness, 3).await?;
@@ -727,7 +706,7 @@ async fn dcr_catalog_policy_private_scheme_dot_rule() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_open_policy_rejects_fragment() -> TestResult {
-  let (_guard, mut harness) = harness(false, "open").await?;
+  let mut harness = harness(false, "open").await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = dpop_request("https://app.example.com/cb?x=1#frag", None);
   let (mut stores, ctx) = parts_of(&mut harness);
@@ -741,7 +720,7 @@ async fn dcr_register_open_policy_rejects_fragment() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_open_policy_accepts_https() -> TestResult {
-  let (_guard, mut harness) = harness(false, "open").await?;
+  let mut harness = harness(false, "open").await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = dpop_request("https://app.example.com/cb", None);
   let response = {
@@ -764,7 +743,7 @@ async fn dcr_register_open_policy_accepts_https() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_open_policy_accepts_loopback() -> TestResult {
-  let (_guard, mut harness) = harness(false, "open").await?;
+  let mut harness = harness(false, "open").await?;
   let iat = issue_iat(&mut harness, 3).await?;
   let request = dpop_request("http://127.0.0.1:1234/cb", None);
   let response = {
@@ -787,7 +766,7 @@ async fn dcr_register_open_policy_accepts_loopback() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_mtls_client_201() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,
@@ -837,7 +816,7 @@ async fn dcr_register_mtls_client_201() -> TestResult {
 
 #[tokio::test]
 async fn dcr_register_jwks_xor_rejected() -> TestResult {
-  let (_guard, mut harness) = harness(false, "catalog").await?;
+  let mut harness = harness(false, "catalog").await?;
   seed_redirect(
     &harness.pool,
     &harness.config.keys,

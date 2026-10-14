@@ -61,14 +61,26 @@ async fn insert_mtls_client(pool: &sqlx::PgPool, client_id: &str, thumbprint: &s
   Ok(())
 }
 
-/// Handler-level [`AppState`] over a real pool and Redis handle.
-fn app_state(pool: sqlx::PgPool, redis: RedisConn) -> Result<AppState, TestError> {
+/// Handler-level [`AppState`] over a real pool and Redis handle, with the
+/// per-test `{state}`/`{rl}` prefixes threaded into the config so the handler's
+/// own store resolves the same keyspace the test minted into.
+fn app_state(
+  pool: sqlx::PgPool,
+  redis: RedisConn,
+  token_prefix: String,
+  ratelimit_prefix: String,
+) -> Result<AppState, TestError> {
   let fixture = serde_json::json!({
     "issuer": "https://auth.example.test",
     "environment": "development",
     "tls": {"cert_path": "/tmp/revoke-test-cert.pem", "key_path": "/tmp/revoke-test-key.pem"},
     "database": {"url": "postgres://127.0.0.1:1/revoke"},
-    "redis": {"url": "redis://127.0.0.1:1", "durability": "waitaof"},
+    "redis": {
+      "url": "redis://127.0.0.1:1",
+      "durability": "waitaof",
+      "token_key_prefix": token_prefix,
+      "ratelimit_key_prefix": ratelimit_prefix,
+    },
     "token_pepper": "revoke-test-pepper-0123456789abcdef",
     "totp_encryption_key": "revoke-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "revoke-test-pii-key-0123456789abcdef",
@@ -151,7 +163,7 @@ async fn revoke_mtls_chain_does_not_match_claimed_client() -> TestResult {
   let (_db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("postgres: {error}")))?;
-  let (_guard, mut conn, store_handle) = test_redis().await?;
+  let (mut conn, store_handle, (token_prefix, ratelimit_prefix)) = test_redis().await?;
   let service = service()?;
   let victim_leaf = cert_der(CLIENT_SELF_PEM)?;
   let victim_thumbprint = mtls::thumbprint_b64url(victim_leaf.as_ref());
@@ -172,7 +184,7 @@ async fn revoke_mtls_chain_does_not_match_claimed_client() -> TestResult {
   let access = minted.access_token.clone();
   let peer = PeerCertificates(Arc::new(vec![attacker_leaf]));
   let mut verify_conn = conn.clone();
-  let state = app_state(pool, conn)?;
+  let state = app_state(pool, conn, token_prefix, ratelimit_prefix)?;
   let (status, body) = revoke_with_certs_full(state, &access, &victim_id, peer).await?;
   if status != StatusCode::BAD_REQUEST {
     return Err(TestError::Unexpected(format!(
@@ -203,7 +215,7 @@ async fn revoke_mtls_disabled_client_rejected() -> TestResult {
   let (_db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("postgres: {error}")))?;
-  let (_guard, mut conn, store_handle) = test_redis().await?;
+  let (mut conn, store_handle, (token_prefix, ratelimit_prefix)) = test_redis().await?;
   let service = service()?;
   let leaf = cert_der(CLIENT_SELF_PEM)?;
   let thumbprint = mtls::thumbprint_b64url(leaf.as_ref());
@@ -225,7 +237,7 @@ async fn revoke_mtls_disabled_client_rejected() -> TestResult {
   }
   let peer = PeerCertificates(Arc::new(vec![leaf]));
   let mut verify_conn = conn.clone();
-  let state = app_state(pool, conn)?;
+  let state = app_state(pool, conn, token_prefix, ratelimit_prefix)?;
   let (status, body) = revoke_with_certs_full(state, &access, &client_id, peer).await?;
   if status != StatusCode::BAD_REQUEST {
     return Err(TestError::Unexpected(format!(
@@ -256,7 +268,7 @@ async fn revoke_mtls_client_self_revokes() -> TestResult {
   let (_db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("postgres: {error}")))?;
-  let (_guard, mut conn, store_handle) = test_redis().await?;
+  let (mut conn, store_handle, (token_prefix, ratelimit_prefix)) = test_redis().await?;
   let service = service()?;
   let leaf = cert_der(CLIENT_SELF_PEM)?;
   let thumbprint = mtls::thumbprint_b64url(leaf.as_ref());
@@ -273,7 +285,7 @@ async fn revoke_mtls_client_self_revokes() -> TestResult {
   let access = minted.access_token.clone();
   let peer = PeerCertificates(Arc::new(vec![leaf]));
   let mut verify_conn = conn.clone();
-  let state = app_state(pool, conn)?;
+  let state = app_state(pool, conn, token_prefix, ratelimit_prefix)?;
   let status = revoke_with_certs(state, &access, &client_id, peer).await?;
   if status != StatusCode::OK {
     return Err(TestError::Unexpected(format!(
@@ -299,7 +311,7 @@ async fn revoke_mtls_unknown_certificate_rejected() -> TestResult {
   let (_db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("postgres: {error}")))?;
-  let (_guard, mut conn, store_handle) = test_redis().await?;
+  let (mut conn, store_handle, (token_prefix, ratelimit_prefix)) = test_redis().await?;
   let service = service()?;
   let leaf = cert_der(CLIENT_SELF_PEM)?;
   let thumbprint = mtls::thumbprint_b64url(leaf.as_ref());
@@ -317,7 +329,7 @@ async fn revoke_mtls_unknown_certificate_rejected() -> TestResult {
   let rogue = cert_der(CLIENT_ROGUE_PEM)?;
   let peer = PeerCertificates(Arc::new(vec![rogue]));
   let mut verify_conn = conn.clone();
-  let state = app_state(pool, conn)?;
+  let state = app_state(pool, conn, token_prefix, ratelimit_prefix)?;
   let status = revoke_with_certs(state, &access, &client_id, peer).await?;
   if status != StatusCode::UNAUTHORIZED && status != StatusCode::BAD_REQUEST {
     return Err(TestError::Unexpected(format!(

@@ -12,7 +12,7 @@ use crate::store::tokens as low;
 /// A rotation replayed by `rotation_request_id` returns the SAME tokens.
 #[tokio::test]
 async fn token_service_rotation_replay_returns_same_tokens() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service(&[("v1", "token-service-pepper-one")])?;
   let grant = unique("grant");
   let client = unique("client");

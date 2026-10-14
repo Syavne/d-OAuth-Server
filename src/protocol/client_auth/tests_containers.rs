@@ -1,10 +1,13 @@
-//! `test(client_auth)` container suite: full dispatch against real Postgres
+//! `test(client_auth)` dispatch suite: full dispatch against real Postgres
 //! and Redis (client lookup, secret verify, `jti` replay, `jwks_uri` guard).
+//!
+//! Historical note: the `_containers` filename is retained from when this
+//! suite booted a throwaway container. It now runs against the shared compose
+//! Postgres and Redis with a per-test unique key-prefix pair; the name is kept
+//! only to avoid churning module paths and test names.
 
 mod assertions;
 mod secrets;
-
-use std::time::Duration;
 
 use base64::Engine as _;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -13,11 +16,6 @@ use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use testcontainers::{
-  GenericImage, ImageExt as _,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -32,7 +30,7 @@ use crate::{
   keys::{KeyId, KeyRing},
   state::RedisConn,
   store::Store,
-  test_guard::{ContainerGuard, Lease},
+  test_guard::Lease,
 };
 
 /// This suite's error type (no `unwrap`/`expect` under the deny lints).
@@ -41,9 +39,6 @@ type TestResult = Result<(), TestError>;
 /// Test scaffolding failures.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -62,8 +57,7 @@ enum TestError {
 }
 
 /// Live handles for one dispatch test: Postgres pool, Redis, store layout,
-/// and the canonical token endpoint. The container is returned separately so
-/// tests hold it alive with a `_container` binding.
+/// and the canonical token endpoint.
 struct Harness {
   _db: Lease<Db>,
   pool: PgPool,
@@ -73,34 +67,21 @@ struct Harness {
   keys: KeyRing,
 }
 
-/// Fresh Postgres database plus a throwaway Redis for one test.
+/// Fresh Postgres database plus a Redis connection for one test, both on the
+/// shared compose services.
 ///
-/// The guard removes the Redis container synchronously when the test drops
-/// it; the Postgres container is owned by the shared `db` lease. AOF is on
-/// because the assertion-`jti` replay markers are durability-barriered.
-async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
+/// The Postgres database is owned by the shared `db` lease; Redis keys live
+/// under a per-test unique prefix pair so parallel tests never collide. AOF is
+/// on because the assertion-`jti` replay markers are durability-barriered.
+async fn harness() -> Result<Harness, TestError> {
   let (_db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("{error}")))?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let store = Store::from_parts(state_prefix, rl_prefix, DurabilityMode::WaitAof);
   let h = Harness {
     _db,
     pool,
@@ -120,7 +101,7 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
     )
     .map_err(|error| TestError::Crypto(format!("{error:?}")))?,
   };
-  Ok((guarded, h))
+  Ok(h)
 }
 
 /// Borrow datastore handles out of a harness.

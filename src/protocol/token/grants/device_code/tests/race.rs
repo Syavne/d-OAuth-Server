@@ -16,7 +16,7 @@ use crate::store::device::poll_key;
 /// loser while still advancing the stamp.
 #[tokio::test]
 async fn test_grant_device_concurrent_interval_admits_only_one() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let device_hash = unique("device-race");
   let now = now_unix();
   let interval = Duration::from_secs(DEVICE_INTERVAL_SECS);

@@ -20,7 +20,7 @@ use crate::{
 
 #[tokio::test]
 async fn test_grant_device_pending_then_approved_issues_bound_tokens() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
@@ -156,7 +156,7 @@ async fn test_grant_device_pending_then_approved_issues_bound_tokens() -> TestRe
 /// §3.5 pacing, which the boundary suite pins separately.
 #[tokio::test]
 async fn test_grant_device_concurrent_poll_mints_once() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,

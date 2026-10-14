@@ -9,7 +9,7 @@ use super::{
 /// Public mint without a `jkt` is rejected; confidential mint is not.
 #[tokio::test]
 async fn token_service_public_mint_requires_jkt() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service(&[("v1", "token-service-pepper-one")])?;
   let grant = unique("grant");
   let client = unique("client");

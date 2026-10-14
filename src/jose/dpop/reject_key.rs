@@ -17,7 +17,7 @@ use super::{
 /// `alg:none` never verifies, even with well-formed claims.
 #[tokio::test]
 async fn dpop_alg_none_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let header =
@@ -47,7 +47,7 @@ async fn dpop_alg_none_rejected() -> TestResult {
 /// HMAC proofs are rejected at the allowlist, before any key is built.
 #[tokio::test]
 async fn dpop_hmac_alg_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let mut header = Header::new(Algorithm::HS256);
@@ -75,7 +75,7 @@ async fn dpop_hmac_alg_rejected() -> TestResult {
 /// embedding another fails the signature check.
 #[tokio::test]
 async fn dpop_jwk_signature_mismatch_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let signer = fresh_es256_key()?;
   let embedded = fresh_es256_key()?;
   let now = now_unix();
@@ -99,7 +99,7 @@ async fn dpop_jwk_signature_mismatch_rejected() -> TestResult {
 /// A JWK smuggling private material is refused before signature work.
 #[tokio::test]
 async fn dpop_private_jwk_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let mut evil = key.jwk.clone();
@@ -131,7 +131,7 @@ async fn dpop_private_jwk_rejected() -> TestResult {
 /// Symmetric JWKs have no place in `DPoP` and are refused outright.
 #[tokio::test]
 async fn dpop_oct_jwk_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let oct = serde_json::json!({"kty": "oct", "k": "GawgguFyGrWKav7AX4VKUg"});
@@ -151,7 +151,7 @@ async fn dpop_oct_jwk_rejected() -> TestResult {
 /// absent `ath` is rejected when a token is presented.
 #[tokio::test]
 async fn dpop_ath_mismatch_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let token = "dpop-test-access-token";

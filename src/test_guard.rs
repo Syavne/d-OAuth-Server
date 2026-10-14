@@ -7,7 +7,8 @@
 //! runs and the container is orphaned. Relying on `Drop` alone therefore leaks
 //! one container per test process.
 //!
-//! This module provides the two primitives every harness uses instead:
+//! This module provides the two primitives the remaining container harnesses
+//! use instead:
 //!
 //! * [`ContainerGuard`] owns one `GenericImage` container and removes it
 //!   synchronously in its `Drop`: the container is taken out of the guard,
@@ -32,6 +33,13 @@
 //! with `#[path = "../src/test_guard.rs"] mod test_guard;` (or
 //! `"../../src/test_guard.rs"` from `tests/common/`), so every compilation
 //! unit compiles its own copy from a single implementation.
+//!
+//! Most `src/**` unit tests no longer containerize: they use the compose-first
+//! helpers in `src/test_support.rs`. This module is retained only for the
+//! remaining testcontainers keep-list: the lifecycle/resilience suite, the
+//! topology suite, the `--appendfsync always` refresh-token suite, the two
+//! Redis-specific tests in `src/store/tests_store.rs`, and the
+//! private-container `dcr_manage_token_survives_redis_flush`.
 
 use std::{ops::Deref, sync::Arc};
 

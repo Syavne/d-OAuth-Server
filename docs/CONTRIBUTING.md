@@ -18,7 +18,8 @@ with the [README](../README.md) and [OPERATIONS.md](OPERATIONS.md).
   `cargo install cargo-nextest --locked`.
 - Docker, to run the shared test Postgres and Redis from
   `compose.test.yaml` (`docker compose -f compose.test.yaml up -d`), and for
-  the lifecycle tests that still use `testcontainers`.
+  the handful of suites that still use `testcontainers` (see
+  [Database-backed tests](#database-backed-tests)).
 - `sqlx-cli` only when you add or change a SQL query or a migration:
   `cargo install sqlx-cli --locked --features runtime-tokio,tls-rustls-ring`.
 
@@ -64,9 +65,10 @@ Start the shared test services before `cargo nextest run --all-targets`:
 `docker compose -f compose.test.yaml up -d`, then tear them down with
 `docker compose -f compose.test.yaml down -v`. `cargo nextest run` is the
 authoritative test entry point. It runs unit, integration, and end-to-end tests;
-the integration tests use the shared services, and the lifecycle suites keep
-`testcontainers`. `cargo test --doc` runs the doc examples separately because
-nextest does not cover doctests.
+they all use the shared services except the keep-list under
+[Database-backed tests](#database-backed-tests), which needs `testcontainers`.
+`cargo test --doc` runs the doc examples separately because nextest does not
+cover doctests.
 
 ### Narrow scope while developing
 
@@ -99,13 +101,24 @@ Migrations are never run by the test process against the shared `postgres`
 database; a test that asserts on a migration applies it to its own fresh
 database.
 
-The lifecycle tests are the exception. `tests/resilience.rs` stops and restarts
-containers through `testcontainers`; the guards synchronously `rm` them on drop,
-so killing the suite mid-run no longer orphans containers. `tests/topology.rs`
-spawns in-process `redis-test` Sentinel/Cluster fixtures, which need a real
-`redis-server` binary. Unit-test helpers under `src/` also still use
-`testcontainers`. They need a working Docker daemon and, for the in-process
-topology fixtures, the `redis-server` binary.
+The suites that need their own Redis nodes are the exception. Only these use
+`testcontainers`:
+
+- `src/test_guard.rs` and `src/state/test_support.rs`: the shared container
+  helpers the rest of this list is built on.
+- `tests/resilience.rs`: stops and restarts containers; the guards synchronously
+  `rm` them on drop, so killing the suite mid-run no longer orphans containers.
+- `src/state/tests_topology.rs`: Sentinel, Cluster, and `requirepass` topology.
+- The `--appendfsync always` refresh-token suite:
+  `src/protocol/token/grants/refresh_token/tests.rs` and its `tests/failover.rs`.
+- The two Redis durability tests in `src/store/tests_store.rs`.
+- `dcr_manage_token_survives_redis_flush` in
+  `src/protocol/dcr/manage/tests_delete.rs`.
+
+Every other unit and integration suite uses the shared services.
+`tests/topology.rs` is separate: it spawns in-process `redis-test`
+Sentinel/Cluster fixtures, which need a real `redis-server` binary. Docker must
+be running, and the in-process topology fixtures additionally need that binary.
 
 ### Fuzzing
 
@@ -212,9 +225,11 @@ Every behavior change follows red, green, refactor:
 Write the test against the shared Postgres and Redis from
 `compose.test.yaml` (defaults `127.0.0.1:5433` and `127.0.0.1:6380`, override
 with `D_OAUTH_TEST_POSTGRES_URL` / `D_OAUTH_TEST_REDIS_URL`), with a fresh
-database and unique Redis prefixes per test. Keep `testcontainers` for the
-stop/start lifecycle cases only. Prefer a real object or an in-memory fake over
-a mock. Assert the observable contract, not an implementation dump.
+database and unique Redis prefixes per test. Reach for `testcontainers` only
+when the test needs Redis nodes of its own (the keep-list under
+[Database-backed tests](#database-backed-tests)); stop/start lifecycle cases are
+the common reason. Prefer a real object or an in-memory fake over a mock. Assert
+the observable contract, not an implementation dump.
 
 ## Commit style
 

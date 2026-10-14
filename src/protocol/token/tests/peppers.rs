@@ -9,7 +9,7 @@ use super::{
 /// Lookup retries retained peppers newest-first.
 #[tokio::test]
 async fn token_service_find_retries_retained_peppers() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let grant = unique("grant");
   let client = unique("client");
 

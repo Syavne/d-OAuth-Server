@@ -8,7 +8,7 @@ use crate::protocol::scope::ScopeSet;
 
 #[tokio::test]
 async fn grant_token_exchange_allowlisted_succeeds() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let caller = unique("caller");
   let subject_client = unique("subject-client");

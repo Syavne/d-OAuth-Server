@@ -15,90 +15,49 @@ pub use redirect_repo::{NewRedirectUri, RedirectKind, RedirectUri, UpsertOutcome
 
 /// Test-only scaffolding shared by the repository suites.
 ///
-/// One `postgres:18-alpine` container is started lazily and reused by every test
-/// in the lib test binary; each test gets a freshly created database with all
-/// embedded migrations applied, so parallel tests stay isolated at one
-/// container cost. Integration tests under `tests/` cannot reach this
-/// `#[cfg(test)]` module and carry their own container helper instead.
+/// Compose-first: the pool is built on the shared external Postgres started by
+/// `docker compose -f compose.test.yaml up -d`, using a fresh database per call
+/// from [`crate::test_support::fresh_database_pool`]. No container is started
+/// here. The [`Shared`]/[`Lease`] pair is retained only so the many callers
+/// that bind `_db: Lease<Db>` compile unchanged.
 #[cfg(test)]
 pub(crate) mod test_support {
-  use sqlx::{Executor as _, PgPool, postgres::PgPoolOptions};
-  use testcontainers::{
-    GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
-  };
+  use sqlx::PgPool;
 
-  use crate::test_guard::{ContainerGuard, Lease, Shared};
+  use crate::test_guard::{Lease, Shared};
 
   /// Boxed test error (no `unwrap`/`expect` under the crate deny lints).
   pub(crate) type TestError = Box<dyn std::error::Error + Send + Sync>;
 
-  /// Test Postgres superuser password.
-  const PG_PASSWORD: &str = "db-repo-secret";
-
-  /// The shared Postgres server plus the container keeping it alive.
+  /// URL-only holder of the shared Postgres lease.
   ///
-  /// The container is a [`ContainerGuard`], so the last test releasing the
-  /// shared slot removes it synchronously instead of orphaning it.
+  /// It owns no external resource; the lease merely satisfies the caller
+  /// signatures.
   pub(crate) struct Db {
-    _container: ContainerGuard,
+    /// Retained only for the `Lease<Db>` type the callers bind; the URL is
+    /// intentionally never dereferenced.
+    #[allow(dead_code)]
     url: String,
   }
 
   static DB: Shared<Db> = Shared::new();
 
-  /// Start (once) and return a lease on the shared Postgres server.
+  /// A fresh database on the shared compose server with every embedded
+  /// migration applied, pooled for the calling test.
   ///
-  /// The lease must stay alive as long as the returned reference is used;
-  /// dropping the last lease removes the shared container deterministically.
-  async fn shared_db() -> Result<Lease<Db>, TestError> {
-    DB.lease::<TestError>(async {
-      let container = GenericImage::new("postgres", "18-alpine")
-        .with_exposed_port(5432.tcp())
-        .with_wait_for(WaitFor::message_on_stderr(
-          "database system is ready to accept connections",
-        ))
-        .with_wait_for(WaitFor::message_on_stdout(
-          "database system is ready to accept connections",
-        ))
-        .with_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
-        .start()
-        .await?;
-      let guarded = ContainerGuard::new(container);
-      let port = guarded.get_host_port_ipv4(5432).await?;
-      let url =
-        format!("postgres://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres?sslmode=disable");
-      Ok(Db {
-        _container: guarded,
-        url,
-      })
-    })
-    .await
-  }
-
-  /// A fresh database on the shared server with every embedded migration
-  /// applied, pooled for the calling test.
-  ///
-  /// The returned lease keeps the shared container alive; bind it (usually
-  /// as `_db`) for the duration of the test.
+  /// Acquires the (resource-free) shared [`Db`] lease, creates a uniquely named
+  /// database via [`crate::test_support::fresh_database_pool`], applies the
+  /// migrations here, and returns the lease plus the pool. Bind the lease
+  /// (usually as `_db`) for the duration of the test.
   pub(crate) async fn migrated_pool() -> Result<(Lease<Db>, PgPool), TestError> {
-    let db = shared_db().await?;
-    let admin = PgPoolOptions::new()
-      .max_connections(1)
-      .connect(&db.url)
+    let db = DB
+      .lease::<TestError>(async {
+        Ok(Db {
+          url: crate::test_support::test_postgres_admin_url(),
+        })
+      })
       .await?;
-    let name = format!("repo_{}", uuid::Uuid::new_v4().simple());
-    // `CREATE DATABASE` cannot take a bind parameter and `&Pool`'s `Executor`
-    // requires a `'static` query; leak this one tiny test-only string.
-    let ddl: &'static str = Box::leak(format!("CREATE DATABASE \"{name}\"").into_boxed_str());
-    admin.execute(ddl).await?;
-    admin.close().await;
-    let target = db.url.replacen("/postgres?", &format!("/{name}?"), 1);
-    let pool = PgPoolOptions::new()
-      .max_connections(4)
-      .connect(&target)
-      .await?;
+    let (_fresh_url, pool) = crate::test_support::fresh_database_pool().await?;
     crate::state::MIGRATOR.run(&pool).await?;
     Ok((db, pool))
   }

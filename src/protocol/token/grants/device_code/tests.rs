@@ -1,22 +1,14 @@
-//! `test(grant_device)` harness: live Postgres + Redis plus builders.
+//! `test(grant_device)` harness: shared compose Postgres + Redis plus builders.
 //!
 //! Child suites share these helpers through `super::*`. Every acceptance
 //! test drives the public [`super::super::poll_device`] API; DPoP proofs are
 //! minted per call because each `jti` is single-use.
 
-use std::{
-  sync::atomic::{AtomicU64, Ordering},
-  time::Duration,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::PgPool;
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 
-use crate::{config::Config, state::RedisConn, store::Store, test_guard::ContainerGuard};
+use crate::{config::Config, state::RedisConn, store::Store};
 
 mod backoff;
 mod expired;
@@ -34,9 +26,6 @@ pub(super) type TestResult = Result<(), TestError>;
 /// Test scaffolding failures.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -85,35 +74,31 @@ pub(super) struct Harness {
   pub(super) config: Config,
 }
 
-pub(super) async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
+pub(super) async fn harness() -> Result<Harness, TestError> {
   let (db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("pg: {error}")))?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let redis_url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(redis_url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
   let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    state_prefix.clone(),
+    rl_prefix.clone(),
     crate::config::DurabilityMode::WaitAof,
   );
+  let redis_url = crate::test_support::test_redis_url();
   let fixture = serde_json::json!({
     "issuer": "https://auth.example.test",
     "environment": "development",
     "tls": {"cert_path": "/tmp/grant-device-test-cert.pem", "key_path": "/tmp/grant-device-test-key.pem"},
     "database": {"url": "postgres://127.0.0.1:1/grant_device"},
-    "redis": {"url": redis_url, "durability": "waitaof"},
+    "redis": {
+      "url": redis_url,
+      "durability": "waitaof",
+      "token_key_prefix": state_prefix,
+      "ratelimit_key_prefix": rl_prefix,
+    },
     "token_pepper": "grant-device-test-pepper-0123456789abcdef",
     "totp_encryption_key": "grant-device-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "grant-device-test-pii-key-0123456789abcdef",
@@ -123,14 +108,11 @@ pub(super) async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
   let source = ::config::Config::try_from(&fixture)
     .map_err(|error| TestError::Unexpected(format!("config source: {error}")))?;
   let config = Config::from_source(source)?;
-  Ok((
-    guarded,
-    Harness {
-      _db: db,
-      pool,
-      conn: RedisConn::Single(manager),
-      store,
-      config,
-    },
-  ))
+  Ok(Harness {
+    _db: db,
+    pool,
+    conn: RedisConn::Single(manager),
+    store,
+    config,
+  })
 }

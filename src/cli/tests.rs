@@ -12,11 +12,6 @@ use ring::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use sqlx::Row as _;
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use time::OffsetDateTime;
 
 use super::{
@@ -58,12 +53,18 @@ async fn bootstrap_setup(
   let (db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Harness(error.to_string()))?;
+  let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
   let fixture = serde_json::json!({
     "issuer": "https://auth.example.test",
     "environment": "development",
     "tls": {"cert_path": "/tmp/bootstrap-test-cert.pem", "key_path": "/tmp/bootstrap-test-key.pem"},
     "database": {"url": "postgres://127.0.0.1:1/bootstrap"},
-    "redis": {"url": redis_url, "durability": "waitaof"},
+    "redis": {
+      "url": redis_url,
+      "durability": "waitaof",
+      "token_key_prefix": state_prefix,
+      "ratelimit_key_prefix": rl_prefix,
+    },
     "token_pepper": "bootstrap-test-pepper-0123456789abcdef",
     "totp_encryption_key": "bootstrap-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "bootstrap-test-pii-key-0123456789abcdef",
@@ -1087,20 +1088,10 @@ async fn admin_bootstrap_generated_password_is_256_bit_and_unlogged() -> Result<
 
 #[tokio::test]
 async fn admin_bootstrap_first_login_restricted_until_rotation() -> Result<(), TestError> {
-  let (_db, pool, config) = bootstrap_setup("redis://127.0.0.1:9").await?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(vec!["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = crate::test_guard::ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(std::time::Duration::from_secs(10)))
-    .set_connection_timeout(Some(std::time::Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  let (_db, pool, config) = bootstrap_setup(&crate::test_support::test_redis_url()).await?;
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Harness(format!("shared redis: {error}")))?;
   let mut conn = RedisConn::Single(manager);
   let store = crate::store::Store::from_config(&config.redis);
 
@@ -1352,7 +1343,11 @@ async fn user_unlock_unknown_user_is_not_found() -> Result<(), TestError> {
 /// without an audit event and the account row stays exactly as it was.
 #[tokio::test]
 async fn user_unlock_redis_outage_fails_closed() -> Result<(), TestError> {
-  let (_postgres, pg_url) = test_support::postgres_container().await?;
+  let (pg_url, setup) = crate::test_support::fresh_database_pool()
+    .await
+    .map_err(|error| TestError::Harness(format!("shared postgres: {error}")))?;
+  crate::state::MIGRATOR.run(&setup).await?;
+  setup.close().await;
   let fixture = serde_json::json!({
     "issuer": "https://auth.example.test",
     "environment": "development",
@@ -1365,9 +1360,6 @@ async fn user_unlock_redis_outage_fails_closed() -> Result<(), TestError> {
   });
   let source = ::config::Config::try_from(&fixture)?;
   let config = Arc::new(Config::from_source(source)?);
-  let pool = super::context::open_pool(&config).await?;
-  crate::state::MIGRATOR.run(&pool).await?;
-  pool.close().await;
   let context = super::context::Context::from_config(config).await?;
   let email = test_support::unique_email("unlock-outage");
   user::create(&context, &email, false, PASSWORD).await?;
@@ -1437,7 +1429,11 @@ fn admin_bootstrap_runbook_matches_cli() -> Result<(), TestError> {
 /// plus `password_file` connects (the cluster migrate-Job contract).
 #[tokio::test]
 async fn open_pool_uses_mounted_database_password() -> Result<(), TestError> {
-  let (_postgres, pg_url) = test_support::postgres_container().await?;
+  let (pg_url, setup) = crate::test_support::fresh_database_pool()
+    .await
+    .map_err(|error| TestError::Harness(format!("shared postgres: {error}")))?;
+  crate::state::MIGRATOR.run(&setup).await?;
+  setup.close().await;
   let user_prefix = "postgres://postgres";
   let user_end = user_prefix.len();
   assert!(pg_url.starts_with(&format!("{user_prefix}:")));

@@ -12,7 +12,7 @@ use crate::protocol::token::SenderProof;
 
 #[tokio::test]
 async fn grant_token_exchange_unlisted_pair_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let subject_client = unique("subject-client");
   let subject_raw = mint_subject(
@@ -63,7 +63,7 @@ async fn grant_token_exchange_unlisted_pair_rejected() -> TestResult {
 
 #[tokio::test]
 async fn grant_token_exchange_unsupported_types_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let caller = unique("caller");
   let subject_client = unique("subject-client");
@@ -114,7 +114,7 @@ async fn grant_token_exchange_unsupported_types_rejected() -> TestResult {
 
 #[tokio::test]
 async fn grant_token_exchange_scope_widening_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let caller = unique("caller");
   let subject_client = unique("subject-client");

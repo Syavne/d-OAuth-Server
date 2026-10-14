@@ -1,22 +1,14 @@
 //! `test(device_authorize)` suite: issuance, approval, misses, brute-force cap.
 //!
-//! Each test runs against a real Redis container plus a migrated Postgres
+//! Each test runs against the shared compose Redis plus a migrated Postgres
 //! database on the shared test server, through the public [`super`] API.
 
-use std::{
-  sync::atomic::{AtomicU64, Ordering},
-  time::Duration,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use secrecy::SecretString;
 use serde_json::json;
 use sqlx::PgPool;
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -32,7 +24,6 @@ use crate::{
   jose::jwk::thumbprint,
   state::RedisConn,
   store::{self, Store},
-  test_guard::ContainerGuard,
 };
 
 /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -41,9 +32,6 @@ type TestResult = Result<(), TestError>;
 /// Test scaffolding failures.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -89,35 +77,31 @@ struct Harness {
   config: Config,
 }
 
-async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
+async fn harness() -> Result<Harness, TestError> {
   let (db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("pg: {error}")))?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let redis_url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(redis_url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("redis: {error}")))?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
   let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    state_prefix.clone(),
+    ratelimit_prefix.clone(),
     crate::config::DurabilityMode::WaitAof,
   );
+  let redis_url = crate::test_support::test_redis_url();
   let fixture = json!({
     "issuer": "https://auth.example.test",
     "environment": "development",
     "tls": {"cert_path": "/tmp/device-test-cert.pem", "key_path": "/tmp/device-test-key.pem"},
     "database": {"url": "postgres://127.0.0.1:1/device"},
-    "redis": {"url": redis_url, "durability": "waitaof"},
+    "redis": {
+      "url": redis_url,
+      "durability": "waitaof",
+      "token_key_prefix": state_prefix,
+      "ratelimit_key_prefix": ratelimit_prefix,
+    },
     "token_pepper": "device-test-pepper-0123456789abcdef",
     "totp_encryption_key": "device-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "device-test-pii-key-0123456789abcdef",
@@ -127,16 +111,13 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
   let source = ::config::Config::try_from(&fixture)
     .map_err(|error| TestError::Unexpected(format!("config source: {error}")))?;
   let config = Config::from_source(source)?;
-  Ok((
-    guarded,
-    Harness {
-      _db: db,
-      pool,
-      conn: RedisConn::Single(manager),
-      store,
-      config,
-    },
-  ))
+  Ok(Harness {
+    _db: db,
+    pool,
+    conn: RedisConn::Single(manager),
+    store,
+    config,
+  })
 }
 
 async fn insert_client(
@@ -255,7 +236,7 @@ async fn issue(
 
 #[tokio::test]
 async fn test_device_authorize_public_client_issues_code_and_interval() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   insert_client(
     &h.pool,
@@ -356,7 +337,7 @@ async fn test_device_authorize_public_client_issues_code_and_interval() -> TestR
 
 #[tokio::test]
 async fn test_device_authorize_confidential_client_secret_post() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("conf");
   insert_client(
     &h.pool,
@@ -415,7 +396,7 @@ async fn test_device_authorize_confidential_client_secret_post() -> TestResult {
 
 #[tokio::test]
 async fn test_device_authorize_public_client_without_dpop_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("nodpop");
   insert_client(
     &h.pool,
@@ -451,7 +432,7 @@ async fn test_device_authorize_public_client_without_dpop_rejected() -> TestResu
 
 #[tokio::test]
 async fn test_device_authorize_over_registered_scope_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("scope");
   insert_client(
     &h.pool,
@@ -490,7 +471,7 @@ async fn test_device_authorize_over_registered_scope_rejected() -> TestResult {
 
 #[tokio::test]
 async fn test_device_authorize_approval_transitions_state() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("approve");
   insert_client(
     &h.pool,
@@ -562,7 +543,7 @@ async fn test_device_authorize_approval_transitions_state() -> TestResult {
 
 #[tokio::test]
 async fn test_device_authorize_unknown_and_expired_user_code_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
 
   // Unknown codes resolve to nothing.
   let miss =
@@ -618,7 +599,7 @@ async fn test_device_authorize_unknown_and_expired_user_code_rejected() -> TestR
 
 #[tokio::test]
 async fn test_device_authorize_eleventh_bad_guess_rate_limited() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let ip = unique("ip");
 
   for attempt in 1..=10 {
@@ -649,7 +630,7 @@ async fn test_device_authorize_eleventh_bad_guess_rate_limited() -> TestResult {
 /// user types stays code-free (RFC 8628 §3.3).
 #[tokio::test]
 async fn test_device_authorize_verification_uri_complete_carries_user_code() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("complete");
   insert_client(
     &h.pool,
@@ -720,7 +701,7 @@ async fn test_device_authorize_verification_uri_complete_carries_user_code() -> 
 /// optional, so case and separators do not change identity.
 #[tokio::test]
 async fn test_device_authorize_user_code_misses_are_generic_and_normalized() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
 
   for raw in [
     "",

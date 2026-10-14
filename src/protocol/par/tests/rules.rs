@@ -17,7 +17,7 @@ use super::TestError;
 
 #[tokio::test]
 async fn par_rejects_unauthenticated_client() -> Result<(), TestError> {
-  let (_guard, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = "par-conf-client";
   let redirect_uri = "https://client.example.test/cb";
   insert_client(
@@ -82,7 +82,7 @@ async fn par_rejects_unauthenticated_client() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn par_rejects_invalid_request_rules() -> Result<(), TestError> {
-  let (_guard, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = "par-rules-client";
   let redirect_uri = "https://client.example.test/cb";
   insert_client(
@@ -152,7 +152,7 @@ async fn par_rejects_invalid_request_rules() -> Result<(), TestError> {
 /// `uri_enc` fails as 503 `PiiDecrypt` (never a flattened client error).
 #[tokio::test]
 async fn par_redirect_mismatch_rejected() -> Result<(), TestError> {
-  let (_guard, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = "par-mismatch-client";
   let redirect_uri = "https://client.example.test/cb";
   insert_client(

@@ -3,12 +3,8 @@
 
 use std::{collections::HashMap, time::Duration};
 
+use redis::aio::ConnectionManager;
 use secrecy::SecretString;
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 
 use super::{CODE_TTL_CAP, CodeClientKind, CodeIssueError, CodeIssueRequest, CodeIssuer};
 use crate::{
@@ -17,7 +13,6 @@ use crate::{
   protocol::scope::ScopeSet,
   state::RedisConn,
   store::{Store, StoreError, codes},
-  test_guard::ContainerGuard,
 };
 
 /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -26,9 +21,6 @@ type TestResult = Result<(), TestError>;
 /// Errors raised by the code-issuance test scaffolding itself.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// The Redis configuration was rejected.
   #[error("config error: {0}")]
   Config(#[from] crate::config::ConfigError),
@@ -65,31 +57,20 @@ fn test_ring() -> Result<KeyRing, TestError> {
   )?)
 }
 
-/// Start a single-node Redis 8 with AOF on.
-async fn redis_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(vec!["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  Ok((guarded, format!("redis://127.0.0.1:{port}")))
-}
-
-/// Connect a [`RedisConn`] plus [`Store`] directly against a live container.
-async fn direct_store(url: &str) -> Result<(RedisConn, Store), TestError> {
-  let client = redis::Client::open(url)?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+/// Connect a [`RedisConn`] plus [`Store`] to the shared compose Redis, scoped
+/// to a per-test unique prefix pair so parallel tests never share a keyspace.
+async fn direct_store(
+  manager: ConnectionManager,
+  token_prefix: &str,
+  ratelimit_prefix: &str,
+) -> Result<(RedisConn, Store), TestError> {
   let raw = RawRedisConfig {
-    url: Some(url.to_owned()),
+    url: Some(crate::test_support::test_redis_url()),
     durability: Some(DurabilityMode::WaitAof),
     response_timeout_secs: 10,
     connect_timeout_secs: 5,
+    token_key_prefix: Some(token_prefix.to_owned()),
+    ratelimit_key_prefix: Some(ratelimit_prefix.to_owned()),
     ..Default::default()
   };
   let config = crate::config::RedisConfig::from_raw(raw)?;
@@ -134,9 +115,14 @@ fn query_pairs(location: &str) -> Result<HashMap<String, String>, TestError> {
   Ok(out)
 }
 
-/// Whether any key or hash field in the current database contains `needle`.
-async fn keyspace_contains(conn: &mut RedisConn, needle: &str) -> Result<bool, TestError> {
-  let keys: Vec<String> = redis::cmd("KEYS").arg("*").query_async(conn).await?;
+/// Whether any key or hash field under `state_prefix` contains `needle`.
+async fn keyspace_contains(
+  conn: &mut RedisConn,
+  state_prefix: &str,
+  needle: &str,
+) -> Result<bool, TestError> {
+  let pattern = format!("{state_prefix}*");
+  let keys: Vec<String> = redis::cmd("KEYS").arg(&pattern).query_async(conn).await?;
   for key in &keys {
     if key.contains(needle) {
       return Ok(true);
@@ -159,8 +145,15 @@ async fn keyspace_contains(conn: &mut RedisConn, needle: &str) -> Result<bool, T
 
 #[tokio::test]
 async fn code_issue_redirect_carries_code_state_iss() -> TestResult {
-  let (_guard, url) = redis_container().await?;
-  let (mut conn, store) = direct_store(&url).await?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let (mut conn, store) = direct_store(
+    crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?,
+    &state_prefix,
+    &ratelimit_prefix,
+  )
+  .await?;
   let issuer = CodeIssuer::new(&TtlConfig::default(), &test_ring()?)?;
   let approved = ScopeSet::parse("api:read")?;
   let entitled = ScopeSet::parse("api:read api:admin")?;
@@ -218,8 +211,15 @@ async fn code_issue_redirect_carries_code_state_iss() -> TestResult {
 
 #[tokio::test]
 async fn code_issue_stores_only_hash_with_bounded_ttl() -> TestResult {
-  let (_guard, url) = redis_container().await?;
-  let (mut conn, store) = direct_store(&url).await?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let (mut conn, store) = direct_store(
+    crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?,
+    &state_prefix,
+    &ratelimit_prefix,
+  )
+  .await?;
   let issuer = CodeIssuer::new(&TtlConfig::default(), &test_ring()?)?;
   let approved = ScopeSet::parse("api:read")?;
   let entitled = ScopeSet::parse("api:read")?;
@@ -242,7 +242,7 @@ async fn code_issue_stores_only_hash_with_bounded_ttl() -> TestResult {
       "storage identity must be a hash, not the code".to_owned(),
     ));
   }
-  if keyspace_contains(&mut conn, &issued.code).await? {
+  if keyspace_contains(&mut conn, &state_prefix, &issued.code).await? {
     return Err(TestError::Unexpected(
       "raw code must never appear in Redis".to_owned(),
     ));
@@ -280,8 +280,15 @@ async fn code_issue_stores_only_hash_with_bounded_ttl() -> TestResult {
 
 #[tokio::test]
 async fn code_issue_rejects_unentitled_approval() -> TestResult {
-  let (_guard, url) = redis_container().await?;
-  let (mut conn, store) = direct_store(&url).await?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let (mut conn, store) = direct_store(
+    crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?,
+    &state_prefix,
+    &ratelimit_prefix,
+  )
+  .await?;
   let issuer = CodeIssuer::new(&TtlConfig::default(), &test_ring()?)?;
   let approved = ScopeSet::parse("api:read api:admin")?;
   let entitled = ScopeSet::parse("api:read")?;
@@ -304,7 +311,7 @@ async fn code_issue_rejects_unentitled_approval() -> TestResult {
       "approval wider than entitlement must be rejected".to_owned(),
     ));
   }
-  if keyspace_contains(&mut conn, "client-abc").await? {
+  if keyspace_contains(&mut conn, &state_prefix, "client-abc").await? {
     return Err(TestError::Unexpected(
       "rejected issuance must store nothing".to_owned(),
     ));
@@ -314,8 +321,15 @@ async fn code_issue_rejects_unentitled_approval() -> TestResult {
 
 #[tokio::test]
 async fn code_issue_public_requires_dpop_jkt() -> TestResult {
-  let (_guard, url) = redis_container().await?;
-  let (mut conn, store) = direct_store(&url).await?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let (mut conn, store) = direct_store(
+    crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?,
+    &state_prefix,
+    &ratelimit_prefix,
+  )
+  .await?;
   let issuer = CodeIssuer::new(&TtlConfig::default(), &test_ring()?)?;
   let approved = ScopeSet::parse("api:read")?;
   let entitled = ScopeSet::parse("api:read api:admin")?;
@@ -415,8 +429,15 @@ fn code_issuer_debug_redacts_pepper() -> TestResult {
 
 #[tokio::test]
 async fn code_issue_debug_redacts_raw_code() -> TestResult {
-  let (_guard, url) = redis_container().await?;
-  let (mut conn, store) = direct_store(&url).await?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let (mut conn, store) = direct_store(
+    crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?,
+    &state_prefix,
+    &ratelimit_prefix,
+  )
+  .await?;
   let issuer = CodeIssuer::new(&TtlConfig::default(), &test_ring()?)?;
   let approved = ScopeSet::parse("api:read")?;
   let entitled = ScopeSet::parse("api:read")?;

@@ -47,7 +47,7 @@ async fn push_public(
 
 #[tokio::test]
 async fn par_push_stores_one_time_record() -> Result<(), TestError> {
-  let (_guard, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = "par-public-client";
   let redirect_uri = "https://client.example.test/cb";
   insert_client(
@@ -97,7 +97,7 @@ async fn par_push_stores_one_time_record() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn par_authorize_binds_client_and_rejects_replay() -> Result<(), TestError> {
-  let (_guard, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_a = "par-client-a";
   let client_b = "par-client-b";
   let redirect_uri = "https://client.example.test/cb";
@@ -190,7 +190,7 @@ async fn par_authorize_binds_client_and_rejects_replay() -> Result<(), TestError
 
 #[tokio::test]
 async fn par_foreign_presentation_does_not_consume_victim_record() -> Result<(), TestError> {
-  let (_guard, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_a = "par-victim-client";
   let client_b = "par-foreign-client";
   let redirect_uri = "https://client.example.test/cb";
@@ -267,7 +267,7 @@ async fn par_foreign_presentation_does_not_consume_victim_record() -> Result<(),
 
 #[tokio::test]
 async fn par_consume_bound_transport_error_recovery() -> Result<(), TestError> {
-  let (_guard, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = "par-recovery-client";
   let record = par::ParRecord {
     client_id: client_id.to_owned(),
@@ -330,7 +330,7 @@ async fn par_consume_bound_transport_error_recovery() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn par_expired_request_uri_is_rejected() -> Result<(), TestError> {
-  let (_guard, mut h) = harness().await?;
+  let mut h = harness().await?;
   let record = par::ParRecord {
     client_id: "par-expiry-client".to_owned(),
     request: "{\"response_type\":\"code\"}".to_owned(),

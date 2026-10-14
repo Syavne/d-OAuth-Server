@@ -48,7 +48,7 @@ async fn dcr_manage_update_rotated_token_forbidden_on_put_and_delete() -> TestRe
   // RFC 7592 §2.2 and Appendix A.1: a successful PUT issues a new registration
   // access token and invalidates the previous one. The old token must fail for
   // every management verb, not only the read the existing suite covers.
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   let first_put = put_request(
@@ -155,7 +155,7 @@ async fn dcr_manage_update_token_denials_match_read() -> TestResult {
   // same contract as GET. Registration tokens carry no expiry field in the
   // schema, so revocation (a successful DELETE that deactivates the client)
   // is the only invalidation path besides rotation.
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
   let request = put_request(
     vec!["https://app.example.test/cb".to_owned()],
@@ -249,7 +249,7 @@ async fn dcr_manage_update_rejects_jwks_and_jwks_uri_together() -> TestResult {
   // RFC 7591 §2: "The jwks_uri and jwks parameters MUST NOT both be present in
   // the same request or response." The PUT validation must reject the pair
   // before any write, so the client and its registration token stay intact.
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
   let mut request = put_request(
     vec!["https://app.example.test/cb".to_owned()],
@@ -320,7 +320,7 @@ async fn dcr_manage_update_request_uris_stored_verbatim() -> TestResult {
   // fetch-time enforcement point (docs/OAUTH.md "JAR and PAR",
   // docs/SECURITY.md "PAR and JAR"). Full-replace semantics must persist the
   // array exactly, including plaintext, loopback, and non-https values.
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
   let request_uris = serde_json::json!([
     "http://app.example.test/req.jwt",
@@ -376,7 +376,7 @@ async fn dcr_manage_update_request_uris_stored_verbatim() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_update_full_replace_rotates() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", Some("read")).await?;
   seed_redirect(
     &harness.pool,
@@ -499,7 +499,7 @@ async fn dcr_manage_update_full_replace_rotates() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_update_replaces_redirect_attachments() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/a", None).await?;
   seed_redirect(
     &harness.pool,
@@ -570,7 +570,7 @@ async fn dcr_manage_update_replaces_redirect_attachments() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_update_omitted_fields_clear() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", Some("read")).await?;
 
   let request = put_request(vec!["https://app.example.test/cb".to_owned()], None, None);
@@ -611,7 +611,7 @@ async fn dcr_manage_update_omitted_fields_clear() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_update_rename() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   let request = put_request(
@@ -656,7 +656,7 @@ async fn dcr_manage_update_rename() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_update_same_mtls_identity_ok() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let subject_dn = "CN=manage-mtls, O=Example";
   let registered = register_mtls(&mut harness, "https://app.example.test/cb", subject_dn).await?;
 

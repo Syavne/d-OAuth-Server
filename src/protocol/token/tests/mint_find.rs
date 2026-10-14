@@ -19,7 +19,7 @@ async fn pttl_ms(conn: &mut crate::state::RedisConn, key: &str) -> Result<i64, T
 /// Mint, find, TTL, and single-token revoke round-trip.
 #[tokio::test]
 async fn token_service_mint_find_revoke() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service(&[("v1", "token-service-pepper-one")])?;
   let grant = unique("grant");
   let client = unique("client");
@@ -146,7 +146,7 @@ async fn token_service_mint_find_revoke() -> TestResult {
 /// The grant set holds both hashes; a grant revoke kills the family.
 #[tokio::test]
 async fn token_service_grant_set_holds_hashes_and_revoke_grant() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service(&[("v1", "token-service-pepper-one")])?;
   let grant = unique("grant");
   let client = unique("client");
@@ -197,7 +197,7 @@ async fn token_service_grant_set_holds_hashes_and_revoke_grant() -> TestResult {
 /// the full string label and the minted token still resolves under it.
 #[tokio::test]
 async fn token_service_non_numeric_kid_preserved_end_to_end() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service(&[("pepper-2026", "token-service-pepper-one")])?;
   let grant = unique("grant");
   let client = unique("client");

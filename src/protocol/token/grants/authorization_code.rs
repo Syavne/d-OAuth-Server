@@ -424,7 +424,8 @@ async fn authenticate_confidential(
 mod tests {
   //! `test(grant_code)` suite: happy paths, single-use, and binding checks.
   //!
-  //! Live Postgres (client registry) plus a per-test Redis 8 container.
+  //! Live Postgres (client registry) plus the shared compose Redis, isolated
+  //! per test by a unique `{state}`/`{rl}` prefix pair.
   //! Codes are issued through [`crate::protocol::code::CodeIssuer`] so the
   //! keyed-hash path is exercised end to end; every negative test issues a
   //! fresh code because redemption consumes exactly once.
@@ -435,11 +436,6 @@ mod tests {
   };
 
   use secrecy::SecretString;
-  use testcontainers::{
-    GenericImage, ImageExt as _,
-    core::{IntoContainerPort as _, WaitFor},
-    runners::AsyncRunner as _,
-  };
 
   use super::{CodeGrantInputs, CodeGrantState, CodeTokenResponse, GRANT_TYPE_REFRESH_TOKEN};
   use crate::{
@@ -458,7 +454,6 @@ mod tests {
     },
     state::RedisConn,
     store::Store,
-    test_guard::ContainerGuard,
   };
 
   /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -467,9 +462,6 @@ mod tests {
   /// Errors raised by the authorization-code test scaffolding itself.
   #[derive(Debug, thiserror::Error)]
   enum TestError {
-    /// A testcontainers operation failed.
-    #[error("container error: {0}")]
-    Containers(#[from] testcontainers::TestcontainersError),
     /// A Redis command failed.
     #[error("redis error: {0}")]
     Redis(#[from] redis::RedisError),
@@ -535,24 +527,14 @@ mod tests {
     ttl: TtlConfig,
   }
 
-  async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
+  async fn harness() -> Result<Harness, TestError> {
     let (db, pool) = crate::db::test_support::migrated_pool()
       .await
       .map_err(|error| TestError::Unexpected(format!("pg: {error}")))?;
-    let container = GenericImage::new("redis", "8-alpine")
-      .with_exposed_port(6379.tcp())
-      .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-      .with_cmd(["redis-server", "--appendonly", "yes"])
-      .start()
-      .await?;
-    let guarded = ContainerGuard::new(container);
-    let port = guarded.get_host_port_ipv4(6379).await?;
-    let url = format!("redis://127.0.0.1:{port}");
-    let client = redis::Client::open(url.as_str())?;
-    let manager_config = redis::aio::ConnectionManagerConfig::new()
-      .set_response_timeout(Some(Duration::from_secs(10)))
-      .set_connection_timeout(Some(Duration::from_secs(5)));
-    let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+    let manager = crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("redis: {error}")))?;
+    let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
     let ring = KeyRing::from_parts(
       vec![(
         KeyId::new("v1"),
@@ -561,21 +543,14 @@ mod tests {
       vec![(KeyId::new("v1"), SecretString::from("grant-code-test-totp"))],
       vec![(KeyId::new("v1"), SecretString::from("grant-code-test-pii"))],
     )?;
-    Ok((
-      guarded,
-      Harness {
-        _db: db,
-        pool,
-        conn: RedisConn::Single(manager),
-        store: Store::from_parts(
-          "oauth:{state}:".to_owned(),
-          "oauth:{rl}:".to_owned(),
-          DurabilityMode::WaitAof,
-        ),
-        ring,
-        ttl: TtlConfig::default(),
-      },
-    ))
+    Ok(Harness {
+      _db: db,
+      pool,
+      conn: RedisConn::Single(manager),
+      store: Store::from_parts(state_prefix, rl_prefix, DurabilityMode::WaitAof),
+      ring,
+      ttl: TtlConfig::default(),
+    })
   }
 
   /// Register a client with the given method, secret, grants, and scope.
@@ -719,7 +694,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_confidential_happy_issues_pair() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("conf");
     insert_client(
       &h,
@@ -792,7 +767,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_public_dpop_happy_then_replay_rejected() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("public");
     insert_client(
       &h,
@@ -867,7 +842,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_wrong_redirect_rejected() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("conf");
     insert_client(
       &h,
@@ -924,7 +899,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_missing_redirect_accepted() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("no-redirect");
     insert_client(
       &h,
@@ -962,7 +937,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_wrong_client_rejected() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_a = unique("a");
     let client_b = unique("b");
     for client_id in [&client_a, &client_b] {
@@ -1005,7 +980,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_foreign_client_does_not_consume_victim_code() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_a = unique("victim");
     let client_b = unique("foreign");
     for client_id in [&client_a, &client_b] {
@@ -1072,7 +1047,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_wrong_verifier_rejected() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("conf");
     insert_client(
       &h,
@@ -1120,7 +1095,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_dpop_mismatch_rejected() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("public");
     insert_client(
       &h,
@@ -1165,7 +1140,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_unknown_code_rejected() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("conf");
     insert_client(
       &h,
@@ -1204,7 +1179,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_grant_code_no_refresh_when_grant_disallowed() -> TestResult {
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("norefresh");
     insert_client(
       &h,
@@ -1253,7 +1228,7 @@ mod tests {
   async fn test_grant_code_public_empty_cnf_is_invalid_grant() -> TestResult {
     use secrecy::ExposeSecret as _;
 
-    let (_container, mut h) = harness().await?;
+    let mut h = harness().await?;
     let client_id = unique("public-empty-cnf");
     insert_client(
       &h,

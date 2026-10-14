@@ -15,7 +15,7 @@ use crate::{
 /// Revoking an access token removes it but leaves its sibling refresh token.
 #[tokio::test]
 async fn revoke_access_token_removes_only_it() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store, _prefixes) = test_redis().await?;
   let service = service()?;
   let client = unique("client");
   let minted = service
@@ -67,7 +67,7 @@ async fn revoke_access_token_removes_only_it() -> TestResult {
 /// Revoking a refresh token cascades to the whole grant family.
 #[tokio::test]
 async fn revoke_refresh_token_cascades_to_grant_chain() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store, _prefixes) = test_redis().await?;
   let service = service()?;
   let client = unique("client");
   let grant = unique("grant");
@@ -120,7 +120,7 @@ async fn revoke_refresh_token_cascades_to_grant_chain() -> TestResult {
 /// An unknown token is a silent `200` no-op.
 #[tokio::test]
 async fn revoke_unknown_token_is_noop_200() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store, _prefixes) = test_redis().await?;
   let service = service()?;
   let outcome = revoke_owned(
     &mut conn,
@@ -147,7 +147,7 @@ async fn revoke_unknown_token_is_noop_200() -> TestResult {
 /// Another client's token is a no-op and is never revoked (no cross-client).
 #[tokio::test]
 async fn revoke_foreign_token_is_noop_and_untouched() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store, _prefixes) = test_redis().await?;
   let service = service()?;
   let owner = unique("owner");
   let attacker = unique("attacker");
@@ -191,7 +191,7 @@ async fn revoke_foreign_token_is_noop_and_untouched() -> TestResult {
 /// An unsupported `token_type_hint` is `400 unsupported_token_type`.
 #[tokio::test]
 async fn revoke_unsupported_hint_is_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store, _prefixes) = test_redis().await?;
   let service = service()?;
   let outcome = revoke_owned(
     &mut conn,
@@ -231,7 +231,7 @@ async fn revoke_unsupported_hint_is_rejected() -> TestResult {
 /// itself, so the sibling refresh token survives).
 #[tokio::test]
 async fn revoke_refresh_hint_on_access_token_still_revokes_it() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store, _prefixes) = test_redis().await?;
   let service = service()?;
   let client = unique("client");
   let minted = service
@@ -284,7 +284,7 @@ async fn revoke_refresh_hint_on_access_token_still_revokes_it() -> TestResult {
 /// refresh token stays resolvable, and its access sibling is untouched too.
 #[tokio::test]
 async fn revoke_foreign_refresh_token_is_noop_and_untouched() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store, _prefixes) = test_redis().await?;
   let service = service()?;
   let owner = unique("owner");
   let attacker = unique("attacker");

@@ -13,7 +13,7 @@ use crate::{
 
 #[tokio::test]
 async fn test_grant_device_fast_poll_is_slow_down() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
@@ -110,7 +110,7 @@ async fn test_grant_device_fast_poll_is_slow_down() -> TestResult {
 
 #[tokio::test]
 async fn test_grant_device_denied_is_access_denied() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
@@ -168,7 +168,7 @@ async fn test_grant_device_denied_is_access_denied() -> TestResult {
 /// a spurious `slow_down`; `slow_down` resumes only inside the window.
 #[tokio::test]
 async fn test_grant_device_interval_boundary_not_slow_down() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
@@ -308,7 +308,7 @@ async fn test_grant_device_interval_boundary_not_slow_down() -> TestResult {
 /// stays `access_denied`, never `authorization_pending` and never a mint.
 #[tokio::test]
 async fn test_grant_device_denied_then_poll_stays_access_denied() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,

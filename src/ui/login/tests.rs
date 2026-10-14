@@ -1,18 +1,14 @@
 //! `test(login)` harness: live Postgres + Redis, user provisioning, presessions.
 //!
 //! Child suites (`auth`, `enroll`) drive the public [`super`] API through
-//! these helpers; every test owns a fresh database and Redis container.
+//! these helpers; every test owns a fresh database and a unique Redis prefix
+//! pair on the shared compose Redis.
 
 use serde_json::json;
 use sqlx::PgPool;
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr},
   time::Duration,
-};
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -28,7 +24,6 @@ use crate::{
   state::RedisConn,
   store::Store,
   store::pending::{self, PendingAuth},
-  test_guard::ContainerGuard,
 };
 
 pub(super) mod auth;
@@ -46,9 +41,6 @@ pub(super) type TestResult = Result<(), TestError>;
 /// Scaffolding failures for the login suites.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -87,8 +79,6 @@ pub(super) struct Harness {
   pub(super) store: Store,
   /// Validated config (weak Argon2 for speed, test keys).
   pub(super) config: std::sync::Arc<Config>,
-  /// Redis container guard (synchronous removal on drop).
-  pub(super) _redis: ContainerGuard,
   /// Fixed clock midpoint of a TOTP step (deterministic codes).
   pub(super) now: OffsetDateTime,
   /// The step counter `now` sits in.
@@ -100,23 +90,13 @@ pub(super) async fn harness() -> Result<Harness, TestError> {
   let (db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("pg: {error}")))?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let redis_url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(redis_url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
   let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    state_prefix.clone(),
+    rl_prefix.clone(),
     crate::config::DurabilityMode::WaitAof,
   );
   let fixture = json!({
@@ -124,7 +104,12 @@ pub(super) async fn harness() -> Result<Harness, TestError> {
     "environment": "development",
     "tls": {"cert_path": "/tmp/login-test-cert.pem", "key_path": "/tmp/login-test-key.pem"},
     "database": {"url": "postgres://127.0.0.1:1/login"},
-    "redis": {"url": redis_url, "durability": "waitaof"},
+    "redis": {
+      "url": crate::test_support::test_redis_url(),
+      "durability": "waitaof",
+      "token_key_prefix": state_prefix,
+      "ratelimit_key_prefix": rl_prefix,
+    },
     "token_pepper": "login-test-pepper-0123456789abcdef",
     "totp_encryption_key": "login-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "login-test-pii-key-0123456789abcdef",
@@ -149,7 +134,6 @@ pub(super) async fn harness() -> Result<Harness, TestError> {
     conn: RedisConn::Single(manager),
     store,
     config: std::sync::Arc::new(config),
-    _redis: guarded,
     now,
     counter,
   })

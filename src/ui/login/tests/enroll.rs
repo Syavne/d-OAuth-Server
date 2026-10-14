@@ -881,9 +881,13 @@ async fn change_password_redis_outage_leaves_password_unchanged() -> TestResult 
     .arg("-@write")
     .query_async(&mut h.conn)
     .await?;
-  let port = h._redis.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://outage-user:{acl_password}@127.0.0.1:{port}");
-  let client = redis::Client::open(url.as_str())?;
+  let info: redis::ConnectionInfo = crate::test_support::test_redis_url().parse()?;
+  let settings = info
+    .redis_settings()
+    .clone()
+    .set_username("outage-user")
+    .set_password(acl_password);
+  let client = redis::Client::open(info.set_redis_settings(settings))?;
   let manager = redis::aio::ConnectionManager::new_lazy_with_config(
     client,
     redis::aio::ConnectionManagerConfig::new()
@@ -958,5 +962,12 @@ async fn change_password_redis_outage_leaves_password_unchanged() -> TestResult 
   {
     return Err(unexpected("a failed change must keep sibling sessions"));
   }
+  // Best-effort: the ACL user lives on the shared Redis, and the result is
+  // ignored so cleanup never turns a passing test into a failing one.
+  let _: Result<(), redis::RedisError> = redis::cmd("ACL")
+    .arg("DELUSER")
+    .arg("outage-user")
+    .query_async(&mut h.conn)
+    .await;
   Ok(())
 }

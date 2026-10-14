@@ -1,7 +1,8 @@
 //! `test(ratelimit)` suite: fixed-window enforcement against real Redis.
 //!
-//! Each test owns a throwaway `redis:8-alpine` container (AOF on), so
-//! counter keys never leak across tests. Fixtures live in [`super::test_support`].
+//! Each test uses the shared compose Redis with its own unique key prefixes,
+//! so counter keys never leak across tests. Fixtures live in
+//! [`super::test_support`].
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -13,16 +14,17 @@ use tower::Layer;
 use super::RateLimitLayer;
 use super::identity::{client_bucket_raw, counter_key};
 use super::test_support::{
-  Extras, Passthrough, TestResult, live_state, peer, redis_container, retry_after, scan_keys, send,
-  send_with, test_config, unavailable_state,
+  Extras, Passthrough, TestResult, live_state, peer, retry_after, scan_keys, send, send_with,
+  test_config, unavailable_state,
 };
 
 /// N in-window requests pass; the N+1th is `429` + `Retry-After`.
 #[tokio::test]
 async fn ratelimit_token_per_ip_rejects_over_budget_with_retry_after() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 3, "token_per_client": 1000}),
   )?;
   let state = live_state(config, &url).await?;
@@ -65,9 +67,10 @@ async fn ratelimit_token_per_ip_rejects_over_budget_with_retry_after() -> TestRe
 /// same client from a different peer owns a separate bucket (T3-C2).
 #[tokio::test]
 async fn ratelimit_token_per_client_enforced_per_peer() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 1000, "token_per_client": 2}),
   )?;
   let state = live_state(config, &url).await?;
@@ -118,9 +121,10 @@ async fn ratelimit_token_per_client_enforced_per_peer() -> TestResult {
 /// A counter resets after its window, so the next request is admitted again.
 #[tokio::test]
 async fn ratelimit_recovers_after_window_expires() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 1, "per_ip": 1}),
   )?;
   let state = live_state(config, &url).await?;
@@ -146,12 +150,14 @@ async fn ratelimit_recovers_after_window_expires() -> TestResult {
 /// Counter keys are hash-tagged and contain no raw IP or `client_id`.
 #[tokio::test]
 async fn ratelimit_keys_are_hashed_and_cluster_tagged() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 100, "token_per_client": 100}),
   )?;
   let state = live_state(config, &url).await?;
+  let prefix = state.config.redis.ratelimit_key_prefix.clone();
   let service = RateLimitLayer::new(state).layer(Passthrough);
 
   let source = SocketAddr::from(([203, 0, 113, 7], 40_000));
@@ -165,7 +171,7 @@ async fn ratelimit_keys_are_hashed_and_cluster_tagged() -> TestResult {
   .await?;
   assert_eq!(response.status(), StatusCode::OK);
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   assert!(
     keys.len() >= 2,
     "both IP and client counters must exist: {keys:?}"
@@ -192,6 +198,7 @@ async fn ratelimit_keys_are_hashed_and_cluster_tagged() -> TestResult {
 async fn ratelimit_token_fails_closed_on_store_outage() -> TestResult {
   let config = test_config(
     "redis://127.0.0.1:1",
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 10, "token_per_client": 10}),
   )?;
   let state = unavailable_state(config)?;
@@ -217,7 +224,11 @@ async fn ratelimit_token_fails_closed_on_store_outage() -> TestResult {
 /// while the store is down.
 #[tokio::test]
 async fn ratelimit_leaves_unlisted_paths_untouched_on_store_outage() -> TestResult {
-  let config = test_config("redis://127.0.0.1:1", json!({"enabled": true}))?;
+  let config = test_config(
+    "redis://127.0.0.1:1",
+    crate::test_support::unique_prefixes(),
+    json!({"enabled": true}),
+  )?;
   let state = unavailable_state(config)?;
   let service = RateLimitLayer::new(state).layer(Passthrough);
 
@@ -231,9 +242,10 @@ async fn ratelimit_leaves_unlisted_paths_untouched_on_store_outage() -> TestResu
 /// evade the limit.
 #[tokio::test]
 async fn ratelimit_ignores_spoofed_x_forwarded_for() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 1, "token_per_client": 1000}),
   )?;
   let state = live_state(config, &url).await?;
@@ -270,7 +282,7 @@ async fn ratelimit_ignores_spoofed_x_forwarded_for() -> TestResult {
     "rotating X-Forwarded-For must not evade the real peer's bucket"
   );
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   assert_eq!(
     keys,
     vec![counter_key(&prefix, "ip", "127.0.0.1")],
@@ -289,9 +301,10 @@ async fn ratelimit_ignores_spoofed_x_forwarded_for() -> TestResult {
 /// different from the recorded peer.
 #[tokio::test]
 async fn ratelimit_ignores_spoofed_forwarded_header() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 1, "token_per_client": 1000}),
   )?;
   let state = live_state(config, &url).await?;
@@ -328,7 +341,7 @@ async fn ratelimit_ignores_spoofed_forwarded_header() -> TestResult {
     "rotating Forwarded must not evade the real peer's bucket"
   );
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   assert_eq!(
     keys,
     vec![counter_key(&prefix, "ip", "127.0.0.1")],
@@ -341,9 +354,10 @@ async fn ratelimit_ignores_spoofed_forwarded_header() -> TestResult {
 /// never limits the same traffic from `::1`, and the reverse.
 #[tokio::test]
 async fn ratelimit_ipv6_peer_owns_a_distinct_bucket() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 1, "token_per_client": 1000}),
   )?;
   let state = live_state(config, &url).await?;
@@ -399,7 +413,7 @@ async fn ratelimit_ipv6_peer_owns_a_distinct_bucket() -> TestResult {
     "the IPv6 peer's own bucket must still enforce the budget"
   );
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   for expected in [
     counter_key(&prefix, "ip", "127.0.0.1"),
     counter_key(&prefix, "ip", "::1"),
@@ -422,9 +436,10 @@ async fn ratelimit_ipv6_peer_owns_a_distinct_bucket() -> TestResult {
 /// separately.
 #[tokio::test]
 async fn ratelimit_per_ip_budget_blocks_fresh_client_from_same_ip() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 1, "token_per_client": 1000}),
   )?;
   let state = live_state(config, &url).await?;
@@ -455,7 +470,7 @@ async fn ratelimit_per_ip_budget_blocks_fresh_client_from_same_ip() -> TestResul
     "a fresh client from an exhausted peer must hit the per-IP budget"
   );
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   for expected in [
     counter_key(&prefix, "ip", "127.0.0.1"),
     counter_key(
@@ -486,9 +501,10 @@ async fn ratelimit_per_ip_budget_blocks_fresh_client_from_same_ip() -> TestResul
 /// configured window.
 #[tokio::test]
 async fn ratelimit_retry_after_is_positive_and_bounded_by_window() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 1, "token_per_client": 1000}),
   )?;
   let state = live_state(config, &url).await?;
@@ -526,12 +542,14 @@ async fn ratelimit_retry_after_is_positive_and_bounded_by_window() -> TestResult
 /// the configured budget are admitted and no limiter key is written.
 #[tokio::test]
 async fn ratelimit_disabled_never_limits_and_writes_no_keys() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": false, "window_secs": 60, "per_ip": 1, "token_per_client": 1}),
   )?;
   let state = live_state(config, &url).await?;
+  let prefix = state.config.redis.ratelimit_key_prefix.clone();
   let service = RateLimitLayer::new(state).layer(Passthrough);
 
   for attempt in 0..3 {
@@ -550,7 +568,7 @@ async fn ratelimit_disabled_never_limits_and_writes_no_keys() -> TestResult {
     );
   }
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   assert!(
     keys.is_empty(),
     "a disabled limiter must not write counter keys: {keys:?}"
@@ -564,9 +582,10 @@ async fn ratelimit_disabled_never_limits_and_writes_no_keys() -> TestResult {
 /// `(peer_ip, client_id)`, so the victim's request still passes.
 #[tokio::test]
 async fn ratelimit_client_bucket_is_scoped_to_peer_ip() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 1000, "token_per_client": 2}),
   )?;
   let state = live_state(config, &url).await?;
@@ -618,9 +637,10 @@ async fn ratelimit_client_bucket_is_scoped_to_peer_ip() -> TestResult {
 /// request regardless of the claimed client identity.
 #[tokio::test]
 async fn ratelimit_rotating_fake_client_ids_does_not_evade_ip_budget() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 2, "token_per_client": 1000}),
   )?;
   let state = live_state(config, &url).await?;
@@ -666,9 +686,10 @@ async fn ratelimit_rotating_fake_client_ids_does_not_evade_ip_budget() -> TestRe
 /// peer itself.
 #[tokio::test]
 async fn ratelimit_trusted_proxy_end_to_end_attributes_xff_bucket() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({
       "enabled": true,
       "window_secs": 60,
@@ -729,7 +750,7 @@ async fn ratelimit_trusted_proxy_end_to_end_attributes_xff_bucket() -> TestResul
     "a different XFF client through the same proxy must own a fresh bucket"
   );
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   for expected in [
     counter_key(&prefix, "ip", "198.51.100.7"),
     counter_key(&prefix, "ip", "198.51.100.8"),
@@ -756,9 +777,10 @@ async fn ratelimit_trusted_proxy_end_to_end_attributes_xff_bucket() -> TestResul
 /// bucket through the full layer instead of minting a foreign bucket.
 #[tokio::test]
 async fn ratelimit_trusted_proxy_unparseable_xff_falls_back_to_peer() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({
       "enabled": true,
       "window_secs": 60,
@@ -819,7 +841,7 @@ async fn ratelimit_trusted_proxy_unparseable_xff_falls_back_to_peer() -> TestRes
     "`unknown` must likewise count against the peer bucket"
   );
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   assert_eq!(
     keys,
     vec![counter_key(&prefix, "ip", "10.0.0.1")],
@@ -833,12 +855,14 @@ async fn ratelimit_trusted_proxy_unparseable_xff_falls_back_to_peer() -> TestRes
 /// to count.
 #[tokio::test]
 async fn ratelimit_missing_peer_fails_closed_without_keys() -> TestResult {
-  let (_redis, url) = redis_container().await?;
+  let url = crate::test_support::test_redis_url();
   let config = test_config(
     &url,
+    crate::test_support::unique_prefixes(),
     json!({"enabled": true, "window_secs": 60, "per_ip": 10, "token_per_client": 10}),
   )?;
   let state = live_state(config, &url).await?;
+  let prefix = state.config.redis.ratelimit_key_prefix.clone();
   let service = RateLimitLayer::new(state).layer(Passthrough);
 
   let response = send_with(
@@ -859,7 +883,7 @@ async fn ratelimit_missing_peer_fails_closed_without_keys() -> TestResult {
     "fail-closed response must carry the contractual Retry-After: 1"
   );
 
-  let keys = scan_keys(&url, "oauth:{rl}:*").await?;
+  let keys = scan_keys(&url, &format!("{prefix}*")).await?;
   assert!(
     keys.is_empty(),
     "a request with no identity must not write counter keys: {keys:?}"

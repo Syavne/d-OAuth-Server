@@ -176,6 +176,9 @@ pub enum TestError {
   /// The layered config source or validation failed.
   #[error("config source error: {0}")]
   Source(#[from] ::config::ConfigError),
+  /// The shared compose test scaffolding failed to provision a service.
+  #[error("shared test services: {0}")]
+  Shared(#[from] crate::test_support::TestError),
   /// A `docker pause/unpause` call failed.
   #[error("docker {0} failed")]
   Docker(String),

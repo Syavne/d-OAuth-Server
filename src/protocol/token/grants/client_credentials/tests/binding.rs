@@ -10,7 +10,7 @@ use crate::protocol::token::ClientKind;
 
 #[tokio::test]
 async fn grant_client_credentials_unbound_bearer_ok() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;
@@ -36,7 +36,7 @@ async fn grant_client_credentials_unbound_bearer_ok() -> TestResult {
 
 #[tokio::test]
 async fn grant_client_credentials_dpop_bound_no_proof_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;
@@ -75,7 +75,7 @@ async fn grant_client_credentials_dpop_bound_no_proof_rejected() -> TestResult {
 
 #[tokio::test]
 async fn grant_client_credentials_dpop_bound_stale_proof_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;
@@ -114,7 +114,7 @@ async fn grant_client_credentials_dpop_bound_stale_proof_rejected() -> TestResul
 
 #[tokio::test]
 async fn grant_client_credentials_dpop_bound_fresh_proof_ok() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;
@@ -145,7 +145,7 @@ async fn grant_client_credentials_dpop_bound_fresh_proof_ok() -> TestResult {
 
 #[tokio::test]
 async fn grant_client_credentials_mtls_bound_no_proof_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;
@@ -184,7 +184,7 @@ async fn grant_client_credentials_mtls_bound_no_proof_rejected() -> TestResult {
 
 #[tokio::test]
 async fn grant_client_credentials_mtls_bound_stale_proof_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;
@@ -223,7 +223,7 @@ async fn grant_client_credentials_mtls_bound_stale_proof_rejected() -> TestResul
 
 #[tokio::test]
 async fn grant_client_credentials_mtls_bound_fresh_proof_ok() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let client = unique("m2m");
   let registered = ScopeSet::parse("api:read")?;

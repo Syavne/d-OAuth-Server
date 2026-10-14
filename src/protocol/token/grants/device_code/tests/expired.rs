@@ -11,7 +11,7 @@ use crate::{
 
 #[tokio::test]
 async fn test_grant_device_expired_token_after_ttl() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,

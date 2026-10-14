@@ -11,7 +11,7 @@ use crate::protocol::client_auth::authenticate_client;
 
 #[tokio::test]
 async fn client_auth_basic_valid() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-basic-valid";
   insert_client(
@@ -43,7 +43,7 @@ async fn client_auth_basic_valid() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_basic_wrong_secret_is_401() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-basic-wrong";
   insert_client(
@@ -71,7 +71,7 @@ async fn client_auth_basic_wrong_secret_is_401() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_post_valid() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-post-valid";
   insert_client(
@@ -96,7 +96,7 @@ async fn client_auth_post_valid() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_none_on_confidential_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-none-on-conf";
   insert_client(
@@ -125,7 +125,7 @@ async fn client_auth_none_on_confidential_rejected() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_none_on_public_accepted() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-none-public";
   insert_client(
@@ -153,7 +153,7 @@ async fn client_auth_none_on_public_accepted() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_expired_secret_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-expired-secret";
   insert_client(
@@ -175,7 +175,7 @@ async fn client_auth_expired_secret_rejected() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_unknown_client_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let req = post_request("client-auth-no-such-client", SecretString::from("whatever"));
   match authenticate_client(&mut stores_of(&mut h), &ctx_of(&endpoint), &req).await {
@@ -186,7 +186,7 @@ async fn client_auth_unknown_client_rejected() -> TestResult {
 
 #[tokio::test]
 async fn client_auth_multiple_methods_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let endpoint = h.endpoint.clone();
   let client_id = "client-auth-multi-method";
   insert_client(

@@ -24,6 +24,8 @@ pub mod state;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_guard;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tls;
 pub mod ui;
 

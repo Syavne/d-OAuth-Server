@@ -16,7 +16,7 @@ use crate::jose::jwk::thumbprint;
 /// A valid proof verifies and returns the proof-key thumbprint as `jkt`.
 #[tokio::test]
 async fn dpop_valid_proof_accepted_returns_bound_jkt() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let jti = unique_jti();
@@ -53,7 +53,7 @@ fn dpop_rfc7638_thumbprint_vector() -> TestResult {
 /// `iat` values verify, one second beyond either side is rejected.
 #[tokio::test]
 async fn dpop_iat_window_boundaries_enforced() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   for offset in [-DPOP_IAT_WINDOW_SECS, DPOP_FUTURE_SKEW_SECS] {
@@ -96,7 +96,7 @@ async fn dpop_iat_window_boundaries_enforced() -> TestResult {
 /// The second presentation of a proof loses the `jti` race and is rejected.
 #[tokio::test]
 async fn dpop_replayed_jti_rejected() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let jti = unique_jti();
@@ -117,7 +117,7 @@ async fn dpop_replayed_jti_rejected() -> TestResult {
 /// the token matches.
 #[tokio::test]
 async fn dpop_ath_bound_access_accepted() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let token = "dpop-test-access-token";
@@ -143,7 +143,7 @@ async fn dpop_ath_bound_access_accepted() -> TestResult {
 /// token-endpoint call with parameters still matches a canonical proof.
 #[tokio::test]
 async fn dpop_htu_query_stripped_server_side_accepted() -> TestResult {
-  let (_redis, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let key = fresh_es256_key()?;
   let now = now_unix();
   let jti = unique_jti();

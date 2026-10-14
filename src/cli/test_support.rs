@@ -1,33 +1,26 @@
-//! Shared testcontainers harness for the `test(cli)` suite.
+//! Compose-services harness for the `test(cli)` suite.
 //!
-//! One Postgres (migrated once) and one Redis (AOF on, satisfying the
-//! durability contract) are shared across the suite; tests use unique emails
-//! and scope names so parallel execution stays isolated.
+//! Tests connect to the shared Postgres and Redis from `compose.test.yaml`
+//! through the crate-wide helpers. Each harness build creates a fresh database
+//! on the shared server (migrated once) and mints a Redis prefix pair that is
+//! per-process under `cargo test` (shared `static HARNESS`) and per-test under
+//! `cargo nextest`; handler-side `Store::from_config` resolves the same
+//! keyspace because the prefixes live in the config.
 
 use std::sync::{Arc, Mutex};
 
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use tracing_subscriber::layer::SubscriberExt as _;
 
-use super::context::{self, CliError, Context};
+use super::context::{CliError, Context};
 use crate::{
   config::Config,
   state::MIGRATOR,
-  test_guard::{ContainerGuard, Lease, Shared},
+  test_guard::{Lease, Shared},
 };
-
-const PG_PASSWORD: &str = "cli-test-secret";
 
 /// Errors raised by the CLI test scaffolding.
 #[derive(Debug, thiserror::Error)]
 pub enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// Crate configuration failed to load.
   #[error("config error: {0}")]
   Config(#[from] crate::config::ConfigError),
@@ -72,34 +65,32 @@ pub enum TestError {
   Harness(String),
 }
 
-/// Shared Postgres + Redis containers plus the validated config.
+/// Validated configuration pointing at the shared services.
 ///
-/// The containers are [`ContainerGuard`]s, so the last test releasing the
-/// shared slot removes them synchronously instead of orphaning them.
+/// Under `cargo test` the shared `static HARNESS` means one harness build per
+/// process owns a fresh database plus a per-process Redis prefix pair; under
+/// `cargo nextest` each test runs in its own process, so the pair is per-test.
 pub struct Harness {
-  /// Validated configuration pointing at the containers.
+  /// Validated configuration pointing at the fresh database and shared Redis.
   pub config: Arc<Config>,
-  _postgres: ContainerGuard,
-  _redis: ContainerGuard,
 }
 
 static HARNESS: Shared<Harness> = Shared::new();
 
-/// Start (once) and return a lease on the shared harness.
+/// Start (once per process) and return a lease on the harness.
 ///
 /// The lease dereferences to the harness; hold it for the duration of the
-/// test so the shared containers stay alive, and dropping the last lease
-/// removes them deterministically.
+/// test alongside the context.
 ///
 /// # Errors
-/// Returns [`TestError`] when a container, config load, or migration fails.
+/// Returns [`TestError`] when the database, config load, or migration fails.
 pub async fn harness() -> Result<Lease<Harness>, TestError> {
   HARNESS.lease(build()).await
 }
 
 /// Build an operator context over the shared harness.
 ///
-/// The lease keeps the shared containers alive; bind it (usually as
+/// The lease keeps the harness alive; bind it (usually as
 /// `_harness`) for the duration of the test alongside the context.
 ///
 /// # Errors
@@ -158,56 +149,34 @@ pub fn captured(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
 }
 
 async fn build() -> Result<Harness, TestError> {
-  let (postgres, pg_url) = postgres_container().await?;
-  let (redis, redis_url) = redis_container().await?;
-  let config = Arc::new(test_config(&pg_url, &redis_url)?);
-  let pool = context::open_pool(&config).await?;
+  let (pg_url, pool) = crate::test_support::fresh_database_pool()
+    .await
+    .map_err(|error| TestError::Harness(format!("shared postgres: {error}")))?;
   MIGRATOR.run(&pool).await?;
-  drop(pool);
-  Ok(Harness {
-    config,
-    _postgres: postgres,
-    _redis: redis,
-  })
+  pool.close().await;
+  let redis_url = crate::test_support::test_redis_url();
+  let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let config = Arc::new(test_config(&pg_url, &redis_url, &state_prefix, &rl_prefix)?);
+  Ok(Harness { config })
 }
 
-pub(crate) async fn postgres_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("postgres", "18-alpine")
-    .with_exposed_port(5432.tcp())
-    .with_wait_for(WaitFor::message_on_stderr(
-      "database system is ready to accept connections",
-    ))
-    .with_wait_for(WaitFor::message_on_stdout(
-      "database system is ready to accept connections",
-    ))
-    .with_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(5432).await?;
-  let url = format!("postgres://postgres:{PG_PASSWORD}@127.0.0.1:{port}/postgres?sslmode=disable");
-  Ok((guarded, url))
-}
-
-async fn redis_container() -> Result<(ContainerGuard, String), TestError> {
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(vec!["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  Ok((guarded, format!("redis://127.0.0.1:{port}")))
-}
-
-fn test_config(pg_url: &str, redis_url: &str) -> Result<Config, TestError> {
+fn test_config(
+  pg_url: &str,
+  redis_url: &str,
+  state_prefix: &str,
+  rl_prefix: &str,
+) -> Result<Config, TestError> {
   let fixture = serde_json::json!({
     "issuer": "https://auth.example.test",
     "environment": "development",
     "tls": {"cert_path": "/tmp/cli-test-cert.pem", "key_path": "/tmp/cli-test-key.pem"},
     "database": {"url": pg_url},
-    "redis": {"url": redis_url, "durability": "waitaof"},
+    "redis": {
+      "url": redis_url,
+      "durability": "waitaof",
+      "token_key_prefix": state_prefix,
+      "ratelimit_key_prefix": rl_prefix,
+    },
     "token_pepper": "cli-test-pepper-0123456789abcdef",
     "totp_encryption_key": "cli-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "cli-test-pii-key-0123456789abcdef",

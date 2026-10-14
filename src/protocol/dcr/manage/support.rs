@@ -1,17 +1,12 @@
-//! Shared harness for the `dcr_manage` container suites.
+//! Shared harness for the `dcr_manage` suites.
 //!
-//! Real Postgres plus a throwaway Redis per test; clients are created through
-//! the production [`register_client`](super::super::register_client) path so
-//! every management test starts from a genuinely registered client.
+//! Real Postgres plus the shared compose Redis per test; clients are created
+//! through the production [`register_client`](super::super::register_client)
+//! path so every management test starts from a genuinely registered client.
 
 use std::time::Duration;
 
 use sqlx::PgPool;
-use testcontainers::{
-  GenericImage, ImageExt as _,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -26,15 +21,12 @@ use crate::{
   error::{AppError, OAuthErrorCode},
   state::RedisConn,
   store::{Store, dcr as dcr_store},
-  test_guard::{ContainerGuard, Lease},
+  test_guard::Lease,
 };
 
 /// This suite's error type (no `unwrap`/`expect` under the deny lints).
 #[derive(Debug, thiserror::Error)]
 pub(super) enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -80,45 +72,59 @@ pub(super) struct Registered {
   pub(super) reg_token: String,
 }
 
-/// Fresh Postgres database plus a throwaway Redis for one test.
-pub(super) async fn harness(policy: &str) -> Result<(ContainerGuard, Harness), TestError> {
-  let (_db, pool) = crate::db::test_support::migrated_pool()
+/// Fresh Postgres database plus the shared compose Redis for one test.
+///
+/// Postgres comes from the shared `db` lease; Redis comes from the shared
+/// compose service, isolated per test by a unique prefix pair.
+pub(super) async fn harness(policy: &str) -> Result<Harness, TestError> {
+  let manager = crate::test_support::redis_manager()
     .await
-    .map_err(|error| TestError::Unexpected(format!("{error}")))?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let redis_url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(redis_url.as_str())?;
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  finish_harness(policy, manager).await
+}
+
+/// Fresh Postgres database plus the Redis at `redis_url` for one test.
+///
+/// Container-free: the caller owns whatever backs `redis_url`. The suite's
+/// Redis-loss test (`tests_delete.rs`, keep-listed) builds a private
+/// container inline, keeps its guard alive for the test, and passes the
+/// container's URL here so its full wipe never touches the shared service.
+/// Every other test uses [`harness`].
+pub(super) async fn harness_with_redis(
+  redis_url: &str,
+  policy: &str,
+) -> Result<Harness, TestError> {
+  let client = redis::Client::open(redis_url)?;
   let manager_config = redis::aio::ConnectionManagerConfig::new()
     .set_response_timeout(Some(Duration::from_secs(10)))
     .set_connection_timeout(Some(Duration::from_secs(5)));
   let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  finish_harness(policy, manager).await
+}
+
+/// Shared tail of [`harness`] and [`harness_with_redis`]: fresh Postgres,
+/// per-test unique prefixes, and the fixture config over dummy URLs.
+async fn finish_harness(
+  policy: &str,
+  manager: redis::aio::ConnectionManager,
+) -> Result<Harness, TestError> {
+  let (_db, pool) = crate::db::test_support::migrated_pool()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("{error}")))?;
   let config = test_config(
     "postgres://postgres:dummy@127.0.0.1:1/postgres?sslmode=disable",
     "redis://127.0.0.1:1",
     policy,
   )?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
-  Ok((
-    guarded,
-    Harness {
-      _db,
-      pool,
-      conn: RedisConn::Single(manager),
-      store,
-      config,
-    },
-  ))
+  let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let store = Store::from_parts(state_prefix, rl_prefix, DurabilityMode::WaitAof);
+  Ok(Harness {
+    _db,
+    pool,
+    conn: RedisConn::Single(manager),
+    store,
+    config,
+  })
 }
 
 /// Build a validated [`Config`] over fixture URLs.

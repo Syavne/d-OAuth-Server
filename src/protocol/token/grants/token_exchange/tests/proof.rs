@@ -12,7 +12,7 @@ use crate::protocol::token::SenderProof;
 
 #[tokio::test]
 async fn grant_token_exchange_missing_proof_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let caller = unique("caller");
   let subject_client = unique("subject-client");
@@ -63,7 +63,7 @@ async fn grant_token_exchange_missing_proof_rejected() -> TestResult {
 
 #[tokio::test]
 async fn grant_token_exchange_subject_binding_mismatch_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let caller = unique("caller");
   let subject_client = unique("subject-client");
@@ -114,7 +114,7 @@ async fn grant_token_exchange_subject_binding_mismatch_rejected() -> TestResult 
 
 #[tokio::test]
 async fn grant_token_exchange_chained_rejected() -> TestResult {
-  let (_lease, mut conn, store) = test_redis().await?;
+  let (mut conn, store) = test_redis().await?;
   let service = service()?;
   let caller = unique("caller");
   let subject_client = unique("subject-client");

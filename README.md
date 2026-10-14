@@ -32,8 +32,9 @@ state is in Redis, so replicas are interchangeable.
 - Redis 8 or newer, with persistence enabled and eviction off.
 - A TLS certificate and key for the public listener.
 - Docker, for the container image, for the shared test Postgres and Redis in
-  `compose.test.yaml`, and for the tests that still use testcontainers (the
-  unit-test helpers under `src/` and the lifecycle suite).
+  `compose.test.yaml`, and for the handful of suites that still use
+  `testcontainers` because they need Redis nodes of their own (the keep-list is
+  under [Tests](#tests)).
 - `cargo-nextest` for the test suite:
   `cargo install cargo-nextest --locked`.
 
@@ -166,11 +167,27 @@ Override the endpoints with `D_OAUTH_TEST_POSTGRES_URL` and
 `D_OAUTH_TEST_REDIS_URL`. Each test gets its own freshly created database and
 unique Redis key prefixes, so tests run in parallel and nothing flushes shared
 state. Killing the suite mid-run no longer orphans containers: the lifecycle
-tests still `rm` theirs on drop. Testcontainers remains only for the unit-test
-helpers under `src/` and for `tests/resilience.rs`, which stops and restarts
-containers; `tests/topology.rs` is the other lifecycle suite and spawns
-in-process `redis-test` Sentinel/Cluster fixtures that need a `redis-server`
-binary. Docker must be running. To iterate on one area, filter by name:
+tests still `rm` theirs on drop.
+
+Only these suites use `testcontainers`; every other unit and integration suite
+uses the shared `compose.test.yaml` services:
+
+- `src/test_guard.rs` and `src/state/test_support.rs`: the shared container
+  helpers the keep-list below is built on.
+- `tests/resilience.rs`: stop and restart lifecycle.
+- `src/state/tests_topology.rs`: Sentinel, Cluster, and `requirepass` topology.
+- The `--appendfsync always` refresh-token suite:
+  `src/protocol/token/grants/refresh_token/tests.rs` and
+  `src/protocol/token/grants/refresh_token/tests/failover.rs`.
+- The two Redis durability tests in `src/store/tests_store.rs`
+  (`store_persistence_survives_restart` and `store_durability_barrier_modes`).
+- `dcr_manage_token_survives_redis_flush` in
+  `src/protocol/dcr/manage/tests_delete.rs`, which starts a private Redis for
+  the flush.
+
+`tests/topology.rs` is separate: it spawns in-process `redis-test`
+Sentinel/Cluster fixtures that need a real `redis-server` binary. Docker must
+be running. To iterate on one area, filter by name:
 
 ```bash
 cargo nextest run -E 'test(refresh_rotation)'

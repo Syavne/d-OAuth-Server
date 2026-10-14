@@ -1,4 +1,4 @@
-//! Fixtures for the `test(ratelimit)` suite: a real Redis container, a lazy
+//! Fixtures for the `test(ratelimit)` suite: the shared compose Redis, a lazy
 //! Postgres pool the limiter never touches, and a `Send` passthrough handler.
 
 use std::error::Error;
@@ -10,16 +10,10 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, Response, header};
 use serde_json::{Value, json};
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use tower::{Service, ServiceExt};
 
 use crate::config::{Config, ConfigError};
 use crate::state::{AppState, Clock, RedisConn};
-use crate::test_guard::ContainerGuard;
 
 /// Result alias keeping `?` usable across containers, Redis, config, and sqlx.
 pub(super) type TestResult = Result<(), Box<dyn Error>>;
@@ -46,29 +40,26 @@ impl Service<Request<Body>> for Passthrough {
   }
 }
 
-/// Start a single-node Redis with AOF enabled and return its URL.
-///
-/// The guard removes the container synchronously when the test drops it.
-pub(super) async fn redis_container() -> Result<(ContainerGuard, String), Box<dyn Error>> {
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  Ok((guarded, format!("redis://127.0.0.1:{port}")))
-}
-
-/// Build a validated config over `redis_url` with the given rate-limit block.
-pub(super) fn test_config(redis_url: &str, rate_limit: Value) -> Result<Config, ConfigError> {
+/// Build a validated config over `redis_url` with the given rate-limit block
+/// and a per-test keyspace prefix pair, so counter keys never collide on the
+/// shared Redis.
+pub(super) fn test_config(
+  redis_url: &str,
+  prefixes: (String, String),
+  rate_limit: Value,
+) -> Result<Config, ConfigError> {
+  let (token_key_prefix, ratelimit_key_prefix) = prefixes;
   let fixture = json!({
     "issuer": "https://auth.example.test",
     "environment": "development",
     "tls": {"cert_path": "/tmp/ratelimit-test-cert.pem", "key_path": "/tmp/ratelimit-test-key.pem"},
     "database": {"url": "postgres://127.0.0.1:1/ratelimit"},
-    "redis": {"url": redis_url, "durability": "waitaof"},
+    "redis": {
+      "url": redis_url,
+      "durability": "waitaof",
+      "token_key_prefix": token_key_prefix,
+      "ratelimit_key_prefix": ratelimit_key_prefix,
+    },
     "token_pepper": "ratelimit-test-pepper-0123456789abcdef",
     "totp_encryption_key": "ratelimit-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "ratelimit-test-pii-key-0123456789abcdef",
@@ -96,7 +87,7 @@ fn build_state(
   }
 }
 
-/// State backed by a live Redis container.
+/// State backed by the shared live Redis.
 pub(super) async fn live_state(
   config: Config,
   redis_url: &str,

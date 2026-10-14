@@ -3,11 +3,17 @@
 
 use uuid::Uuid;
 
+use testcontainers::{
+  GenericImage, ImageExt as _,
+  core::{IntoContainerPort, WaitFor},
+  runners::AsyncRunner,
+};
+
 use super::delete::delete_client;
 use super::read_client;
 use super::support::{
   Harness, TestError, TestResult, expect_app_error, expect_forbidden, expect_unauthorized, harness,
-  manage_parts, mtls_request, register, register_mtls, try_register,
+  harness_with_redis, manage_parts, mtls_request, register, register_mtls, try_register,
 };
 use crate::db::client_repo::{self, NewClient};
 use crate::error::OAuthErrorCode;
@@ -15,7 +21,7 @@ use crate::protocol::token::{ClientKind, MintRequest, SenderProof, TokenService}
 
 #[tokio::test]
 async fn dcr_manage_cross_client_forbidden() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let first = register(&mut harness, "https://app.example.test/a", None).await?;
   let second = register(&mut harness, "https://app.example.test/b", None).await?;
 
@@ -86,7 +92,7 @@ async fn dcr_manage_cross_client_forbidden() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_delete_deactivates() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   {
@@ -142,7 +148,7 @@ async fn dcr_manage_delete_deactivates() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_delete_revokes_tokens() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
   let other = register(&mut harness, "https://app.example.test/other", None).await?;
 
@@ -231,7 +237,7 @@ async fn dcr_manage_delete_token_denials_match_read() -> TestResult {
   // client answers 401, a mismatched credential on an existing client answers
   // 403. A successful DELETE invalidates the token, so replaying it answers
   // 401 (the deactivated row no longer authorizes management).
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   {
@@ -377,7 +383,7 @@ async fn dcr_manage_delete_subject_dn_stays_reserved() -> TestResult {
   // docs/DATABASE.md "oauth_clients" and its edge cases). Re-registering the
   // same subject DN must therefore stay a typed 400 invalid_client_metadata
   // duplicate, while a different DN is unaffected.
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let redirect = "https://app.example.test/cb";
   let subject_dn = "CN=reserved-dn, O=Example";
   let first = register_mtls(&mut harness, redirect, subject_dn).await?;
@@ -438,7 +444,7 @@ async fn dcr_manage_delete_thumbprint_stays_reserved() -> TestResult {
   // thumbprint is a partial unique index over every non-NULL value with no
   // `active` predicate (docs/DATABASE.md "oauth_clients"), so deactivation
   // must not free it. The row is driven through the real management DELETE.
-  let (_guard, mut harness) = harness("catalog").await?;
+  let mut harness = harness("catalog").await?;
   let thumbprint = "x5t-s256-manage-thumbprint-fixture";
 
   let raw = crate::crypto::tokens::mint_token()
@@ -483,7 +489,25 @@ async fn dcr_manage_delete_thumbprint_stays_reserved() -> TestResult {
 
 #[tokio::test]
 async fn dcr_manage_token_survives_redis_flush() -> TestResult {
-  let (_guard, mut harness) = harness("catalog").await?;
+  // Private-container test: its purpose is a full Redis wipe (`FLUSHALL`),
+  // which must never touch the shared compose Redis, and DCR state is
+  // Postgres-backed, so a prefix-scoped `SCAN`+`DEL` would be a vacuous
+  // no-op. The harness is built via the container-free `harness_with_redis`
+  // over this container's URL (`_private` keeps it alive for the test).
+  let container = GenericImage::new("redis", "8-alpine")
+    .with_exposed_port(6379.tcp())
+    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+    .with_cmd(["redis-server", "--appendonly", "yes"])
+    .start()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("private redis: {error}")))?;
+  let guarded = crate::test_guard::ContainerGuard::new(container);
+  let port = guarded
+    .get_host_port_ipv4(6379)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("private redis port: {error}")))?;
+  let _private = guarded;
+  let mut harness = harness_with_redis(&format!("redis://127.0.0.1:{port}"), "catalog").await?;
   let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
 
   {

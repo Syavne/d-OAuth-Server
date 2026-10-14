@@ -12,11 +12,6 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use secrecy::SecretString;
 use sqlx::{PgPool, Row as _};
-use testcontainers::{
-  GenericImage, ImageExt,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use uuid::Uuid;
 
 use super::{
@@ -45,7 +40,7 @@ use crate::{
     pending::{self, PendingAuth},
     sessions,
   },
-  test_guard::{ContainerGuard, Lease},
+  test_guard::Lease,
   ui::login::form_token,
 };
 
@@ -66,39 +61,20 @@ struct Harness {
   store: Store,
   /// PII key ring for the encrypted user-email lookup (strict encrypt-only).
   keys: KeyRing,
-  /// Redis container guard (synchronous removal on drop).
-  _redis: ContainerGuard,
 }
 
 /// Start Postgres (fresh DB) + Redis for one test.
 async fn harness() -> Result<Harness, TestError> {
   let (db, pool) = crate::db::test_support::migrated_pool().await?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .with_cmd(["redis-server", "--appendonly", "yes"])
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
+  let manager = crate::test_support::redis_manager().await?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let store = Store::from_parts(state_prefix, ratelimit_prefix, DurabilityMode::WaitAof);
   Ok(Harness {
     _db: db,
     pool,
     conn: RedisConn::Single(manager),
     store,
     keys: test_ring()?,
-    _redis: guarded,
   })
 }
 

@@ -85,12 +85,20 @@ Integration tests use the real shared Postgres and Redis from
 `compose.test.yaml` (`docker compose -f compose.test.yaml up -d`: Postgres on
 `127.0.0.1:5433`, Redis on `127.0.0.1:6380`; override with
 `D_OAUTH_TEST_POSTGRES_URL` and `D_OAUTH_TEST_REDIS_URL`). They get per-test
-isolation from a fresh database and unique Redis key prefixes. Testcontainers
-remains only for unit-test helpers under `src/` and for `tests/resilience.rs`,
-which stops and restarts containers; `tests/topology.rs` uses in-process
-`redis-test` fixtures that need a `redis-server` binary. Prefer a real object or
-an in-memory fake over a mock. Assert the observable contract. Tear the services
-down with `docker compose -f compose.test.yaml down -v`.
+isolation from a fresh database and unique Redis key prefixes. `testcontainers`
+remains only for the suites that need Redis nodes of their own:
+`src/test_guard.rs` and `src/state/test_support.rs` (the shared container
+helpers), `tests/resilience.rs` (stop/start lifecycle),
+`src/state/tests_topology.rs` (Sentinel/Cluster/`requirepass`), the
+`--appendfsync always` refresh-token suite
+(`src/protocol/token/grants/refresh_token/tests.rs` and its `tests/failover.rs`),
+the two Redis durability tests in `src/store/tests_store.rs`, and
+`dcr_manage_token_survives_redis_flush` in
+`src/protocol/dcr/manage/tests_delete.rs`. Every other unit and integration
+suite uses the shared services. `tests/topology.rs` uses in-process `redis-test`
+fixtures that need a `redis-server` binary. Prefer a real object or an in-memory
+fake over a mock. Assert the observable contract. Tear the services down with
+`docker compose -f compose.test.yaml down -v`.
 
 Quality gates for any change:
 

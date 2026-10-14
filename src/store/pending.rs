@@ -245,11 +245,6 @@ mod tests {
   };
 
   use axum::http::StatusCode;
-  use testcontainers::{
-    GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
-  };
 
   use super::{PendingAuth, PendingError, consume, get, new_request_id, pending_key, put};
   use crate::{
@@ -257,7 +252,6 @@ mod tests {
     error::{AppError, OAuthErrorCode},
     state::RedisConn,
     store::{Store, StoreError},
-    test_guard::ContainerGuard,
   };
 
   /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -266,9 +260,6 @@ mod tests {
   /// Errors raised by the pending-auth test scaffolding itself.
   #[derive(Debug, thiserror::Error)]
   enum TestError {
-    /// A testcontainers operation failed.
-    #[error("container error: {0}")]
-    Containers(#[from] testcontainers::TestcontainersError),
     /// The Redis configuration was rejected.
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
@@ -310,31 +301,20 @@ mod tests {
     }
   }
 
-  /// Start a single-node Redis 8 with AOF on.
-  async fn redis_container() -> Result<(ContainerGuard, String), TestError> {
-    let container = GenericImage::new("redis", "8-alpine")
-      .with_exposed_port(6379.tcp())
-      .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-      .with_cmd(vec!["redis-server", "--appendonly", "yes"])
-      .start()
-      .await?;
-    let guarded = ContainerGuard::new(container);
-    let port = guarded.get_host_port_ipv4(6379).await?;
-    Ok((guarded, format!("redis://127.0.0.1:{port}")))
-  }
-
-  /// Connect a [`RedisConn`] plus [`Store`] directly against a live container.
-  async fn direct_store(url: &str) -> Result<(RedisConn, Store), TestError> {
-    let client = redis::Client::open(url)?;
-    let manager_config = redis::aio::ConnectionManagerConfig::new()
-      .set_response_timeout(Some(Duration::from_secs(10)))
-      .set_connection_timeout(Some(Duration::from_secs(5)));
-    let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  /// Connect a [`RedisConn`] plus [`Store`] to the shared test Redis, scoping
+  /// every key to the given per-test prefix pair.
+  async fn direct_store(prefixes: (String, String)) -> Result<(RedisConn, Store), TestError> {
+    let manager = crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+    let (token_key_prefix, ratelimit_key_prefix) = prefixes;
     let raw = RawRedisConfig {
-      url: Some(url.to_owned()),
+      url: Some(crate::test_support::test_redis_url()),
       durability: Some(DurabilityMode::WaitAof),
       response_timeout_secs: 10,
       connect_timeout_secs: 5,
+      token_key_prefix: Some(token_key_prefix),
+      ratelimit_key_prefix: Some(ratelimit_key_prefix),
       ..Default::default()
     };
     let config = RedisConfig::from_raw(raw)?;
@@ -375,8 +355,7 @@ mod tests {
   /// store → load (non-destructive) → consume exactly once; replay rejected.
   #[tokio::test]
   async fn pending_auth_store_load_consume_exactly_once() -> TestResult {
-    let (_container, url) = redis_container().await?;
-    let (mut conn, store) = direct_store(&url).await?;
+    let (mut conn, store) = direct_store(crate::test_support::unique_prefixes()).await?;
     let request_id = unique("req");
     let record = sample_record();
 
@@ -427,8 +406,7 @@ mod tests {
   /// Unknown and expired ids both render `invalid_request`.
   #[tokio::test]
   async fn pending_auth_unknown_and_expired_are_invalid_request() -> TestResult {
-    let (_container, url) = redis_container().await?;
-    let (mut conn, store) = direct_store(&url).await?;
+    let (mut conn, store) = direct_store(crate::test_support::unique_prefixes()).await?;
 
     // Unknown id: consume rejects, get is empty.
     let missing = unique("missing");

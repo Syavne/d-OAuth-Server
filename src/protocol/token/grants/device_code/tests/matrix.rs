@@ -14,7 +14,7 @@ use crate::{
 
 #[tokio::test]
 async fn test_grant_device_public_without_dpop_rejected() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("public");
   setup::insert_client(
     &h.pool,
@@ -66,7 +66,7 @@ async fn test_grant_device_public_without_dpop_rejected() -> TestResult {
 
 #[tokio::test]
 async fn test_grant_device_confidential_secret_redeems_bearer() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("conf");
   setup::insert_client(
     &h.pool,
@@ -134,7 +134,7 @@ async fn test_grant_device_confidential_secret_redeems_bearer() -> TestResult {
 
 #[tokio::test]
 async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let client_id = unique("bound-conf");
   setup::insert_client_bound(
     &h.pool,
@@ -228,7 +228,7 @@ async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> Tes
 /// code, so the legitimate client still redeems it.
 #[tokio::test]
 async fn test_grant_device_cross_client_poll_is_invalid_grant() -> TestResult {
-  let (_container, mut h) = harness().await?;
+  let mut h = harness().await?;
   let owner_id = unique("owner");
   let intruder_id = unique("intruder");
   setup::insert_client(

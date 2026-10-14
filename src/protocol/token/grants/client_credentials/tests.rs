@@ -1,22 +1,14 @@
 //! `test(grant_client_credentials)` suite: confidential-only, scope, bindings.
 //!
-//! Shared Redis 8 container plus per-test connections; unique client
-//! labels keep the shared keyspace collision-free.
+//! The shared compose Redis plus a per-test unique key-prefix pair; unique
+//! client labels keep the shared keyspace collision-free.
 
 mod binding;
 mod issue;
 
-use std::{
-  sync::atomic::{AtomicU64, Ordering},
-  time::Duration,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use secrecy::SecretString;
-use testcontainers::{
-  GenericImage, ImageExt as _,
-  core::{IntoContainerPort as _, WaitFor},
-  runners::AsyncRunner as _,
-};
 
 use super::{ClientCredentialsInput, ClientCredentialsTokens};
 use crate::{
@@ -29,7 +21,6 @@ use crate::{
   },
   state::RedisConn,
   store::{Store, StoreError},
-  test_guard::{ContainerGuard, Lease, Shared},
 };
 
 /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -38,9 +29,6 @@ type TestResult = Result<(), TestError>;
 /// Errors raised by the client-credentials test scaffolding itself.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error")]
   Redis(#[from] redis::RedisError),
@@ -61,35 +49,14 @@ enum TestError {
   Unexpected(String),
 }
 
-/// One shared Redis 8 container for the whole suite.
-static REDIS: Shared<ContainerGuard> = Shared::new();
-
-/// Fresh connection plus store handle against the shared container.
-async fn test_redis() -> Result<(Lease<ContainerGuard>, RedisConn, Store), TestError> {
-  let container = REDIS
-    .lease::<TestError>(async {
-      let started = GenericImage::new("redis", "8-alpine")
-        .with_exposed_port(6379.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .with_cmd(["redis-server", "--appendonly", "yes"])
-        .start()
-        .await?;
-      Ok(ContainerGuard::new(started))
-    })
-    .await?;
-  let port = container.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
-  Ok((container, RedisConn::Single(manager), store))
+/// Fresh connection plus store handle against the shared compose Redis.
+async fn test_redis() -> Result<(RedisConn, Store), TestError> {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let store = Store::from_parts(state_prefix, rl_prefix, DurabilityMode::WaitAof);
+  Ok((RedisConn::Single(manager), store))
 }
 
 static TEST_NONCE: AtomicU64 = AtomicU64::new(400_000);

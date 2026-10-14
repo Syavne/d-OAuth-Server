@@ -1,9 +1,10 @@
 //! `test(revoke)` suite: ownership-scoped revocation and grant cascade.
 //!
-//! A shared Redis 8 container (AOF on) backs the token/grant stores; unique
-//! grant/client labels keep the keyspace collision-free. Authentication-scoped
-//! behaviour that needs no database is exercised against a lazy Postgres pool
-//! that is never dialed.
+//! The shared compose Redis (`compose.test.yaml`) backs the token/grant stores;
+//! a per-test unique `{state}`/`{rl}` prefix pair keeps the keyspace
+//! collision-free, and unique grant/client labels keep lookups distinct.
+//! Authentication-scoped behaviour that needs no database is exercised against
+//! a lazy Postgres pool that is never dialed.
 
 mod auth;
 mod cascade;
@@ -18,11 +19,6 @@ use std::{
 };
 
 use secrecy::SecretString;
-use testcontainers::{
-  GenericImage, ImageExt as _,
-  core::{IntoContainerPort as _, WaitFor},
-  runners::AsyncRunner as _,
-};
 
 use crate::{
   config::{DurabilityMode, TtlConfig},
@@ -33,7 +29,6 @@ use crate::{
   },
   state::{AppState, Clock, RedisConn},
   store::{Store, StoreError},
-  test_guard::{ContainerGuard, Lease, Shared},
 };
 
 /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -42,9 +37,6 @@ type TestResult = Result<(), TestError>;
 /// Errors raised by the revocation test scaffolding itself.
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error")]
   Redis(#[from] redis::RedisError),
@@ -74,39 +66,29 @@ enum TestError {
   Unexpected(String),
 }
 
-/// One shared Redis 8 container for the whole suite.
-static REDIS: Shared<ContainerGuard> = Shared::new();
-
-/// Fresh connection plus store handle against the shared container.
-async fn test_redis() -> Result<(Lease<ContainerGuard>, RedisConn, Store), TestError> {
-  let container = REDIS
-    .lease::<TestError>(async {
-      let started = GenericImage::new("redis", "8-alpine")
-        .with_exposed_port(6379.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .with_cmd(["redis-server", "--appendonly", "yes"])
-        .start()
-        .await?;
-      Ok(ContainerGuard::new(started))
-    })
-    .await?;
-  let port = container.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
-  Ok((container, RedisConn::Single(manager), store()))
+/// Fresh connection plus a scoped store handle against the shared compose
+/// Redis, paired with the exact `{state}`/`{rl}` prefixes that scope the store.
+async fn test_redis() -> Result<(RedisConn, Store, (String, String)), TestError> {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let store = Store::from_parts(
+    state_prefix.clone(),
+    ratelimit_prefix.clone(),
+    DurabilityMode::WaitAof,
+  );
+  Ok((
+    RedisConn::Single(manager),
+    store,
+    (state_prefix, ratelimit_prefix),
+  ))
 }
 
-/// A store handle with the canonical test key prefixes.
+/// A store handle with a fresh per-test unique key-prefix pair.
 fn store() -> Store {
-  Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  )
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  Store::from_parts(state_prefix, ratelimit_prefix, DurabilityMode::WaitAof)
 }
 
 /// A lazy Redis connection that is never actually dialed.

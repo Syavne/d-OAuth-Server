@@ -298,16 +298,7 @@ fn store_mapped(error: redis::RedisError) -> AppError {
 
 #[cfg(test)]
 mod tests {
-  use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-  };
-
-  use testcontainers::{
-    GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
-  };
+  use std::time::Duration;
 
   use super::{PurgedSubject, purge_sibling_sessions, purge_subject};
   use crate::{
@@ -315,13 +306,10 @@ mod tests {
     error::{AppError, OAuthErrorCode},
     state::RedisConn,
     store::Store,
-    test_guard::ContainerGuard,
   };
 
   #[derive(Debug, thiserror::Error)]
   enum TestError {
-    #[error("container error: {0}")]
-    Containers(#[from] testcontainers::TestcontainersError),
     #[error("redis error: {0}")]
     Redis(#[from] redis::RedisError),
     #[error("store error: {0}")]
@@ -334,30 +322,17 @@ mod tests {
 
   type TestResult = Result<(), TestError>;
 
-  static NONCE: AtomicU64 = AtomicU64::new(1);
-
-  async fn harness() -> Result<(ContainerGuard, RedisConn, Store), TestError> {
-    let n = NONCE.fetch_add(1, Ordering::Relaxed);
-    let container = GenericImage::new("redis", "8-alpine")
-      .with_exposed_port(6379.tcp())
-      .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-      .with_cmd(["redis-server", "--appendonly", "yes"])
-      .start()
-      .await?;
-    let guarded = ContainerGuard::new(container);
-    let port = guarded.get_host_port_ipv4(6379).await?;
-    let url = format!("redis://127.0.0.1:{port}");
-    let client = redis::Client::open(url.as_str())?;
-    let manager_config = redis::aio::ConnectionManagerConfig::new()
-      .set_response_timeout(Some(Duration::from_secs(10)))
-      .set_connection_timeout(Some(Duration::from_secs(5)));
-    let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
-    let store = Store::from_parts(
-      format!("purge-test-{n}:{{state}}:"),
-      "oauth:{rl}:".to_owned(),
-      DurabilityMode::WaitAof,
-    );
-    Ok((guarded, RedisConn::Single(manager), store))
+  /// Shared compose Redis plus a per-test uuid prefix pair.
+  ///
+  /// Unique prefixes are mandatory: `purge_subject` `SCAN`s its prefix, and a
+  /// per-process counter collides across parallel nextest processes.
+  async fn harness() -> Result<(RedisConn, Store), TestError> {
+    let manager = crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+    let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+    let store = Store::from_parts(state_prefix, rl_prefix, DurabilityMode::WaitAof);
+    Ok((RedisConn::Single(manager), store))
   }
 
   async fn hset(conn: &mut RedisConn, key: &str, pairs: &[(&str, &str)]) -> TestResult {
@@ -407,7 +382,7 @@ mod tests {
 
   #[tokio::test]
   async fn purge_subject_deletes_all_subject_state() -> TestResult {
-    let (_guard, mut conn, store) = harness().await?;
+    let (mut conn, store) = harness().await?;
     let email = "alice@example.test";
     let user_id = uuid::Uuid::new_v4().to_string();
     let decoy = "bob@example.test";
@@ -616,7 +591,7 @@ mod tests {
 
   #[tokio::test]
   async fn purge_subject_with_no_matching_state_returns_zero() -> TestResult {
-    let (_guard, mut conn, store) = harness().await?;
+    let (mut conn, store) = harness().await?;
     let summary = purge_subject(&mut conn, &store, "nobody@example.test", "no-id").await?;
     if summary != PurgedSubject::default() {
       return Err(TestError::Unexpected(format!(
@@ -656,7 +631,7 @@ mod tests {
 
   #[tokio::test]
   async fn purge_sibling_sessions_deletes_meta_sidecar_and_keeps_current() -> TestResult {
-    let (_guard, mut conn, store) = harness().await?;
+    let (mut conn, store) = harness().await?;
     let email = "sibling-meta@example.test";
     let user_id = uuid::Uuid::new_v4().to_string();
     let current_key = store.session_key("sess-current");
@@ -692,7 +667,7 @@ mod tests {
 
   #[tokio::test]
   async fn purge_sibling_sessions_leaves_other_subjects_tokens_and_grants() -> TestResult {
-    let (_guard, mut conn, store) = harness().await?;
+    let (mut conn, store) = harness().await?;
     let email = "sibling-scope@example.test";
     let user_id = uuid::Uuid::new_v4().to_string();
     let other = "stranger@example.test";
@@ -745,7 +720,7 @@ mod tests {
 
   #[tokio::test]
   async fn purge_sibling_sessions_matches_subject_by_user_id() -> TestResult {
-    let (_guard, mut conn, store) = harness().await?;
+    let (mut conn, store) = harness().await?;
     let email = "sibling-id@example.test";
     let user_id = uuid::Uuid::new_v4().to_string();
     let current_key = store.session_key("sess-id-current");

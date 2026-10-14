@@ -1,4 +1,4 @@
-//! `test(par)` container suite: PAR push, one-time client-bound consume,
+//! `test(par)` suite: PAR push, one-time client-bound consume,
 //! cross-client/replay/expiry rejection, and auth/rule enforcement.
 
 mod consume;
@@ -7,11 +7,6 @@ mod rules;
 use std::{collections::HashMap, time::Duration};
 
 use sqlx::PgPool;
-use testcontainers::{
-  GenericImage,
-  core::{IntoContainerPort, WaitFor},
-  runners::AsyncRunner,
-};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -25,16 +20,13 @@ use crate::{
   protocol::client_auth::ClientAuthRequest,
   state::RedisConn,
   store::Store,
-  test_guard::{ContainerGuard, Lease},
+  test_guard::Lease,
 };
 use secrecy::SecretString;
 
 /// Test scaffolding failures (no `unwrap`/`expect` under the deny lints).
 #[derive(Debug, thiserror::Error)]
 enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error: {0}")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error: {0}")]
   Redis(#[from] redis::RedisError),
@@ -62,26 +54,19 @@ struct Harness {
   keys: KeyRing,
 }
 
-/// Fresh Postgres database plus a throwaway Redis for one test.
-async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
+/// Fresh Postgres database plus the shared compose Redis for one test.
+///
+/// The Redis keyspace is isolated by a per-test unique `{state}`/`{rl}` prefix
+/// pair, so parallel tests never observe each other's keys.
+async fn harness() -> Result<Harness, TestError> {
   let (_db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("{error}")))?;
-  let container = GenericImage::new("redis", "8-alpine")
-    .with_exposed_port(6379.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-    .start()
-    .await?;
-  let guarded = ContainerGuard::new(container);
-  let port = guarded.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://127.0.0.1:{port}");
+  let url = crate::test_support::test_redis_url();
   let client = redis::Client::open(url.as_str())?;
   let manager = redis::aio::ConnectionManager::new(client).await?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let store = Store::from_parts(state_prefix, ratelimit_prefix, DurabilityMode::WaitAof);
   let h = Harness {
     _db,
     pool,
@@ -95,7 +80,7 @@ async fn harness() -> Result<(ContainerGuard, Harness), TestError> {
     )
     .map_err(|error| TestError::Crypto(format!("{error:?}")))?,
   };
-  Ok((guarded, h))
+  Ok(h)
 }
 
 /// Borrow datastore handles out of a harness.

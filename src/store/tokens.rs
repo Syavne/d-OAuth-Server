@@ -675,26 +675,19 @@ fn store_redis(error: StoreError) -> redis::RedisError {
 mod put_member_tests {
   use std::time::Duration;
 
-  use testcontainers::{
-    GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
-  };
-
   use super::{AccessRecord, RefreshRecord, get_access, get_refresh, put_access, put_refresh};
   use crate::{
     config::{DurabilityMode, RedisConfig, redis::RawRedisConfig},
     state::RedisConn,
     store::{Store, StoreError},
-    test_guard::ContainerGuard,
   };
 
   type TestResult = Result<(), TestError>;
 
   #[derive(Debug, thiserror::Error)]
   enum TestError {
-    #[error("container error: {0}")]
-    Containers(#[from] testcontainers::TestcontainersError),
+    #[error("test support error: {0}")]
+    Support(#[from] crate::test_support::TestError),
     #[error("config error: {0}")]
     Config(#[from] crate::config::ConfigError),
     #[error("redis error: {0}")]
@@ -713,26 +706,16 @@ mod put_member_tests {
   /// shortens the set TTL.
   #[tokio::test]
   async fn put_member_writes_record_and_index_atomically() -> TestResult {
-    let container = GenericImage::new("redis", "8-alpine")
-      .with_exposed_port(6379.tcp())
-      .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-      .with_cmd(vec!["redis-server", "--appendonly", "yes"])
-      .start()
-      .await?;
-    let guarded = ContainerGuard::new(container);
-    let port = guarded.get_host_port_ipv4(6379).await?;
-    let url = format!("redis://127.0.0.1:{port}");
-    let client = redis::Client::open(url.as_str())?;
-    let manager_config = redis::aio::ConnectionManagerConfig::new()
-      .set_response_timeout(Some(Duration::from_secs(10)))
-      .set_connection_timeout(Some(Duration::from_secs(5)));
-    let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+    let manager = crate::test_support::redis_manager().await?;
+    let (token_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
     let mut conn = RedisConn::Single(manager);
     let raw = RawRedisConfig {
-      url: Some(url),
+      url: Some(crate::test_support::test_redis_url()),
       durability: Some(DurabilityMode::WaitAof),
       response_timeout_secs: 10,
       connect_timeout_secs: 5,
+      token_key_prefix: Some(token_prefix),
+      ratelimit_key_prefix: Some(ratelimit_prefix),
       ..Default::default()
     };
     let store = Store::from_config(&RedisConfig::from_raw(raw)?);

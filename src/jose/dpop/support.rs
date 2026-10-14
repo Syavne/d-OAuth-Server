@@ -1,19 +1,11 @@
 //! Shared harness for the `dpop_*` suite: test keys, proof minting, Redis.
 
-use std::{
-  sync::atomic::{AtomicU64, Ordering},
-  time::Duration,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use testcontainers::{
-  GenericImage, ImageExt as _,
-  core::{IntoContainerPort as _, WaitFor},
-  runners::AsyncRunner as _,
-};
 use time::OffsetDateTime;
 
 use crate::{
@@ -22,7 +14,6 @@ use crate::{
   jose::jwk::JwkError,
   state::RedisConn,
   store::{Store, StoreError},
-  test_guard::{ContainerGuard, Lease, Shared},
 };
 
 /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -31,9 +22,6 @@ pub(super) type TestResult = Result<(), TestError>;
 /// Errors raised by the `dpop` test scaffolding itself.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum TestError {
-  /// A testcontainers operation failed.
-  #[error("container error")]
-  Containers(#[from] testcontainers::TestcontainersError),
   /// A Redis command failed.
   #[error("redis error")]
   Redis(#[from] redis::RedisError),
@@ -65,44 +53,20 @@ pub(super) const TEST_HTM: &str = "POST";
 /// URI every test proof is bound to.
 pub(super) const TEST_HTU: &str = "https://as.example.test/token";
 
-/// One shared Redis 8 container for the whole `dpop` suite.
+/// Fresh connection plus store handle against the shared compose Redis.
 ///
-/// The slot holds a [`ContainerGuard`], so the last test releasing it removes
-/// the container synchronously instead of orphaning it at process exit.
-static REDIS: Shared<ContainerGuard> = Shared::new();
-
-/// Fresh connection plus store handle against the shared container.
-///
-/// The returned lease keeps the shared container alive; bind it (usually as
-/// `_redis`) for the duration of the test.
-///
-/// Timeouts are generous (10 s/5 s): the container is local and no barrier
-/// runs here, so any failure is a real defect, not a budget cut.
-pub(super) async fn test_redis() -> Result<(Lease<ContainerGuard>, RedisConn, Store), TestError> {
-  let container = REDIS
-    .lease::<TestError>(async {
-      let started = GenericImage::new("redis", "8-alpine")
-        .with_exposed_port(6379.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .with_cmd(["redis-server", "--appendonly", "yes"])
-        .start()
-        .await?;
-      Ok(ContainerGuard::new(started))
-    })
-    .await?;
-  let port = container.get_host_port_ipv4(6379).await?;
-  let url = format!("redis://127.0.0.1:{port}");
-  let client = redis::Client::open(url.as_str())?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
-  let store = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
-    DurabilityMode::WaitAof,
-  );
-  Ok((container, RedisConn::Single(manager), store))
+/// Isolation comes from a per-test [`crate::test_support::unique_prefixes`]
+/// pair, so parallel `dpop` tests never observe each other's keys. The
+/// [`crate::test_support::redis_manager`] helper uses the suite-wide 10 s/5 s
+/// timeouts: the server is local and no barrier runs here, so any failure is a
+/// real defect, not a budget cut.
+pub(super) async fn test_redis() -> Result<(RedisConn, Store), TestError> {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let store = Store::from_parts(state_prefix, ratelimit_prefix, DurabilityMode::WaitAof);
+  Ok((RedisConn::Single(manager), store))
 }
 
 static JTI_NONCE: AtomicU64 = AtomicU64::new(1);

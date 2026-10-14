@@ -7,15 +7,11 @@
 
 use std::sync::Arc;
 
-use sqlx::postgres::PgPoolOptions;
-
 use super::{
   AppState,
-  test_support::{
-    TestError, TestResult, get_health, postgres_container, redis_single_container,
-    single_redis_block, test_config,
-  },
+  test_support::{TestError, TestResult, get_health, single_redis_block, test_config},
 };
+use crate::test_support::{fresh_database_pool, test_redis_url};
 
 /// Seed one legacy row per PII table: every blanked plaintext column non-NULL.
 async fn seed_legacy(pool: &sqlx::PgPool) -> Result<(), TestError> {
@@ -106,12 +102,8 @@ const BLANKS: [&str; 9] = [
 /// Encrypt-only with any legacy plaintext PII still present is not ready.
 #[tokio::test]
 async fn startup_guard_blocks_encrypt_only_with_legacy_plaintext() -> TestResult {
-  let (_pg, pg_url) = postgres_container().await?;
-  let (_redis, redis_url) = redis_single_container(None).await?;
-  let admin = PgPoolOptions::new()
-    .max_connections(1)
-    .connect(&pg_url)
-    .await?;
+  let (pg_url, admin) = fresh_database_pool().await?;
+  let redis_url = test_redis_url();
   super::MIGRATOR.run(&admin).await?;
   seed_legacy(&admin).await?;
   // Helper level: encrypt-only sees the legacy plaintext; dual-write exempts.
@@ -139,12 +131,8 @@ async fn startup_guard_blocks_encrypt_only_with_legacy_plaintext() -> TestResult
 /// A fresh install (no rows) and a fully backfilled DB are ready.
 #[tokio::test]
 async fn startup_guard_ok_when_backfilled() -> TestResult {
-  let (_pg, pg_url) = postgres_container().await?;
-  let (_redis, redis_url) = redis_single_container(None).await?;
-  let admin = PgPoolOptions::new()
-    .max_connections(1)
-    .connect(&pg_url)
-    .await?;
+  let (pg_url, admin) = fresh_database_pool().await?;
+  let redis_url = test_redis_url();
   super::MIGRATOR.run(&admin).await?;
   // Fresh install: no rows at all.
   assert!(!super::probe_transition_unsafe(&admin, false).await?);

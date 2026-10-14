@@ -1,8 +1,9 @@
 //! `test(store)` suite: atomic Lua, tombstones, grant index, durability.
 //!
-//! Every test here spins its own single-node Redis 8 container with AOF
-//! enabled (mirroring `state::test_support`), so persistence, barriers, and
-//! concurrent compare-and-set run against a real server.
+//! Most tests share the compose Redis (`crate::test_support`) with a fresh
+//! `unique_prefixes()` pair per test. Only the restart lifecycle test and the
+//! durability-barrier test keep their own single-node Redis 8 containers with
+//! AOF enabled, since they assert server-side persistence behavior.
 
 use std::{
   sync::atomic::{AtomicU64, Ordering},
@@ -21,7 +22,10 @@ use super::{
   sha256_hex, tokens,
 };
 use crate::{
-  config::{ConfigError, DurabilityMode, RedisConfig, TtlConfig, redis::RawRedisConfig},
+  config::{
+    ConfigError, DurabilityMode, RedisConfig, TtlConfig,
+    redis::{DEFAULT_RATELIMIT_KEY_PREFIX, DEFAULT_TOKEN_KEY_PREFIX, RawRedisConfig},
+  },
   state::RedisConn,
   test_guard::ContainerGuard,
 };
@@ -85,17 +89,27 @@ async fn redis_container(extra: Vec<&str>) -> Result<(ContainerGuard, String), T
 async fn direct_store(
   url: &str,
   durability: DurabilityMode,
+  token_prefix: &str,
+  ratelimit_prefix: &str,
 ) -> Result<(RedisConn, Store), TestError> {
-  let client = redis::Client::open(url)?;
-  let manager_config = redis::aio::ConnectionManagerConfig::new()
-    .set_response_timeout(Some(Duration::from_secs(10)))
-    .set_connection_timeout(Some(Duration::from_secs(5)));
-  let manager = redis::aio::ConnectionManager::new_with_config(client, manager_config).await?;
+  let manager = if url == crate::test_support::test_redis_url() {
+    crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(error.to_string()))?
+  } else {
+    let client = redis::Client::open(url)?;
+    let manager_config = redis::aio::ConnectionManagerConfig::new()
+      .set_response_timeout(Some(Duration::from_secs(10)))
+      .set_connection_timeout(Some(Duration::from_secs(5)));
+    redis::aio::ConnectionManager::new_with_config(client, manager_config).await?
+  };
   let raw = RawRedisConfig {
     url: Some(url.to_owned()),
     durability: Some(durability),
     response_timeout_secs: 10,
     connect_timeout_secs: 5,
+    token_key_prefix: Some(token_prefix.to_owned()),
+    ratelimit_key_prefix: Some(ratelimit_prefix.to_owned()),
     ..Default::default()
   };
   let config = RedisConfig::from_raw(raw)?;
@@ -179,8 +193,10 @@ fn assert_ttl_within(pttl: i64, cap: Duration) -> TestResult {
 
 #[tokio::test]
 async fn store_code_consume_exactly_once() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let hash = unique("code");
   let grant = unique("grant");
   let client = unique("client");
@@ -214,8 +230,10 @@ async fn store_code_consume_exactly_once() -> TestResult {
 
 #[tokio::test]
 async fn store_refresh_rotate_idempotent_replay() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
   let old = unique("old-refresh");
@@ -285,8 +303,10 @@ async fn store_refresh_rotate_idempotent_replay() -> TestResult {
 
 #[tokio::test]
 async fn store_refresh_concurrent_cas_one_rotated_one_reuse() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
   let old = unique("old-refresh");
@@ -369,8 +389,10 @@ async fn store_refresh_concurrent_cas_one_rotated_one_reuse() -> TestResult {
 
 #[tokio::test]
 async fn store_refresh_reuse_without_mapping_cascades() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
   let old = unique("old-refresh");
@@ -472,8 +494,10 @@ async fn store_refresh_reuse_without_mapping_cascades() -> TestResult {
 
 #[tokio::test]
 async fn store_grant_revoke_cascade() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
   let refresh = unique("refresh");
@@ -541,8 +565,10 @@ async fn store_grant_revoke_cascade() -> TestResult {
 
 #[tokio::test]
 async fn store_tombstone_detectable_after_rotation() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
   let old = unique("old-refresh");
@@ -615,7 +641,13 @@ async fn store_persistence_survives_restart() -> TestResult {
   let refresh_hash = unique("refresh");
   let jti = unique("jti");
   {
-    let (mut conn, store) = direct_store(&url, DurabilityMode::AppendFsyncAlways).await?;
+    let (mut conn, store) = direct_store(
+      &url,
+      DurabilityMode::AppendFsyncAlways,
+      DEFAULT_TOKEN_KEY_PREFIX,
+      DEFAULT_RATELIMIT_KEY_PREFIX,
+    )
+    .await?;
     codes::issue(
       &mut conn,
       &store,
@@ -642,6 +674,8 @@ async fn store_persistence_survives_restart() -> TestResult {
   let (mut conn, store) = direct_store(
     &format!("redis://127.0.0.1:{port}"),
     DurabilityMode::AppendFsyncAlways,
+    DEFAULT_TOKEN_KEY_PREFIX,
+    DEFAULT_RATELIMIT_KEY_PREFIX,
   )
   .await?;
 
@@ -675,7 +709,13 @@ async fn store_persistence_survives_restart() -> TestResult {
 async fn store_durability_barrier_modes() -> TestResult {
   let (_container, url) = redis_container(Vec::new()).await?;
   // Single-node: WAITAOF barrier succeeds after a write.
-  let (mut conn, waitaof) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (mut conn, waitaof) = direct_store(
+    &url,
+    DurabilityMode::WaitAof,
+    DEFAULT_TOKEN_KEY_PREFIX,
+    DEFAULT_RATELIMIT_KEY_PREFIX,
+  )
+  .await?;
   durability_barrier(&mut conn, &waitaof).await?;
   // `WAIT 1` on a replica-less node acknowledges zero: fail closed.
   let wait = Store::from_parts(
@@ -701,15 +741,23 @@ async fn store_durability_barrier_modes() -> TestResult {
   }
   // ...and succeeds where the server actually fsyncs always.
   let (_always_container, always_url) = redis_container(vec!["--appendfsync", "always"]).await?;
-  let (mut always_conn, _) = direct_store(&always_url, DurabilityMode::AppendFsyncAlways).await?;
+  let (mut always_conn, _) = direct_store(
+    &always_url,
+    DurabilityMode::AppendFsyncAlways,
+    DEFAULT_TOKEN_KEY_PREFIX,
+    DEFAULT_RATELIMIT_KEY_PREFIX,
+  )
+  .await?;
   durability_barrier(&mut always_conn, &always).await?;
   Ok(())
 }
 
 #[tokio::test]
 async fn store_ratelimit_fixed_window() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let bucket = unique("bucket");
   let window = Duration::from_secs(60);
 
@@ -744,8 +792,10 @@ async fn store_ratelimit_fixed_window() -> TestResult {
 
 #[tokio::test]
 async fn store_replay_markers_first_claim_wins() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let jti = unique("jti");
   let assertion = unique("assertion");
 
@@ -778,8 +828,10 @@ async fn store_replay_markers_first_claim_wins() -> TestResult {
 
 #[tokio::test]
 async fn store_sessions_and_login_counters() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let old_session = unique("session");
   let new_session = unique("session");
   let record = sessions::SessionRecord {
@@ -855,8 +907,10 @@ async fn store_sessions_and_login_counters() -> TestResult {
 
 #[tokio::test]
 async fn store_device_par_and_dcr_round_trip() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let client = unique("client");
 
   // Device flow: put, poll, approve, consume exactly once.
@@ -1000,8 +1054,10 @@ async fn store_device_par_and_dcr_round_trip() -> TestResult {
 /// lifetime, capped at [`crate::protocol::code::CODE_TTL_CAP`] (60 s).
 #[tokio::test]
 async fn store_code_ttl_within_configured_window() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let ttl = TtlConfig::default();
   let hash = unique("code");
 
@@ -1021,8 +1077,10 @@ async fn store_code_ttl_within_configured_window() -> TestResult {
 /// device-code record and its user-code mapping under `ttl.device` (600 s).
 #[tokio::test]
 async fn store_par_device_and_user_code_ttl_within_configured_windows() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let ttl = TtlConfig::default();
   let client = unique("client");
 
@@ -1074,8 +1132,10 @@ async fn store_par_device_and_user_code_ttl_within_configured_windows() -> TestR
 /// `--ttl`, defaulting to the configured `ttl.dcr_initial_access` (24 h).
 #[tokio::test]
 async fn store_dcr_initial_access_ttl_within_configured_window() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let ttl = TtlConfig::default();
   let iat = unique("iat");
 
@@ -1101,8 +1161,10 @@ async fn store_dcr_initial_access_ttl_within_configured_window() -> TestResult {
 /// the refresh lifetime, and the per-grant token index lives with the grant.
 #[tokio::test]
 async fn store_rotation_grace_tombstone_and_grant_index_ttl() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
   let old = unique("old-refresh");
@@ -1190,8 +1252,10 @@ async fn store_rotation_grace_tombstone_and_grant_index_ttl() -> TestResult {
 /// (12 h); a presession is the same record before login binds a subject.
 #[tokio::test]
 async fn store_session_and_presession_ttl_within_configured_window() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let session_ttl = TtlConfig::default().session;
 
   let session_id = unique("session");
@@ -1235,8 +1299,10 @@ async fn store_session_and_presession_ttl_within_configured_window() -> TestResu
 /// (`routes::PENDING_TTL`, 300 s).
 #[tokio::test]
 async fn store_pending_auth_ttl_within_request_window() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let request_id = unique("pending");
 
   pending::put(
@@ -1266,8 +1332,10 @@ async fn store_pending_auth_ttl_within_request_window() -> TestResult {
 /// (`ui::login::LOCKOUT_WINDOW`, 15 min) and keys a hash of the account label.
 #[tokio::test]
 async fn store_login_failure_counter_ttl_within_lockout_window() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let window = crate::ui::login::LOCKOUT_WINDOW;
   let account = unique("alice@example.test");
 
@@ -1280,8 +1348,10 @@ async fn store_login_failure_counter_ttl_within_lockout_window() -> TestResult {
 /// leaves the account counter and every other IP's bucket intact.
 #[tokio::test]
 async fn store_ip_failure_clear_is_scoped_to_source() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let window = crate::ui::login::LOCKOUT_WINDOW;
   let account = unique("alice@example.test");
 
@@ -1314,8 +1384,10 @@ async fn store_ip_failure_clear_is_scoped_to_source() -> TestResult {
 /// bounded by the assertion's remaining validity (at most 360 s).
 #[tokio::test]
 async fn store_replay_marker_ttl_within_proof_window() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
 
   let dpop_ttl = crate::jose::dpop::DPOP_JTI_TTL;
   let jti = unique("jti");
@@ -1659,8 +1731,10 @@ async fn store_retry_budget_bounds_idempotent_reads() -> TestResult {
   use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
   static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
   ATTEMPTS.store(0, AtomicOrdering::Relaxed);
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut _conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut _conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let outcome: Result<(), redis::RedisError> = retry_op!(&mut _conn, store.retry_budget(), async {
     ATTEMPTS.fetch_add(1, AtomicOrdering::Relaxed);
     Err::<(), redis::RedisError>(redis::RedisError::from((
@@ -1686,8 +1760,10 @@ async fn store_retry_budget_bounds_idempotent_reads() -> TestResult {
 /// TTL, and a rewrite re-arms the expiry (never a persistent key).
 #[tokio::test]
 async fn store_hset_record_writes_fields_and_ttl() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, _store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, _store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let key = unique("hset-record");
   let ttl = Duration::from_secs(300);
   let pairs = vec![
@@ -1750,8 +1826,10 @@ async fn store_hset_record_writes_fields_and_ttl() -> TestResult {
 /// member records behind it.
 #[tokio::test]
 async fn store_grant_revoke_exhaustion_is_not_silent() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
   let seed = unique("seed-refresh");
@@ -1820,8 +1898,10 @@ async fn store_grant_revoke_exhaustion_is_not_silent() -> TestResult {
 /// admission).
 #[tokio::test]
 async fn claim_poll_slot_corrupt_marker_fails_closed() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let device_hash = unique("device");
   let key = device::poll_key(&store, &device_hash);
   let _: () = redis::cmd("SET")
@@ -1928,8 +2008,10 @@ fn store_error_classification_lua_runtime_is_500() -> TestResult {
 /// the delete, i.e. a lost update.
 #[tokio::test]
 async fn store_device_decide_consume_leaves_no_zombie() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let client = unique("client");
   for round in 0..100u32 {
     let device_hash = format!("{}-{round:03}", unique("device-race"));
@@ -2006,8 +2088,10 @@ async fn store_device_decide_consume_leaves_no_zombie() -> TestResult {
 /// (fail closed, no cascade on a fenced write).
 #[tokio::test]
 async fn store_grant_revoke_fence_rejects_rotation_into_revoked_grant() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
   let old = unique("old-refresh");
@@ -2099,8 +2183,10 @@ async fn store_grant_revoke_fence_rejects_rotation_into_revoked_grant() -> TestR
 /// a mint that lands mid-cascade is deleted by a later pass.
 #[tokio::test]
 async fn store_grant_revoke_drains_mid_cascade_members() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let grant = unique("grant");
   let client = unique("client");
 
@@ -2199,11 +2285,13 @@ async fn store_grant_revoke_drains_mid_cascade_members() -> TestResult {
 /// tombstoned old token still cascades (fail closed, no tokens).
 #[tokio::test]
 async fn store_rotation_barrier_failure_returns_replay_for_originating_id() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, durable) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, durable) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let fragile = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    token_prefix.clone(),
+    rl_prefix.clone(),
     DurabilityMode::Wait,
   );
   let grant = unique("grant");
@@ -2302,11 +2390,13 @@ async fn store_rotation_barrier_failure_returns_replay_for_originating_id() -> T
 /// claimant still loses while the marker stands.
 #[tokio::test]
 async fn store_replay_marker_barrier_failure_does_not_burn_proof() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, durable) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, durable) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let fragile = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    token_prefix.clone(),
+    rl_prefix.clone(),
     DurabilityMode::Wait,
   );
   let jti = unique("jti");
@@ -2342,8 +2432,10 @@ async fn store_replay_marker_barrier_failure_does_not_burn_proof() -> TestResult
 /// live expiry instead of becoming persistent (or erroring out).
 #[tokio::test]
 async fn store_hset_record_empty_pairs_keeps_ttl() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, _store) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, _store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let key = unique("hset-empty");
   let ttl = Duration::from_secs(300);
   let pairs = vec![("client_id".to_owned(), "client-1".to_owned())];
@@ -2367,11 +2459,13 @@ async fn store_hset_record_empty_pairs_keeps_ttl() -> TestResult {
 /// pre-mint must skip it (`Ok`) while the barriered write fails closed.
 #[tokio::test]
 async fn store_put_access_pending_skips_barrier() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, _) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, _) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let fragile = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    token_prefix.clone(),
+    rl_prefix.clone(),
     DurabilityMode::Wait,
   );
   let grant = unique("grant");
@@ -2419,11 +2513,13 @@ async fn store_put_access_pending_skips_barrier() -> TestResult {
 /// delete that recovered pair, so no unbarriered token survives revocation.
 #[tokio::test]
 async fn store_recovered_pair_revocable_after_unbarriered_rotation() -> TestResult {
-  let (_container, url) = redis_container(Vec::new()).await?;
-  let (mut conn, durable) = direct_store(&url, DurabilityMode::WaitAof).await?;
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, durable) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
   let fragile = Store::from_parts(
-    "oauth:{state}:".to_owned(),
-    "oauth:{rl}:".to_owned(),
+    token_prefix.clone(),
+    rl_prefix.clone(),
     DurabilityMode::Wait,
   );
   let grant = unique("grant");
