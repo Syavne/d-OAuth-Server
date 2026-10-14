@@ -27,10 +27,10 @@ the library.
 | `src/jose/` | DPoP proof verification, JAR request objects, `private_key_jwt` client assertions, and JWK parsing. |
 | `src/db/` | Postgres repositories for the six domain tables. See [DATABASE.md](DATABASE.md). |
 | `src/store/` | Redis ephemeral state and the durability barrier. See [REDIS.md](REDIS.md). |
-| `src/protocol/` | OAuth endpoints and grants, plus the subject-scoped Redis purge (`src/protocol/purge.rs`, `purge_subject`, used by `user disable`). |
+| `src/protocol/` | OAuth endpoints and grants, plus the subject-scoped Redis purges (`src/protocol/purge.rs`: `purge_subject` for `user disable`, `purge_sibling_sessions` on credential change). |
 | `src/ui/` | Server-rendered login, consent, and device pages (Askama templates) plus the embedded same-origin stylesheet served at `/assets/app.css`. |
 | `src/middleware/` | Request id, tracing and redaction, rate limiting, security headers, and audit. |
-| `src/resilience.rs` | Load-shed, concurrency-limit, and timeout guard between CORS and rate limiting. |
+| `src/resilience.rs` | Load-shed, timeout, and concurrency-limit guard between CORS and rate limiting. |
 | `src/routes.rs` | Router assembly and the middleware order. |
 | `src/serve.rs`, `src/tls.rs` | Listener bootstrap and the custom TLS accept loop. |
 | `src/state.rs`, `src/state/` | `AppState`, the topology-aware Redis connection, health endpoints. |
@@ -56,14 +56,14 @@ is fixed in `build_router_with_options` in `src/routes.rs`:
    still carry the headers.
 3. CORS: answers preflights from the explicit allowlist. Absent when the
    allowlist is empty, which is the default.
-4. Resilience: sheds excess load, caps concurrency, and times out slow
-   handlers before they reach rate limiting.
+4. Resilience: sheds excess load, times out slow handlers, then caps
+   concurrency before they reach rate limiting.
 5. Rate limit: enforces the per-IP and per-client budgets. The per-client
    bucket is keyed by the `(peer_ip, client_id)` composite, because
    `client_id` is read before client authentication and must never select a
-   global bucket on its own; the per-IP bucket is the primary control. Health
-   and metadata have no rule and pass through; those handlers fail closed on
-   their own.
+   global bucket on its own; the per-IP bucket is the primary control. Health,
+   metadata, and `/assets` have no rule and pass through; those handlers fail
+   closed on their own.
 6. Body limit: caps request bodies at 2 MiB.
 
 A handler that needs a dependency takes `AppState` and calls a repository or the
@@ -100,9 +100,13 @@ The split is strict and drives the whole design:
   unknown subject stays live. `user disable` purges the user's Redis state
   before flipping `users.disabled`, failing closed on a Redis error.
 - Redis holds every short-lived value: authorization codes, access and refresh
-  tokens, grant chains, sessions, PAR request URIs, device codes, DCR
-  initial-access tokens, DPoP and `private_key_jwt` replay markers, and
-  rate-limit counters.
+  tokens, grant chains, sessions, PAR request URIs, pending-auth records
+  (`pending:<id>`, 300 s), device codes plus their `user_code` mappings
+  (`ttl.device`, 600 s), DCR
+  initial-access tokens, DPoP and `private_key_jwt` replay markers, TOTP replay
+  markers (`totp_replay:*`, 180 s), rotation idempotency mappings
+  (`rotation:*`, min(900 s, refresh TTL)), login-failure counters
+  (`loginfail:*`, 15 min), and rate-limit counters.
 
 The consequence is that a Redis flush loses ephemeral state but not clients,
 users, scopes, or redirect URIs. Registration access tokens are the one token
@@ -138,7 +142,7 @@ so they stay on a single slot. See [REDIS.md](REDIS.md).
 - A mTLS client certificate terminates at an L7 ingress that strips it. In that
   case in-process verification fails; use L4/TCP passthrough. See
   [DEPLOYMENT.md](DEPLOYMENT.md).
-- `/metadata` reads the enabled scope catalog from Postgres on every request, so
+- `GET /.well-known/oauth-authorization-server` (discovery document) reads the enabled scope catalog from Postgres on every request, so
   a CLI catalog mutation is visible immediately on every replica; when Postgres
   is down it returns `503` rather than advertising an empty or unknown scope
   list.
@@ -163,6 +167,7 @@ so they stay on a single slot. See [REDIS.md](REDIS.md).
 - `src/lib.rs` for the authoritative module list.
 - `src/routes.rs` for endpoint inventory and middleware order.
 - `src/serve.rs` for listener bootstrap and shutdown semantics.
-- `src/state.rs`, `src/state/health.rs`, `src/state/redis.rs`,
-  `src/state/sentinel.rs` for state, health, and topology.
+- `src/state.rs`, `src/state/health.rs`, `src/state/pg.rs`,
+  `src/state/redis.rs`, `src/state/sentinel.rs` for state, health, the Postgres
+  pool, and topology.
 - `src/tls.rs` for the TLS accept loop.

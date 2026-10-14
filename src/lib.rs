@@ -2,8 +2,8 @@
 //!
 //! Module layout (authoritative; see `.omo/plans/rust-oauth21-server.md`):
 //! `config`, `keys`, `error`, `state`, `crypto::*`, `jose::*`, `db::*`,
-//! `store::*`, `protocol::*`, `ui::*`, `middleware::*`, `routes`, `serve`,
-//! `cli`.
+//! `store::*`, `protocol::*`, `ui::*`, `middleware::*`, `resilience`, `routes`,
+//! `serve`, `tls`, `cli`.
 //! Every later todo places new code in exactly one of these modules.
 
 #![forbid(unsafe_code)]

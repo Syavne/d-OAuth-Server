@@ -62,7 +62,9 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 - Cluster hardening in `deploy/k8s`: the token pepper and TOTP key mount as
   `0400` tmpfs files under `/run/secrets` (read through
   `D_OAUTH_TOKEN_PEPPER_FILE` / `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE`, mirrored
-  in `compose.yaml`), the image reference is digest-pinned, a NetworkPolicy
+  in `compose.yaml`), the image reference defaults to the mutable `:latest`
+  tag (a digest pin is available but not the default; see
+  `docs/DEPLOYMENT.md`), a NetworkPolicy
   default-denies pod egress except DNS plus Postgres/Redis scoped to their
   namespace (no internet-wide `0.0.0.0/0` peer; `scripts/check_manifests.py`
   rejects one), and `automountServiceAccountToken` is `false`. Remote JAR
@@ -80,6 +82,11 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
   introspection endpoints do; a missing or unregistered chain fails closed as
   `invalid_client`. Client certificates are expected to be short-lived, so
   expiry bounds exposure without a revocation list.
+- The token-pepper key ring can retain a previous pepper, matching TOTP and
+  PII: `token_pepper_previous_key` / `token_pepper_previous_key_file` with an
+  explicit `token_pepper_previous_key_id` lets a rotated pepper keep verifying
+  hashes issued under the old one, so rotation no longer invalidates live
+  opaque tokens.
 
 ### Changed
 

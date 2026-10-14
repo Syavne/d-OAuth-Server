@@ -20,8 +20,8 @@ the admin surface.
 | PII field codec / blind index | `src/crypto/field.rs` | Versioned AES-256-GCM; never log plaintext or key material. |
 | JOSE verification (DPoP, JAR, `private_key_jwt`) | `src/jose/` | Reject fail-closed with the exact error code. |
 | Postgres query or repository | `src/db/` | `query!`/`query_as!` macros; regenerate `.sqlx`. |
-| Redis record or Lua script | `src/store/` | Keep every key under `{state}`; update [docs/REDIS.md](docs/REDIS.md). |
-| OAuth endpoint or grant | `src/protocol/` | Cite the RFC section in a comment. Update [docs/OAUTH.md](docs/OAUTH.md). A subject-scoped Redis purge lives at `src/protocol/purge.rs` (`purge_subject`), used by `user disable`; keep every key under `{state}` and update docs/REDIS.md. |
+| Redis record or Lua script | `src/store/` | Domain keys under `{state}`, rate-limit counters under `{rl}` (must differ); update [docs/REDIS.md](docs/REDIS.md). |
+| OAuth endpoint or grant | `src/protocol/` | Cite the RFC section in a comment. Update [docs/OAUTH.md](docs/OAUTH.md). A subject-scoped Redis purge lives at `src/protocol/purge.rs` (`purge_subject` for `user disable`, `purge_sibling_sessions` on credential change); domain keys under `{state}`, rate-limit counters under `{rl}` and update docs/REDIS.md. |
 | Login, consent, or device page | `src/ui/` | Keep CSP and CSRF intact. |
 | Cross-cutting HTTP concern | `src/middleware/` | Mind the layer order in `src/routes.rs`. |
 | Endpoint or layer order | `src/routes.rs` | Update [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). |
@@ -68,7 +68,7 @@ Before finishing any change, confirm:
 - [ ] A sender-constrained grant re-verifies a fresh proof on every use.
 - [ ] `private_key_jwt` is treated as authentication only, never as a binding.
 - [ ] Master keys (pepper, TOTP/PII keys, and retained previous keys) carry at least 32 bytes; shorter material is rejected at load (`WeakKeyMaterial`).
-- [ ] A disabled subject is dead everywhere: introspection reports inactive, refresh rejects with `invalid_grant` before minting, and refresh re-checks current entitlements; `user disable` purges the subject's Redis state (sessions, codes, devices, grants, standalone tokens, lockout) before flipping `users.disabled`, failing closed on a Redis error.
+- [ ] A disabled subject is dead everywhere: introspection reports inactive, refresh rejects with `invalid_grant` before minting, and refresh re-checks current entitlements; `user disable` purges the subject's Redis state (sessions and their meta, codes, devices with their sidecars and `user_code` mappings, grants and their token sidecars, standalone tokens and their sidecars, lockout) before flipping `users.disabled`, failing closed on a Redis error.
 - [ ] The change does not introduce a wildcard scope, redirect URI, or CORS
       origin.
 
@@ -99,14 +99,18 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo nextest run --all-targets
 cargo test --doc
+cargo audit
+cargo deny check
 python3 scripts/check_doc_links.py
 ```
 
 When a query or migration is added or changed, regenerate and commit the
-offline cache:
+offline cache. CI runs `cargo sqlx prepare --check --workspace` and fails if
+the committed cache is stale; regenerate it with the plain form:
 
 ```bash
-cargo sqlx prepare --workspace
+cargo sqlx prepare --check --workspace   # CI gate
+cargo sqlx prepare --workspace           # regenerate the cache
 ```
 
 ## File-scope discipline
@@ -142,5 +146,6 @@ A command in a doc must match the real CLI. Then run the link check:
 python3 scripts/check_doc_links.py
 ```
 
-The CI `doc-links` job runs the same check, so a stale file or heading
-reference fails the build.
+The `.github/workflows/docs.yml` `link-check` job (mirrored by the `doc-links`
+job in `.github/workflows/ci.yml`) runs the same check, so a stale file or
+heading reference fails the build.

@@ -3,29 +3,33 @@
 //! [`build_router`] mounts every endpoint behind one [`tower::ServiceBuilder`]
 //! whose execution order (outer-to-inner) is exactly {request-id → security
 //! headers → CORS (when configured) → resilience (load-shed →
-//! concurrency-limit → timeout) → rate-limit → body limit}:
+//! timeout → concurrency-limit) → rate-limit → body limit}:
 //!
 //! 1. [`middleware::request_id::RequestIdLayer`] mints/propagates
 //!    `X-Request-Id` and opens the redacted `http_request` tracing span
 //!    (tracing and redaction live in this layer).
-//! 2. [`middleware::security_headers::cors_layer`] answers CORS preflights
-//!    from the explicit allowlist before the limiter can bill them — mounted
+//! 2. [`middleware::security_headers::SecurityHeadersLayer`] decorates
+//!    responses with `Referrer-Policy`, `X-Content-Type-Options`, a CSP with
+//!    `frame-ancestors 'none'` (plus a strict script policy on the
+//!    login/consent/device pages), and HSTS on the TLS listener. Every response
+//!    except `/.well-known/…` metadata is also `Cache-Control: no-store`.
+//! 3. [`middleware::security_headers::cors_layer`] answers CORS preflights
+//!    from the explicit allowlist before the limiter can bill them; mounted
 //!    only when `cors_allowed_origins` is non-empty (default empty: no CORS
 //!    headers, browser clients unsupported).
-//! 3. [`middleware::ratelimit::RateLimitLayer`] enforces per-IP/per-client
+//! 4. [`ResilienceLayer`] sheds excess load, then times out slow handlers,
+//!    then caps concurrency, so overload returns a `503` before it can queue
+//!    into `PoolTimedOut`; it sits outside the rate limiter and inside the
+//!    request-id span.
+//! 5. [`middleware::ratelimit::RateLimitLayer`] enforces per-IP/per-client
 //!    budgets on every endpoint except health and metadata (those paths have
 //!    no rule and pass through to handlers that fail closed on their own).
 //!    The IP bucket uses the verified TCP peer unless the peer is a
 //!    configured `rate_limit.trusted_proxies` entry, in which case the
 //!    rightmost-untrusted `X-Forwarded-For` address is attributed instead
 //!    (rate-limit bucket selection only; never client authentication).
-//! 4. [`tower_http::limit::RequestBodyLimitLayer`] caps form bodies at
+//! 6. [`tower_http::limit::RequestBodyLimitLayer`] caps form bodies at
 //!    [`MAX_BODY_BYTES`].
-//! 5. [`middleware::security_headers::SecurityHeadersLayer`] decorates
-//!    responses with `Referrer-Policy`, `X-Content-Type-Options`, a CSP with
-//!    `frame-ancestors 'none'` (plus a strict script policy on the
-//!    login/consent/device pages), and HSTS on the TLS listener. Every response
-//!    except `/.well-known/…` metadata is also `Cache-Control: no-store`.
 //!
 //! Endpoint inventory: `GET /.well-known/oauth-authorization-server`
 //! ([`protocol::metadata`]), `GET /authorize` ([`authorize_entry`] —

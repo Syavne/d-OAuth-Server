@@ -1,7 +1,8 @@
 //! HTTP middleware: observability, rate limiting, request ids, security headers.
 //!
-//! Ordered in `routes.rs`: request-id → security headers → rate limit →
-//! trace. Nothing here performs authentication or authorization.
+//! Ordered in `routes.rs`: request-id → security headers → CORS (when
+//! configured) → resilience (load-shed → timeout → concurrency-limit) → rate
+//! limit → body limit. Nothing here performs authentication or authorization.
 //!
 //! `observability` installs the JSON log subscriber; `request_id` attaches the
 //! `X-Request-Id` span; `redaction` is the shared secret-scrubbing policy and

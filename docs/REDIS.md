@@ -20,7 +20,7 @@ differ.
 
 | Key | Contents | TTL |
 | --- | --- | --- |
-| `oauth:{state}:code:<hash>` | Single-use authorization code, PKCE-bound. | `ttl.code` (60s) |
+| `oauth:{state}:code:<hash>` | Single-use authorization code, PKCE-bound. | `ttl.code` (60s), clamped to 60 s (`CODE_TTL_CAP`) |
 | `oauth:{state}:access:<hash>` | Access-token record. | `ttl.access` (300s) |
 | `oauth:{state}:access:<hash>:act` | Token-exchange `act` claim sidecar. | Lives with the access record |
 | `oauth:{state}:refresh:<hash>` | Refresh-token record or tombstone. | `ttl.refresh` (30d) |
@@ -35,13 +35,13 @@ differ.
 | `oauth:{state}:device:<hash>:poll` | Device poll-throttle marker. | Lives with the device record |
 | `oauth:{state}:user_code:<code-hash>` | User code to device-hash mapping. | `ttl.device` |
 | `oauth:{state}:dcr_iat:<hash>` | DCR initial-access token budget. | CLI `--ttl` |
-| `oauth:{state}:dpop_jti:<hash>` | DPoP `jti` replay marker. | Proof freshness window |
+| `oauth:{state}:dpop_jti:<hash>` | DPoP `jti` replay marker. | 300 s (`DPOP_JTI_TTL`; fixed, independent of proof `iat`) |
 | `oauth:{state}:client_assertion_jti:<hash>` | `private_key_jwt` `jti` replay marker. | Remaining assertion validity (`exp + 30s skew - now`), clamped `[1s, 360s]` (300s max lifetime + 2×30s skew) |
 | `oauth:{state}:rotation:<request-id>` | Rotation idempotency mapping. | `min(900s, refresh TTL)` |
 | `oauth:{state}:loginfail:<sha256>` | Failed-login counter (hashed label; the global per-account cap). | `ui::login::LOCKOUT_WINDOW` (15 min) |
 | `oauth:{state}:loginfail:ip:<sha256>:<sha256>` | Composite failed-login counter for one source IP and one account (both halves hashed; locks that IP only). | `ui::login::LOCKOUT_WINDOW` (15 min) |
 | `oauth:{state}:loginfail:unknown:<sha256>` | Unknown-label bucket for one source IP (hashed IP only; no per-label keys, so label enumeration cannot spray the keyspace). | `ui::login::LOCKOUT_WINDOW` (15 min) |
-| `oauth:{state}:totp_replay:<fingerprint>` | TOTP used-code replay marker. The fingerprint is an HMAC under the token pepper (never the code itself), so a dump does not reveal the code. | Time step window |
+| `oauth:{state}:totp_replay:<fingerprint>` | TOTP used-code replay marker. The fingerprint is an HMAC under the token pepper (never the code itself), so a dump does not reveal the code. | 180 s (`USED_CODE_TTL`; fixed, 6× the 30 s step) |
 | `oauth:{rl}:ratelimit:<bucket-hash>` | Fixed-window rate-limit counter. | `rate_limit.window` (60s) |
 
 `<hash>` is always a keyed hash. Tokens are opaque, so the server can look a
@@ -57,7 +57,8 @@ token state. This is what keeps two promises:
 
 - A multi-key token operation never fails with `CROSSSLOT`.
 - Counters can never evict tokens, because the two keyspaces are separate and
-  Redis eviction is off entirely (`noeviction`).
+  Redis eviction is off by default (`noeviction`, required unless
+  `redis.noeviction_required` is set false).
 
 The server asserts both properties at startup and refuses a prefix that lacks
 its tag.
@@ -163,7 +164,9 @@ rotation mapping or the record instead of replaying the write.
 ## Security properties
 
 - Only keyed hashes are stored. A Redis dump does not reveal a usable token.
-- `noeviction` and AOF are required and asserted at startup.
+- `noeviction` and AOF are required by default and asserted at startup unless
+  the matching opt-out flag (`redis.noeviction_required` or `redis.aof_required`)
+  is set false.
 - Token state and rate-limit counters are separated, so a counter cannot evict
   a token.
 - Replay markers are written atomically with `SET NX`, so a replayed `jti` is
@@ -234,8 +237,10 @@ For a single node without replicas, use `appendfsync always` or Redis 7.2+ so
 `WAITAOF` is available, and set `redis.durability = waitaof`.
 
 On startup the server runs `PING`, checks `maxmemory-policy`, and checks
-`appendonly`. A violation is a startup failure, not a warning. To inspect a key
-family, use `SCAN` with the prefix; never use `KEYS` in a request path.
+`appendonly`. A violation is a startup failure, not a warning, unless the
+matching opt-out flag (`redis.noeviction_required` or `redis.aof_required`) is
+set false. To inspect a key family, use `SCAN` with the prefix; never use `KEYS`
+in a request path.
 
 ## File and directory references
 

@@ -40,9 +40,9 @@ practice in RFC 9700. This server enforces every one of these:
 | The `plain` PKCE method is removed | `code_challenge_method=plain` is rejected. | RFC 7636 §4.3, RFC 9700 §2.1.1 |
 | The implicit grant is removed | Only `response_type=code` exists; there is no token response. | draft-ietf-oauth-v2-1-16, RFC 9700 |
 | The resource-owner-password grant is removed | There is no `grant_type=password` code path. | draft-ietf-oauth-v2-1-16 |
-| Bearer credentials in the URI query are rejected | Access tokens are presented in the `Authorization` header. | RFC 6750 §2 |
+| Bearer credentials in the URI query are rejected | Access tokens are presented in the `Authorization` header. | draft-ietf-oauth-v2-1-16 §5.1 |
 | Redirect URIs are matched exactly | No prefix or wildcard match; one loopback exception. | RFC 9700 §2.1, RFC 3986 §6.2.1 |
-| Public-client refresh tokens rotate | Rotation on every use, with tombstone reuse detection. | RFC 9700 §2.2.2, §4.14 |
+| All refresh tokens rotate on every use | Rotation with tombstone reuse detection applies to every refresh grant. | RFC 9700 §2.2.2, §4.14 |
 | Authorization codes are single-use and short-lived | A code is consumed atomically and capped at 60 seconds. | RFC 9700 §4.5.3 |
 | `state` is supported and echoed | The value is returned on the success and error redirects. | RFC 6749 §4.1.2.1 |
 | No open redirect | The redirect URI must be registered, attached, and enabled. | RFC 9700 §4.1.3 |
@@ -61,12 +61,18 @@ mounts only `/health/live` and `/health/ready`.
 | POST | `/device_authorization` | RFC 8628 §3.1 | Wired |
 | GET, POST | `/device` | RFC 8628 §3.3 | Wired |
 | GET, POST | `/login` | RFC 9700 §4.7.1 | Wired |
+| GET | `/login/success` | server-specific | Wired |
+| GET, POST | `/login/change-password` | server-specific | Wired |
+| GET | `/login/totp/setup` | server-specific | Wired |
+| GET, POST | `/login/totp/confirm` | server-specific | Wired |
 | GET, POST | `/logout` | server-specific | Wired |
 | GET, POST | `/consent` | RFC 9700 §4.7.1 | Wired |
 | POST | `/introspect` | RFC 7662 §2.1 | Wired |
 | POST | `/revoke` | RFC 7009 §2.1 | Wired |
 | POST | `/register` | RFC 7591 §2 | Wired |
 | GET, PUT, DELETE | `/register/{client_id}` | RFC 7592 §2 | Wired |
+| GET | `/assets/app.css` | server-specific | Wired |
+| GET | `/health/live`, `/health/ready` | server-specific (canonical: ARCHITECTURE.md) | Wired |
 
 `GET /logout` and `POST /logout` are a server-specific session endpoint, not a
 feature defined by OAuth 2.1 or OIDC. `GET /logout` is read-only: it renders
@@ -258,12 +264,16 @@ Errors use the RFC 6749 §5.2 body `{error, error_description}`.
 | `invalid_dpop_proof` | 400 | Missing or invalid DPoP proof; replayed `jti`. |
 | `invalid_redirect_uri` | 400 | DCR redirect URI not in the catalog or otherwise ineligible. |
 | `invalid_client_metadata` | 400 | DCR metadata that violates the rules. |
-| `access_denied` | 400 | Resource-owner denial; RFC 7592 token mismatch. |
+| `access_denied` | 400 (403 on DCR manage token mismatch) | Resource-owner denial; RFC 7592 token mismatch. |
 | `authorization_pending` | 400 | Device flow before approval. |
 | `slow_down` | 400 | Device polling faster than the interval. |
 | `expired_token` | 400 | Device code or code expired. |
 | `temporarily_unavailable` | 503 with `Retry-After: 1` | Postgres or Redis is unavailable on a security path. |
 | `server_error` | 500 | A masked internal failure. |
+
+The device polling codes `authorization_pending`, `slow_down`, and
+`expired_token` live in `src/protocol/token/grants/device_code/error.rs`
+(`DevicePollError`) and have no `AppError` counterpart.
 
 The server never fails open on a security path: a dependency outage yields
 `503`, never a silent success.
@@ -283,9 +293,9 @@ never satisfies sender constraint. For token exchange, the proof must match the
 subject token's confirmation. See [SECURITY.md](SECURITY.md) for the full matrix
 and the confirmation propagation rule. `private_key_jwt` accepts `RS256`, `PS256`, `ES256`, and
 `EdDSA` only (`none` and HMAC are rejected); DPoP proofs accept `ES256`, `EdDSA`, and `RS256` only (no `PS256`).
-`exp` may lie at most 300 s past `now` with 30 s clock-skew leeway on each side
-(360 s bound), and the single-use `jti` marker lives for the
-assertion's remaining validity, clamped to `[1 s, 360 s]`.
+The `exp` acceptance bound is 330 s: `exp` may lie at most 300 s past `now` plus
+30 s clock-skew leeway. The single-use `jti` marker lives for the assertion's
+remaining validity, clamped to `[1 s, 360 s]`.
 
 ## Metadata
 

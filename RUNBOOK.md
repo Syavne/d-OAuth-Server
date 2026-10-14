@@ -168,7 +168,7 @@ correlation. No step below writes a secret to a log.
       (the raw token is printed once).
 - [ ] **6. Verify fail-closed behavior.** Readiness must report ready only with
       both dependencies up:
-      `d-oauth-server healthcheck --url http://127.0.0.1:8081/health/ready`
+      `d-oauth-server healthcheck [--url http://127.0.0.1:8081/health/ready]`
       (readiness; liveness is `/health/live` as in
       [docs/OPERATIONS.md](docs/OPERATIONS.md)).
       A dependency outage during recovery must yield `503`, never a fail-open

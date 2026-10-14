@@ -10,18 +10,27 @@
 //!
 //! - `oauth:{state}:code:<hash>` — single-use authorization codes.
 //! - `oauth:{state}:access:<hash>` — access-token records.
+//! - `oauth:{state}:access:<hash>:act` — token-exchange `act` claim sidecar.
 //! - `oauth:{state}:refresh:<hash>` — refresh-token records and tombstones.
 //! - `oauth:{state}:grant:<id>` — grant-chain records.
 //! - `oauth:{state}:grant:<id>:tokens` — per-grant token-member sets.
 //! - `oauth:{state}:session:<id>` — server-side login sessions.
+//! - `oauth:{state}:session:<id>:meta` — session sidecar: CSRF secret, bound
+//!   `request_id`, and post-logout client/URI (see `purge_subject`).
 //! - `oauth:{state}:par:<id>` — PAR `request_uri` records.
 //! - `oauth:{state}:pending:<id>` — validated pending-auth JSON records.
 //! - `oauth:{state}:device:<hash>` — device-code records.
+//! - `oauth:{state}:device:<hash>:cnf` — device sender-binding sidecar.
+//! - `oauth:{state}:device:<hash>:poll` — device poll-throttle marker.
 //! - `oauth:{state}:user_code:<code-hash>` — user-code to device mapping.
 //! - `oauth:{state}:dcr_iat:<hash>` — DCR initial-access-token records.
 //! - `oauth:{state}:dpop_jti:<hash>` — DPoP `jti` replay markers.
 //! - `oauth:{state}:client_assertion_jti:<hash>` — `private_key_jwt` replay markers.
 //! - `oauth:{state}:rotation:<request-id>` — rotation idempotency mappings.
+//! - `oauth:{state}:loginfail:<sha256>` — per-account failed-login counter.
+//! - `oauth:{state}:loginfail:ip:<sha256>:<sha256>` — composite per-IP counter.
+//! - `oauth:{state}:loginfail:unknown:<sha256>` — unknown-label IP bucket.
+//! - `oauth:{state}:totp_replay:<fingerprint>` — TOTP used-code replay marker.
 //! - `oauth:{rl}:ratelimit:<bucket-hash>` — rate-limit counters (own keyspace).
 //!
 //! Registration access tokens are NOT here: their hash lives only in Postgres

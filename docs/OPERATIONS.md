@@ -43,7 +43,7 @@ d-oauth-server config check
 
 ```bash
 d-oauth-server user create --email <email> [--admin] [--password-stdin] [--password-file <path>]
-d-oauth-server user enroll-totp --email <email>
+d-oauth-server user enroll-totp --email <email> [--show-secret]
 d-oauth-server user disable --email <email>
 d-oauth-server user unlock --email <email>
 d-oauth-server user grant-scope --email <email> --scope <scope>
@@ -89,10 +89,11 @@ d-oauth-server scope disable <name>
 d-oauth-server scope delete <name>
 ```
 
-`create` upserts: it creates a scope or updates its description. `delete`
+`create` upserts: it creates a scope, updates its description, or re-enables a
+disabled one. `delete`
 deletes a scope that nothing references, and disables it when `user_scopes`
 references it, so entitlements are not silently destroyed. The enabled scope
-catalog is what `/metadata` advertises as `scopes_supported`.
+catalog is what `GET /.well-known/oauth-authorization-server` (discovery document) advertises as `scopes_supported`.
 
 ### Redirect URIs and client attachments
 
@@ -126,8 +127,11 @@ disable or delete the legacy row first, then re-run the sync.
 authorization-response callback. `post_logout` is a bare return target used only
 by `POST /logout` to send the browser back to the client after the session ends
 (`GET /logout` is read-only and issues no redirect).
-A client may register at most one enabled `post_logout` URI; `POST /logout`
-redirects only to it, and only while the URI is enabled and the client active.
+`POST /logout` redirects only while exactly one enabled `post_logout` URI is
+registered for the client and the client is active. Zero registered enabled URIs
+or more than one, and `POST /logout` performs no redirect: the target must be
+unambiguous or nothing happens. Registering a second enabled `post_logout` URI
+is a configuration error, not a silent last-writer-wins.
 
 ### Declarative config
 
@@ -169,14 +173,15 @@ when `allow_open_registration` is false.
 ### Key generation and health
 
 ```bash
-d-oauth-server keygen --alg es256
-d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
+d-oauth-server keygen [--alg es256]
+d-oauth-server healthcheck [--url <url>]
 ```
 
 `keygen` emits an ES256 keypair for test fixtures and client-side DPoP keys. It
 is never an authorization-server signing key; the server publishes no
-`jwks_uri`. `healthcheck` probes the health listener over raw HTTP and exits 0
-or 1; it is the container `HEALTHCHECK`.
+`jwks_uri`. `--alg` defaults to `es256` (the only algorithm). `healthcheck` probes the health listener over raw HTTP and exits 0
+or 1; it is the container `HEALTHCHECK`. `--url` defaults to
+`http://127.0.0.1:8081/health/live` (liveness).
 
 ### PII and TOTP migration commands
 
@@ -255,7 +260,7 @@ The file is JSON. Every section is optional and defaults to empty.
 
 Scope names must match the RFC 6749 scope-token grammar. `openid` is reserved.
 Redirect URIs must be absolute and are matched exactly at `/authorize` (or, for
-`kind: post_logout`, at `GET /logout`). `kind` defaults to `authorize`.
+`kind: post_logout`, at `POST /logout`). `kind` defaults to `authorize`.
 
 Apply and re-apply:
 
@@ -271,13 +276,15 @@ Upserts use `IS DISTINCT FROM`, so an unchanged row does not bump `updated_at`.
 
 CLI mutations go to the `audit` target with `event = "cli.mutation"`, an
 `operation`, and a `subject`. The operations are `migrate`, `config.sync`,
-`user.create`, `user.enroll_totp`, `user.disable`, `user.grant_scope`,
+`user.create`, `user.enroll_totp`, `user.disable`, `user.unlock`,
+`user.grant_scope`,
 `user.revoke_scope`, `scope.create`, `scope.enable`, `scope.disable`,
 `scope.delete`, `redirect_uri.create`, `redirect_uri.enable`,
 `redirect_uri.disable`, `redirect_uri.delete`, `client.attach_redirect_uri`,
 `client.detach_redirect_uri`, `initial_access_token.issue`,
-`pii.backfill`, `pii.rotate`, `totp.rewrap`, and the `admin.bootstrap.*`
-family. `pii verify` is read-only and emits no mutation event.
+`pii.backfill`, `pii.rotate`, `totp.rewrap`, `admin.count.changed`, and the
+`admin.bootstrap.*` family. `pii verify` and `user scopes` are read-only and
+emit no mutation event.
 
 HTTP events on the same target include `login.success`, `login.failure`,
 `consent`, `token.issue`, `token.revoke`, `token.refresh_reuse_detected`, and

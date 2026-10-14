@@ -183,12 +183,22 @@ fn build_key_ring(raw: &RawConfig) -> Result<KeyRing, ConfigError> {
     )?),
     "pii_previous_key",
   )?;
+  let pepper_previous = require_min_key_bytes(
+    non_blank(resolve_secret(
+      raw.token_pepper_previous_key.as_deref(),
+      raw.token_pepper_previous_key_file.as_deref(),
+    )?),
+    "token_pepper_previous_key",
+  )?;
   let pepper_id = key_id_or_default(raw.token_pepper_id.as_deref())?;
   let totp_id = key_id_or_default(raw.totp_key_id.as_deref())?;
   let pii_id = key_id_or_default(raw.pii_key_id.as_deref())?;
-  let peppers = pepper
-    .map(|secret| vec![(pepper_id, secret)])
-    .unwrap_or_default();
+  let peppers = active_first_chain(
+    pepper.map(|secret| (pepper_id, secret)),
+    raw.token_pepper_previous_key_id.as_deref(),
+    pepper_previous,
+    KeyRingError::MissingTokenPepper,
+  )?;
   let totp_keys = active_first_chain(
     totp.map(|secret| (totp_id, secret)),
     raw.totp_previous_key_id.as_deref(),

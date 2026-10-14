@@ -35,15 +35,20 @@ cargo build --locked --release  # release (thin LTO, stripped)
 The build is offline-safe for SQL: with `SQLX_OFFLINE=true` the `query!` macros
 compile against the committed `.sqlx/` cache, so no database is needed at build
 time. The Docker build relies on exactly this. When a query or a migration
-changes, regenerate and commit the cache:
+changes, regenerate and commit the cache. CI runs the check form and fails if
+the committed cache is stale:
 
 ```bash
-cargo sqlx prepare --workspace
+cargo sqlx prepare --check --workspace   # CI gate
+cargo sqlx prepare --workspace           # regenerate the cache
 ```
 
 ## Quality gates
 
-Run all of these before opening a change. CI runs the same set.
+Run all of these before opening a change. CI runs this set plus additional
+gates: `cargo sqlx prepare --check --workspace`, the fuzz targets
+(`cargo fuzz build`), coverage, `cargo mutants`, `miri`, and the separate
+`.github/workflows/docs.yml` link check.
 
 ```bash
 cargo fmt --check
@@ -175,8 +180,11 @@ Every module has a single responsibility:
 | Protocol handlers | `src/protocol/` | OAuth endpoints and grants. |
 | Server-rendered UI | `src/ui/` | Login, consent, and device pages. |
 | Middleware | `src/middleware/` | Request id, tracing/redaction, rate limit, security headers, audit. |
+| Resilience | `src/resilience.rs` | Load-shed, timeout, and concurrency-limit guard. |
 | Routing and serving | `src/routes.rs`, `src/serve.rs`, `src/tls.rs` | Router assembly and the two listeners. |
+| Application state | `src/state.rs`, `src/state/` | `AppState`, the topology-aware Redis connection, health endpoints (health/pg/redis/sentinel). |
 | Operator CLI | `src/cli.rs`, `src/cli/` | Every administrative command. |
+| Errors | `src/error.rs` | `AppError`: the client-safe OAuth error type and its HTTP mapping. |
 
 Rules that apply everywhere:
 

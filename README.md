@@ -27,7 +27,8 @@ state is in Redis, so replicas are interchangeable.
 ## Prerequisites
 
 - Rust stable, as pinned by `rust-toolchain.toml`.
-- PostgreSQL 18 or newer with the `citext` extension available.
+- PostgreSQL 16 or newer with the `citext` extension available (the shipped
+  `compose.yaml` pins `postgres:18-alpine`).
 - Redis 8 or newer, with persistence enabled and eviction off.
 - A TLS certificate and key for the public listener.
 - Docker, for the container image, for the shared test Postgres and Redis in
@@ -67,7 +68,8 @@ export D_OAUTH_PII_ENCRYPTION_KEY='replace-with-32-bytes-of-random-00'
 ```
 
 Development relaxes the database TLS requirement. Production requires
-`sslmode=verify-full` and a non-localhost `issuer`.
+`sslmode=verify-full` (unless `database.require_verify_full` is set false) and an
+`issuer` on `https` (no trailing slash, non-empty authority, no whitespace).
 
 Validate the configuration, then apply the schema once:
 
@@ -180,6 +182,8 @@ Quality gates:
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo nextest run --all-targets
+cargo test --doc
 cargo audit
 cargo deny check
 python3 scripts/check_doc_links.py
@@ -245,10 +249,12 @@ certificate.
   device records, and lockout counters before flipping `users.disabled`; that
   user's live tokens then introspect inactive and refuse refresh
   (`invalid_grant`).
-- Production requires `issuer` on `https` and a database URL with
+- Production requires `issuer` on `https` and, unless
+  `database.require_verify_full` is set false, a database URL with
   `sslmode=verify-full`.
 - Redis must run with `noeviction` and persistence. The server asserts this at
-  startup and refuses to start otherwise.
+  startup and refuses to start otherwise, unless `redis.noeviction_required` or
+  `redis.aof_required` is set false (both default `true`).
 - When Postgres or Redis is unavailable, security endpoints return `503` rather
   than failing open.
 - CORS is empty by default. Browser clients need an explicit origin allowlist.
@@ -260,7 +266,9 @@ certificate.
 - Scope catalog: `scope create|list|enable|disable|delete`. Scopes are
   runtime-managed and start empty.
 - Redirect URIs: `redirect-uri create|list|enable|disable|delete` and
-  `client attach-redirect-uri|detach-redirect-uri|redirect-uris`. Each accepts
+  `client attach-redirect-uri|detach-redirect-uri|redirect-uris`.
+  `redirect-uri create|enable|disable|delete` and
+  `client attach-redirect-uri|detach-redirect-uri` accept
   `--kind authorize|post_logout` (default `authorize`); `post_logout` URIs are
   the return targets for `POST /logout` (`GET /logout` is read-only).
 - Users and entitlements: `user create|enroll-totp|disable|unlock|grant-scope|revoke-scope|scopes`.
@@ -268,7 +276,8 @@ certificate.
 - Declarative apply: `config sync --file` and `config check`.
 - PII migration and rotation: `pii backfill`, `pii verify`, and `pii rotate`,
   plus `totp rewrap` for the TOTP key. See [docs/OPERATIONS.md](docs/OPERATIONS.md).
-- DCR initial access: `initial-access-token issue [--show-secret]`.
+- DCR initial access:
+  `initial-access-token issue --uses <n> --ttl <seconds> [--label <text>] [--show-secret]`.
 - Utilities: `keygen` and `healthcheck`.
 
 Full flags are in [docs/OPERATIONS.md](docs/OPERATIONS.md).

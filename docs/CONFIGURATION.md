@@ -151,7 +151,10 @@ connection directly, so it may contain any bytes (no URL encoding required).
 | `token_pepper` | none | Inline token-pepper secret. Required unless `token_pepper_file` is set. |
 | `token_pepper_file` | none | Mounted token-pepper secret. |
 | `token_pepper_id` | `v1` | Version id stored with the hash so peppers can rotate. |
-| `totp_encryption_key` | none | Inline AES-256-GCM key for TOTP secrets. Required to enroll TOTP. |
+| `token_pepper_previous_key` | none | Optional retained previous token-pepper secret for rotation. Required unless `token_pepper_previous_key_file` is set. |
+| `token_pepper_previous_key_file` | none | Mounted previous token-pepper secret. |
+| `token_pepper_previous_key_id` | none | Required when a previous pepper key is set; must differ from `token_pepper_id`. |
+| `totp_encryption_key` | none | Inline AES-256-GCM key for TOTP secrets. Required; the server refuses to start without it (or `totp_encryption_key_file`). |
 | `totp_encryption_key_file` | none | Mounted TOTP key. |
 | `totp_key_id` | `v1` | Version id carried in the encrypted TOTP blob. |
 | `totp_previous_key` | none | Optional retained previous TOTP key for rotation. |
@@ -172,6 +175,9 @@ The exact environment spellings:
 | `token_pepper` | `D_OAUTH_TOKEN_PEPPER` |
 | `token_pepper_file` | `D_OAUTH_TOKEN_PEPPER_FILE` |
 | `token_pepper_id` | `D_OAUTH_TOKEN_PEPPER_ID` |
+| `token_pepper_previous_key` | `D_OAUTH_TOKEN_PEPPER_PREVIOUS_KEY` |
+| `token_pepper_previous_key_file` | `D_OAUTH_TOKEN_PEPPER_PREVIOUS_KEY_FILE` |
+| `token_pepper_previous_key_id` | `D_OAUTH_TOKEN_PEPPER_PREVIOUS_KEY_ID` |
 | `totp_encryption_key` | `D_OAUTH_TOTP_ENCRYPTION_KEY` |
 | `totp_encryption_key_file` | `D_OAUTH_TOTP_ENCRYPTION_KEY_FILE` |
 | `totp_key_id` | `D_OAUTH_TOTP_KEY_ID` |
@@ -186,9 +192,12 @@ The exact environment spellings:
 | `pii_previous_key_id` | `D_OAUTH_PII_PREVIOUS_KEY_ID` |
 | `pii_dual_write` | `D_OAUTH_PII_DUAL_WRITE` |
 
-The token pepper and the PII field-encryption key are required: without either
-the key ring cannot be built and the server refuses to start with
-`MissingPiiKey` (or `MissingPepper`). Key ids (`token_pepper_id`,
+The token pepper, the TOTP encryption key, and the PII field-encryption key are
+required: without any of them the key ring cannot be built and the server
+refuses to start with `ConfigError::KeyRing(KeyRingError::MissingTokenPepper)`
+for the token pepper, `ConfigError::KeyRing(KeyRingError::MissingTotpKey)` for
+the TOTP key, or `ConfigError::KeyRing(KeyRingError::MissingPiiKey)` for the
+PII key. Key ids (`token_pepper_id`,
 `totp_key_id`, `pii_key_id`, and any `*_previous_key_id`) are stored verbatim:
 token hashes as `<kid>.<digest>` (split on the first `.`) and PII blind
 indexes as `<kid>:<digest>`, so an id must contain neither `.` (token split)
@@ -238,7 +247,9 @@ The security endpoints are `authorize`, `token`, `introspect`, `revoke`, `par`,
 | `argon2.parallelism` | `1` |
 
 Every TTL must be non-zero, and the access-token TTL must not exceed the
-refresh-token TTL. Argon2 memory must be at least 8192 KiB, with a non-zero
+refresh-token TTL. The authorization-code lifetime is additionally capped at
+60 s (`CODE_TTL_CAP` in `src/protocol/code.rs`), so a `ttl.code_secs` value
+above 60 is effectively clamped. Argon2 memory must be at least 8192 KiB, with a non-zero
 iteration count and parallelism.
 
 ## Rate-limit keys
@@ -318,8 +329,9 @@ the statement.
 - Forwarded client-cert and client-IP headers are never trusted: the listener
   uses only the TLS peer address and the certificate chain it verified itself.
 - CORS and open registration are off by default.
-- File-backed pepper/TOTP/PII keys are read from a `0400` tmpfs file, never
-  from the process environment.
+- File-backed pepper/TOTP/PII keys are read from a `0400` tmpfs file, so the
+  material avoids the process environment; the inline forms are supported and
+  win when both are set.
 
 ## Edge cases
 

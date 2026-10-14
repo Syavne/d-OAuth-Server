@@ -371,7 +371,11 @@ fn config_rejects_weak_key_material() {
       "{key} shorter than 32 bytes must be rejected"
     );
   }
-  for key in ["totp_previous_key", "pii_previous_key"] {
+  for key in [
+    "totp_previous_key",
+    "pii_previous_key",
+    "token_pepper_previous_key",
+  ] {
     let mut map = base();
     map.insert(
       key.to_owned(),
@@ -442,6 +446,35 @@ fn config_builds_pii_chain() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn config_builds_pepper_chain() -> Result<(), Box<dyn Error>> {
+  let mut map = base();
+  map.insert(
+    "token_pepper_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PEPPER_PREVIOUS-0123456789ab".to_owned()),
+  );
+  map.insert(
+    "token_pepper_previous_key_id".to_owned(),
+    Value::String("v0".to_owned()),
+  );
+  let cfg = try_load(&map)?;
+  let active = cfg.keys.active_pepper().ok_or("missing active pepper")?;
+  assert_eq!(active.0.as_str(), "v1");
+  let retained = cfg
+    .keys
+    .pepper_by_id("v0")
+    .ok_or("missing retained pepper")?;
+  assert!(!cfg.keys.pepper_by_id("v9").is_some());
+  let _ = retained;
+  let ids: Vec<&str> = cfg
+    .keys
+    .peppers_newest_first()
+    .map(|(id, _)| id.as_str())
+    .collect();
+  assert_eq!(ids, vec!["v1", "v0"]);
+  Ok(())
+}
+
+#[test]
 fn config_rejects_previous_key_without_id() {
   let mut map = base();
   map.insert(
@@ -469,6 +502,14 @@ fn config_rejects_previous_key_without_id() {
     Value::String("SUPER_SECRET_TOTP_PREVIOUS-0123456789abcdef".to_owned()),
   );
   let result = try_load(&totp);
+  assert!(matches!(result, Err(ConfigError::MissingPreviousKeyId)));
+
+  let mut pepper = base();
+  pepper.insert(
+    "token_pepper_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PEPPER_PREVIOUS-0123456789ab".to_owned()),
+  );
+  let result = try_load(&pepper);
   assert!(matches!(result, Err(ConfigError::MissingPreviousKeyId)));
 }
 
@@ -502,6 +543,21 @@ fn config_rejects_previous_key_without_active() {
   assert!(matches!(
     result,
     Err(ConfigError::KeyRing(KeyRingError::MissingTotpKey))
+  ));
+
+  let mut pepper = without("token_pepper");
+  pepper.insert(
+    "token_pepper_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PEPPER_PREVIOUS-0123456789ab".to_owned()),
+  );
+  pepper.insert(
+    "token_pepper_previous_key_id".to_owned(),
+    Value::String("v0".to_owned()),
+  );
+  let result = try_load(&pepper);
+  assert!(matches!(
+    result,
+    Err(ConfigError::KeyRing(KeyRingError::MissingTokenPepper))
   ));
 }
 
@@ -571,6 +627,19 @@ fn config_rejects_dotted_key_id() {
   );
   assert!(matches!(
     try_load(&previous),
+    Err(ConfigError::InvalidKeyId { .. })
+  ));
+  let mut pepper_previous = base();
+  pepper_previous.insert(
+    "token_pepper_previous_key".to_owned(),
+    Value::String("SUPER_SECRET_PEPPER_PREVIOUS-0123456789ab".to_owned()),
+  );
+  pepper_previous.insert(
+    "token_pepper_previous_key_id".to_owned(),
+    Value::String("v0.evil".to_owned()),
+  );
+  assert!(matches!(
+    try_load(&pepper_previous),
     Err(ConfigError::InvalidKeyId { .. })
   ));
 }

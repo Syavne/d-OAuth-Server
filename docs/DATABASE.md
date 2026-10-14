@@ -35,10 +35,10 @@ One row per registered client (RFC 7591 / RFC 7592).
 | `jwks` | `jsonb` | Optional inline JWKS. Public by design; never sealed. |
 | `jwks_uri` | `text` | Optional JWKS URL (fetched with the SSRF guard). |
 | `jwks_uri_enc` | `bytea` | Sealed JWKS URL. |
-| `tls_client_auth_subject_dn` | `text` | RFC 8705 subject DN binding. Nullable after the expansion migration. |
+| `tls_client_auth_subject_dn` | `text` | RFC 8705 subject DN binding. Nullable in the base table. |
 | `tls_client_auth_subject_dn_enc` | `bytea` | Sealed subject DN. |
 | `tls_client_auth_subject_dn_index` | `text` | Keyed blind index over the subject DN. |
-| `tls_client_auth_cert_thumbprint` | `text` | RFC 8705 `x5t#S256` binding. Nullable after the expansion migration. |
+| `tls_client_auth_cert_thumbprint` | `text` | RFC 8705 `x5t#S256` binding. Nullable in the base table. |
 | `tls_client_auth_cert_thumbprint_enc` | `bytea` | Sealed certificate thumbprint. |
 | `tls_client_auth_cert_thumbprint_index` | `text` | Keyed blind index over the thumbprint. |
 | `request_uris` | `jsonb` | Pre-registered JAR request URIs. |
@@ -142,7 +142,9 @@ is unique per `(uri, kind)`.
 `ux_redirect_uris_uri_index_kind` is a partial unique index on
 `(uri_index, kind)` where `uri_index` is not null; the legacy
 `ux_redirect_uris_uri_kind UNIQUE (uri, kind)` constraint is kept and goes inert
-once every `uri` is NULL.
+once every `uri` is NULL. `ck_redirect_uris_kind` is a
+`CHECK (kind IN ('authorize', 'post_logout'))` constraint that keeps the column
+to those two values.
 
 `kind` separates the two browser landings: `authorize` URIs are valid
 authorization-response callbacks (they carry `code`/`state`); `post_logout` URIs
@@ -174,16 +176,21 @@ them, or an operator must install the extension out of band before migrating.
 
 ## PII encryption at rest
 
-The plaintext identifier columns stay in the schema, but once the migration
-completes they are inert: NULL for every row, kept only so version N-1 replicas
-can still read them during the rollout. The live values move into two parallel
-columns per field:
+The plaintext identifier columns stay in the schema. The PII migration only adds
+the `_enc`/`_index` columns and drops `NOT NULL`; it blanks nothing. The
+plaintext is nulled later by the `pii backfill` cutover (`pii_dual_write=false`,
+app tier scaled to zero), and only then are the columns inert: NULL for every
+row, kept only so version N-1 replicas can still read them during the rollout.
+While `pii_dual_write=true`, writers still store the plaintext alongside the
+sealed value. The live values move into two parallel columns per field:
 
-- **`_enc` (`bytea`)** holds a versioned AES-256-GCM blob. The blob carries the
-  key id (`kid`) of the PII key that wrote it, then a random 96-bit nonce, then
-  the ciphertext and tag. The key is derived from the master PII key with
-  HKDF-SHA256 (info `pii-field-gcm-v1`), so the ciphertext is not key-stable:
-  rotating the master key re-encrypts every blob.
+- **`_enc` (`bytea`)** holds a versioned AES-256-GCM blob with the framing
+  `version(1)=1 || kid_len(1) || kid || nonce(12) || ciphertext+tag`: the format
+  version byte, a one-byte key-id length, the key id (`kid`) of the PII key that
+  wrote it, a random 96-bit nonce, then the ciphertext and tag. The key is
+  derived from the master PII key with HKDF-SHA256 (info `pii-field-gcm-v1`), so
+  the ciphertext is not key-stable: rotating the master key re-encrypts every
+  blob.
 - **`_index` (`text`)** holds a keyed-HMAC blind index in the form
   `{kid}:{hex}`. Encrypted bytes cannot be compared or made unique directly, so
   the columns that are looked up or must stay unique (`email_index`, the two
@@ -213,8 +220,10 @@ zero) while `pii rotate` re-encrypts and recomputes every index; see
 - `serve` never migrates. Startup only reads the schema. Readiness returns 503
   until every embedded migration version is present in `_sqlx_migrations`.
 - A checksum mismatch or a dirty migration fails fast rather than guessing.
-- Each file is deterministic with no down path. There is no `DROP` and no
-  rollback.
+- Each file is deterministic with no down path. There is no rollback and no
+  `DROP TABLE` or `DROP COLUMN`; the release only adds columns, apart from
+  dropping the legacy `ux_redirect_uris_uri` constraint and the `NOT NULL`s on
+  the plaintext columns the backfill blanks.
 
 In a cluster, run migrations from a dedicated Job, never from every replica.
 
@@ -247,7 +256,9 @@ The PII encryption rollout follows this lifecycle exactly:
    blanked plaintext PII column still holds a value.
 6. **Contract (later release).** Dropping the now-inert plaintext columns and
    legacy constraints is a deliberate follow-up release, not part of this
-   change. This release drops and renames nothing.
+   change. This release renames no column and drops no table or column, though
+   it does drop the legacy `ux_redirect_uris_uri` constraint and the `NOT NULL`s
+   on the plaintext columns the backfill blanks.
 
 **Maintenance window.** `ALTER TABLE ... DROP NOT NULL` takes `ACCESS EXCLUSIVE`
 on `users`, `redirect_uris`, and `oauth_clients`, blocking reads and writes for

@@ -88,9 +88,9 @@ fallback.
   Postgres, Redis, logs, an error body, or an evidence file.
 - Log redaction masks `authorization`, `cookie`, `dpop`, `code`, `token`,
   `client_secret`, `code_verifier`, `password`, `user_code`, `device_code`, and
-  `request_uri`, plus any `*_token`/`*_secret`/`*_password`/`*_code` key, in
-  headers, JSON, form bodies, and query strings; `code_challenge` and
-  `request_id` stay visible.
+  `request_uri`, plus any key whose name contains `secret`, and any
+  `*_token`/`*_secret`/`*_password`/`*_code` key, in headers, JSON, form bodies,
+  and query strings; `code_challenge` and `request_id` stay visible.
 - Secret comparisons are constant time.
 
 ## Browser and intermediary caching

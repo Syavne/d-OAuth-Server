@@ -84,7 +84,10 @@ noticeably slower than the amd64 build.
 Then run the image:
 
 ```bash
-docker run --rm -p 8080:8080 --read-only d-oauth-server:latest
+docker run --rm -p 8080:8080 --read-only \
+  --env-file ./oauth.env \
+  -v /path/to/tls:/certs:ro \
+  d-oauth-server:latest
 ```
 
 The container needs its configuration from the environment, its TLS material
@@ -275,8 +278,9 @@ A correct Deployment has these properties:
   environment or baked into the image.
 - A `NetworkPolicy` that default-denies pod egress except DNS, Postgres, and
   Redis, and admits ingress only on the two pod ports (see below).
-- The `ghcr.io/syavne/d-oauth-server:latest` image reference that
-  `kustomization.yaml` applies. `:latest` is mutable, so a rollout is only as
+- The `ghcr.io/syavne/d-oauth-server:latest` image reference carried in
+  `deployment.yaml` and `migrate-job.yaml`; `kustomization.yaml` applies no
+  `images:` override. `:latest` is mutable, so a rollout is only as
   fresh as the last pull; that is a deliberate convenience tradeoff, not an
   immutable pin.
 - Client-CA material mounted read-only if in-process mTLS is used. The Postgres
@@ -308,6 +312,10 @@ D_OAUTH_PII_ENCRYPTION_KEY_FILE=/run/secrets/pii-encryption-key
 D_OAUTH_DATABASE__PASSWORD_FILE=/run/secrets/database-password
 D_OAUTH_REDIS__PASSWORD_FILE=/run/secrets/redis-password
 ```
+
+The two password variables also accept the unprefixed
+`DATABASE_PASSWORD_FILE` / `REDIS_PASSWORD_FILE` alias, but the shipped
+manifests and `scripts/check_manifests.py` use the prefixed `D_OAUTH_*` forms.
 
 The passwordless DSNs are non-secret and live in the ConfigMap
 (`D_OAUTH_DATABASE__URL` with `sslmode=verify-full` and `D_OAUTH_REDIS__URL`);
@@ -425,8 +433,13 @@ spec:
 
 ### Database access and backups
 
-The schema is plaintext PII plus hashed or encrypted secrets, so the database
-and every copy of it are in scope for the full-disclosure threat model. The
+The schema stores sealed PII (`_enc` AES-256-GCM ciphertext plus
+keyed-HMAC blind indexes) alongside hashed or encrypted secrets; the PII
+migration only adds the `_enc` columns and drops `NOT NULL`, and the legacy
+plaintext identifier columns are blanked to NULL by the `pii backfill` cutover,
+kept only so version N-1 replicas can still read them during the rollout. The
+database and every copy of it are in scope for the full-disclosure threat
+model. The
 server opens one DSN as one role; it does not create roles, audit rows, or
 encrypted backups, so those controls live with the operator. Apply at least:
 
@@ -447,14 +460,20 @@ encrypted backups, so those controls live with the operator. Apply at least:
   permission changes. A read-only dump otherwise leaves no trace.
 - **Encrypt the backups and their keys.** `pg_dump`, `pg_basebackup`, and
   pgBackRest output must be encrypted at rest, stored off-site, and restore
-  tested. The backup is a full copy of the plaintext PII columns, so treat it
-  exactly like a live dump; the backup key is custodied separately and never
+  tested. The backup is a point-in-time copy of the `_enc` ciphertext and the
+  blind indexes, plus the inert NULL plaintext columns, so treat it
+  exactly like a live dump; after the PII key is rotated, an old backup is
+  readable only with the retained old PII key, so custody of the key store
+  still governs backup disclosure. The backup key is custodied separately and
+  never
   with the database (see
   [SECURITY.md](SECURITY.md#master-key-custody)).
 - **Consider Postgres-level encryption.** Disk or volume encryption (cloud
   EBS/PD or a filesystem layer) protects stolen media; `pg_tde` or an engine's
   TDE protects the data files; `pgcrypto` can encrypt selected PII columns at
-  the SQL layer. The application already encrypts TOTP secrets with AES-256-GCM
+  the SQL layer. The application already seals directory PII in `_enc`
+  AES-256-GCM columns with keyed-HMAC blind indexes and encrypts TOTP secrets
+  with AES-256-GCM
   and hashes passwords and client secrets with Argon2id, so `pgcrypto` is an
   alternative, not the current design, and it moves key custody into the SQL
   path.
@@ -568,7 +587,10 @@ cosign verify \
 kustomize build deploy/k8s
 python3 scripts/check_manifests.py
 
-# 3. Roll out (migration Job first; the Deployment readiness gate waits for it).
+# 3. Roll out. A single `kubectl apply -k` creates the migration Job and the
+#    Deployment together; the Deployment readiness gate (`/health/ready`
+#    against `_sqlx_migrations`) keeps new replicas out of traffic until the
+#    Job has applied the schema, so it sequences itself.
 kubectl apply --dry-run=server -k deploy/k8s
 kubectl apply -k deploy/k8s
 ```
@@ -646,28 +668,36 @@ tarball.
   the process.
 - A CNI that does not enforce NetworkPolicy leaves pod egress unrestricted;
   verify the cluster CNI applies the policy before relying on it.
-- Re-applying the manifests after a new push rolls forward: `:latest` is
-  mutable, so an unchanged manifest can still pull a newer build than the one
-  you verified.
+- Re-applying the manifests after a new push does not roll forward on its own:
+  both workloads use `imagePullPolicy: IfNotPresent` with a mutable `:latest`,
+  so an unchanged pod template triggers no rollout and the cached image is
+  reused. Pin an explicit tag or digest, or force a rollout (`kubectl rollout
+  restart` or a pod-template annotation change), to pull a new build. `:latest`
+  is mutable, so even a fresh pull can differ from the one you verified.
 
 ## Operational runbook
 
 - Roll out a new image by re-applying the manifests; they track
-  `ghcr.io/syavne/d-oauth-server:latest`, and the migration Job runs first. To
-  roll a specific build instead, point the `images` entry at a release tag such
-  as `<X.Y.Z>`.
-- Probe commands inside the pod network:
-
-```bash
-wget -qO- http://<pod-ip>:8081/health/live
-wget -qO- http://<pod-ip>:8081/health/ready
-```
-
-- The container healthcheck, usable without a shell:
+  `ghcr.io/syavne/d-oauth-server:latest` directly in `deployment.yaml` and
+  `migrate-job.yaml` (`kustomization.yaml` applies no `images:` override), and
+  the migration Job runs first because the Deployment readiness gate waits for
+  it. Re-applying alone does not roll forward: both workloads use
+  `imagePullPolicy: IfNotPresent`, so an unchanged pod template triggers no
+  rollout and a cached `:latest` is reused. To roll a specific build, pin an
+  explicit tag or digest in those files' `image:` (or add an `images:` override
+  to `kustomization.yaml`), or force a rollout with `kubectl rollout restart`
+  or a pod-template annotation change.
+- Probe commands inside the pod, using the in-image `healthcheck`. The runtime
+  image has no shell, `wget`, or `curl`, so a `wget` variant needs a debug or
+  sidecar container that carries those tools:
 
 ```bash
 d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
+d-oauth-server healthcheck --url http://127.0.0.1:8081/health/ready
 ```
+
+- The same `healthcheck` subcommand is the image `HEALTHCHECK`, usable without
+  a shell.
 
 - On a rolling upgrade, watch that the PDB keeps at least two replicas ready
   and that readiness recovers after the drain.
@@ -692,14 +722,14 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
   passwords — all
   file-mounted and replaced by the secret manager), `service.yaml` (public TLS
   port only, never the health port), `deployment.yaml` (3 stateless replicas,
-  probes on the plaintext health listener, PDB + topology spread,
+  probes on the plaintext health listener, topology spread,
   `automountServiceAccountToken: false`, every secret file-mounted),
   `migrate-job.yaml` (exactly-once schema migration, never per replica),
   `networkpolicy.yaml` (default-deny egress except DNS + Postgres/Redis scoped
   to their namespace, no `0.0.0.0/0` peer; ingress to the two pod ports),
-  `pdb.yaml` (`minAvailable: 2`), `kustomization.yaml`
-  (an `images` entry pointing at `ghcr.io/syavne/d-oauth-server:latest`), and
-  `tls-secret.example.yaml` (how to provision `/certs`, never applied). No
+  `pdb.yaml` (`minAvailable: 2`), `kustomization.yaml` (no `images:` override;
+  the mutable `:latest` tag lives in `deployment.yaml` / `migrate-job.yaml`),
+  and `tls-secret.example.yaml` (how to provision `/certs`, never applied). No
   Ingress is shipped: mTLS requires L4/TCP passthrough.
 - `compose.yaml` for the local 3-replica proof (one Postgres + one Redis,
   one-shot `migrate`, file-mounted dev secrets under `/run/secrets`, random
