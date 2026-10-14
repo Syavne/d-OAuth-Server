@@ -7,6 +7,15 @@
 
 cd "$SRC/d-oauth-server/fuzz"
 
+# The OSS-Fuzz base image exports CXX=clang++ with a CXXFLAGS that selects
+# libc++ (-stdlib=libc++). libfuzzer-sys's build script compiles libFuzzer's
+# C++ runtime with those flags, but rustc/cc links the C++ stdlib as libstdc++
+# (-lstdc++), so the runtime's libc++ (std::__1::) symbols end up undefined at
+# link time. clang++ defaults to libstdc++ when the flag is absent, so drop it
+# to make the compiled runtime and the link line agree.
+CXXFLAGS="${CXXFLAGS:-}"
+export CXXFLAGS="${CXXFLAGS//-stdlib=libc++/}"
+
 cargo fuzz build -O --debug-assertions
 
 for target_path in fuzz_targets/*.rs; do

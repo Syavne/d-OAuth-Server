@@ -13,3 +13,14 @@ examine_globs = [
   "src/protocol/scope.rs",
   "src/protocol/redirect_repo.rs",
 ]
+
+# `examine_globs` only limits which files are mutated; cargo-mutants otherwise
+# runs the whole package suite, whose e2e/integration binaries need the shared
+# Postgres/Redis. Restrict the test run to the tests that cover the examined
+# modules (their unit tests plus the three pure property suites), which keeps
+# the leg container-free and fast enough for the mutation budget. The filter
+# is appended to every `cargo nextest run` cargo-mutants issues.
+additional_cargo_test_args = [
+  "-E",
+  "test(crypto::ct) | test(crypto::pkce) | test(crypto::tokens) | test(protocol::scope) | test(protocol::redirect_repo) | binary(proptest_pkce) | binary(proptest_scope) | binary(proptest_redirect)",
+]

@@ -128,6 +128,14 @@ cargo fuzz build                       # every target must compile
 cargo fuzz run <target> -- -max_total_time=60 -rss_limit_mb=2048
 ```
 
+The containerized (ClusterFuzzLite/OSS-Fuzz) build runs inside the Rust base
+image, which exports `CXX=clang++` with a `CXXFLAGS` selecting libc++. That
+breaks the link: libfuzzer-sys compiles libFuzzer's C++ runtime with `$CXX`,
+but rustc/`cc` links the C++ stdlib as `-lstdc++`, so the runtime's libc++
+(`std::__1::`) symbols go undefined. `.clusterfuzzlite/build.sh` drops
+`-stdlib=libc++` before building (clang++ then defaults to libstdc++), and the
+image pins `cargo-fuzz` so the tool cannot drift.
+
 Corpora persist across runs: `cargo fuzz run` reads and writes
 `fuzz/corpus/<target>/` (gitignored, but cached across CI runs by the
 `fuzz-run` leg), and crashes land in `fuzz/artifacts/<target>/`. To grow a

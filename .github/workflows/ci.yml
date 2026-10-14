@@ -352,6 +352,11 @@ jobs:
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-mutants
+      # cargo-mutants runs the baseline and every mutant via `cargo nextest run`.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: nextest
       - name: Budgeted mutation run (see .cargo/mutants.toml)
         run: cargo mutants --timeout 1800 --test-tool nextest
 
@@ -432,7 +437,9 @@ jobs:
           # Relaxed isolation for the first scheduled runs (wall-clock/env
           # access); tighten in a follow-up once green.
           MIRIFLAGS: -Zmiri-disable-isolation
+        # `+nightly` overrides the root `rust-toolchain.toml` stable pin, which
+        # would otherwise resolve `cargo miri` to stable (where miri is absent).
         run: >
-          cargo miri test --lib --
+          cargo +nightly miri test --lib --
           crypto::ct crypto::pkce crypto::tokens
           jose::jar
