@@ -275,9 +275,10 @@ A correct Deployment has these properties:
   environment or baked into the image.
 - A `NetworkPolicy` that default-denies pod egress except DNS, Postgres, and
   Redis, and admits ingress only on the two pod ports (see below).
-- A digest-pinned image reference. The release pipeline replaces the committed
-  placeholder digest in `kustomization.yaml` with the signed build digest;
-  `:latest` is never a shippable reference.
+- The `ghcr.io/syavne/d-oauth-server:latest` image reference that
+  `kustomization.yaml` applies. `:latest` is mutable, so a rollout is only as
+  fresh as the last pull; that is a deliberate convenience tradeoff, not an
+  immutable pin.
 - Client-CA material mounted read-only if in-process mTLS is used. The Postgres
   CA for `sslmode=verify-full` is mounted at `/certs/db-ca.crt` and pinned with
   `database.root_cert_path` (`d-oauth-tls` also carries a `db-ca.crt` key).
@@ -527,9 +528,8 @@ on:
   publishes `<X.Y.Z>`, `<X.Y>`, `<X>`, and `latest`, and creates a GitHub
   Release with generated notes (a pre-release such as `v1.2.3-rc1` gets only
   `<X.Y.Z>`). No `sha-<commit>` tags are published. These tags are convenience
-  references only; a production rollout still pins the digest (see
-  [Deploy path](#deploy-path-use-the-signed-ghcrio-image)). `pin-digest` runs
-  only on master/scheduled builds, never on a tag.
+  references; the deploy path applies the mutable `latest` tag (see
+  [Deploy path](#deploy-path-use-the-ghcrio-image)).
 - Registry cleanup (job `cleanup`, weekly + manual): GHCR has no retention and
   keeps superseded manifests as untagged versions, so the job deletes untagged
   manifests and the legacy `sha-*` tags, keeping `latest` and every release tag.
@@ -544,40 +544,31 @@ on:
   `Keyless sign (cosign, OIDC)`: `cosign sign` on the merged index digest,
   stored as an OCI 1.1 referrer/bundle; the per-arch SBOM and SLSA provenance
   attestations are attached by the `build` legs).
-- Digest pinning (job `pin-digest`, step
-  `Pin kustomization to the built digest + strict lint`): the signed merge
-  digest overwrites `images[].digest` in `deploy/k8s/kustomization.yaml`,
-  then re-runs `python3 scripts/check_manifests.py --strict-digest`, with a
-  periodic rebuild so base digests advance.
 - `cargo deny check` in CI, which enforces the ring-only TLS policy in
   `deny.toml`.
 - A per-PR fuzz build plus a scheduled bounded run of every fuzz target
   (`.github/workflows/ci.yml`); a crash uploads its artifact and fails the run.
 
-### Deploy path: use the signed `ghcr.io` image
+### Deploy path: use the `ghcr.io` image
 
 The only shippable artifact is the signed registry image, never a locally
-built tarball. Every rollout verifies provenance before applying anything,
-then records the exact digest it shipped:
+built tarball. Every rollout verifies provenance before applying anything:
 
 ```bash
-# 1. Read the pinned digest the `pin-digest` job committed.
-grep -A2 'name: ghcr.io/syavne/d-oauth-server' deploy/k8s/kustomization.yaml
-
-# 2. Verify the keyless cosign signature from the `merge` job's
+# 1. Verify the keyless cosign signature from the `merge` job's
 #    `Keyless sign (cosign, OIDC)` step before pulling or applying.
-#    Match the identity to the signing workflow; the placeholder below
-#    stands for the real digest from step 1 (no real digest is recorded here).
+#    Match the identity to the signing workflow. The tag resolves to the
+#    current digest at verify time.
 cosign verify \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'supply-chain' \
-  'ghcr.io/syavne/d-oauth-server@sha256:<digest>'
+  'ghcr.io/syavne/d-oauth-server:latest'
 
-# 3. Confirm the manifests resolve to that digest and pass policy.
+# 2. Confirm the manifests resolve and pass policy.
 kustomize build deploy/k8s
-python3 scripts/check_manifests.py --strict-digest
+python3 scripts/check_manifests.py
 
-# 4. Roll out (migration Job first; the Deployment readiness gate waits for it).
+# 3. Roll out (migration Job first; the Deployment readiness gate waits for it).
 kubectl apply --dry-run=server -k deploy/k8s
 kubectl apply -k deploy/k8s
 ```
@@ -587,11 +578,16 @@ Sigstore bundles, not the legacy `sha256-<digest>.sig` tag; verify with a
 cosign v3+ client (cosign v2.6+ can read them with `--new-bundle-format`). The
 `cosign verify` flags above are unchanged from v2.
 
-Record the shipped `sha256:<digest>` in [RUNBOOK.md](../RUNBOOK.md)
-(deploy provenance entry: digest, `sbom.spdx.json` / `trivy.sarif` run, and
-the `cosign verify` result). A rollout with no matching record is an
-unverified deploy: stop and re-verify. `:latest` is never a shippable
-reference.
+The manifests apply `ghcr.io/syavne/d-oauth-server:latest`, a mutable tag. A
+rollout picks up whatever digest the tag points at when the node pulls it, so
+two nodes can briefly run different builds mid-rollout, and a later re-apply
+can pull a newer image than the one you verified. That is the deliberate
+tradeoff for a simple, low-ceremony admin flow; treat the tag as a convenience
+reference, not an immutable pin. Record the rollout in
+[RUNBOOK.md](../RUNBOOK.md) (deploy provenance entry: the digest the tag
+resolved to, the `sbom.spdx.json` / `trivy.sarif` run, and the `cosign verify`
+result). A rollout with no matching record is an unverified deploy: stop and
+re-verify.
 
 ### Fallback: local build (unsigned host, sign and verify locally)
 
@@ -603,21 +599,20 @@ live host:
 ```bash
 # 1. Build the same target CI signs.
 docker buildx bake image --set image.platform=linux/amd64
-docker images --digests d-oauth-server
 
-# 2. Sign the local digest and verify it before loading or running.
+# 2. Sign the local image and verify it before loading or running.
 #    (Keyless OIDC is unavailable off CI, so a local key stands in;
 #    keep the private key off the target host.)
-cosign sign --key <local-key-ref> 'd-oauth-server@sha256:<digest>'
-cosign verify --key <local-pub-ref> 'd-oauth-server@sha256:<digest>'
+cosign sign --key <local-key-ref> 'd-oauth-server:latest'
+cosign verify --key <local-pub-ref> 'd-oauth-server:latest'
 
-# 3. Record the local `sha256:<digest>` and the verify result in RUNBOOK.md
-#    as an explicitly local, non-`ghcr.io` deploy.
+# 3. Load the verified image and record the deploy in RUNBOOK.md as an
+#    explicitly local, non-`ghcr.io` rollout.
 ```
 
 Prefer the signed `ghcr.io` path for every production rollout; the fallback
-exists so an air-gapped host still gets a sign/verify step and a recorded
-digest, not an anonymous tarball.
+exists so an air-gapped host still gets a sign/verify step, not an anonymous
+tarball.
 
 ## Security properties
 
@@ -651,13 +646,16 @@ digest, not an anonymous tarball.
   the process.
 - A CNI that does not enforce NetworkPolicy leaves pod egress unrestricted;
   verify the cluster CNI applies the policy before relying on it.
-- Shipping the committed placeholder digest without running the release
-  pipeline fails closed: the image cannot be pulled. Run `pin-digest` first.
+- Re-applying the manifests after a new push rolls forward: `:latest` is
+  mutable, so an unchanged manifest can still pull a newer build than the one
+  you verified.
 
 ## Operational runbook
 
-- Roll out a new image by updating the Deployment digest; the migration Job
-  runs first.
+- Roll out a new image by re-applying the manifests; they track
+  `ghcr.io/syavne/d-oauth-server:latest`, and the migration Job runs first. To
+  roll a specific build instead, point the `images` entry at a release tag such
+  as `<X.Y.Z>`.
 - Probe commands inside the pod network:
 
 ```bash
@@ -687,8 +685,7 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
   SBOM + provenance, a `merge` job that assembles the multi-arch manifest
   (`docker buildx imagetools create`) and runs the trivy/grype HIGH/CRITICAL
   gates (uploading the trivy SARIF to code scanning) plus keyless cosign
-  signing, digest pinning of
-  `deploy/k8s/kustomization.yaml`, and the weekly rebuild.
+  signing, and the weekly rebuild.
 - `deploy/k8s/` for the cluster manifests: `namespace.yaml`, `configmap.yaml`
   (non-secret settings only, including the passwordless DSNs), `secret.yaml`
   (placeholder secrets — pepper, TOTP key, PII key, database and Redis
@@ -701,9 +698,9 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/live
   `networkpolicy.yaml` (default-deny egress except DNS + Postgres/Redis scoped
   to their namespace, no `0.0.0.0/0` peer; ingress to the two pod ports),
   `pdb.yaml` (`minAvailable: 2`), `kustomization.yaml`
-  (committed placeholder digest; the release pipeline pins the real image
-  digest here), and `tls-secret.example.yaml` (how to provision `/certs`,
-  never applied). No Ingress is shipped: mTLS requires L4/TCP passthrough.
+  (an `images` entry pointing at `ghcr.io/syavne/d-oauth-server:latest`), and
+  `tls-secret.example.yaml` (how to provision `/certs`, never applied). No
+  Ingress is shipped: mTLS requires L4/TCP passthrough.
 - `compose.yaml` for the local 3-replica proof (one Postgres + one Redis,
   one-shot `migrate`, file-mounted dev secrets under `/run/secrets`, random
   host ports so `--scale app=3` never collides).

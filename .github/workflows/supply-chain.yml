@@ -7,11 +7,10 @@
 # no QEMU), each pushed by digest with SBOM + provenance; the `merge` job then
 # assembles the multi-arch manifest (`imagetools create`), publishes it under
 # the mutable `latest` tag, scans it (trivy/grype gate HIGH/CRITICAL, syft SBOM
-# artifact), keyless-signs the index with cosign, and `pin-digest` writes the
-# index digest into `deploy/k8s/kustomization.yaml` (strict lint re-run).
+# artifact), and keyless-signs the index with cosign.
 # Release tags (`v*`): the merged multi-arch image is published under semver
 # tags (X.Y.Z, X.Y, X, `latest`; a pre-release tag gets only X.Y.Z) and a GitHub
-# Release is created. `pin-digest` does not run on a tag (it tracks master).
+# Release is created.
 # No `sha-<commit>` tag is published: a master push only moves `latest`, and
 # GHCR keeps the superseded (now-untagged) manifests until they are pruned.
 # Scheduled legs (weekly rebuild, Monday 04:00 UTC): rebuild + rescan + resign
@@ -216,39 +215,6 @@ jobs:
           COSIGN_YES: "true"
         run: |
           cosign sign "${REGISTRY_IMAGE}@${{ steps.merge.outputs.digest }}"
-
-  pin-digest:
-    name: pin-digest
-    needs: [merge]
-    # Only master/scheduled builds advance the committed digest; a release tag
-    # must not rewrite kustomization.
-    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.x"
-      - name: Pin kustomization to the built digest + strict lint
-        env:
-          DIGEST: ${{ needs.merge.outputs.digest }}
-        run: |
-          pip install pyyaml
-          python3 - "${DIGEST}" <<'EOF'
-          import sys
-          from pathlib import Path
-          import yaml
-          digest = sys.argv[1]
-          assert digest.startswith("sha256:"), f"bad digest: {digest}"
-          path = Path("deploy/k8s/kustomization.yaml")
-          doc = yaml.safe_load(path.read_text())
-          for img in doc.get("images", []):
-              if img.get("name") == "ghcr.io/syavne/d-oauth-server":
-                  img.pop("newTag", None)
-                  img["digest"] = digest
-          path.write_text(yaml.safe_dump(doc, sort_keys=False))
-          EOF
-          python3 scripts/check_manifests.py --strict-digest
 
   release:
     name: release

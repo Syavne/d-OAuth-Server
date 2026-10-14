@@ -183,39 +183,35 @@ correlation. No step below writes a secret to a log.
 - Do not paste the leaked registration tokens, client secrets, or the pepper
   into a ticket, chat, or log.
 
-## 6. Deploy provenance (signed image + digest record)
+## 6. Deploy provenance (signed `ghcr.io` image)
 
 Every rollout ships the signed `ghcr.io/syavne/d-oauth-server` image the
-`supply-chain.yml` `merge` job signed (step `Keyless sign (cosign, OIDC)`)
-and the `pin-digest` job pinned into `deploy/k8s/kustomization.yaml`
-(step `Pin kustomization to the built digest + strict lint`). Nothing ships
-from an unverified local tarball. The full path is in
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#deploy-path-use-the-signed-ghcrio-image).
+`supply-chain.yml` `merge` job signed (step `Keyless sign (cosign, OIDC)`).
+Nothing ships from an unverified local tarball. The full path is in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#deploy-path-use-the-ghcrio-image).
 
-- [ ] Read the digest the `pin-digest` job committed:
-  `grep -A2 'name: ghcr.io/syavne/d-oauth-server' deploy/k8s/kustomization.yaml`.
-- [ ] Verify it before applying (placeholder `sha256:<digest>` stands for the
-  value from the previous step; no real digest is recorded here; signatures are
-  cosign v3 OCI 1.1 referrers, so use a cosign v3+ client):
+- [ ] Verify the signature before applying (the `latest` tag resolves to the
+  current digest at verify time; signatures are cosign v3 OCI 1.1 referrers, so
+  use a cosign v3+ client):
 
   ```sh
   cosign verify \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     --certificate-identity-regexp 'supply-chain' \
-    'ghcr.io/syavne/d-oauth-server@sha256:<digest>'
+    'ghcr.io/syavne/d-oauth-server:latest'
   kustomize build deploy/k8s
-  python3 scripts/check_manifests.py --strict-digest
+  python3 scripts/check_manifests.py
   kubectl apply --dry-run=server -k deploy/k8s
   kubectl apply -k deploy/k8s
   ```
 
-- [ ] Record the rollout: the shipped `sha256:<digest>`, the `build` run that
-  produced the `sbom.spdx.json` artifact and `trivy.sarif`, and the
-  `cosign verify` result. A rollout with no matching record is unverified:
-  stop and re-verify.
+- [ ] Record the rollout: the digest the `latest` tag resolved to (from the
+  `cosign verify` output), the `build` run that produced the `sbom.spdx.json`
+  artifact and `trivy.sarif`, and the `cosign verify` result. A rollout with no
+  matching record is unverified: stop and re-verify.
 - [ ] Local-build fallback only (registry unreachable): build with
-  `docker buildx bake image --set image.platform=linux/amd64`, sign with
-  `cosign sign --key <local-key-ref>`, confirm with
-  `cosign verify --key <local-pub-ref>`, then record the local digest as an
-  explicitly local, non-`ghcr.io` deploy. Never
-  `docker save | docker load` an unsigned image onto a live host.
+  `docker buildx bake image --set image.platform=linux/amd64`, sign and verify
+  the image with `cosign sign --key <local-key-ref> 'd-oauth-server:latest'`
+  and `cosign verify --key <local-pub-ref> 'd-oauth-server:latest'`, then load
+  the verified image and record the deploy as explicitly local, non-`ghcr.io`.
+  Never `docker save | docker load` an unsigned image onto a live host.

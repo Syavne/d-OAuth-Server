@@ -46,10 +46,6 @@ contract WITHOUT a live cluster:
 
 Usage:
   python3 scripts/check_manifests.py [--manifest-dir deploy/k8s]
-                                     [--strict-digest]
-
-`--strict-digest` (used by supply-chain CI after the pin step) additionally
-requires every workload image to be digest-pinned (`@sha256:<64 hex>`).
 """
 
 from __future__ import annotations
@@ -75,7 +71,6 @@ SECRET_NAME_RE = re.compile(
   r")"
 )
 PEM_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|-----BEGIN CERTIFICATE-----")
-DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
 HIGH_ENTROPY_VALUE_RE = re.compile(r"^[A-Za-z0-9+/=_-]{32,}$")
 # A DSN that carries `user:password@` (or `:password@`) embeds a credential.
 EMBEDDED_PASSWORD_RE = re.compile(r"://[^/@?#]*:[^/@?#]*@")
@@ -397,7 +392,7 @@ def check_networkpolicy(doc: dict, fails: Failures) -> None:
       fails.add(f"networkpolicy/{name}: egress must allow port {port}")
 
 
-def check_deployment(doc: dict, fails: Failures, strict_digest: bool) -> None:
+def check_deployment(doc: dict, fails: Failures) -> None:
   name = doc.get("metadata", {}).get("name", "?")
   spec = doc.get("spec", {})
   if spec.get("replicas") != 3:
@@ -452,13 +447,10 @@ def check_deployment(doc: dict, fails: Failures, strict_digest: bool) -> None:
           f"deployment/{name}/{cname}: {probe_name} must httpGet "
           f"{path} on port {HEALTH_PORT} (plaintext health listener)"
         )
-    image = container.get("image", "")
-    if strict_digest and not DIGEST_RE.search(image):
-      fails.add(f"deployment/{name}/{cname}: image must be digest-pinned")
     check_file_mounted_secrets(f"deployment/{name}", tpl, container, fails)
 
 
-def check_job(doc: dict, fails: Failures, strict_digest: bool) -> None:
+def check_job(doc: dict, fails: Failures) -> None:
   name = doc.get("metadata", {}).get("name", "?")
   spec = doc.get("spec", {}).get("template", {}).get("spec", {})
   if spec.get("restartPolicy") != "Never":
@@ -477,8 +469,6 @@ def check_job(doc: dict, fails: Failures, strict_digest: bool) -> None:
   ):
     fails.add(f"job/{name}: exactly one migrate Job must run `/d-oauth-server migrate`")
   for container in containers:
-    if strict_digest and not DIGEST_RE.search(container.get("image", "")):
-      fails.add(f"job/{name}: image must be digest-pinned")
     check_file_mounted_secrets(f"job/{name}", spec, container, fails)
 
 
@@ -517,7 +507,6 @@ def check_l7_mtls(docs: list[dict], fails: Failures) -> None:
 def main() -> int:
   parser = argparse.ArgumentParser()
   parser.add_argument("--manifest-dir", default="deploy/k8s")
-  parser.add_argument("--strict-digest", action="store_true")
   args = parser.parse_args()
 
   fails = Failures()
@@ -543,9 +532,9 @@ def main() -> int:
     name = (doc.get("metadata") or {}).get("name")
     check_configmap(doc, fails, requires_dsn=name in required_dsn_configmaps)
   for doc in by_kind(docs, "Deployment"):
-    check_deployment(doc, fails, args.strict_digest)
+    check_deployment(doc, fails)
   for doc in by_kind(docs, "Job"):
-    check_job(doc, fails, args.strict_digest)
+    check_job(doc, fails)
   for doc in by_kind(docs, "PodDisruptionBudget"):
     check_pdb(doc, fails)
   for doc in by_kind(docs, "Service"):
@@ -555,7 +544,7 @@ def main() -> int:
   check_l7_mtls(docs, fails)
 
   if fails.ok():
-    print(f"manifest lint: OK ({len(docs)} documents, strict-digest={args.strict_digest})")
+    print(f"manifest lint: OK ({len(docs)} documents)")
     return 0
   print(f"manifest lint: {len(fails.items)} failure(s):")
   for item in fails.items:

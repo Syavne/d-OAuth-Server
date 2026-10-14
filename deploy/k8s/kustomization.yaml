@@ -3,14 +3,9 @@
 # Validate: `kustomize build deploy/k8s`
 # Dry-run against a cluster: `kubectl apply --dry-run=server -k deploy/k8s`
 #
-# Release pinning: the `images` entry below carries a
-# placeholder digest, never a floating tag. The `pin-digest` job in
-# `.github/workflows/supply-chain.yml` overwrites `images[].digest` with the
-# digest of the signed multi-arch build (`docker buildx bake`) after every
-# push to main and re-runs `scripts/check_manifests.py --strict-digest`. The
-# per-workload `image:` fields in `deployment.yaml` / `migrate-job.yaml` also
-# carry the placeholder; this entry overrides them in `kustomize build`.
-# `:latest` is never a shippable reference.
+# Release images: the workloads in `deployment.yaml` / `migrate-job.yaml`
+# carry the mutable `:latest` tag directly, and no `images:` override is
+# applied, so `kustomize build` emits `:latest` as-is.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: d-oauth
@@ -23,13 +18,6 @@ resources:
   - migrate-job.yaml
   - pdb.yaml
   - networkpolicy.yaml
-images:
-  - name: ghcr.io/syavne/d-oauth-server
-    newName: ghcr.io/syavne/d-oauth-server
-    # Placeholder (all zeroes), not a pullable reference: a rollout without
-    # the pin step fails closed instead of silently floating on a tag. CI
-    # replaces this with the released `sha256:<digest>` after signing.
-    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 # NOTE: no Ingress resource is shipped on purpose. In-process mTLS
 # verification needs L4/TCP passthrough (NLB gateway / TLSRoute); an L7
 # ingress that terminates TLS strips the client certificate. Adding an

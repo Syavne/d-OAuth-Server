@@ -12,9 +12,8 @@
 # read-only rootfs, ALL capabilities dropped, `automountServiceAccountToken:
 # false`, and every secret (token pepper, TOTP key, mandatory PII key, DB/Redis
 # passwords) mounted as 0400 tmpfs files under `/run/secrets` (read through the
-# `*_FILE` variables) instead of env vars. The image carries the same placeholder
-# digest; `pin-digest` rewrites the real digest in `kustomization.yaml` for
-# every workload.
+# `*_FILE` variables) instead of env vars. It runs the same mutable `:latest`
+# image reference as the Deployment.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -46,9 +45,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: migrate
-          # Same pinning rule as the Deployment: placeholder digest, never a
-          # shippable `:latest`; CI resolves it via `kustomization.yaml`.
-          image: ghcr.io/syavne/d-oauth-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          # Same image reference as the Deployment: mutable `:latest`.
+          image: ghcr.io/syavne/d-oauth-server:latest
           imagePullPolicy: IfNotPresent
           # Overrides the image ENTRYPOINT (["/d-oauth-server","serve"]).
           command: ["/d-oauth-server", "migrate"]
