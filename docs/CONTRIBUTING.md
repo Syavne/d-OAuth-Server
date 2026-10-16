@@ -150,9 +150,14 @@ The containerized (ClusterFuzzLite/OSS-Fuzz) build runs inside the Rust base
 image, which exports `CXX=clang++` with a `CXXFLAGS` selecting libc++. That
 breaks the link: libfuzzer-sys compiles libFuzzer's C++ runtime with `$CXX`,
 but rustc/`cc` links the C++ stdlib as `-lstdc++`, so the runtime's libc++
-(`std::__1::`) symbols go undefined. `.clusterfuzzlite/build.sh` drops
-`-stdlib=libc++` before building (clang++ then defaults to libstdc++), and the
-image pins `cargo-fuzz` so the tool cannot drift.
+ (`std::__1::`) symbols go undefined. `.clusterfuzzlite/build.sh` drops
+`-stdlib=libc++` before building (clang++ then defaults to libstdc++). It also
+drops the ClusterFuzzLite-injected sanitizer `RUSTFLAGS`: applied globally,
+they instrument host proc-macro dylibs (e.g. `sqlx-macros`), which then fail
+at `dlopen` with `undefined symbol: __sancov_lowest_stack`. `cargo fuzz`
+re-applies its own scoped flags instead (same as the `ci.yml fuzz-build` leg).
+Per-target `rustflags` cannot fix this — host and target share one triple —
+and the image pins `cargo-fuzz` so the tool cannot drift.
 
 Corpora persist across runs: `cargo fuzz run` reads and writes
 `fuzz/corpus/<target>/` (gitignored, but cached across CI runs by the
