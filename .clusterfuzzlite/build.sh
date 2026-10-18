@@ -7,25 +7,22 @@
 
 cd "$SRC/d-oauth-server/fuzz"
 
-# The OSS-Fuzz base image exports CXX=clang++ with a CXXFLAGS that selects
-# libc++ (-stdlib=libc++). libfuzzer-sys's build script compiles libFuzzer's
-# C++ runtime with those flags, but rustc/cc links the C++ stdlib as libstdc++
-# (-lstdc++), so the runtime's libc++ (std::__1::) symbols end up undefined at
-# link time. clang++ defaults to libstdc++ when the flag is absent, so drop it
-# to make the compiled runtime and the link line agree.
-CXXFLAGS="${CXXFLAGS:-}"
-export CXXFLAGS="${CXXFLAGS//-stdlib=libc++/}"
-
-# ClusterFuzzLite exports sanitizer RUSTFLAGS globally (-Cpasses=sancov-module,
-# -Zsanitizer=address, ...). Cargo applies RUSTFLAGS to every unit including
-# host proc-macro dylibs; an instrumented proc-macro (e.g. sqlx-macros) then
-# fails at dlopen with `undefined symbol: __sancov_lowest_stack`, because the
-# sancov runtime links only into the final fuzz executable. Host and target
-# share the same triple here, so per-target rustflags would match proc-macros
-# too. Drop the inherited flags and let `cargo fuzz` re-apply its own scoped
-# sanitizer/coverage flags (the same mechanism `ci.yml fuzz-build` relies on,
-# which runs with no sanitizer env).
-unset RUSTFLAGS
+# Drop the OSS-Fuzz sanitizer C flags. The base image prepends
+# `-fsanitize=address ...` to CFLAGS/CXXFLAGS; the `cc`-compiled C/asm in a
+# dependency (ring, pulled by sqlx's `tls-rustls-ring-webpki` feature) then
+# carries ASan instrumentation. Those objects reach the *host* proc-macro
+# `sqlx-macros` through its dependency graph, and because rustc does not link
+# the ASan runtime into a proc-macro cdylib, that `.so` ends up with undefined
+# `__asan_*`/`__sancov_lowest_stack` symbols and rustc cannot dlopen it while
+# compiling `sqlx` (the scheduled `cflite-batch` failure). Dropping CXXFLAGS
+# also lets clang++ default to libstdc++: the image's `-stdlib=libc++` would
+# otherwise leave libFuzzer's C++ runtime (`std::__1::`) symbols undefined at
+# link time. The Rust code keeps full ASan + libFuzzer coverage -- `cargo fuzz`
+# supplies those Rust flags itself (the same scoped-flag mechanism `ci.yml
+# fuzz-build` relies on, and it runs with no sanitizer env) -- and the C parts
+# (libFuzzer runtime, ring) need no instrumentation for these pure-parser
+# targets.
+unset CFLAGS CXXFLAGS RUSTFLAGS
 
 cargo fuzz build -O --debug-assertions
 

@@ -147,17 +147,24 @@ cargo fuzz run <target> -- -max_total_time=60 -rss_limit_mb=2048
 ```
 
 The containerized (ClusterFuzzLite/OSS-Fuzz) build runs inside the Rust base
-image, which exports `CXX=clang++` with a `CXXFLAGS` selecting libc++. That
-breaks the link: libfuzzer-sys compiles libFuzzer's C++ runtime with `$CXX`,
-but rustc/`cc` links the C++ stdlib as `-lstdc++`, so the runtime's libc++
- (`std::__1::`) symbols go undefined. `.clusterfuzzlite/build.sh` drops
-`-stdlib=libc++` before building (clang++ then defaults to libstdc++). It also
-drops the ClusterFuzzLite-injected sanitizer `RUSTFLAGS`: applied globally,
-they instrument host proc-macro dylibs (e.g. `sqlx-macros`), which then fail
-at `dlopen` with `undefined symbol: __sancov_lowest_stack`. `cargo fuzz`
-re-applies its own scoped flags instead (same as the `ci.yml fuzz-build` leg).
-Per-target `rustflags` cannot fix this — host and target share one triple —
-and the image pins `cargo-fuzz` so the tool cannot drift.
+image, which prepends `-fsanitize=address …` to `CFLAGS`/`CXXFLAGS` and exports
+`CXX=clang++` with a `CXXFLAGS` selecting libc++. `.clusterfuzzlite/build.sh`
+drops `CFLAGS`/`CXXFLAGS`/`RUSTFLAGS` for the build:
+
+- The sanitizer C flags instrument the `cc`-compiled C/asm in a dependency
+  (`ring`, pulled by sqlx's `tls-rustls-ring-webpki` feature). Those objects
+  reach the host proc-macro `sqlx-macros` through its dependency graph, and
+  rustc does not link the ASan runtime into a proc-macro cdylib, so that `.so`
+  fails at `dlopen` with undefined `__asan_*`/`__sancov_lowest_stack`.
+- Dropping `CXXFLAGS` also removes `-stdlib=libc++`; libfuzzer-sys compiles
+  libFuzzer's C++ runtime with `$CXX` while rustc/`cc` links `-lstdc++`, so the
+  runtime's libc++ (`std::__1::`) symbols would otherwise go undefined. clang++
+  then defaults to libstdc++.
+
+The Rust code keeps full ASan + libFuzzer coverage: `cargo fuzz` supplies those
+Rust flags itself (the same scoped flags as the `ci.yml fuzz-build` leg, which
+runs with no sanitizer env). The image pins `cargo-fuzz` so the tool cannot
+drift.
 
 Corpora persist across runs: `cargo fuzz run` reads and writes
 `fuzz/corpus/<target>/` (gitignored, but cached across CI runs by the
