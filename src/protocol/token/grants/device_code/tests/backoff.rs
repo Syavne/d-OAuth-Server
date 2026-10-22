@@ -38,6 +38,7 @@ async fn test_grant_device_fast_poll_is_slow_down() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -135,6 +136,7 @@ async fn test_grant_device_denied_is_access_denied() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -194,6 +196,7 @@ async fn test_grant_device_interval_boundary_not_slow_down() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -334,6 +337,7 @@ async fn test_grant_device_denied_then_poll_stays_access_denied() -> TestResult 
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)

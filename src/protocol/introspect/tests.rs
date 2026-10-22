@@ -33,14 +33,15 @@ use crate::{
   config::Config,
   crypto::secret::{Argon2Params, hash_secret},
   db::{
-    NewClient, TokenEndpointAuthMethod, client_repo,
+    NewClient, TokenEndpointAuthMethod, client_repo, resource_repo,
     test_support::migrated_pool,
     user_repo::{self, NewUser, UserRecord},
   },
+  jose::jwt_access::{JwtAccessSigner, JwtClaims},
   protocol::{
     client_auth::ClientAuthRequest,
     revoke::{RevokeContext, RevokeOutcome, RevokeRequest, RevokeStores, revoke_tokens},
-    token::{ClientKind, MintRequest, SenderProof, TokenService},
+    token::{ClientKind, MintRequest, SenderProof, TokenFormat, TokenService},
   },
   state::{AppState, Clock, RedisConn},
   store::Store,
@@ -94,6 +95,9 @@ async fn harness() -> TestResult<Harness> {
     "token_pepper": "introspect-test-pepper-0123456789abcdef",
     "totp_encryption_key": "introspect-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "introspect-test-pii-key-0123456789abcdef",
+    "resource_indicators_enabled": true,
+    "jwt_access_tokens_enabled": true,
+    "jwt_signing_key": "bcdefghijklmnopqrstuvwxyzabcdefg",
   });
   let source = ::config::Config::try_from(&fixture)?;
   let config = Config::from_source(source)?;
@@ -135,6 +139,7 @@ async fn insert_client(
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   };
   client_repo::insert(pool, keys, false, &new).await?;
@@ -160,10 +165,14 @@ async fn mint_bound(
         &MintRequest {
           client_id: client_id.to_owned(),
           client_kind: ClientKind::Confidential,
+          dpop_required: false,
           subject: "user-1".to_owned(),
           scope: "orders:read".to_owned(),
           grant_id: unique("grant"),
           proof,
+          aud: Vec::new(),
+          refresh_aud: Vec::new(),
+          format: TokenFormat::Opaque,
         },
         now_unix(),
       )
@@ -195,7 +204,39 @@ async fn run_core(
   client_id: &str,
   secret: &str,
 ) -> TestResult<IntrospectionResponse> {
+  run_core_with_resources(h, token, hint, client_id, secret, &[]).await
+}
+
+/// Drive the core with an explicit validated `resource` set, mirroring the
+/// handler: the JWT signer is built from the harness config (never cached, so
+/// rotation takes effect).
+async fn run_core_with_resources(
+  h: &mut Harness,
+  token: &str,
+  hint: Option<&str>,
+  client_id: &str,
+  secret: &str,
+  resource: &[String],
+) -> TestResult<IntrospectionResponse> {
+  run_core_full(h, token, hint, client_id, secret, resource, true).await
+}
+
+/// Core driver with an explicit JWT-signer switch: `with_signer = false`
+/// reproduces the feature-flag-off handler (signer absent, so a JWT-shaped
+/// token introspects inactive).
+async fn run_core_full(
+  h: &mut Harness,
+  token: &str,
+  hint: Option<&str>,
+  client_id: &str,
+  secret: &str,
+  resource: &[String],
+  with_signer: bool,
+) -> TestResult<IntrospectionResponse> {
   let service = token_service(h)?;
+  let signer = with_signer
+    .then(|| JwtAccessSigner::from_config(&h.config))
+    .transpose()?;
   let mut stores = IntrospectStores {
     pool: &h.pool,
     keys: &h.config.keys,
@@ -205,7 +246,9 @@ async fn run_core(
   let ctx = IntrospectContext {
     issuer: &h.config.issuer,
     now_unix: now_unix(),
+    cimd: None,
     service: &service,
+    jwt_signer: signer.as_ref(),
   };
   let inputs = IntrospectHttpInputs {
     token,
@@ -216,6 +259,7 @@ async fn run_core(
     assertion_type: None,
     assertion: None,
     peer_certs: None,
+    resource,
   };
   Ok(introspect(&mut stores, &ctx, &inputs).await?)
 }
@@ -793,6 +837,7 @@ async fn test_introspect_after_revoke_endpoint_is_inactive() -> TestResult {
     let ctx = RevokeContext {
       token_endpoint: "https://auth.example.test/token",
       now: OffsetDateTime::now_utc(),
+      cimd: None,
       request_id: Some("req-introspect-revoke"),
     };
     let request = RevokeRequest {
@@ -800,7 +845,7 @@ async fn test_introspect_after_revoke_endpoint_is_inactive() -> TestResult {
       token_type_hint: None,
       auth: &auth,
     };
-    revoke_tokens(&mut stores, &ctx, &request).await?
+    revoke_tokens(&mut stores, &ctx, &request, None).await?
   };
   assert_eq!(
     outcome,
@@ -823,6 +868,48 @@ async fn test_introspect_after_revoke_endpoint_is_inactive() -> TestResult {
   Ok(())
 }
 
+/// Mint one token pair owned by `client_id` with an explicit audience.
+async fn mint_audience(
+  h: &mut Harness,
+  client_id: &str,
+  aud: &[&str],
+) -> TestResult<crate::protocol::token::MintedTokens> {
+  mint_audience_subject(h, client_id, aud, "user-1").await
+}
+
+/// Mint one token pair owned by `client_id` with an explicit audience and
+/// subject.
+async fn mint_audience_subject(
+  h: &mut Harness,
+  client_id: &str,
+  aud: &[&str],
+  subject: &str,
+) -> TestResult<crate::protocol::token::MintedTokens> {
+  let service = token_service(h)?;
+  let aud: Vec<String> = aud.iter().map(|value| (*value).to_owned()).collect();
+  Ok(
+    service
+      .mint(
+        &mut h.conn,
+        &h.store,
+        &MintRequest {
+          client_id: client_id.to_owned(),
+          client_kind: ClientKind::Confidential,
+          dpop_required: false,
+          subject: subject.to_owned(),
+          scope: "orders:read".to_owned(),
+          grant_id: unique("grant"),
+          proof: SenderProof::none(),
+          aud: aud.clone(),
+          refresh_aud: aud,
+          format: TokenFormat::Opaque,
+        },
+        now_unix(),
+      )
+      .await?,
+  )
+}
+
 /// Mint one token pair owned by `client_id` with an explicit subject.
 async fn mint_subject(
   h: &mut Harness,
@@ -838,10 +925,14 @@ async fn mint_subject(
         &MintRequest {
           client_id: client_id.to_owned(),
           client_kind: ClientKind::Confidential,
+          dpop_required: false,
           subject: subject.to_owned(),
           scope: "orders:read".to_owned(),
           grant_id: unique("grant"),
           proof: SenderProof::none(),
+          aud: Vec::new(),
+          refresh_aud: Vec::new(),
+          format: TokenFormat::Opaque,
         },
         now_unix(),
       )
@@ -1007,5 +1098,514 @@ async fn test_introspect_empty_and_unknown_subjects_stay_active() -> TestResult 
   .await?;
   assert!(response.active, "an unmapped subject must stay active");
   assert_eq!(response.sub.as_deref(), Some("synthetic-subject-9"));
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_enforces_requested_resource() -> TestResult {
+  let mut h = harness().await?;
+  let client_id = unique("resource-filter");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretBasic,
+    Some("resource-secret"),
+  )
+  .await?;
+  let audience_a = "https://a.introspect.test/";
+  let audience_b = "https://b.introspect.test/";
+  let audience_c = "https://c.introspect.test/";
+  for identifier in [audience_a, audience_b, audience_c] {
+    resource_repo::upsert(&h.pool, identifier, "introspect audience").await?;
+  }
+  let minted = mint_audience(&mut h, &client_id, &[audience_a, audience_b]).await?;
+  let auth = basic_header(&client_id, "resource-secret");
+  let access = &minted.access_token;
+
+  // RFC 7662 defines no `resource` parameter; this server accepts it as a
+  // local extension. A subset of the token audience stays active.
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={access}&resource={audience_a}"),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body.get("active").and_then(Value::as_bool),
+    Some(true),
+    "a requested audience contained in the token aud must stay active"
+  );
+
+  // Repeated values are a set: both members are present, order-insensitive.
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={access}&resource={audience_a}&resource={audience_b}"),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body.get("active").and_then(Value::as_bool),
+    Some(true),
+    "the complete repeated set must stay active"
+  );
+
+  // A requested audience the token is not bound to collapses to the inactive
+  // shape: no scope, client_id, sub, cnf, or expiry may leak.
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={access}&resource={audience_c}"),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body,
+    json!({"active": false}),
+    "a mismatched audience must not report token metadata"
+  );
+
+  // Absent `resource` keeps RFC 7662 introspection audience-agnostic.
+  let (status, body) = post_form(router(&h), Some(&auth), &format!("token={access}")).await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body.get("active").and_then(Value::as_bool),
+    Some(true),
+    "no resource parameter must preserve today's behavior"
+  );
+  assert_eq!(
+    body.get("scope").and_then(Value::as_str),
+    Some("orders:read"),
+    "an unfiltered active response keeps its metadata"
+  );
+
+  // The filter follows the token record, not the hint: the access token
+  // resolves through the refresh hint (RFC 7662 §2.1 fallback) and stays
+  // filtered, and the refresh token is filtered under its own hint.
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={access}&token_type_hint=refresh_token&resource={audience_c}"),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body,
+    json!({"active": false}),
+    "hint ordering must not bypass the audience filter"
+  );
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!(
+      "token={}&token_type_hint=refresh_token&resource={audience_a}",
+      minted.refresh_token
+    ),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body.get("active").and_then(Value::as_bool),
+    Some(true),
+    "a refresh token bound to the requested audience must stay active"
+  );
+
+  // An unbound token (empty aud) cannot satisfy any requested audience.
+  let empty = mint_audience(&mut h, &client_id, &[]).await?;
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={}&resource={audience_a}", empty.access_token),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body,
+    json!({"active": false}),
+    "an empty token audience must not satisfy a requested resource"
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_introspect_reports_aud() -> TestResult {
+  let mut h = harness().await?;
+  let client_id = unique("aud-report");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretBasic,
+    Some("secret-au"),
+  )
+  .await?;
+  let audience_a = "https://a.aud-introspect.test/";
+  let audience_b = "https://b.aud-introspect.test/";
+  for identifier in [audience_a, audience_b] {
+    resource_repo::upsert(&h.pool, identifier, "introspect audience").await?;
+  }
+  let auth = basic_header(&client_id, "secret-au");
+
+  // RFC 9068 §2.2 array shape: an aud-bound token reports the exact stored
+  // set as a JSON array, even though RFC 7662 §2.2 documents a string.
+  let minted = mint_audience(&mut h, &client_id, &[audience_a, audience_b]).await?;
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={}", minted.access_token),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(body.get("active").and_then(Value::as_bool), Some(true));
+  assert_eq!(
+    body.get("aud"),
+    Some(&json!([audience_a, audience_b])),
+    "the access token must report its exact stored audience set"
+  );
+
+  // A single audience is still a one-element array, never a bare string.
+  let single = mint_audience(&mut h, &client_id, &[audience_a]).await?;
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={}", single.access_token),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  let aud = body.get("aud").ok_or("aud member missing")?;
+  assert!(aud.is_array(), "aud must be a JSON array, not a string");
+  assert_eq!(aud, &json!([audience_a]));
+
+  // The same rule applies to a refresh record that carries an audience.
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!(
+      "token={}&token_type_hint=refresh_token",
+      minted.refresh_token
+    ),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(body.get("active").and_then(Value::as_bool), Some(true));
+  assert_eq!(
+    body.get("aud"),
+    Some(&json!([audience_a, audience_b])),
+    "a refresh record carrying an audience must report it"
+  );
+
+  // An unbound token omits the member entirely.
+  let unbound = mint_audience(&mut h, &client_id, &[]).await?;
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={}", unbound.access_token),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert!(body.get("aud").is_none(), "an unbound token must omit aud");
+
+  // A disabled subject collapses to the RFC 7662 §2.2 inactive shape with no
+  // audience leak, even when the record carries one.
+  let user = provision_user(&h, "aud-disabled@example.test").await?;
+  let disabled = mint_audience_subject(&mut h, &client_id, &[audience_a], &user.email).await?;
+  assert!(user_repo::disable_user(&h.pool, user.id).await?);
+  let (status, body) = post_form(
+    router(&h),
+    Some(&auth),
+    &format!("token={}", disabled.access_token),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(body, json!({"active": false}));
+  assert!(
+    body.get("aud").is_none(),
+    "an inactive response must not leak aud"
+  );
+
+  // An unknown token is inactive and carries no aud.
+  let (status, body) = post_form(router(&h), Some(&auth), "token=not-a-real-aud-token").await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(body, json!({"active": false}));
+  Ok(())
+}
+
+/// Mint one JWT access token owned by `client_id` through the configured
+/// signer (Todo 26 branch): the returned token verifies under the harness
+/// config, so the introspection JWT path must accept it.
+async fn mint_jwt(
+  h: &mut Harness,
+  client_id: &str,
+  aud: &[&str],
+  subject: &str,
+  proof: SenderProof,
+) -> TestResult<String> {
+  let signer = JwtAccessSigner::from_config(&h.config)?;
+  let service = token_service(h)?.with_jwt_signer(signer);
+  let aud: Vec<String> = aud.iter().map(|value| (*value).to_owned()).collect();
+  let minted = service
+    .mint(
+      &mut h.conn,
+      &h.store,
+      &MintRequest {
+        client_id: client_id.to_owned(),
+        client_kind: ClientKind::Confidential,
+        dpop_required: false,
+        subject: subject.to_owned(),
+        scope: "orders:read".to_owned(),
+        grant_id: unique("grant"),
+        proof,
+        aud: aud.clone(),
+        refresh_aud: aud,
+        format: TokenFormat::Jwt,
+      },
+      now_unix(),
+    )
+    .await?;
+  if minted.access_token.split('.').count() != 3 {
+    return Err("a jwt mint must return three JOSE segments".into());
+  }
+  Ok(minted.access_token)
+}
+
+/// Flip the first signature character so the token still parses but the
+/// signature breaks (flipping the last char trips base64 padding instead).
+fn tamper_signature(token: &str) -> String {
+  let mut parts: Vec<String> = token.split('.').map(str::to_owned).collect();
+  let sig = parts[2].clone();
+  let first = sig.chars().next().unwrap_or('a');
+  let replacement = if first == 'a' { 'b' } else { 'a' };
+  parts[2] = format!("{replacement}{}", &sig[1..]);
+  parts.join(".")
+}
+
+#[tokio::test]
+async fn test_introspect_dual_path() -> TestResult {
+  let mut h = harness().await?;
+  let client_id = unique("dual-owner");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &client_id,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some("secret-dual"),
+  )
+  .await?;
+  let foreign = unique("dual-foreign");
+  insert_client(
+    &h.pool,
+    &h.config.keys,
+    &foreign,
+    TokenEndpointAuthMethod::ClientSecretPost,
+    Some("secret-foreign"),
+  )
+  .await?;
+  let audience_a = "https://a.dual-introspect.test/";
+  let audience_b = "https://b.dual-introspect.test/";
+  let audience_c = "https://c.dual-introspect.test/";
+  for identifier in [audience_a, audience_b, audience_c] {
+    resource_repo::upsert(&h.pool, identifier, "dual audience").await?;
+  }
+
+  // Opaque regression: an opaque access token stays active with its stored
+  // aud, and a refresh hint still falls back to the access record.
+  let opaque = mint_audience_subject(&mut h, &client_id, &[audience_a], "opaque-sub").await?;
+  let response = run_core_full(
+    &mut h,
+    &opaque.access_token,
+    None,
+    &client_id,
+    "secret-dual",
+    &[],
+    true,
+  )
+  .await?;
+  assert!(response.active, "an opaque token must stay active");
+  assert_eq!(response.token_type.as_deref(), Some("Bearer"));
+  assert_eq!(response.aud, Some(vec![audience_a.to_owned()]));
+  let hinted = run_core_full(
+    &mut h,
+    &opaque.access_token,
+    Some("refresh_token"),
+    &client_id,
+    "secret-dual",
+    &[],
+    true,
+  )
+  .await?;
+  assert!(
+    hinted.active,
+    "an opaque token under a refresh hint must still resolve"
+  );
+  assert_eq!(hinted.token_type.as_deref(), Some("Bearer"));
+
+  // JWT: active with aud, token_type, client_id, sub, scope, exp/iat, cnf,
+  // and no leaked JOSE internals.
+  let jwt = mint_jwt(
+    &mut h,
+    &client_id,
+    &[audience_a, audience_b],
+    "jwt-subject-1",
+    SenderProof {
+      dpop_jkt: Some("dual-jkt".to_owned()),
+      mtls_x5t_s256: None,
+    },
+  )
+  .await?;
+  let before = now_unix();
+  let response = run_core_full(&mut h, &jwt, None, &client_id, "secret-dual", &[], true).await?;
+  assert!(response.active, "a live JWT must introspect active");
+  assert_eq!(response.client_id.as_deref(), Some(client_id.as_str()));
+  assert_eq!(response.scope.as_deref(), Some("orders:read"));
+  assert_eq!(response.sub.as_deref(), Some("jwt-subject-1"));
+  assert_eq!(response.token_type.as_deref(), Some("Bearer"));
+  assert_eq!(
+    response.aud,
+    Some(vec![audience_a.to_owned(), audience_b.to_owned()])
+  );
+  let cnf = response.cnf.as_ref().ok_or("cnf missing")?;
+  assert_eq!(cnf.jkt.as_deref(), Some("dual-jkt"));
+  let iat = response.iat.ok_or("iat missing")?;
+  let exp = response.exp.ok_or("exp missing")?;
+  assert!(exp > before, "exp must be in the future");
+  let ttl = i64::try_from(h.config.ttl.access.as_secs())?;
+  assert_eq!(exp - iat, ttl, "the JWT window rides the claims");
+  assert_eq!(response.act, None, "a JWT carries no sidecar act");
+  let json = serde_json::to_value(&response)?;
+  assert!(
+    json.get("jti").is_none(),
+    "the allowlist jti must never leak into the response"
+  );
+  assert!(
+    !serde_json::to_string(&json)?.contains(&jwt),
+    "the presented JWT must never be echoed"
+  );
+
+  // The hint is advisory for opaque lookups and irrelevant for JWTs: a
+  // refresh hint must not change the JWT verdict.
+  let hinted_jwt = run_core_full(
+    &mut h,
+    &jwt,
+    Some("refresh_token"),
+    &client_id,
+    "secret-dual",
+    &[],
+    true,
+  )
+  .await?;
+  assert!(
+    hinted_jwt.active,
+    "a token_type_hint must not change the JWT path"
+  );
+
+  // A JWT owned by another client collapses to the same inactive shape as
+  // an unknown token (RFC 7662 §2.2 indistinguishability).
+  let foreign_response =
+    run_core_full(&mut h, &jwt, None, &foreign, "secret-foreign", &[], true).await?;
+  assert!(
+    !foreign_response.active,
+    "a cross-client JWT must be inactive"
+  );
+  assert_eq!(foreign_response, IntrospectionResponse::inactive());
+
+  // A tampered signature, an unknown marker (signed but never minted), and
+  // an expired JWT are all inactive, never errors.
+  let tampered = tamper_signature(&jwt);
+  let response = run_core_full(
+    &mut h,
+    &tampered,
+    None,
+    &client_id,
+    "secret-dual",
+    &[],
+    true,
+  )
+  .await?;
+  assert!(!response.active, "a tampered JWT must be inactive");
+  let signer = JwtAccessSigner::from_config(&h.config)?;
+  let ghost = signer.sign(&JwtClaims {
+    iss: h.config.issuer.clone(),
+    sub: "ghost-subject".to_owned(),
+    aud: vec![audience_a.to_owned()],
+    scope: "orders:read".to_owned(),
+    exp: now_unix() + 3_600,
+    iat: now_unix(),
+    jti: unique("ghost-jti"),
+    client_id: client_id.clone(),
+    cnf: None,
+    act: None,
+  })?;
+  let response = run_core_full(&mut h, &ghost, None, &client_id, "secret-dual", &[], true).await?;
+  assert!(!response.active, "a JWT with no marker must be inactive");
+  let stale = signer.sign(&JwtClaims {
+    iss: h.config.issuer.clone(),
+    sub: "ghost-subject".to_owned(),
+    aud: vec![audience_a.to_owned()],
+    scope: "orders:read".to_owned(),
+    exp: now_unix() - 10,
+    iat: now_unix() - 3_610,
+    jti: unique("stale-jti"),
+    client_id: client_id.clone(),
+    cnf: None,
+    act: None,
+  })?;
+  let response = run_core_full(&mut h, &stale, None, &client_id, "secret-dual", &[], true).await?;
+  assert!(!response.active, "an expired JWT must be inactive");
+
+  // A disabled subject renders the live JWT inactive with no aud leak.
+  let user = provision_user(&h, "dual-disabled@example.test").await?;
+  let bound = mint_jwt(
+    &mut h,
+    &client_id,
+    &[audience_a],
+    &user.email,
+    SenderProof::none(),
+  )
+  .await?;
+  assert!(user_repo::disable_user(&h.pool, user.id).await?);
+  let response = run_core_full(&mut h, &bound, None, &client_id, "secret-dual", &[], true).await?;
+  assert!(
+    !response.active,
+    "a disabled subject's JWT must be inactive"
+  );
+  assert_eq!(response, IntrospectionResponse::inactive());
+
+  // Flag off: the same live JWT introspects inactive (never 5xx). The core
+  // returns `Ok`, so reaching this line already proves no error was raised.
+  let response = run_core_full(&mut h, &jwt, None, &client_id, "secret-dual", &[], false).await?;
+  assert!(!response.active, "a JWT with the flag off must be inactive");
+  assert_eq!(response, IntrospectionResponse::inactive());
+
+  // Request-`resource` parity over HTTP (handler validation included): a
+  // requested audience the JWT lacks is inactive; one it has stays active.
+  // The fixture client is `ClientSecretPost`, so the HTTP calls carry the
+  // credentials in the body (a Basic header against a post client is 401).
+  let credentials = format!("client_id={client_id}&client_secret=secret-dual");
+  let (status, body) = post_form(
+    router(&h),
+    None,
+    &format!("token={jwt}&resource={audience_c}&{credentials}"),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body,
+    json!({"active": false}),
+    "a JWT missing the requested resource must be inactive"
+  );
+  let (status, body) = post_form(
+    router(&h),
+    None,
+    &format!("token={jwt}&resource={audience_a}&{credentials}"),
+  )
+  .await?;
+  assert_eq!(status, StatusCode::OK);
+  assert_eq!(
+    body.get("active").and_then(Value::as_bool),
+    Some(true),
+    "a JWT carrying the requested resource must stay active"
+  );
   Ok(())
 }

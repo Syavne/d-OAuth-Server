@@ -3,16 +3,20 @@
 An OAuth 2.1-only authorization server written in Rust. It is deliberately not
 backwards compatible with OAuth 2.0: PKCE is mandatory, the implicit and
 resource-owner-password grants do not exist, bearer-in-query is rejected, and
-redirect URIs match exactly.
+redirect URIs match exactly (with the RFC 8252 §7.3 loopback exception, which
+includes the host `localhost` only when `allow_localhost_redirect` is set).
 
 It implements the authorization-code, refresh-token, client-credentials,
 device-code, and token-exchange grants, with DPoP, mTLS, PAR, JAR, dynamic
 client registration, introspection, and revocation. Tokens are opaque and
-hashed at rest. All durable domain state is in PostgreSQL and all ephemeral
-state is in Redis, so replicas are interchangeable.
+hashed at rest by default; an opt-in per-client or global `jwt` access-token
+format mints RFC 9068 `at+jwt` tokens verified against the AS JWKS. All
+durable domain state is in PostgreSQL and all ephemeral state is in Redis, so
+replicas are interchangeable.
 
 - Protocol and deltas: [docs/OAUTH.md](docs/OAUTH.md)
 - Threat model and token design: [docs/SECURITY.md](docs/SECURITY.md)
+- Resource-server contract (RFC 9728): [docs/RS-CONTRACT.md](docs/RS-CONTRACT.md)
 - Vulnerability reporting policy: [SECURITY.md](SECURITY.md)
 - Module layout and request flow: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Every configuration key: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
@@ -20,6 +24,7 @@ state is in Redis, so replicas are interchangeable.
 - Redis keys and durability: [docs/REDIS.md](docs/REDIS.md)
 - Container and cluster: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 - Admin CLI and runbooks: [docs/OPERATIONS.md](docs/OPERATIONS.md)
+- Resource-server onboarding runbook (RFC 9728): [docs/OPERATIONS.md](docs/OPERATIONS.md#resource-server-onboarding-rfc-9728)
 - Contributor guide: [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)
 - Changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 - Admin bootstrap procedure: [RUNBOOK.md](RUNBOOK.md)
@@ -140,8 +145,14 @@ curl -sk https://localhost:8080/token \
   -d code_verifier="$VERIFIER"
 ```
 
-5. A public client must present a DPoP proof with the token request; a
-   confidential client authenticates with its secret or an mTLS certificate.
+5. A DPoP-bound public client (`dpop_bound_access_tokens: true`) must present
+   a DPoP proof with the token request; an unbound public client (the
+   default) mints `Bearer` tokens with no proof. A confidential client
+   authenticates with its secret or an mTLS certificate.
+
+Rollout note: unbound public clients become bearer-capable on upgrade.
+Operators wanting DPoP-mandatory public clients register them with
+`dpop_bound_access_tokens: true`.
 
 The `POST /token` dispatcher and the `/register*` DCR routes (RFC 7591/RFC
 7592) are wired, so step 4 redeems a code end to end; a client can also be
@@ -288,6 +299,11 @@ certificate.
   `client attach-redirect-uri|detach-redirect-uri` accept
   `--kind authorize|post_logout` (default `authorize`); `post_logout` URIs are
   the return targets for `POST /logout` (`GET /logout` is read-only).
+- Resource indicators: `resource-server create|list|enable|disable|delete`
+  manage the RFC 8707 resource-server catalog (exact identifiers, no wildcard).
+- Access-token format: `client set-access-token-format --client-id <id>
+  --format opaque|jwt` is the operator-only opt-in to JWT access tokens;
+  dynamic registration always stores `opaque`.
 - Users and entitlements: `user create|enroll-totp|disable|unlock|grant-scope|revoke-scope|scopes`.
 - Admin: `admin bootstrap` (see [RUNBOOK.md](RUNBOOK.md)).
 - Declarative apply: `config sync --file` and `config check`.

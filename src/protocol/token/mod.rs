@@ -19,6 +19,6 @@ pub mod grants;
 pub use dispatch::{TokenForm, handler};
 pub use service::TokenService;
 pub use types::{
-  ClientKind, Cnf, FoundAccess, FoundRefresh, MintRequest, MintedTokens, SenderProof,
+  ClientKind, Cnf, FoundAccess, FoundRefresh, MintRequest, MintedTokens, SenderProof, TokenFormat,
   TokenServiceError,
 };

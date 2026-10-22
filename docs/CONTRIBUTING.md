@@ -200,7 +200,7 @@ Every module has a single responsibility:
 | Crypto primitives | `src/crypto/` | Constant-time compare, PKCE, token mint/hash, TOTP, secret hashing. |
 | Field encryption | `src/crypto/field.rs` | AES-256-GCM PII field codec and keyed-HMAC blind index. |
 | JOSE | `src/jose/` | DPoP, JAR, `private_key_jwt` verification, JWK parsing. |
-| Postgres repositories | `src/db/` | The six domain tables. |
+| Postgres repositories | `src/db/` | The seven domain tables. |
 | Redis store | `src/store/` | Ephemeral state: codes, tokens, grants, sessions, PAR, device, DCR, rate limits. |
 | Protocol handlers | `src/protocol/` | OAuth endpoints and grants. |
 | Server-rendered UI | `src/ui/` | Login, consent, and device pages. |

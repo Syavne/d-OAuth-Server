@@ -122,6 +122,7 @@ fn ctx_of(endpoint: &str) -> AuthContext<'_> {
   AuthContext {
     token_endpoint: endpoint,
     now: OffsetDateTime::now_utc(),
+    cimd: None,
   }
 }
 
@@ -171,6 +172,7 @@ async fn insert_client(
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   };
   client_repo::insert(pool, &keys, false, &new).await?;

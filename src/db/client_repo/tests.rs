@@ -60,6 +60,7 @@ fn confidential(client_id: &str) -> NewClient {
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   }
 }

@@ -1,13 +1,12 @@
 //! `test(dcr_manage)` delete suite: cross-client denial, DELETE, revocation,
 //! and Redis-loss survival.
 
-use uuid::Uuid;
-
 use testcontainers::{
   GenericImage, ImageExt as _,
   core::{IntoContainerPort, WaitFor},
   runners::AsyncRunner,
 };
+use uuid::Uuid;
 
 use super::delete::delete_client;
 use super::read_client;
@@ -17,7 +16,7 @@ use super::support::{
 };
 use crate::db::client_repo::{self, NewClient};
 use crate::error::OAuthErrorCode;
-use crate::protocol::token::{ClientKind, MintRequest, SenderProof, TokenService};
+use crate::protocol::token::{ClientKind, MintRequest, SenderProof, TokenFormat, TokenService};
 
 #[tokio::test]
 async fn dcr_manage_cross_client_forbidden() -> TestResult {
@@ -164,10 +163,14 @@ async fn dcr_manage_delete_revokes_tokens() -> TestResult {
         &MintRequest {
           client_id: registered.client_id.clone(),
           client_kind: ClientKind::Confidential,
+          dpop_required: false,
           subject: String::new(),
           scope: String::new(),
           grant_id: Uuid::new_v4().to_string(),
           proof: SenderProof::none(),
+          aud: Vec::new(),
+          refresh_aud: Vec::new(),
+          format: TokenFormat::Opaque,
         },
         now,
       )
@@ -183,10 +186,14 @@ async fn dcr_manage_delete_revokes_tokens() -> TestResult {
       &MintRequest {
         client_id: other.client_id.clone(),
         client_kind: ClientKind::Confidential,
+        dpop_required: false,
         subject: String::new(),
         scope: String::new(),
         grant_id: Uuid::new_v4().to_string(),
         proof: SenderProof::none(),
+        aud: Vec::new(),
+        refresh_aud: Vec::new(),
+        format: TokenFormat::Opaque,
       },
       now,
     )
@@ -363,6 +370,7 @@ async fn insert_thumbprint_client(
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: Some(registration_token_hash.to_owned()),
   };
   client_repo::insert(

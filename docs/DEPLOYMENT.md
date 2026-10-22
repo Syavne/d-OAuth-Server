@@ -266,7 +266,10 @@ A correct Deployment has these properties:
 - Resource requests and limits.
 - A `startupProbe` and `livenessProbe` on `/health/live`, and a
   `readinessProbe` on `/health/ready`, all an HTTP GET against the plaintext
-  health port. The public listener stays TLS-only.
+  health port. The public listener stays TLS-only. Never point a probe at
+  `GET /jwks.json`: it is the public JWT verification-key document and is
+  intentionally cacheable (`public, max-age=300`) by reverse proxies and
+  clients.
 - `terminationGracePeriodSeconds` greater than the drain deadline. The server
   uses a one second readiness propagation grace and a bounded drain below the
   grace budget.
@@ -445,7 +448,7 @@ encrypted backups, so those controls live with the operator. Apply at least:
 
 - **Separate the roles.** Run migrations as a schema-owning role that holds the
   `citext` privilege the `users` migration needs, and run replicas as a runtime
-  role limited to `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the six tables — no
+  role limited to `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the seven tables — no
   DDL, no superuser. The migration Job and the Deployment can then use different
   credentials.
 - **Encrypt the transport and pin the CA.** Production requires

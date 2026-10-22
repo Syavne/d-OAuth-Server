@@ -7,7 +7,7 @@ use super::{
 use crate::protocol::{
   scope::ScopeSet,
   token::{
-    ClientKind,
+    ClientKind, TokenFormat,
     grants::refresh_token::{RefreshInput, refresh},
   },
 };
@@ -231,12 +231,15 @@ async fn grant_refresh_narrow_drops_revoked_from_refresh_scope() -> TestResult {
     &RefreshInput {
       client_id: &client,
       client_kind: ClientKind::Public,
+      dpop_required: true,
       refresh_token: &minted.refresh_token,
       requested_scope: Some("read"),
+      requested_resources: &[],
       proof: &proof,
       enabled: &enabled,
       client_registered: &registered,
       user_entitled: &entitled,
+      token_format: TokenFormat::Opaque,
       now_unix: now_unix(),
     },
   )

@@ -58,6 +58,7 @@ async fn test_grant_device_expired_token_after_ttl() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)

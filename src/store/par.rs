@@ -15,6 +15,9 @@ pub struct ParRecord {
   pub client_id: String,
   /// Serialized authorized request parameters (JSON).
   pub request: String,
+  /// Resource audiences (RFC 8707) pinned to the request; empty when unbound.
+  #[serde(default)]
+  pub aud: Vec<String>,
 }
 
 impl ParRecord {
@@ -22,6 +25,7 @@ impl ParRecord {
     vec![
       ("client_id".to_owned(), self.client_id.clone()),
       ("request".to_owned(), self.request.clone()),
+      ("aud".to_owned(), super::aud::encode(&self.aud)),
     ]
   }
 
@@ -30,6 +34,7 @@ impl ParRecord {
     Ok(Self {
       client_id: get("client_id")?,
       request: get("request")?,
+      aud: super::aud::decode(map.get("aud"))?,
     })
   }
 }

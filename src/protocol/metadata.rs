@@ -9,14 +9,21 @@
 //! no restart. When Postgres is unavailable the endpoint fails closed with `503
 //! temporarily_unavailable` rather than advertising an unknown scope list.
 //!
-//! No `jwks_uri`: the AS signs nothing (there is no AS JWT-signing key), and
-//! `code_challenge_methods_supported` advertises `S256` only — `plain` is
+//! The JWT access-token feature adds two conditional members: `jwks_uri`
+//! (RFC 8414 §2), pointing at `GET /jwks.json`, and
+//! `access_token_signing_alg_values_supported` (RFC 9068 §2.1), whose list is
+//! exactly the configured `jwt_access_token_signing_alg`. Both are ABSENT
+//! unless `jwt_access_tokens_enabled` is set, so a client never sees a key or
+//! an algorithm the signer would not honor. There is no RSA branch: the
+//! signer produces `ES256` or `EdDSA` only.
+//!
+//! `code_challenge_methods_supported` advertises `S256` only; `plain` is
 //! never offered.
 
 use axum::{Json, extract::State};
 use serde::Serialize;
 
-use crate::{db::scope_repo, error::AppError, state::AppState};
+use crate::{config::JwtSigningAlg, db::scope_repo, error::AppError, state::AppState};
 
 /// The five grant types this server supports (RFC 6749, RFC 8628, RFC 8693).
 pub const GRANT_TYPES_SUPPORTED: [&str; 5] = [
@@ -103,6 +110,45 @@ pub struct AuthorizationServerMetadata {
   pub authorization_response_iss_parameter_supported: bool,
   /// Enabled scope catalog (single source of truth: the `scopes` table).
   pub scopes_supported: Vec<String>,
+  /// RFC 9728 §4 resource identifiers this AS can mint tokens for. Omitted
+  /// unless `protected_resources_enabled` is set. `resource_metadata` is a
+  /// resource-server `WWW-Authenticate` parameter (§5.1), never an AS member.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub protected_resources: Option<Vec<String>>,
+  /// Whether the RFC 8707 `resource` request parameter is honored.
+  ///
+  /// A vetted LOCAL EXTENSION: RFC 8707 registers only the `resource`
+  /// parameter (RFC 8707 §5.1) and the `invalid_target` error (§5.2); it
+  /// defines no authorization-server metadata member. The member is emitted
+  /// as `true` only when `resource_indicators_enabled` is set and is ABSENT
+  /// (not `false`) otherwise, so a client never sees a capability the server
+  /// would reject with `invalid_target`.
+  #[serde(skip_serializing_if = "std::ops::Not::not")]
+  pub resource_indicators_supported: bool,
+  /// Whether a `client_id` URL may name a Client ID Metadata Document.
+  ///
+  /// The CIMD draft's "Authorization Server Metadata" section
+  /// (`draft-ietf-oauth-client-id-metadata-document-02` §6) registers this
+  /// Boolean in the RFC 8414 metadata document; it is emitted as `true` only
+  /// when `cimd_enabled` is set and is ABSENT (not `false`) otherwise. Client
+  /// interoperability requires it TOGETHER with `none` in
+  /// [`Self::token_endpoint_auth_methods_supported`]: mainstream MCP clients
+  /// select CIMD only when both are present (the CIMD client is a public
+  /// client unless its document publishes a key, §4.1).
+  #[serde(skip_serializing_if = "std::ops::Not::not")]
+  pub client_id_metadata_document_supported: bool,
+  /// Public JWK Set (RFC 7517 §5) for verifying the AS's own signed access
+  /// tokens (RFC 9068 §4). Omitted unless `jwt_access_tokens_enabled` is set.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub jwks_uri: Option<String>,
+  /// JWS algorithms the access-token signer can produce (RFC 9068 §2.1).
+  ///
+  /// Exactly the configured `jwt_access_token_signing_alg` (`ES256` or
+  /// `EdDSA`), never a broader list: the signer has no RSA branch, so
+  /// advertising `RS256` would name an algorithm no key can produce. Omitted
+  /// unless `jwt_access_tokens_enabled` is set.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub access_token_signing_alg_values_supported: Option<Vec<String>>,
 }
 
 impl AuthorizationServerMetadata {
@@ -111,7 +157,17 @@ impl AuthorizationServerMetadata {
   /// `issuer` is validated elsewhere to be absolute `https` with no trailing
   /// slash, so endpoint paths append directly.
   #[must_use]
-  pub fn for_issuer(issuer: &str, scopes_supported: Vec<String>) -> Self {
+  pub fn for_issuer(
+    issuer: &str,
+    scopes_supported: Vec<String>,
+    protected_resources: Option<Vec<String>>,
+    resource_indicators_supported: bool,
+    client_id_metadata_document_supported: bool,
+    jwt_signing_alg: Option<JwtSigningAlg>,
+  ) -> Self {
+    let jwks_uri = jwt_signing_alg.map(|_| endpoint(issuer, "/jwks.json"));
+    let access_token_signing_alg_values_supported =
+      jwt_signing_alg.map(|alg| vec![alg.as_str().to_owned()]);
     Self {
       issuer: issuer.to_owned(),
       authorization_endpoint: endpoint(issuer, "/authorize"),
@@ -132,6 +188,11 @@ impl AuthorizationServerMetadata {
       tls_client_certificate_bound_access_tokens: true,
       authorization_response_iss_parameter_supported: true,
       scopes_supported,
+      protected_resources,
+      resource_indicators_supported,
+      client_id_metadata_document_supported,
+      jwks_uri,
+      access_token_signing_alg_values_supported,
     }
   }
 }
@@ -152,9 +213,21 @@ pub async fn metadata(
   let rows = scope_repo::list_enabled(&state.pool).await?;
   let mut scopes: Vec<String> = rows.into_iter().map(|row| row.name).collect();
   scopes.sort();
+  let protected_resources = state
+    .config
+    .protected_resources_enabled
+    .then(|| state.config.protected_resource_ids.clone());
+  let jwt_signing_alg = state
+    .config
+    .jwt_access_tokens_enabled
+    .then_some(state.config.jwt_access_token_signing_alg);
   Ok(Json(AuthorizationServerMetadata::for_issuer(
     &state.config.issuer,
     scopes,
+    protected_resources,
+    state.config.resource_indicators_enabled,
+    state.config.cimd_enabled,
+    jwt_signing_alg,
   )))
 }
 

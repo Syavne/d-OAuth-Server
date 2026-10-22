@@ -34,13 +34,13 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use axum::response::IntoResponse;
+use identity::{client_bucket_raw, client_ip, counter_key, extract_client_id};
 use redis::Script;
 use serde::Serialize;
 use tower::{Layer, Service};
 
 use crate::config::RateLimitConfig;
 use crate::state::AppState;
-use identity::{client_bucket_raw, client_ip, counter_key, extract_client_id};
 
 #[cfg(test)]
 mod test_support;

@@ -248,8 +248,9 @@ pub const fn redact_token(_token: &str) -> &'static str {
 
 #[cfg(test)]
 mod crypto_tests {
-  use super::*;
   use std::collections::HashSet;
+
+  use super::*;
 
   fn is_base64url(s: &str) -> bool {
     s.bytes()

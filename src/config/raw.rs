@@ -9,11 +9,20 @@ use serde::Deserialize;
 
 use super::{
   db::RawDbConfig,
+  jwt::JwtSigningAlg,
   policy::RawFailurePolicy,
   redis::RawRedisConfig,
   scope::{RawScopeDefinition, RawTokenExchangeRule},
   types::{DcrRedirectPolicy, Environment, RawArgon2, RawRateLimit, RawTtlConfig},
 };
+
+/// Raw `{kid, key}` entry of `jwt_signing_previous_keys`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct RawJwtSigningKey {
+  pub kid: Option<String>,
+  pub key: Option<String>,
+}
 
 /// Raw `tls` block.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -67,4 +76,29 @@ pub(crate) struct RawConfig {
   pub scope_registry: Vec<RawScopeDefinition>,
   pub allow_token_exchange: bool,
   pub token_exchange_allowlist: Vec<RawTokenExchangeRule>,
+  pub resource_indicators_enabled: bool,
+  pub cimd_enabled: bool,
+  pub protected_resources_enabled: bool,
+  #[serde(default, deserialize_with = "crate::config::deserialize_string_or_vec")]
+  pub protected_resource_ids: Vec<String>,
+  pub allow_localhost_redirect: bool,
+  pub jwt_access_tokens_enabled: bool,
+  pub jwt_signing_key: Option<String>,
+  pub jwt_signing_key_file: Option<PathBuf>,
+  pub jwt_signing_kid: Option<String>,
+  pub jwt_signing_previous_keys: Vec<RawJwtSigningKey>,
+  #[serde(default)]
+  pub jwt_access_token_signing_alg: JwtSigningAlg,
+  #[serde(default = "default_cimd_fetch_timeout_secs")]
+  pub cimd_fetch_timeout_secs: u64,
+  #[serde(default = "default_cimd_max_bytes")]
+  pub cimd_max_bytes: usize,
+}
+
+fn default_cimd_fetch_timeout_secs() -> u64 {
+  5
+}
+
+fn default_cimd_max_bytes() -> usize {
+  5_120
 }

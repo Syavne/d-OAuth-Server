@@ -15,16 +15,16 @@ use sqlx::Row as _;
 use time::OffsetDateTime;
 
 use super::{
-  Cli, ClientCommand, Command, RedirectUriCommand, ScopeCommand, UserCommand, admin, ops, redirect,
-  scope, secret,
-  sync::{RedirectEntry, ScopeEntry, SyncFile},
+  Cli, CliError, ClientCommand, Command, RedirectUriCommand, ResourceServerCommand, ScopeCommand,
+  UserCommand, admin, ops, redirect, resource, scope, secret,
+  sync::{ClientTokenFormatEntry, RedirectEntry, ResourceServerEntry, ScopeEntry, SyncFile},
   test_support::{self, TestError},
   user,
 };
 use crate::{
   config::Config,
   crypto::totp,
-  db::{client_repo, redirect_repo, user_repo},
+  db::{client_repo, redirect_repo, resource_repo, user_repo},
   keys::{KeyId, KeyRing},
   state::{AppState, RedisConn},
   ui::login::{
@@ -491,6 +491,8 @@ async fn cli_config_sync_is_idempotent() -> Result<(), TestError> {
     }],
     user_scopes: Vec::new(),
     client_redirect_uris: Vec::new(),
+    resource_servers: Vec::new(),
+    client_access_token_formats: Vec::new(),
   };
 
   let first = super::sync::apply(&context, &file).await?;
@@ -541,6 +543,7 @@ async fn insert_redirect_client(
       contacts: None,
       software_id: None,
       dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
       registration_access_token_hash: None,
     },
   )
@@ -566,6 +569,8 @@ async fn config_sync_redirects() -> Result<(), TestError> {
     }],
     user_scopes: Vec::new(),
     client_redirect_uris: Vec::new(),
+    resource_servers: Vec::new(),
+    client_access_token_formats: Vec::new(),
   };
 
   let first = super::sync::apply(&context, &file).await?;
@@ -1834,6 +1839,180 @@ fn cli_password_file_trims_trailing_newline() -> Result<(), TestError> {
     secret.as_str(),
     "placeholder-secret-value",
     "a trailing CR/LF must be trimmed in place"
+  );
+  Ok(())
+}
+
+/// `resource-server` create/list/enable/disable/delete round-trips, rejects a
+/// wildcard identifier, and re-applies a `config sync` `resource_servers`
+/// array idempotently.
+#[tokio::test]
+async fn cli_resource_server_create() -> Result<(), TestError> {
+  let (_harness, context) = test_support::context().await?;
+  let identifier = format!("https://api-{}.example.test", uuid::Uuid::new_v4());
+
+  resource::run(
+    &context,
+    ResourceServerCommand::Create {
+      identifier: identifier.clone(),
+      description: Some("orders API".to_owned()),
+    },
+  )
+  .await?;
+  assert!(
+    resource_repo::find_enabled(context.pool(), &identifier)
+      .await?
+      .is_some(),
+    "a created resource server is enabled"
+  );
+
+  let wildcard = resource::run(
+    &context,
+    ResourceServerCommand::Create {
+      identifier: "https://*.example.test".to_owned(),
+      description: None,
+    },
+  )
+  .await;
+  assert!(
+    matches!(wildcard, Err(CliError::Input(_))),
+    "a wildcard identifier must be rejected"
+  );
+
+  resource::run(
+    &context,
+    ResourceServerCommand::Disable {
+      identifier: identifier.clone(),
+    },
+  )
+  .await?;
+  assert!(
+    resource_repo::find_enabled(context.pool(), &identifier)
+      .await?
+      .is_none(),
+    "a disabled resource server is not enabled"
+  );
+  resource::run(
+    &context,
+    ResourceServerCommand::Enable {
+      identifier: identifier.clone(),
+    },
+  )
+  .await?;
+
+  let synced = format!("https://synced-{}.example.test", uuid::Uuid::new_v4());
+  let file = SyncFile {
+    resource_servers: vec![ResourceServerEntry {
+      identifier: synced.clone(),
+      description: Some("synced".to_owned()),
+      enabled: true,
+    }],
+    ..SyncFile::default()
+  };
+  let first = super::sync::apply(&context, &file).await?;
+  assert_eq!(first.resource_servers_created, 1);
+  let second = super::sync::apply(&context, &file).await?;
+  assert!(second.is_noop(), "second sync must be a no-op: {second}");
+
+  resource::run(
+    &context,
+    ResourceServerCommand::Delete {
+      identifier: identifier.clone(),
+    },
+  )
+  .await?;
+  assert!(
+    resource_repo::find_enabled(context.pool(), &identifier)
+      .await?
+      .is_none(),
+    "a deleted resource server is gone"
+  );
+  Ok(())
+}
+
+/// `client set-access-token-format` writes `jwt` (operator opt-in), reads it
+/// back through the repository projection, rejects an unknown client, and
+/// refuses an invalid `--format` value at parse time.
+#[tokio::test]
+async fn cli_client_set_access_token_format() -> Result<(), TestError> {
+  let (_harness, context) = test_support::context().await?;
+  let client_id = format!("fmt-client-{}", uuid::Uuid::new_v4());
+  insert_redirect_client(context.pool(), &context.config().keys, &client_id).await?;
+
+  let initial: String =
+    sqlx::query_scalar("SELECT access_token_format FROM oauth_clients WHERE client_id = $1")
+      .bind(&client_id)
+      .fetch_one(context.pool())
+      .await?;
+  assert_eq!(initial, "opaque", "a new client defaults to opaque");
+
+  redirect::run_client(
+    &context,
+    ClientCommand::SetAccessTokenFormat {
+      client_id: client_id.clone(),
+      format: "jwt".to_owned(),
+    },
+  )
+  .await?;
+
+  let stored: String =
+    sqlx::query_scalar("SELECT access_token_format FROM oauth_clients WHERE client_id = $1")
+      .bind(&client_id)
+      .fetch_one(context.pool())
+      .await?;
+  assert_eq!(stored, "jwt");
+
+  let client =
+    client_repo::find_active_by_client_id(context.pool(), &context.config().keys, &client_id)
+      .await?
+      .ok_or(TestError::Missing("client after format change"))?;
+  assert_eq!(client.access_token_format, "jwt", "read-back must be jwt");
+
+  let second = format!("fmt-sync-{}", uuid::Uuid::new_v4());
+  insert_redirect_client(context.pool(), &context.config().keys, &second).await?;
+  let file = SyncFile {
+    client_access_token_formats: vec![ClientTokenFormatEntry {
+      client_id: second.clone(),
+      access_token_format: "jwt".to_owned(),
+    }],
+    ..SyncFile::default()
+  };
+  let first = super::sync::apply(&context, &file).await?;
+  assert_eq!(first.client_formats_set, 1);
+  let reapply = super::sync::apply(&context, &file).await?;
+  assert!(reapply.is_noop(), "second sync must be a no-op: {reapply}");
+  let synced: String =
+    sqlx::query_scalar("SELECT access_token_format FROM oauth_clients WHERE client_id = $1")
+      .bind(&second)
+      .fetch_one(context.pool())
+      .await?;
+  assert_eq!(synced, "jwt", "sync must apply the declared format");
+
+  let unknown = redirect::run_client(
+    &context,
+    ClientCommand::SetAccessTokenFormat {
+      client_id: "no-such-client".to_owned(),
+      format: "opaque".to_owned(),
+    },
+  )
+  .await;
+  assert!(
+    matches!(unknown, Err(CliError::NotFound(_))),
+    "an unknown client is not found"
+  );
+
+  let parsed = Cli::try_parse_from([
+    "d-oauth-server",
+    "client",
+    "set-access-token-format",
+    "--client-id",
+    &client_id,
+    "--format",
+    "bogus",
+  ]);
+  assert!(
+    parsed.is_err(),
+    "an invalid --format value must be rejected"
   );
   Ok(())
 }

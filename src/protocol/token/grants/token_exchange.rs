@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::super::{ClientKind, Cnf, MintRequest, SenderProof, TokenService};
+use super::super::{ClientKind, Cnf, MintRequest, SenderProof, TokenFormat, TokenService};
 use crate::{
   config::{GrantKind, TokenExchangeRule},
   crypto::tokens as crypto_tokens,
@@ -56,6 +56,9 @@ pub struct ExchangeInput<'a> {
   pub caller_client_id: &'a str,
   /// Public or confidential: selects the `cnf` matrix on the new token.
   pub caller_kind: ClientKind,
+  /// Whether a public caller must present a DPoP proof: mirrors the
+  /// caller's `dpop_bound_access_tokens` registration.
+  pub caller_dpop_required: bool,
   /// Scopes registered to the caller client.
   pub caller_registered: &'a ScopeSet,
   /// Raw subject token.
@@ -270,10 +273,20 @@ pub async fn exchange(
       &MintRequest {
         client_id: input.caller_client_id.to_owned(),
         client_kind: input.caller_kind,
+        dpop_required: input.caller_dpop_required,
+        // RFC 8707 is excluded from token exchange (Todo 9 rejects
+        // `resource`): the minted pair carries no audience, and the subject
+        // token's audience is never inherited.
+        // Token exchange never mints a JWT (Todo 26): the dispatcher rejects
+        // a `jwt`-format caller fail-closed before this runs, so `act` can
+        // never be wrapped in an `at+jwt`.
         subject: subject.record.subject.clone(),
         scope: issued.render(),
         grant_id,
         proof: input.proof.clone(),
+        aud: Vec::new(),
+        refresh_aud: Vec::new(),
+        format: TokenFormat::Opaque,
       },
       input.now_unix,
     )
@@ -292,6 +305,7 @@ pub async fn exchange(
     scope: issued.render(),
     subject: subject.record.subject.clone(),
     cnf: minted.cnf.to_storage().map_err(AppError::from)?,
+    aud: Vec::new(),
   };
   low::put_access(conn, store, &minted.access_hash, &record, ttl)
     .await

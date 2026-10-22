@@ -56,6 +56,7 @@ pub(super) async fn insert_client_bound(
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: dpop_bound,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   };
   client_repo::insert(pool, &config.keys, config.pii_dual_write, &new).await?;

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE resource_servers SET enabled = false WHERE identifier = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6f7321dc8b54b0878866201efde81d7534a3df9de264614a088a4561c6e81136"
+}

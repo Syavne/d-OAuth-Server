@@ -1,8 +1,14 @@
 //! `test(ssrf)` suite: URL policy and target blocking (offline).
 
 use std::net::IpAddr;
+use std::time::Duration;
 
-use super::{check_fetch_host, fetch_guarded_bytes, is_blocked_ip, validate_fetch_url};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::{
+  check_fetch_host, fetch_guarded_bytes, fetch_guarded_bytes_with, fetch_pinned, is_blocked_ip,
+  validate_fetch_url,
+};
 
 /// This suite's error type (no `unwrap`/`expect` under the deny lints).
 type TestResult = Result<(), TestError>;
@@ -193,4 +199,190 @@ async fn ssrf_check_denies_hostname_resolving_to_blocked() -> TestResult {
       "localhost must never validate".to_owned(),
     )),
   }
+}
+
+async fn serve_once(
+  status: u16,
+  headers: &[(&str, &str)],
+  body: &[u8],
+  delay: Duration,
+) -> Result<reqwest::Url, TestError> {
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    .await
+    .map_err(|err| TestError::Unexpected(err.to_string()))?;
+  let addr = listener
+    .local_addr()
+    .map_err(|err| TestError::Unexpected(err.to_string()))?;
+  let body = body.to_vec();
+  let headers: Vec<(String, String)> = headers
+    .iter()
+    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+    .collect();
+  tokio::spawn(async move {
+    let Ok((mut socket, _)) = listener.accept().await else {
+      return;
+    };
+    let mut scratch = [0_u8; 1024];
+    let _ = socket.read(&mut scratch).await;
+    if !delay.is_zero() {
+      tokio::time::sleep(delay).await;
+    }
+    let mut response = format!(
+      "HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Length: {}\r\n",
+      body.len()
+    );
+    for (name, value) in &headers {
+      response.push_str(name);
+      response.push_str(": ");
+      response.push_str(value);
+      response.push_str("\r\n");
+    }
+    response.push_str("\r\n");
+    let _ = socket.write_all(response.as_bytes()).await;
+    let _ = socket.write_all(&body).await;
+    let _ = socket.shutdown().await;
+  });
+  reqwest::Url::parse(&format!("http://{addr}/doc.json"))
+    .map_err(|err| TestError::Unexpected(err.to_string()))
+}
+
+#[tokio::test]
+async fn ssrf_per_call_cap_and_timeout() -> TestResult {
+  match fetch_guarded_bytes_with(
+    "https://127.0.0.1:8443/doc.json",
+    5120,
+    Duration::from_secs(1),
+  )
+  .await
+  {
+    Err(super::SsrfError::BlockedTarget) => {}
+    Err(other) => return Err(TestError::Unexpected(format!("wrong error: {other}"))),
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "loopback must never be fetched".to_owned(),
+      ));
+    }
+  }
+  match fetch_guarded_bytes_with("http://127.0.0.1:9/doc.json", 5120, Duration::from_secs(1)).await
+  {
+    Err(super::SsrfError::NonHttps) => {}
+    Err(other) => return Err(TestError::Unexpected(format!("wrong error: {other}"))),
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "http must never be fetched".to_owned(),
+      ));
+    }
+  }
+  match fetch_guarded_bytes("https://192.0.2.1/doc.json").await {
+    Err(super::SsrfError::BlockedTarget) => {}
+    Err(other) => return Err(TestError::Unexpected(format!("wrong error: {other}"))),
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "documentation range must not be fetched".to_owned(),
+      ));
+    }
+  }
+
+  // The loopback ban is bypassed for these mechanics only: the https policy
+  // is asserted above, and a trusted test CA cannot be stood up offline.
+  let over = vec![b'a'; 5121];
+  let over_url = serve_once(200, &[], &over, Duration::ZERO).await?;
+  match fetch_pinned(&over_url, "127.0.0.1", &[], 5120, Duration::from_secs(5)).await {
+    Err(super::SsrfError::TooLarge) => {}
+    Err(other) => return Err(TestError::Unexpected(format!("wrong error: {other}"))),
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "over-cap body must be rejected".to_owned(),
+      ));
+    }
+  }
+
+  let exact = vec![b'b'; 5120];
+  let exact_url = serve_once(200, &[], &exact, Duration::ZERO).await?;
+  match fetch_pinned(&exact_url, "127.0.0.1", &[], 5120, Duration::from_secs(5)).await {
+    Ok(body) if body.len() == 5120 => {}
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "body at the cap must be intact".to_owned(),
+      ));
+    }
+    Err(other) => return Err(TestError::Unexpected(format!("wrong error: {other}"))),
+  }
+
+  let redirect_url = serve_once(302, &[("Location", "/elsewhere")], b"", Duration::ZERO).await?;
+  match fetch_pinned(
+    &redirect_url,
+    "127.0.0.1",
+    &[],
+    5120,
+    Duration::from_secs(5),
+  )
+  .await
+  {
+    Err(super::SsrfError::BadStatus) => {}
+    Err(other) => return Err(TestError::Unexpected(format!("wrong error: {other}"))),
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "redirect must not be followed".to_owned(),
+      ));
+    }
+  }
+
+  let slow_url = serve_once(200, &[], b"ok", Duration::from_millis(500)).await?;
+  match fetch_pinned(&slow_url, "127.0.0.1", &[], 5120, Duration::from_millis(50)).await {
+    Err(super::SsrfError::FetchFailed) => {}
+    Err(other) => return Err(TestError::Unexpected(format!("wrong error: {other}"))),
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "slow response must time out".to_owned(),
+      ));
+    }
+  }
+
+  Ok(())
+}
+
+#[test]
+fn ssrf_rejects_special_use_ranges() -> TestResult {
+  for addr in [
+    "0.0.0.0",
+    "0.255.255.255",
+    "192.0.0.1",
+    "192.0.0.170",
+    "192.88.99.1",
+    "198.18.0.1",
+    "198.19.255.255",
+    "192.0.2.1",
+    "198.51.100.1",
+    "203.0.113.1",
+    "100.64.0.1",
+    "240.0.0.1",
+    "64:ff9b::7f00:1",
+    "64:ff9b:1::1",
+    "2002:7f00:1::",
+    "2001::1",
+    "2001:2::1",
+    "2001:10::1",
+    "2001:20::1",
+    "100::1",
+    "2001:db8::1",
+    "::ffff:0.0.0.1",
+    "::ffff:192.0.0.1",
+    "::ffff:198.18.0.1",
+  ] {
+    if !blocked(addr)? {
+      return Err(TestError::Unexpected(format!("{addr} should be blocked")));
+    }
+  }
+  for addr in [
+    "192.0.1.1",
+    "198.17.0.1",
+    "198.20.0.1",
+    "2001:4860:4860::8888",
+  ] {
+    if blocked(addr)? {
+      return Err(TestError::Unexpected(format!("{addr} should pass")));
+    }
+  }
+  Ok(())
 }

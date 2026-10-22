@@ -4,13 +4,16 @@
 //! character, no normalization) plus the RFC 8252 §7.3 loopback exception:
 //! a registration whose scheme is `http` and whose host is the loopback
 //! literal `127.0.0.1` or `[::1]` matches a request with the same
-//! scheme+host+path and any port.
+//! scheme+host+path and any port. When `allow_localhost` is set (config
+//! `allow_localhost_redirect`), the exact host `localhost` joins that
+//! exception; it is not treated as loopback otherwise.
 //!
 //! Fail-closed: a registered URI carrying userinfo, a query, or a fragment
 //! is never eligible, plaintext `http` to a non-loopback host is refused,
-//! `localhost` is not treated as loopback, and matching never falls back to
-//! prefix/wildcard/substring comparison. A [`RedirectDecision::Reject`] means
-//! the authorization request MUST fail without redirecting the user agent.
+//! `localhost` is loopback only under the explicit flag, and matching never
+//! falls back to prefix/wildcard/substring comparison. A
+//! [`RedirectDecision::Reject`] means the authorization request MUST fail
+//! without redirecting the user agent.
 //!
 //! The effective (attached + enabled) set is owned by `db::redirect_repo`;
 //! this module is pure and takes that set as a slice of strings.
@@ -23,7 +26,8 @@ pub enum RedirectDecision {
   /// character-for-character identical to a registered URI.
   Exact,
   /// RFC 8252 §7.3 loopback match: the registered URI is plaintext `http`
-  /// to a loopback literal (`127.0.0.1` or `[::1]`) and the requested URI
+  /// to a loopback host (`127.0.0.1`, `[::1]`, or — only under
+  /// `allow_localhost` — the exact host `localhost`) and the requested URI
   /// has the same scheme, host, and path, with the port ignored.
   Loopback,
   /// No registered URI is an acceptable match. The request MUST be rejected
@@ -43,8 +47,17 @@ pub enum RedirectDecision {
 /// A requested or registered URI whose private-use scheme lacks reverse-DNS
 /// dot notation (draft-ietf-oauth-v2-1-16 §2.3.1, SHOULD-level) never
 /// matches: the request is rejected without redirecting the user agent.
+///
+/// `allow_localhost` maps to config `allow_localhost_redirect`: when true the
+/// exact host `localhost` is an RFC 8252 §7.3 loopback host; when false it is
+/// not loopback and plaintext `http://localhost` registrations and requests
+/// stay rejected.
 #[must_use]
-pub fn match_redirect_uri<S: AsRef<str>>(registered: &[S], requested: &str) -> RedirectDecision {
+pub fn match_redirect_uri<S: AsRef<str>>(
+  registered: &[S],
+  requested: &str,
+  allow_localhost: bool,
+) -> RedirectDecision {
   if !is_valid_redirect_scheme(requested) {
     return RedirectDecision::Reject;
   }
@@ -66,8 +79,8 @@ pub fn match_redirect_uri<S: AsRef<str>>(registered: &[S], requested: &str) -> R
       continue;
     }
 
-    // Plaintext http is only ever acceptable to a loopback literal.
-    if is_http(reg.scheme) && !is_loopback_host(reg.host) {
+    // Plaintext http is only ever acceptable to a loopback host.
+    if is_http(reg.scheme) && !is_loopback_host(reg.host, allow_localhost) {
       continue;
     }
 
@@ -79,10 +92,10 @@ pub fn match_redirect_uri<S: AsRef<str>>(registered: &[S], requested: &str) -> R
     // RFC 8252 §7.3 loopback: ignore the port, require scheme+host+path, and
     // refuse a request that smuggles userinfo, a query, or a fragment.
     if is_http(reg.scheme)
-      && is_loopback_host(reg.host)
+      && is_loopback_host(reg.host, allow_localhost)
       && let Some(req) = requested_parts.as_ref()
       && is_http(req.scheme)
-      && is_loopback_host(req.host)
+      && is_loopback_host(req.host, allow_localhost)
       && reg.host == req.host
       && reg.path == req.path
       && req.userinfo.is_none()
@@ -219,12 +232,14 @@ pub fn is_valid_redirect_scheme(uri: &str) -> bool {
   scheme.contains('.')
 }
 
-/// The only hosts eligible for the RFC 8252 §7.3 loopback exception.
+/// Hosts eligible for the RFC 8252 §7.3 loopback exception.
 ///
-/// `localhost` is deliberately absent: hostname resolution is
-/// attacker-influenced, so the plan permits loopback literal IPs only.
-fn is_loopback_host(host: &str) -> bool {
-  host == "127.0.0.1" || host == "[::1]"
+/// The literal IPs `127.0.0.1` and `[::1]` are always loopback. The exact
+/// host `localhost` is loopback only when `allow_localhost` is set: hostname
+/// resolution is attacker-influenced (RFC 8252 §8.3), so accepting it is an
+/// explicit operator opt-in, never a default.
+fn is_loopback_host(host: &str, allow_localhost: bool) -> bool {
+  host == "127.0.0.1" || host == "[::1]" || (allow_localhost && host == "localhost")
 }
 
 #[cfg(test)]

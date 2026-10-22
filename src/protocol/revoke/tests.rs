@@ -8,6 +8,7 @@
 
 mod auth;
 mod cascade;
+mod jwt;
 mod mtls;
 
 use std::{
@@ -25,7 +26,7 @@ use crate::{
   keys::{KeyId, KeyRing, KeyRingError},
   protocol::{
     client_auth::ClientAuthRequest,
-    token::{ClientKind, MintRequest, SenderProof, TokenService, TokenServiceError},
+    token::{ClientKind, MintRequest, SenderProof, TokenFormat, TokenService, TokenServiceError},
   },
   state::{AppState, Clock, RedisConn},
   store::{Store, StoreError},
@@ -179,10 +180,14 @@ fn mint_request(client: &str, grant: &str) -> MintRequest {
   MintRequest {
     client_id: client.to_owned(),
     client_kind: ClientKind::Confidential,
+    dpop_required: false,
     subject: "user-1".to_owned(),
     scope: "orders:read".to_owned(),
     grant_id: grant.to_owned(),
     proof: SenderProof::none(),
+    aud: Vec::new(),
+    refresh_aud: Vec::new(),
+    format: TokenFormat::Opaque,
   }
 }
 

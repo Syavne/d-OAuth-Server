@@ -7,14 +7,17 @@
 //! TODO(task 19): wire re-exports as each endpoint lands.
 
 pub mod authorize;
+pub mod cimd;
 pub mod client_auth;
 pub mod code;
 pub mod dcr;
 pub mod device;
 pub mod introspect;
+pub mod jwks;
 pub mod metadata;
 pub mod mtls;
 pub mod par;
+pub mod params;
 pub mod purge;
 pub mod redirect_repo;
 pub mod revoke;

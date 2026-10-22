@@ -31,6 +31,9 @@ pub struct CodeRecord {
   pub grant_id: String,
   /// Sender-constraint binding (`cnf`), empty when unconstrained.
   pub cnf: String,
+  /// Resource audiences (RFC 8707) the code is bound to; empty when unbound.
+  #[serde(default)]
+  pub aud: Vec<String>,
 }
 
 impl CodeRecord {
@@ -43,6 +46,7 @@ impl CodeRecord {
       ("subject".to_owned(), self.subject.clone()),
       ("grant_id".to_owned(), self.grant_id.clone()),
       ("cnf".to_owned(), self.cnf.clone()),
+      ("aud".to_owned(), super::aud::encode(&self.aud)),
     ]
   }
 
@@ -56,6 +60,7 @@ impl CodeRecord {
       subject: get("subject")?,
       grant_id: get("grant_id")?,
       cnf: get("cnf")?,
+      aud: super::aud::decode(map.get("aud"))?,
     })
   }
 }

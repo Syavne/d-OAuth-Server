@@ -136,6 +136,7 @@ fn refresh_record(client: &str, grant: &str) -> RefreshRecord {
     scope: "read".to_owned(),
     subject: "user-1".to_owned(),
     cnf: String::new(),
+    aud: Vec::new(),
   }
 }
 
@@ -146,6 +147,7 @@ fn access_record(client: &str, grant: &str) -> AccessRecord {
     scope: "read".to_owned(),
     subject: "user-1".to_owned(),
     cnf: String::new(),
+    aud: Vec::new(),
   }
 }
 
@@ -167,6 +169,7 @@ fn rotation_input(
     new_refresh_ttl: Duration::from_secs(600),
     new_access_ttl: Duration::from_secs(300),
     request_id: Some(request_id.to_owned()),
+    jwt_jti_hash: None,
   }
 }
 
@@ -201,6 +204,7 @@ async fn rotation_apply_replay_absent_mismatch() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(600),
   )

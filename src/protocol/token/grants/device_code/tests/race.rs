@@ -8,6 +8,7 @@ use super::super::interval::check_interval;
 use super::flows::now_unix;
 use super::{TestError, TestResult, harness, unique};
 use crate::protocol::device::DEVICE_INTERVAL_SECS;
+use crate::protocol::token::TokenFormat;
 use crate::store::device::poll_key;
 
 /// T3-B2: two polls racing at the same instant must not both pass the
@@ -37,6 +38,9 @@ async fn test_grant_device_concurrent_interval_admits_only_one() -> TestResult {
       device_ttl: h.config.ttl.device,
       interval,
       ttl: &h.config.ttl,
+      token_format: TokenFormat::Opaque,
+      jwt_signer: None,
+      cimd: None,
       now_unix: now,
     };
     let mut right = PollState {
@@ -48,6 +52,9 @@ async fn test_grant_device_concurrent_interval_admits_only_one() -> TestResult {
       device_ttl: h.config.ttl.device,
       interval,
       ttl: &h.config.ttl,
+      token_format: TokenFormat::Opaque,
+      jwt_signer: None,
+      cimd: None,
       now_unix: now,
     };
     let (left_outcome, right_outcome) = tokio::join!(

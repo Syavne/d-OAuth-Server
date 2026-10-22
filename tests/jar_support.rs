@@ -9,7 +9,7 @@
 //! uses unique key prefixes, so parallel tests never share state (and never
 //! FLUSH shared state).
 
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use d_oauth::{
   db::client_repo::Client,
@@ -96,6 +96,7 @@ pub fn test_client(auth_method: &str, request_uris: Option<Value>) -> Client {
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     active: true,
     created_at: now,
     updated_at: now,
@@ -157,7 +158,7 @@ pub async fn store_conn() -> Result<(Lease<JarRedis>, RedisConn, Store), TestErr
 }
 
 /// The error code of a resolve outcome, or `None` on success.
-pub fn code_of(outcome: &Result<HashMap<String, String>, AppError>) -> Option<OAuthErrorCode> {
+pub fn code_of<T>(outcome: &Result<T, AppError>) -> Option<OAuthErrorCode> {
   match outcome {
     Ok(_) => None,
     Err(error) => Some(error.code()),

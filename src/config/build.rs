@@ -3,13 +3,14 @@
 //! Kept in a submodule so the root `config.rs` stays focused on the public
 //! types and loader surface.
 
-use std::{net::SocketAddr, path::Path, str::FromStr};
+use std::{net::SocketAddr, path::Path, str::FromStr, time::Duration};
 
 use secrecy::{ExposeSecret, SecretString};
 
 use super::{
   Config, ConfigError, TlsConfig,
   db::DbConfig,
+  jwt::{JWT_KEY_BYTES, JwtSigningKey},
   policy::FailurePolicy,
   raw::{RawConfig, RawTls},
   read_secret_file,
@@ -36,6 +37,9 @@ impl Config {
       })?;
     let tls = TlsConfig::from_raw(&raw.tls)?;
     let keys = build_key_ring(&raw)?;
+    let (jwt_signing_key, jwt_signing_previous_keys) = build_jwt_signing(&raw)?;
+    let cimd_fetch_timeout = validate_cimd_fetch_timeout(raw.cimd_fetch_timeout_secs)?;
+    let cimd_max_bytes = validate_cimd_max_bytes(raw.cimd_max_bytes)?;
     let database = DbConfig::from_raw(raw.database, environment)?;
     let redis = RedisConfig::from_raw(raw.redis)?;
     let failure_policy = FailurePolicy::from_raw(raw.failure_policy)?;
@@ -81,6 +85,17 @@ impl Config {
       scope_registry,
       allow_token_exchange: raw.allow_token_exchange,
       token_exchange_allowlist,
+      resource_indicators_enabled: raw.resource_indicators_enabled,
+      cimd_enabled: raw.cimd_enabled,
+      protected_resources_enabled: raw.protected_resources_enabled,
+      protected_resource_ids: raw.protected_resource_ids,
+      allow_localhost_redirect: raw.allow_localhost_redirect,
+      jwt_access_tokens_enabled: raw.jwt_access_tokens_enabled,
+      jwt_signing_key,
+      jwt_signing_previous_keys,
+      jwt_access_token_signing_alg: raw.jwt_access_token_signing_alg,
+      cimd_fetch_timeout,
+      cimd_max_bytes,
     })
   }
 }
@@ -212,6 +227,102 @@ fn build_key_ring(raw: &RawConfig) -> Result<KeyRing, ConfigError> {
     KeyRingError::MissingPiiKey,
   )?;
   KeyRing::from_parts(peppers, totp_keys, pii_keys).map_err(ConfigError::from)
+}
+
+/// Require the JWT signing key to be exactly [`JWT_KEY_BYTES`] bytes: short
+/// material cannot form a key and over-long material is refused (the pepper/
+/// TOTP/PII chains enforce only a minimum).
+fn require_exact_jwt_key_bytes(
+  secret: &SecretString,
+  key: &'static str,
+) -> Result<(), ConfigError> {
+  if secret.expose_secret().len() == JWT_KEY_BYTES {
+    Ok(())
+  } else {
+    Err(ConfigError::WeakKeyMaterial { key })
+  }
+}
+
+/// Build the optional active JWT signing key and its previous (verify-only)
+/// keys, validating length, kid uniqueness, and JOSE construction at load.
+fn build_jwt_signing(
+  raw: &RawConfig,
+) -> Result<(Option<JwtSigningKey>, Vec<JwtSigningKey>), ConfigError> {
+  let alg = raw.jwt_access_token_signing_alg;
+  let current = match non_blank(resolve_secret(
+    raw.jwt_signing_key.as_deref(),
+    raw.jwt_signing_key_file.as_deref(),
+  )?) {
+    Some(secret) => {
+      require_exact_jwt_key_bytes(&secret, "jwt_signing_key")?;
+      let kid = key_id_or_default(raw.jwt_signing_kid.as_deref())?;
+      Some(JwtSigningKey::from_raw(
+        kid,
+        alg,
+        &secret,
+        "jwt_signing_key",
+      )?)
+    }
+    None => None,
+  };
+  let mut previous = Vec::with_capacity(raw.jwt_signing_previous_keys.len());
+  for entry in &raw.jwt_signing_previous_keys {
+    let id_raw = entry
+      .kid
+      .as_deref()
+      .map(str::trim)
+      .filter(|value| !value.is_empty())
+      .ok_or(ConfigError::MissingPreviousKeyId)?;
+    let kid = validate_key_id(id_raw)?;
+    let secret = entry
+      .key
+      .as_deref()
+      .map(str::trim)
+      .filter(|value| !value.is_empty())
+      .ok_or(ConfigError::InvalidJwtSigningKey {
+        key: "jwt_signing_previous_keys",
+      })?;
+    let secret = SecretString::from(secret.to_owned());
+    require_exact_jwt_key_bytes(&secret, "jwt_signing_previous_keys")?;
+    previous.push(JwtSigningKey::from_raw(
+      kid,
+      alg,
+      &secret,
+      "jwt_signing_previous_keys",
+    )?);
+  }
+  if (raw.jwt_access_tokens_enabled || !previous.is_empty()) && current.is_none() {
+    return Err(ConfigError::MissingJwtSigningKey);
+  }
+  let active_kid = current.as_ref().map(|key| key.kid().clone());
+  for (index, key) in previous.iter().enumerate() {
+    let clashes_active = active_kid.as_ref().is_some_and(|id| id == key.kid());
+    let clashes_previous = previous[..index].iter().any(|seen| seen.kid() == key.kid());
+    if clashes_active || clashes_previous {
+      return Err(ConfigError::DuplicateJwtSigningKid {
+        kid: key.kid().as_str().to_owned(),
+      });
+    }
+  }
+  Ok((current, previous))
+}
+
+/// CIMD fetch timeout must sit inside the 1-10 second window.
+fn validate_cimd_fetch_timeout(secs: u64) -> Result<Duration, ConfigError> {
+  if (1..=10).contains(&secs) {
+    Ok(Duration::from_secs(secs))
+  } else {
+    Err(ConfigError::InvalidCimdFetchTimeout)
+  }
+}
+
+/// CIMD document byte cap must be positive and at most 5120 bytes.
+fn validate_cimd_max_bytes(bytes: usize) -> Result<usize, ConfigError> {
+  if (1..=5_120).contains(&bytes) {
+    Ok(bytes)
+  } else {
+    Err(ConfigError::InvalidCimdMaxBytes)
+  }
 }
 
 /// Build an active-first chain from the active key plus its retained previous

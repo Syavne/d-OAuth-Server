@@ -22,11 +22,6 @@ mod tests_resilience;
 #[cfg(test)]
 mod tests_topology;
 
-pub use health::health_router;
-pub(crate) use pg::connect_options;
-pub use redis::RedisConn;
-pub use sentinel::SentinelConn;
-
 use std::{
   fmt,
   sync::{
@@ -36,6 +31,10 @@ use std::{
   time::Duration,
 };
 
+pub use health::health_router;
+pub(crate) use pg::connect_options;
+pub use redis::RedisConn;
+pub use sentinel::SentinelConn;
 use time::OffsetDateTime;
 
 use crate::{

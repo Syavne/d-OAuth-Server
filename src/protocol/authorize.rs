@@ -16,7 +16,7 @@
 //! failure redirects to the validated `redirect_uri` with `error` (+ `error_description`, + `state`, + RFC 9207
 //! `iss`).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use axum::{
   body::Body,
@@ -31,10 +31,26 @@ use crate::{
   db::{client_repo, redirect_repo, scope_repo},
   error::{AppError, OAuthErrorCode},
   jose::jar::{self, JarRequest},
-  protocol::{redirect_repo as redirect_match, scope},
+  protocol::{cimd, redirect_repo as redirect_match, scope},
   state::RedisConn,
   store::Store,
 };
+
+/// Client ID Metadata Document (CIMD) resolution settings for a request path.
+///
+/// Present only when `config.cimd_enabled`; a `None` value makes a CIMD URL
+/// `client_id` take the existing unknown-client path, so enabling the feature
+/// is the sole switch (CIMD draft §3/§4.1).
+#[derive(Debug, Clone, Copy)]
+pub struct CimdRequest<'a> {
+  /// Token keyspace prefix carrying the `{state}` hash tag, for the
+  /// `cimd:<sha256(url)>` document cache.
+  pub token_prefix: &'a str,
+  /// Maximum accepted document size (`config.cimd_max_bytes`).
+  pub max_bytes: usize,
+  /// Total fetch budget (`config.cimd_fetch_timeout`).
+  pub timeout: Duration,
+}
 
 /// Inputs to [`validate`]: live stores plus the raw authorize query.
 pub struct AuthorizeInput<'a> {
@@ -48,8 +64,19 @@ pub struct AuthorizeInput<'a> {
   pub store: &'a Store,
   /// Server issuer; the `aud` of JAR request objects.
   pub issuer: &'a str,
-  /// Raw authorize query parameters as received.
+  /// Config `allow_localhost_redirect`: treat the exact host `localhost` as
+  /// an RFC 8252 §7.3 loopback redirect host.
+  pub allow_localhost_redirect: bool,
+  /// CIMD resolution settings; `None` when `config.cimd_enabled` is off.
+  pub cimd: Option<CimdRequest<'a>>,
+  /// Raw query parameters as received.
   pub query: &'a HashMap<String, String>,
+  /// Repeated `resource` indicators (RFC 8707) in wire order, captured from
+  /// the raw query by the `RawQuery` extractor (see `protocol::params`).
+  pub resources: Vec<String>,
+  /// Config `resource_indicators_enabled`: off + any `resource` present is
+  /// `invalid_target` (fail-closed, no silent drop).
+  pub resource_indicators_enabled: bool,
 }
 
 /// An authorize request that passed every validation step.
@@ -70,6 +97,9 @@ pub struct ValidatedRequest {
   pub code_challenge: String,
   /// The `state` value to echo in the authorization response, if supplied.
   pub state: Option<String>,
+  /// Validated resource audiences (RFC 8707), sorted and deduped; empty
+  /// when unbound. Pinned into the pending record at the route layer.
+  pub aud: Vec<String>,
   /// The client's single registered post-logout return URI, when it has one.
   /// Resolved during validation so a later logout can return the browser to
   /// the client without accepting any redirect target from a request.
@@ -139,6 +169,37 @@ impl AuthorizeFailure {
   }
 }
 
+/// The resolved authorize client: a registered row, or a registration-free
+/// Client ID Metadata Document (CIMD draft §3/§4.1).
+///
+/// The CIMD arm is purely in-memory: it never writes a row, never attaches a
+/// catalog redirect, and never consumes an initial access token.
+enum ResolvedClient {
+  /// An active `oauth_clients` row.
+  Registered(Box<client_repo::Client>),
+  /// A validated document fetched from an `https://` `client_id`.
+  Cimd(cimd::ValidatedCimd),
+}
+
+impl ResolvedClient {
+  /// The public `client_id` (the document URL for the CIMD arm).
+  fn client_id(&self) -> &str {
+    match self {
+      Self::Registered(client) => &client.client_id,
+      Self::Cimd(validated) => &validated.client_id,
+    }
+  }
+
+  /// The scope bound used as the client-registered set for the intersect: a
+  /// registered client's stored `scope`, or the document's `scope`.
+  fn registered_scope(&self) -> &str {
+    match self {
+      Self::Registered(client) => &client.scope,
+      Self::Cimd(validated) => &validated.scope,
+    }
+  }
+}
+
 /// Validate an authorize request following the mandated order.
 ///
 /// Returns the normalized request when every check passes. Returns
@@ -148,28 +209,61 @@ impl AuthorizeFailure {
 /// # Errors
 ///
 /// Returns [`AuthorizeFailure`] as described by the error-delivery matrix.
-pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, AuthorizeFailure> {
+pub async fn validate(mut input: AuthorizeInput<'_>) -> Result<ValidatedRequest, AuthorizeFailure> {
   let client_id = present(input.query.get("client_id"))
     .ok_or_else(|| page(AppError::invalid_request("client_id is required")))?;
-  let client = client_repo::find_active_by_client_id(input.pool, input.keys, client_id)
+
+  // A registered row always wins over CIMD; an `https://` `client_id` with no
+  // active row is a CIMD client only while the feature is enabled (CIMD
+  // draft §3). With `cimd` absent the unknown-client page is unchanged.
+  let resolution = match client_repo::find_active_by_client_id(input.pool, input.keys, client_id)
     .await
     .map_err(AuthorizeFailure::Page)?
-    .ok_or_else(|| page(AppError::invalid_client_non_basic()))?;
+  {
+    Some(client) => ResolvedClient::Registered(Box::new(client)),
+    None => match resolve_cimd(&mut input, client_id).await? {
+      Some(validated) => ResolvedClient::Cimd(validated),
+      None => return Err(page(AppError::invalid_client_non_basic())),
+    },
+  };
 
+  // A registration-free CIMD client resolves through the same JAR entry
+  // point as a registered row, but against a synthetic principal
+  // materialized from the validated document (CIMD draft §4.1/§5): its
+  // inline `jwks` verifies request objects, `require_par_or_jar` keeps the
+  // PAR/JAR matrix (a `private_key_jwt` document must use PAR or JAR, a
+  // `none` document may use the plain query), and a PAR-issued `request_uri`
+  // binds to the document URL exactly as a row id would.
+  let synthetic;
+  let jar_client: &client_repo::Client = match &resolution {
+    ResolvedClient::Registered(client) => client,
+    ResolvedClient::Cimd(validated) => {
+      synthetic = validated.to_client();
+      &synthetic
+    }
+  };
   let jar_input = JarRequest {
-    client: &client,
+    client: jar_client,
     issuer: input.issuer,
     query: input.query,
     request: present(input.query.get("request")).map(String::as_str),
     request_uri: present(input.query.get("request_uri")).map(String::as_str),
   };
-  let merged = jar::resolve(input.conn, input.store, &jar_input)
+  let merged_claims = jar::resolve(input.conn, input.store, &jar_input)
     .await
     .map_err(AuthorizeFailure::Page)?;
+  // Query-presented indicators union with JAR/PAR-pinned ones (both are
+  // catalog-validated below, so the union cannot smuggle anything past the
+  // catalog). A `resource` in both transports is already rejected by the
+  // merge as `invalid_request_object`.
+  let mut resources = input.resources.clone();
+  resources.extend(merged_claims.resource);
+  let merged = &merged_claims.params;
 
+  let expected_client_id = resolution.client_id();
   if merged
     .get("client_id")
-    .is_some_and(|seen| seen != &client.client_id)
+    .is_some_and(|seen| seen.as_str() != expected_client_id)
   {
     return Err(page(AppError::invalid_request(
       "client_id binding mismatch",
@@ -178,11 +272,26 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
 
   let redirect_uri = present(merged.get("redirect_uri"))
     .ok_or_else(|| page(AppError::invalid_request("redirect_uri is required")))?;
-  let effective = redirect_repo::effective_for_client(input.pool, input.keys, &client.client_id)
-    .await
-    .map_err(AuthorizeFailure::Page)?;
-  let registered: Vec<&str> = effective.iter().map(|entry| entry.uri.as_str()).collect();
-  match redirect_match::match_redirect_uri(&registered, redirect_uri) {
+  // A registered client matches against its effective catalog set; a CIMD
+  // client against its own document `redirect_uris` only — the catalog is
+  // never consulted for a registration-free client (CIMD draft §5).
+  let registered_uris: Vec<String> = match &resolution {
+    ResolvedClient::Registered(client) => {
+      redirect_repo::effective_for_client(input.pool, input.keys, &client.client_id)
+        .await
+        .map_err(AuthorizeFailure::Page)?
+        .into_iter()
+        .map(|entry| entry.uri)
+        .collect()
+    }
+    ResolvedClient::Cimd(validated) => validated.redirect_uris.clone(),
+  };
+  let registered: Vec<&str> = registered_uris.iter().map(String::as_str).collect();
+  match redirect_match::match_redirect_uri(
+    &registered,
+    redirect_uri,
+    input.allow_localhost_redirect,
+  ) {
     redirect_match::RedirectDecision::Exact | redirect_match::RedirectDecision::Loopback => {}
     redirect_match::RedirectDecision::Reject => {
       return Err(page(AppError::invalid_request(
@@ -199,6 +308,15 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
     state: merged.get("state").cloned(),
     iss: input.issuer.to_owned(),
   };
+
+  // Resource indicators (RFC 8707) validate after the redirect target, so a
+  // bad audience redirects (never a page): unknown, non-https, or flag-off
+  // `resource` is `invalid_target`, and the sorted deduped set pins into
+  // `ValidatedRequest.aud` for the pending record.
+  let aud =
+    super::params::validate_resources(input.pool, input.resource_indicators_enabled, &resources)
+      .await
+      .map_err(redirect_err)?;
 
   match present(merged.get("response_type")) {
     Some(response_type) if response_type == "code" => {}
@@ -218,9 +336,9 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
     .await
     .map_err(redirect_err)?;
   let enabled_names: Vec<String> = enabled.iter().map(|record| record.name.clone()).collect();
-  let enabled_set = scope_set_of(&enabled_names, &redirect, &merged, input.issuer)?;
-  let client_registered =
-    scope::ScopeSet::parse(&client.scope).map_err(|_| redirect_err(AppError::server_error()))?;
+  let enabled_set = scope_set_of(&enabled_names, &redirect, merged, input.issuer)?;
+  let client_registered = scope::ScopeSet::parse(resolution.registered_scope())
+    .map_err(|_| redirect_err(AppError::server_error()))?;
   let scope_input = scope::ScopeInput {
     requested: present(merged.get("scope")).map(String::as_str),
     client_registered: &client_registered,
@@ -249,19 +367,67 @@ pub async fn validate(input: AuthorizeInput<'_>) -> Result<ValidatedRequest, Aut
   verify_method(S256_METHOD).map_err(|_| redirect_err(AppError::server_error()))?;
   check_challenge_shape(challenge).map_err(redirect_err)?;
 
-  let post_logout_uri =
-    redirect_repo::post_logout_for_client(input.pool, input.keys, &client.client_id)
-      .await
-      .map_err(redirect_err)?;
+  // A registration-free client has no catalog post-logout target; only a
+  // registered row is consulted.
+  let post_logout_uri = match &resolution {
+    ResolvedClient::Registered(client) => {
+      redirect_repo::post_logout_for_client(input.pool, input.keys, &client.client_id)
+        .await
+        .map_err(redirect_err)?
+    }
+    ResolvedClient::Cimd(_) => None,
+  };
 
   Ok(ValidatedRequest {
-    client_id: client.client_id,
+    client_id: resolution.client_id().to_owned(),
     redirect_uri: redirect,
     scope: effective_scope,
     code_challenge: challenge.clone(),
     state: merged.get("state").cloned(),
+    aud,
     post_logout_uri,
   })
+}
+
+/// Resolve a Client ID Metadata Document for an `https://` `client_id` when
+/// the feature is enabled and no registered row matched.
+///
+/// Returns `Ok(None)` when CIMD is disabled or `client_id` is not an
+/// `https://` URL, so the caller keeps the existing unknown-client behavior.
+/// A document that fails validation maps to its client-safe error
+/// (`invalid_client_metadata`/`invalid_redirect_uri`; a dependency outage is
+/// a fail-closed `503`).
+///
+/// # Errors
+///
+/// Returns [`AuthorizeFailure::Page`] for any fetch/validation/backend
+/// [`cimd::CimdError`].
+async fn resolve_cimd(
+  input: &mut AuthorizeInput<'_>,
+  client_id: &str,
+) -> Result<Option<cimd::ValidatedCimd>, AuthorizeFailure> {
+  let Some(settings) = input.cimd else {
+    return Ok(None);
+  };
+  // CIMD draft §3: only an `https://` URL names a metadata document.
+  if !client_id.starts_with("https://") {
+    return Ok(None);
+  }
+  let limits = cimd::CimdLimits {
+    max_bytes: settings.max_bytes,
+    timeout: settings.timeout,
+  };
+  let validated = cimd::resolve_with_catalog(
+    input.conn,
+    settings.token_prefix,
+    input.pool,
+    client_id,
+    input.allow_localhost_redirect,
+    limits,
+  )
+  .await
+  .map_err(|error| page(AppError::from(error)))?;
+  Ok(Some(validated))
 }
 
 /// Treat `None` and `""` alike: an absent parameter.

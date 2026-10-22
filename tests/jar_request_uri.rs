@@ -19,7 +19,6 @@ use d_oauth::{
   store::par::{self, ParRecord},
 };
 use serde_json::json;
-
 use support::{CLIENT_ID, ISSUER, TestError, TestResult, code_of, store_conn, test_client};
 
 static TEST_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -108,6 +107,7 @@ async fn jar_par_request_uri_consumed_once() -> TestResult {
       "response_type": "code", "client_id": CLIENT_ID,
       "redirect_uri": "https://client.example.test/cb", "scope": "read",
     }))?,
+    aud: Vec::new(),
   };
   par::put(&mut conn, &store, &id, &record, Duration::from_secs(90)).await?;
   let uri = format!("{PAR_REQUEST_URI_PREFIX}{id}");
@@ -123,7 +123,7 @@ async fn jar_par_request_uri_consumed_once() -> TestResult {
   let merged = resolve(&mut conn, &store, &input)
     .await
     .map_err(|error| TestError::Unexpected(error.to_string()))?;
-  if merged.get("scope").map(String::as_str) != Some("read") {
+  if merged.params.get("scope").map(String::as_str) != Some("read") {
     return Err(TestError::Unexpected("PAR params not merged".to_owned()));
   }
   let replay = resolve(&mut conn, &store, &input).await;
@@ -142,6 +142,7 @@ async fn jar_par_cross_client_rejected() -> TestResult {
   let record = ParRecord {
     client_id: CLIENT_ID.to_owned(),
     request: serde_json::to_string(&json!({"response_type": "code"}))?,
+    aud: Vec::new(),
   };
   par::put(&mut conn, &store, &id, &record, Duration::from_secs(90)).await?;
   let uri = format!("{PAR_REQUEST_URI_PREFIX}{id}");

@@ -7,14 +7,14 @@
 //! must never fail a live token. Every test gets a fresh migrated database
 //! from [`crate::db::test_support`].
 
+use secrecy::SecretString;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{NewUser, SubjectAccountStatus, create_user, disable_user, subject_account_status};
 use crate::crypto::secret::{Argon2Params, hash_secret};
 use crate::db::test_support::{TestError, migrated_pool};
 use crate::keys::{KeyId, KeyRing};
-use secrecy::SecretString;
-use sqlx::PgPool;
 
 /// Test PII key ring (the blind-index candidates must derive from it).
 fn test_keys() -> Result<KeyRing, TestError> {

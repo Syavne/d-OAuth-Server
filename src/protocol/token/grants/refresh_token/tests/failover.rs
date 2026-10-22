@@ -11,7 +11,7 @@ use crate::{
   config::{DurabilityMode, TtlConfig},
   protocol::{
     scope::ScopeSet,
-    token::{ClientKind, MintRequest, TokenService, grants::refresh_token::refresh},
+    token::{ClientKind, MintRequest, TokenFormat, TokenService, grants::refresh_token::refresh},
   },
   store::Store,
   test_guard::ContainerGuard,
@@ -53,10 +53,14 @@ async fn grant_refresh_failover_no_double_rotation() -> TestResult {
       &MintRequest {
         client_id: client.clone(),
         client_kind: ClientKind::Public,
+        dpop_required: true,
         subject: unique("failover-subject"),
         scope: "read".to_owned(),
         grant_id: unique("failover-grant"),
         proof: proof.clone(),
+        aud: Vec::new(),
+        refresh_aud: Vec::new(),
+        format: TokenFormat::Opaque,
       },
       super::now_unix(),
     )

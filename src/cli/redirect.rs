@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
   crypto::field::blind_index_candidates,
-  db::{NewRedirectUri, RedirectKind, UpsertOutcome, redirect_repo},
+  db::{NewRedirectUri, RedirectKind, UpsertOutcome, client_repo, redirect_repo},
 };
 
 /// Run a `redirect-uri` subcommand.
@@ -56,7 +56,34 @@ pub async fn run_client(context: &Context, command: ClientCommand) -> Result<(),
       kind,
     } => detach(context, &client_id, &uri, &kind).await,
     ClientCommand::RedirectUris { client_id } => list_for_client(context, &client_id).await,
+    ClientCommand::SetAccessTokenFormat { client_id, format } => {
+      set_access_token_format(context, &client_id, &format).await
+    }
   }
+}
+
+/// Set a client's access-token format (`opaque` or `jwt`).
+///
+/// This is the operator-only opt-in to JWT access tokens; dynamic registration
+/// can never set it. The format value is constrained by the CLI and the schema
+/// CHECK constraint.
+async fn set_access_token_format(
+  context: &Context,
+  client_id: &str,
+  format: &str,
+) -> Result<(), CliError> {
+  ensure_client_exists(context, client_id).await?;
+  let changed = client_repo::set_access_token_format(context.pool(), client_id, format).await?;
+  audit(
+    "client.set_access_token_format",
+    &format!("{client_id}:{format}"),
+  );
+  if changed {
+    println!("set access token format of {client_id} to {format}");
+  } else {
+    println!("client {client_id} already uses {format} access tokens");
+  }
+  Ok(())
 }
 
 async fn list(context: &Context) -> Result<(), CliError> {

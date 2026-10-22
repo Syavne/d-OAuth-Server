@@ -50,6 +50,9 @@ pub struct DeviceRecord {
   pub subject: String,
   /// Grant chain, empty until approved.
   pub grant_id: String,
+  /// Resource audiences (RFC 8707) requested by the device; empty when unbound.
+  #[serde(default)]
+  pub aud: Vec<String>,
 }
 
 impl DeviceRecord {
@@ -60,6 +63,7 @@ impl DeviceRecord {
       ("status".to_owned(), self.status.as_str().to_owned()),
       ("subject".to_owned(), self.subject.clone()),
       ("grant_id".to_owned(), self.grant_id.clone()),
+      ("aud".to_owned(), super::aud::encode(&self.aud)),
     ]
   }
 
@@ -71,6 +75,7 @@ impl DeviceRecord {
       status: DeviceStatus::parse(get("status")?.as_str())?,
       subject: get("subject")?,
       grant_id: get("grant_id")?,
+      aud: super::aud::decode(map.get("aud"))?,
     })
   }
 }

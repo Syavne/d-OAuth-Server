@@ -1,9 +1,10 @@
 //! Token-service vocabulary: errors, client kinds, proofs, and claims.
 //!
-//! The sender-constraint matrix lives here ([`resolve_cnf`]): public clients
-//! REQUIRE DPoP (`cnf.jkt`) — absence is a hard error, never "if present".
-//! Confidential clients record mTLS (`cnf.x5t#S256`) and/or DPoP, both when
-//! both were proven; an unconstrained confidential grant carries an empty
+//! The sender-constraint matrix lives here ([`resolve_cnf`]): DPoP is
+//! mandatory for a public client only when it is DPoP-bound
+//! (`dpop_bound_access_tokens=true`); an unbound public client is
+//! Bearer-capable. Confidential clients record mTLS (`cnf.x5t#S256`) and/or
+//! DPoP when proven; an unconstrained confidential grant carries an empty
 //! `cnf`.
 
 use std::fmt;
@@ -11,6 +12,23 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{crypto::tokens as crypto_tokens, error::AppError, store::StoreError};
+
+/// How a client's access tokens are represented to resource servers.
+///
+/// `Opaque` is the default: a random token whose keyed hash names the record.
+/// `Jwt` is the opt-in RFC 9068 profile (Todo 26): the access token returned
+/// to the client is a signed `at+jwt`, while the refresh half stays an opaque
+/// token (rotation semantics unchanged). The type lives here so `dispatch`
+/// and `service` share one decision without a module cycle; `dispatch`
+/// re-exports it so Todo 25's `require_token_format` call sites keep
+/// compiling. Token exchange never mints `Jwt` (fail-closed `act` never).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenFormat {
+  /// Opaque bearer token; the JWT stack is never touched.
+  Opaque,
+  /// RFC 9068 JWT access token; requires the global switch and key material.
+  Jwt,
+}
 
 /// Fail-closed token-service failures.
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +48,14 @@ pub enum TokenServiceError {
   /// A store operation failed.
   #[error("token store failure")]
   Store(#[from] StoreError),
+  /// A `Jwt` mint ran without an attached signer (the dispatcher guarantees
+  /// one; fail closed instead of minting opaque).
+  #[error("no JWT signer configured for a jwt mint")]
+  JwtSignerMissing,
+  /// JWT signing or claim construction failed (keys are validated at load,
+  /// so this is unreachable in practice; fail closed).
+  #[error("JWT minting failed")]
+  Jwt(#[from] crate::jose::jwt_access::JwtError),
 }
 
 impl From<TokenServiceError> for AppError {
@@ -50,7 +76,8 @@ impl From<TokenServiceError> for AppError {
 /// Whether the client authenticates as public or confidential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKind {
-  /// No client secret: DPoP binding is mandatory.
+  /// No client secret: DPoP is mandatory only for a DPoP-bound client;
+  /// unbound public clients use Bearer.
   Public,
   /// Authenticated client: mTLS and/or DPoP are recorded when proven.
   Confidential,
@@ -121,35 +148,60 @@ impl Cnf {
 
 /// Apply the sender-constraint matrix to one mint call.
 ///
+/// A public client registers its DPoP posture per client: a DPoP-bound client
+/// (`dpop_required`) must present a `jkt`, while an unbound public client
+/// mints a `Bearer` token when no proof was verified (a presented proof is
+/// still recorded). Empty proof strings count as absent.
+///
 /// # Errors
 ///
-/// Returns [`TokenServiceError::MissingDpopBinding`] for a public client
-/// without a `jkt`. Empty proof strings count as absent.
-pub(super) fn resolve_cnf(kind: ClientKind, proof: &SenderProof) -> Result<Cnf, TokenServiceError> {
+/// Returns [`TokenServiceError::MissingDpopBinding`] for a DPoP-bound public
+/// client without a `jkt`.
+pub(super) fn resolve_cnf(
+  kind: ClientKind,
+  proof: &SenderProof,
+  dpop_required: bool,
+) -> Result<Cnf, TokenServiceError> {
   let jkt = proof.dpop_jkt.clone().filter(|value| !value.is_empty());
   let x5t_s256 = proof
     .mtls_x5t_s256
     .clone()
     .filter(|value| !value.is_empty());
   match kind {
-    ClientKind::Public => match jkt {
+    ClientKind::Public if dpop_required => match jkt {
       Some(jkt) => Ok(Cnf {
         jkt: Some(jkt),
         x5t_s256,
       }),
       None => Err(TokenServiceError::MissingDpopBinding),
     },
+    ClientKind::Public => Ok(Cnf { jkt, x5t_s256 }),
     ClientKind::Confidential => Ok(Cnf { jkt, x5t_s256 }),
   }
 }
 
 /// Inputs for one mint call.
+///
+/// Resource audiences (RFC 8707 §2) travel as a pair: [`MintRequest::aud`]
+/// binds the ACCESS token while [`MintRequest::refresh_aud`] binds the
+/// REFRESH token and the grant-chain record. The two are equal on every first
+/// issuance; they diverge only on a narrowed refresh rotation, where RFC 8707
+/// §2.2 keeps the refresh token bound to the full original grant set while
+/// the access token narrows (an omitted `resource` defaults to that full
+/// set, NOT to §3's empty set). `mint_inner` writes each half to its record,
+/// so the rotation script — which commits the [`RotationInput`] records
+/// verbatim and never rewrites the grant record — preserves the full binding
+/// while the access token narrows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintRequest {
   /// Client the tokens are issued to.
   pub client_id: String,
   /// Public or confidential: selects the constraint matrix.
   pub client_kind: ClientKind,
+  /// Whether a public client must present a DPoP proof: mirrors the
+  /// client's `dpop_bound_access_tokens` registration (unbound public
+  /// clients mint `Bearer` tokens). Ignored for confidential clients.
+  pub dpop_required: bool,
   /// Resource-owner subject, empty for client-credentials tokens.
   pub subject: String,
   /// Space-joined scope.
@@ -158,6 +210,18 @@ pub struct MintRequest {
   pub grant_id: String,
   /// Freshly verified proofs for this request.
   pub proof: SenderProof,
+  /// Resource audiences (RFC 8707 §2) bound into the ACCESS token record.
+  pub aud: Vec<String>,
+  /// Resource audiences bound into the REFRESH token record and the
+  /// grant-chain record: the full original grant set, even when `aud` is a
+  /// narrowed refresh subset.
+  pub refresh_aud: Vec<String>,
+  /// Access-token representation for this mint: `Opaque` reproduces today's
+  /// behavior byte-for-byte (records plus grant membership, no marker, no
+  /// JWT); `Jwt` returns a signed RFC 9068 `at+jwt` whose `aud` claim takes
+  /// [`MintRequest::aud`] (the narrowed access set, never `refresh_aud`)
+  /// while the refresh half stays opaque.
+  pub format: TokenFormat,
 }
 
 /// Freshly minted pair: raw tokens (return to the caller once) plus their
@@ -183,6 +247,17 @@ pub struct MintedTokens {
   pub access_expires_at: i64,
   /// Refresh-token expiry (Unix seconds).
   pub refresh_expires_at: i64,
+}
+
+impl MintedTokens {
+  /// The `jti` hash when this mint produced a JWT access token: the access
+  /// identity is the grant-set member `jwt:<jti-hash>` (never a pepper
+  /// hash), so stripping the prefix recovers the marker key material.
+  /// `None` for opaque mints, whose identity is a pepper hash.
+  #[must_use]
+  pub fn jwt_jti_hash(&self) -> Option<&str> {
+    self.access_hash.strip_prefix("jwt:")
+  }
 }
 
 impl fmt::Debug for MintedTokens {

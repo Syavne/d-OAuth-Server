@@ -14,7 +14,7 @@ use crate::{
   jose::jwk::thumbprint,
   protocol::{
     device::{DEVICE_INTERVAL_SECS, DeviceHttpInputs},
-    token::{Cnf, TokenService},
+    token::{Cnf, TokenFormat, TokenService},
   },
 };
 
@@ -47,6 +47,7 @@ async fn test_grant_device_pending_then_approved_issues_bound_tokens() -> TestRe
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -183,6 +184,7 @@ async fn test_grant_device_concurrent_poll_mints_once() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -211,6 +213,9 @@ async fn test_grant_device_concurrent_poll_mints_once() -> TestResult {
     device_ttl: h.config.ttl.device,
     interval: Duration::ZERO,
     ttl: &h.config.ttl,
+    token_format: TokenFormat::Opaque,
+    jwt_signer: None,
+    cimd: None,
     now_unix: t1,
   };
   let mut right_state = PollState {
@@ -222,6 +227,9 @@ async fn test_grant_device_concurrent_poll_mints_once() -> TestResult {
     device_ttl: h.config.ttl.device,
     interval: Duration::ZERO,
     ttl: &h.config.ttl,
+    token_format: TokenFormat::Opaque,
+    jwt_signer: None,
+    cimd: None,
     now_unix: t1,
   };
   let (left, right) = tokio::join!(

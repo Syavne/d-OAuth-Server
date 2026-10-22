@@ -125,6 +125,7 @@ fn code_record(client: &str, grant: &str) -> codes::CodeRecord {
     subject: "user-1".to_owned(),
     grant_id: grant.to_owned(),
     cnf: String::new(),
+    aud: Vec::new(),
   }
 }
 
@@ -135,6 +136,7 @@ fn refresh_record(client: &str, grant: &str) -> tokens::RefreshRecord {
     scope: "orders:read".to_owned(),
     subject: "user-1".to_owned(),
     cnf: String::new(),
+    aud: Vec::new(),
   }
 }
 
@@ -145,6 +147,7 @@ fn access_record(client: &str, grant: &str) -> tokens::AccessRecord {
     scope: "orders:read".to_owned(),
     subject: "user-1".to_owned(),
     cnf: String::new(),
+    aud: Vec::new(),
   }
 }
 
@@ -166,6 +169,7 @@ fn rotation_input(
     new_refresh_ttl: Duration::from_secs(3600),
     new_access_ttl: Duration::from_secs(300),
     request_id,
+    jwt_jti_hash: None,
   }
 }
 
@@ -249,6 +253,7 @@ async fn store_refresh_rotate_idempotent_replay() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -320,6 +325,7 @@ async fn store_refresh_concurrent_cas_one_rotated_one_reuse() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -408,6 +414,7 @@ async fn store_refresh_reuse_without_mapping_cascades() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -511,6 +518,7 @@ async fn store_grant_revoke_cascade() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -584,6 +592,7 @@ async fn store_tombstone_detectable_after_rotation() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -927,6 +936,7 @@ async fn store_device_par_and_dcr_round_trip() -> TestResult {
       status: device::DeviceStatus::Pending,
       subject: String::new(),
       grant_id: String::new(),
+      aud: Vec::new(),
     },
     Duration::from_secs(600),
   )
@@ -988,6 +998,7 @@ async fn store_device_par_and_dcr_round_trip() -> TestResult {
     &par::ParRecord {
       client_id: client.clone(),
       request: "{\"response_type\":\"code\"}".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(90),
   )
@@ -1092,6 +1103,7 @@ async fn store_par_device_and_user_code_ttl_within_configured_windows() -> TestR
     &par::ParRecord {
       client_id: client.clone(),
       request: "{\"response_type\":\"code\"}".to_owned(),
+      aud: Vec::new(),
     },
     ttl.par,
   )
@@ -1114,6 +1126,7 @@ async fn store_par_device_and_user_code_ttl_within_configured_windows() -> TestR
       status: device::DeviceStatus::Pending,
       subject: String::new(),
       grant_id: String::new(),
+      aud: Vec::new(),
     },
     ttl.device,
   )
@@ -1183,6 +1196,7 @@ async fn store_rotation_grace_tombstone_and_grant_index_ttl() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     refresh_ttl,
   )
@@ -1318,6 +1332,7 @@ async fn store_pending_auth_ttl_within_request_window() -> TestResult {
       dpop_jkt: None,
       iss: "https://as.example.test".to_owned(),
       post_logout_uri: None,
+      aud: Vec::new(),
     },
     crate::routes::PENDING_TTL,
   )
@@ -1414,6 +1429,400 @@ async fn store_replay_marker_ttl_within_proof_window() -> TestResult {
   )
 }
 
+/// docs/REDIS.md: every audience-bearing record stores `aud` as a JSON array
+/// string. A record written before audiences (no `aud` hash field — a rolling
+/// deploy from a pre-audience replica) decodes to an empty list, and a
+/// comma-bearing URI survives the round trip (no delimiter-join collision).
+#[tokio::test]
+async fn store_aud_backward_compat() -> TestResult {
+  let (token_prefix, rl_prefix) = crate::test_support::unique_prefixes();
+  let url = crate::test_support::test_redis_url();
+  let (mut conn, store) =
+    direct_store(&url, DurabilityMode::WaitAof, &token_prefix, &rl_prefix).await?;
+  let client = unique("client");
+  let grant = unique("grant");
+  let aud = vec![
+    "https://a.example.test,alt".to_owned(),
+    "https://b.example.test".to_owned(),
+  ];
+
+  // Access: legacy hash without `aud` reads empty; new record round-trips.
+  let legacy_access = unique("legacy-access");
+  hset_record(
+    &mut conn,
+    &store.access_key(&legacy_access),
+    &[
+      ("client_id".to_owned(), client.clone()),
+      ("grant_id".to_owned(), grant.clone()),
+      ("scope".to_owned(), "orders:read".to_owned()),
+      ("subject".to_owned(), "user-1".to_owned()),
+      ("cnf".to_owned(), String::new()),
+    ],
+    Duration::from_secs(300),
+  )
+  .await?;
+  if tokens::get_access(&mut conn, &store, &legacy_access)
+    .await?
+    .is_none_or(|record| !record.aud.is_empty())
+  {
+    return Err(TestError::Unexpected(
+      "legacy access must decode aud to empty".to_owned(),
+    ));
+  }
+  let access_hash = unique("access");
+  tokens::put_access(
+    &mut conn,
+    &store,
+    &access_hash,
+    &tokens::AccessRecord {
+      client_id: client.clone(),
+      grant_id: grant.clone(),
+      scope: "orders:read".to_owned(),
+      subject: "user-1".to_owned(),
+      cnf: String::new(),
+      aud: aud.clone(),
+    },
+    Duration::from_secs(300),
+  )
+  .await?;
+  if tokens::get_access(&mut conn, &store, &access_hash)
+    .await?
+    .is_none_or(|record| record.aud != aud)
+  {
+    return Err(TestError::Unexpected(
+      "access aud must round-trip".to_owned(),
+    ));
+  }
+
+  // Refresh: legacy empty; new round-trips.
+  let legacy_refresh = unique("legacy-refresh");
+  hset_record(
+    &mut conn,
+    &store.refresh_key(&legacy_refresh),
+    &[
+      ("client_id".to_owned(), client.clone()),
+      ("grant_id".to_owned(), grant.clone()),
+      ("scope".to_owned(), "orders:read".to_owned()),
+      ("subject".to_owned(), "user-1".to_owned()),
+      ("cnf".to_owned(), String::new()),
+    ],
+    Duration::from_secs(3600),
+  )
+  .await?;
+  if tokens::get_refresh(&mut conn, &store, &legacy_refresh)
+    .await?
+    .is_none_or(|record| !record.aud.is_empty())
+  {
+    return Err(TestError::Unexpected(
+      "legacy refresh must decode aud to empty".to_owned(),
+    ));
+  }
+  let refresh_hash = unique("refresh");
+  tokens::put_refresh(
+    &mut conn,
+    &store,
+    &refresh_hash,
+    &tokens::RefreshRecord {
+      client_id: client.clone(),
+      grant_id: grant.clone(),
+      scope: "orders:read".to_owned(),
+      subject: "user-1".to_owned(),
+      cnf: String::new(),
+      aud: aud.clone(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  if tokens::get_refresh(&mut conn, &store, &refresh_hash)
+    .await?
+    .is_none_or(|record| record.aud != aud)
+  {
+    return Err(TestError::Unexpected(
+      "refresh aud must round-trip".to_owned(),
+    ));
+  }
+
+  // Code: legacy consume reads empty; new consume round-trips.
+  let legacy_code = unique("legacy-code");
+  hset_record(
+    &mut conn,
+    &store.code_key(&legacy_code),
+    &[
+      ("client_id".to_owned(), client.clone()),
+      (
+        "redirect_uri".to_owned(),
+        "https://client.example.test/cb".to_owned(),
+      ),
+      (
+        "code_challenge".to_owned(),
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+      ),
+      ("scope".to_owned(), "orders:read".to_owned()),
+      ("subject".to_owned(), "user-1".to_owned()),
+      ("grant_id".to_owned(), grant.clone()),
+      ("cnf".to_owned(), String::new()),
+    ],
+    Duration::from_secs(60),
+  )
+  .await?;
+  if codes::consume(&mut conn, &store, &legacy_code)
+    .await?
+    .is_none_or(|record| !record.aud.is_empty())
+  {
+    return Err(TestError::Unexpected(
+      "legacy code must decode aud to empty".to_owned(),
+    ));
+  }
+  let code_hash = unique("code");
+  codes::issue(
+    &mut conn,
+    &store,
+    &code_hash,
+    &codes::CodeRecord {
+      client_id: client.clone(),
+      redirect_uri: "https://client.example.test/cb".to_owned(),
+      scope: "orders:read".to_owned(),
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+      subject: "user-1".to_owned(),
+      grant_id: grant.clone(),
+      cnf: String::new(),
+      aud: aud.clone(),
+    },
+    Duration::from_secs(60),
+  )
+  .await?;
+  if codes::consume(&mut conn, &store, &code_hash)
+    .await?
+    .is_none_or(|record| record.aud != aud)
+  {
+    return Err(TestError::Unexpected("code aud must round-trip".to_owned()));
+  }
+
+  // Grant: legacy reads empty; new round-trips.
+  let legacy_grant = unique("legacy-grant");
+  hset_record(
+    &mut conn,
+    &store.grant_key(&legacy_grant),
+    &[
+      ("grant_id".to_owned(), legacy_grant.clone()),
+      ("client_id".to_owned(), client.clone()),
+      ("subject".to_owned(), "user-1".to_owned()),
+      ("scope".to_owned(), "orders:read".to_owned()),
+    ],
+    Duration::from_secs(3600),
+  )
+  .await?;
+  if grants::get(&mut conn, &store, &legacy_grant)
+    .await?
+    .is_none_or(|record| !record.aud.is_empty())
+  {
+    return Err(TestError::Unexpected(
+      "legacy grant must decode aud to empty".to_owned(),
+    ));
+  }
+  let new_grant = unique("grant-roundtrip");
+  grants::create(
+    &mut conn,
+    &store,
+    &grants::GrantRecord {
+      grant_id: new_grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "orders:read".to_owned(),
+      aud: aud.clone(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  if grants::get(&mut conn, &store, &new_grant)
+    .await?
+    .is_none_or(|record| record.aud != aud)
+  {
+    return Err(TestError::Unexpected(
+      "grant aud must round-trip".to_owned(),
+    ));
+  }
+
+  // PAR: legacy consume reads empty; new consume round-trips.
+  let legacy_par = unique("legacy-par");
+  hset_record(
+    &mut conn,
+    &store.par_key(&legacy_par),
+    &[
+      ("client_id".to_owned(), client.clone()),
+      (
+        "request".to_owned(),
+        "{\"response_type\":\"code\"}".to_owned(),
+      ),
+    ],
+    Duration::from_secs(90),
+  )
+  .await?;
+  if par::consume(&mut conn, &store, &legacy_par)
+    .await?
+    .is_none_or(|record| !record.aud.is_empty())
+  {
+    return Err(TestError::Unexpected(
+      "legacy PAR must decode aud to empty".to_owned(),
+    ));
+  }
+  let new_par = unique("par-roundtrip");
+  par::put(
+    &mut conn,
+    &store,
+    &new_par,
+    &par::ParRecord {
+      client_id: client.clone(),
+      request: "{\"response_type\":\"code\"}".to_owned(),
+      aud: aud.clone(),
+    },
+    Duration::from_secs(90),
+  )
+  .await?;
+  if par::consume(&mut conn, &store, &new_par)
+    .await?
+    .is_none_or(|record| record.aud != aud)
+  {
+    return Err(TestError::Unexpected("PAR aud must round-trip".to_owned()));
+  }
+
+  // Device: legacy poll reads empty; new poll round-trips.
+  let legacy_device = unique("legacy-device");
+  hset_record(
+    &mut conn,
+    &store.device_key(&legacy_device),
+    &[
+      ("client_id".to_owned(), client.clone()),
+      ("scope".to_owned(), "orders:read".to_owned()),
+      ("status".to_owned(), "pending".to_owned()),
+      ("subject".to_owned(), String::new()),
+      ("grant_id".to_owned(), String::new()),
+    ],
+    Duration::from_secs(600),
+  )
+  .await?;
+  if device::poll(&mut conn, &store, &legacy_device)
+    .await?
+    .is_none_or(|record| !record.aud.is_empty())
+  {
+    return Err(TestError::Unexpected(
+      "legacy device must decode aud to empty".to_owned(),
+    ));
+  }
+  let new_device = unique("device-roundtrip");
+  device::put(
+    &mut conn,
+    &store,
+    &new_device,
+    &unique("user-code-roundtrip"),
+    &device::DeviceRecord {
+      client_id: client.clone(),
+      scope: "orders:read".to_owned(),
+      status: device::DeviceStatus::Pending,
+      subject: String::new(),
+      grant_id: String::new(),
+      aud: aud.clone(),
+    },
+    Duration::from_secs(600),
+  )
+  .await?;
+  if device::poll(&mut conn, &store, &new_device)
+    .await?
+    .is_none_or(|record| record.aud != aud)
+  {
+    return Err(TestError::Unexpected(
+      "device aud must round-trip".to_owned(),
+    ));
+  }
+
+  // Rotation path (Lua/cjson): a non-empty aud written through the rotation
+  // script round-trips, proving the JSON string encoding survives cjson.
+  let rotate_grant = unique("rotate-grant");
+  grants::create(
+    &mut conn,
+    &store,
+    &grants::GrantRecord {
+      grant_id: rotate_grant.clone(),
+      client_id: client.clone(),
+      subject: "user-1".to_owned(),
+      scope: "orders:read".to_owned(),
+      aud: Vec::new(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  let old_refresh = unique("rotate-old");
+  tokens::put_refresh(
+    &mut conn,
+    &store,
+    &old_refresh,
+    &tokens::RefreshRecord {
+      client_id: client.clone(),
+      grant_id: rotate_grant.clone(),
+      scope: "orders:read".to_owned(),
+      subject: "user-1".to_owned(),
+      cnf: String::new(),
+      aud: Vec::new(),
+    },
+    Duration::from_secs(3600),
+  )
+  .await?;
+  let rotated_refresh = unique("rotate-new-refresh");
+  let rotated_access = unique("rotate-new-access");
+  let outcome = tokens::rotate(
+    &mut conn,
+    &store,
+    b"store-test-pepper",
+    &tokens::RotationInput {
+      old_refresh_hash: old_refresh.clone(),
+      expected_client_id: client.clone(),
+      new_refresh_hash: rotated_refresh.clone(),
+      new_access_hash: rotated_access.clone(),
+      new_refresh: tokens::RefreshRecord {
+        client_id: client.clone(),
+        grant_id: rotate_grant.clone(),
+        scope: "orders:read".to_owned(),
+        subject: "user-1".to_owned(),
+        cnf: String::new(),
+        aud: aud.clone(),
+      },
+      new_access: tokens::AccessRecord {
+        client_id: client.clone(),
+        grant_id: rotate_grant.clone(),
+        scope: "orders:read".to_owned(),
+        subject: "user-1".to_owned(),
+        cnf: String::new(),
+        aud: aud.clone(),
+      },
+      new_refresh_ttl: Duration::from_secs(3600),
+      new_access_ttl: Duration::from_secs(300),
+      request_id: None,
+      jwt_jti_hash: None,
+    },
+  )
+  .await?;
+  if !matches!(outcome, tokens::RotateOutcome::Rotated { .. }) {
+    return Err(TestError::Unexpected("rotation must succeed".to_owned()));
+  }
+  if tokens::get_access(&mut conn, &store, &rotated_access)
+    .await?
+    .is_none_or(|record| record.aud != aud)
+  {
+    return Err(TestError::Unexpected(
+      "rotated access aud must round-trip through Lua".to_owned(),
+    ));
+  }
+  if tokens::get_refresh(&mut conn, &store, &rotated_refresh)
+    .await?
+    .is_none_or(|record| record.aud != aud)
+  {
+    return Err(TestError::Unexpected(
+      "rotated refresh aud must round-trip through Lua".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
 #[test]
 fn store_keys_share_hash_tag_and_keyspaces_split() -> TestResult {
   let store = Store::from_parts(
@@ -1439,10 +1848,17 @@ fn store_keys_share_hash_tag_and_keyspaces_split() -> TestResult {
     store.login_fail_key("l"),
     store.login_fail_ip_key("i", "l"),
     store.login_fail_unknown_key("i"),
+    store.jwt_marker_key("j"),
+    store.cimd_cache_key("u"),
   ] {
     if !key.contains("{state}") {
       return Err(TestError::Unexpected(
         "token key must carry the {state} tag".to_owned(),
+      ));
+    }
+    if key.contains("{rl}") {
+      return Err(TestError::Unexpected(
+        "token key must never carry the {rl} tag".to_owned(),
       ));
     }
   }
@@ -1602,8 +2018,9 @@ fn store_error_classification_and_retry_scope() -> TestResult {
 
 #[test]
 fn store_permanent_infra_errors_map_to_503() -> TestResult {
-  use crate::error::{AppError, OAuthErrorCode};
   use axum::http::StatusCode;
+
+  use crate::error::{AppError, OAuthErrorCode};
 
   let cross_slot = redis::RedisError::from((
     redis::ErrorKind::Server(redis::ServerErrorKind::CrossSlot),
@@ -1657,8 +2074,9 @@ fn store_permanent_infra_errors_map_to_503() -> TestResult {
 
 #[test]
 fn store_error_classification() -> TestResult {
-  use crate::error::{AppError, OAuthErrorCode};
   use axum::http::StatusCode;
+
+  use crate::error::{AppError, OAuthErrorCode};
 
   let parse = redis::RedisError::from((redis::ErrorKind::Parse, "parse"));
   let unexpected = redis::RedisError::from((redis::ErrorKind::UnexpectedReturnType, "type"));
@@ -1841,6 +2259,7 @@ async fn store_grant_revoke_exhaustion_is_not_silent() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -1936,8 +2355,9 @@ async fn claim_poll_slot_corrupt_marker_fails_closed() -> TestResult {
 /// (`OOM`, `READONLY`, `CROSSSLOT`, auth, transient/connection) stays 503.
 #[test]
 fn store_error_classification_lua_runtime_is_500() -> TestResult {
-  use crate::error::{AppError, OAuthErrorCode};
   use axum::http::StatusCode;
+
+  use crate::error::{AppError, OAuthErrorCode};
 
   let lua_err = redis::RedisError::from((
     redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
@@ -2028,6 +2448,7 @@ async fn store_device_decide_consume_leaves_no_zombie() -> TestResult {
         status: device::DeviceStatus::Pending,
         subject: String::new(),
         grant_id: String::new(),
+        aud: Vec::new(),
       },
       Duration::from_secs(600),
     )
@@ -2105,6 +2526,7 @@ async fn store_grant_revoke_fence_rejects_rotation_into_revoked_grant() -> TestR
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -2198,6 +2620,7 @@ async fn store_grant_revoke_drains_mid_cascade_members() -> TestResult {
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -2227,7 +2650,8 @@ async fn store_grant_revoke_drains_mid_cascade_members() -> TestResult {
   first.key(set_key.as_str()).key(grant_key.as_str());
   first
     .arg(store.refresh_key_prefix().as_str())
-    .arg(store.access_key_prefix().as_str());
+    .arg(store.access_key_prefix().as_str())
+    .arg(store.jwt_key_prefix().as_str());
   let _: u64 = first.invoke_async(&mut conn).await?;
 
   let late_refresh = unique("late-refresh");
@@ -2309,6 +2733,7 @@ async fn store_rotation_barrier_failure_returns_replay_for_originating_id() -> T
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -2537,6 +2962,7 @@ async fn store_recovered_pair_revocable_after_unbarriered_rotation() -> TestResu
       client_id: client.clone(),
       subject: "user-1".to_owned(),
       scope: "orders:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )

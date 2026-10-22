@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, client_id, client_secret_expires_at, client_id_issued_at, client_name, client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, dpop_bound_access_tokens, active, created_at, updated_at FROM oauth_clients WHERE id = $1",
+  "query": "SELECT id, client_id, client_secret_expires_at, client_id_issued_at, client_name, client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, dpop_bound_access_tokens, access_token_format, active, created_at, updated_at FROM oauth_clients WHERE ($1 OR active = true) ORDER BY created_at, client_id",
   "describe": {
     "columns": [
       {
@@ -269,6 +269,17 @@
       },
       {
         "ordinal": 24,
+        "name": "access_token_format",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "access_token_format"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
         "name": "active",
         "type_info": "Bool",
         "origin": {
@@ -279,7 +290,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -290,7 +301,7 @@
         }
       },
       {
-        "ordinal": 26,
+        "ordinal": 27,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -303,7 +314,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Bool"
       ]
     },
     "nullable": [
@@ -333,8 +344,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "310cbe7ee6b575d3ae246b0e401a58e19c0cf92d2eeb58ebdc512b3319e67cd5"
+  "hash": "b0dae9eff317f7551fc27d5c4170c7d984f41982ce9b02ccaf7b847417809111"
 }

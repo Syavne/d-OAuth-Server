@@ -322,6 +322,7 @@ async fn seed_refresh(
       scope: "api:read".to_owned(),
       subject: "user-1".to_owned(),
       cnf: String::new(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -334,6 +335,7 @@ async fn seed_refresh(
       client_id: client.to_owned(),
       subject: "user-1".to_owned(),
       scope: "api:read".to_owned(),
+      aud: Vec::new(),
     },
     Duration::from_secs(3600),
   )
@@ -361,6 +363,7 @@ fn rotation_input(
       scope: "api:read".to_owned(),
       subject: "user-1".to_owned(),
       cnf: String::new(),
+      aud: Vec::new(),
     },
     new_access: AccessRecord {
       client_id: client.to_owned(),
@@ -368,10 +371,12 @@ fn rotation_input(
       scope: "api:read".to_owned(),
       subject: "user-1".to_owned(),
       cnf: String::new(),
+      aud: Vec::new(),
     },
     new_refresh_ttl: Duration::from_secs(3600),
     new_access_ttl: Duration::from_secs(600),
     request_id: Some(request_id.to_owned()),
+    jwt_jti_hash: None,
   }
 }
 

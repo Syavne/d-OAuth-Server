@@ -4,10 +4,13 @@
 //! the user (canonical email or user-id string): login sessions (plus their
 //! `:meta` sidecars), the lockout counters (the account key plus every
 //! per-IP composite key), authorization codes, device records
-//! (plus `:cnf`/`:poll` sidecars and `user_code` mappings), and token grants
-//! (cascade-revoked through [`grants::revoke`] so member token keys, the
-//! member set, and the barrier stay correct, plus standalone access/refresh
-//! records and `:act` sidecars).
+//! (plus `:cnf`/`:poll` sidecars and `user_code` mappings), token grants
+//! (cascade-revoked through [`grants::revoke`] so member token keys, JWT
+//! allowlist markers, the member set, and the barrier stay correct, plus
+//! standalone access/refresh records and `:act` sidecars), and JWT allowlist
+//! markers (`jwt:<jti-hash>` hashes swept directly by their `subject` field,
+//! so session-bound and client-credentials markers die even when no grant
+//! cascade covers them).
 //!
 //! Records without a `subject` field are never touched: `par:`, `pending:`,
 //! `dpop_jti:`, `client_assertion_jti:`, `rotation:`, `totp_replay:`, and the
@@ -45,6 +48,9 @@ pub struct PurgedSubject {
   pub access: u64,
   /// Standalone refresh-token records deleted.
   pub refresh: u64,
+  /// JWT allowlist marker hashes (`jwt:<jti-hash>`) whose `subject` field
+  /// named the user, deleted.
+  pub jwt_markers: u64,
 }
 
 /// Delete every Redis record whose `subject` is `email` or `user_id`.
@@ -54,7 +60,9 @@ pub struct PurgedSubject {
 /// lockout key is derived from it with the same normalization the login flow
 /// uses. Refresh-owned families cascade through [`grants::revoke`]; the
 /// grant's member `:act` sidecars are removed alongside because the revoke
-/// script deletes member keys only.
+/// script deletes member keys only. JWT allowlist markers are swept directly
+/// by their `subject` field in the same call (counted in
+/// [`PurgedSubject::jwt_markers`)).
 ///
 /// # Errors
 ///
@@ -193,6 +201,18 @@ pub async fn purge_subject(
     if is_subject(&read_fields(conn, &key).await?, email, user_id) {
       del_key(conn, &key).await?;
       summary.refresh += 1;
+    }
+  }
+
+  // JWT allowlist markers carry the same `subject` hash field as the other
+  // records (empty for client-credentials tokens), so the subject sweep
+  // deletes them directly: grant-bound markers are additionally covered by
+  // the per-grant cascade above, but session-bound and client-credentials
+  // markers are not, and the cascade must never be the only path.
+  for key in scan_keys(conn, &store.jwt_key_prefix()).await? {
+    if is_subject(&read_fields(conn, &key).await?, email, user_id) {
+      del_key(conn, &key).await?;
+      summary.jwt_markers += 1;
     }
   }
 
@@ -556,6 +576,7 @@ mod tests {
       grants: 1,
       access: 1,
       refresh: 1,
+      jwt_markers: 0,
     };
     if summary != expected {
       return Err(TestError::Unexpected(format!(
@@ -586,6 +607,65 @@ mod tests {
 
     require_present(&mut conn, &decoy_session_key).await?;
     require_present(&mut conn, &decoy_access_key).await?;
+    Ok(())
+  }
+
+  /// `test(purge_subject_deletes_jwt_markers)`: the subject sweep deletes
+  /// `jwt:<jti-hash>` marker hashes whose `subject` field names the user and
+  /// bumps `jwt_markers`, while a marker naming another subject survives.
+  /// Grant-bound markers are additionally covered by the per-grant cascade,
+  /// but this sweep must not rely on it (client-credentials markers carry an
+  /// empty subject and session-bound markers may name no grant).
+  #[tokio::test]
+  async fn purge_subject_deletes_jwt_markers() -> TestResult {
+    let (mut conn, store) = harness().await?;
+    let email = "jwt-purge@example.test";
+    let user_id = uuid::Uuid::new_v4().to_string();
+
+    let marker_key = store.jwt_marker_key("purgejtihash");
+    hset(
+      &mut conn,
+      &marker_key,
+      &[
+        ("grant_id", "grant-jwt-purge"),
+        ("client_id", "client-jwt-purge"),
+        ("subject", email),
+      ],
+    )
+    .await?;
+    let id_marker_key = store.jwt_marker_key("purgejtihashbyid");
+    hset(
+      &mut conn,
+      &id_marker_key,
+      &[
+        ("grant_id", "grant-jwt-purge-id"),
+        ("client_id", "client-jwt-purge"),
+        ("subject", user_id.as_str()),
+      ],
+    )
+    .await?;
+    let decoy_marker_key = store.jwt_marker_key("decoyjtihash");
+    hset(
+      &mut conn,
+      &decoy_marker_key,
+      &[
+        ("grant_id", "grant-decoy"),
+        ("client_id", "client-decoy"),
+        ("subject", "someone-else@example.test"),
+      ],
+    )
+    .await?;
+
+    let summary = purge_subject(&mut conn, &store, email, &user_id).await?;
+    if summary.jwt_markers != 2 {
+      return Err(TestError::Unexpected(format!(
+        "the purge must delete both subject markers, got {}",
+        summary.jwt_markers
+      )));
+    }
+    require_gone(&mut conn, &marker_key).await?;
+    require_gone(&mut conn, &id_marker_key).await?;
+    require_present(&mut conn, &decoy_marker_key).await?;
     Ok(())
   }
 

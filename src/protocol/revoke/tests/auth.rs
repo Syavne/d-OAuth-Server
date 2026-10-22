@@ -39,6 +39,7 @@ async fn revoke_unauthenticated_request_is_401() -> TestResult {
   let ctx = RevokeContext {
     token_endpoint: "https://auth.example.test/token",
     now: time::OffsetDateTime::now_utc(),
+    cimd: None,
     request_id: Some("req-revoke-test"),
   };
   let request = RevokeRequest {
@@ -47,7 +48,7 @@ async fn revoke_unauthenticated_request_is_401() -> TestResult {
     auth: &auth,
   };
 
-  match revoke_tokens(&mut stores, &ctx, &request).await {
+  match revoke_tokens(&mut stores, &ctx, &request, None).await {
     Err(error) => {
       if error.code() != OAuthErrorCode::InvalidClient {
         return Err(TestError::Unexpected(
@@ -96,6 +97,7 @@ async fn revoke_missing_token_is_invalid_request() -> TestResult {
   let ctx = RevokeContext {
     token_endpoint: "https://auth.example.test/token",
     now: time::OffsetDateTime::now_utc(),
+    cimd: None,
     request_id: None,
   };
   let request = RevokeRequest {
@@ -103,7 +105,7 @@ async fn revoke_missing_token_is_invalid_request() -> TestResult {
     token_type_hint: None,
     auth: &auth,
   };
-  match revoke_tokens(&mut stores, &ctx, &request).await {
+  match revoke_tokens(&mut stores, &ctx, &request, None).await {
     Err(error) if error.code() == OAuthErrorCode::InvalidRequest => Ok(()),
     Err(_) | Ok(_) => Err(TestError::Unexpected(
       "missing token must be invalid_request".to_owned(),

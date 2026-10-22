@@ -661,6 +661,215 @@ fn read_secret_file_preserves_surrounding_spaces() -> Result<(), Box<dyn Error>>
 
 /// The trusted-proxy allowlist defaults to empty: headers are never honored
 /// unless the operator configures the proxy peers explicitly.
+/// A raw 32-byte ES256/EdDSA key with a deterministic, non-zero, in-range
+/// scalar (printable ASCII keeps the helper representable as a JSON string).
+fn jwt_key(seed: u8) -> String {
+  (0..32_u8)
+    .map(|index| char::from(b'a' + ((seed.wrapping_add(index)) % 26)))
+    .collect()
+}
+
+/// All optional feature flags are off by default: adding the keys must not
+/// change any default-on behavior.
+#[test]
+fn config_jwt_flags_default_off() -> Result<(), Box<dyn Error>> {
+  let cfg = try_load(&base())?;
+  assert!(!cfg.resource_indicators_enabled);
+  assert!(!cfg.cimd_enabled);
+  assert!(!cfg.protected_resources_enabled);
+  assert!(!cfg.jwt_access_tokens_enabled);
+  assert!(!cfg.allow_localhost_redirect);
+  assert!(cfg.protected_resource_ids.is_empty());
+  assert!(cfg.jwt_signing_key.is_none());
+  assert!(cfg.jwt_signing_previous_keys.is_empty());
+  assert_eq!(
+    cfg.jwt_access_token_signing_alg,
+    super::JwtSigningAlg::Es256
+  );
+  assert_eq!(cfg.cimd_fetch_timeout, Duration::from_secs(5));
+  assert_eq!(cfg.cimd_max_bytes, 5_120);
+  Ok(())
+}
+
+/// C5b: the `localhost` loopback exception is gated by a flag that defaults
+/// off, so `http://localhost` redirects stay rejected unless opted in.
+#[test]
+fn config_localhost_redirect_defaults_off() -> Result<(), Box<dyn Error>> {
+  let cfg = try_load(&base())?;
+  assert!(!cfg.allow_localhost_redirect);
+  Ok(())
+}
+
+/// A JWT signing key that is not exactly 32 bytes is rejected at load with the
+/// offending key named — both short and over-long material.
+#[test]
+fn config_rejects_weak_jwt_key() {
+  for len in [16_usize, 31, 33, 64] {
+    let mut map = base();
+    map.insert("jwt_signing_key".to_owned(), Value::String("k".repeat(len)));
+    assert!(
+      matches!(
+        try_load(&map),
+        Err(ConfigError::WeakKeyMaterial {
+          key: "jwt_signing_key"
+        })
+      ),
+      "jwt_signing_key of {len} bytes must be rejected"
+    );
+  }
+  let mut previous = base();
+  previous.insert("jwt_signing_key".to_owned(), Value::String(jwt_key(1)));
+  previous.insert(
+    "jwt_signing_previous_keys".to_owned(),
+    json!([{ "kid": "v0", "key": "short-previous-jwt-key" }]),
+  );
+  assert!(matches!(
+    try_load(&previous),
+    Err(ConfigError::WeakKeyMaterial {
+      key: "jwt_signing_previous_keys"
+    })
+  ));
+}
+
+/// A 32-byte current key plus a rotated-out previous key loads; key material
+/// never appears in `Debug`.
+#[test]
+fn config_accepts_jwt_signing_key_and_previous_keys() -> Result<(), Box<dyn Error>> {
+  let current = jwt_key(1);
+  let previous = jwt_key(9);
+  let mut map = base();
+  map.insert("jwt_signing_key".to_owned(), Value::String(current.clone()));
+  map.insert("jwt_signing_kid".to_owned(), Value::String("v2".to_owned()));
+  map.insert(
+    "jwt_signing_previous_keys".to_owned(),
+    json!([{ "kid": "v0", "key": previous }]),
+  );
+  map.insert("jwt_access_tokens_enabled".to_owned(), Value::Bool(true));
+  let cfg = try_load(&map)?;
+  let active = cfg
+    .jwt_signing_key
+    .as_ref()
+    .ok_or("missing active jwt key")?;
+  assert_eq!(active.kid().as_str(), "v2");
+  assert_eq!(active.alg(), super::JwtSigningAlg::Es256);
+  assert_eq!(cfg.jwt_signing_previous_keys.len(), 1);
+  assert_eq!(cfg.jwt_signing_previous_keys[0].kid().as_str(), "v0");
+  let rendered = format!("{cfg:?}");
+  assert!(!rendered.contains(&current));
+  assert!(!rendered.contains("k".repeat(32).as_str()));
+  Ok(())
+}
+
+/// An all-zero scalar is not a valid EC private key: construction/validation
+/// happens at config load, so the process fails at boot, not at first mint.
+#[test]
+fn config_rejects_zero_scalar_jwt_key() {
+  let mut map = base();
+  map.insert(
+    "jwt_signing_key".to_owned(),
+    Value::String("\u{0}".repeat(32)),
+  );
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::InvalidJwtSigningKey {
+      key: "jwt_signing_key"
+    })
+  ));
+}
+
+/// Enabling JWT access tokens without a signing key fails closed.
+#[test]
+fn config_rejects_jwt_enabled_without_key() {
+  let mut map = base();
+  map.insert("jwt_access_tokens_enabled".to_owned(), Value::Bool(true));
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::MissingJwtSigningKey)
+  ));
+}
+
+/// A duplicated previous kid (or one matching the active kid) is rejected.
+#[test]
+fn config_rejects_duplicate_jwt_signing_kids() {
+  let mut map = base();
+  map.insert("jwt_signing_key".to_owned(), Value::String(jwt_key(1)));
+  map.insert("jwt_signing_kid".to_owned(), Value::String("v1".to_owned()));
+  map.insert(
+    "jwt_signing_previous_keys".to_owned(),
+    json!([
+      { "kid": "v0", "key": jwt_key(2) },
+      { "kid": "v0", "key": jwt_key(3) }
+    ]),
+  );
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::DuplicateJwtSigningKid { .. })
+  ));
+
+  let mut clash = base();
+  clash.insert("jwt_signing_key".to_owned(), Value::String(jwt_key(1)));
+  clash.insert("jwt_signing_kid".to_owned(), Value::String("v1".to_owned()));
+  clash.insert(
+    "jwt_signing_previous_keys".to_owned(),
+    json!([{ "kid": "v1", "key": jwt_key(2) }]),
+  );
+  assert!(matches!(
+    try_load(&clash),
+    Err(ConfigError::DuplicateJwtSigningKid { .. })
+  ));
+}
+
+/// `EdDSA` is an allowed JWT signing algorithm; an unknown value fails to
+/// deserialize rather than silently defaulting.
+#[test]
+fn config_accepts_eddsa_jwt_alg() -> Result<(), Box<dyn Error>> {
+  let mut map = base();
+  map.insert("jwt_signing_key".to_owned(), Value::String(jwt_key(1)));
+  map.insert(
+    "jwt_access_token_signing_alg".to_owned(),
+    Value::String("EdDSA".to_owned()),
+  );
+  let cfg = try_load(&map)?;
+  assert_eq!(
+    cfg.jwt_access_token_signing_alg,
+    super::JwtSigningAlg::EdDsa
+  );
+  let key = cfg
+    .jwt_signing_key
+    .as_ref()
+    .ok_or("missing active jwt key")?;
+  assert_eq!(key.alg(), super::JwtSigningAlg::EdDsa);
+  Ok(())
+}
+
+/// CIMD fetch bounds: the timeout ladder and byte cap are validated at load.
+#[test]
+fn config_validates_cimd_limits() -> Result<(), Box<dyn Error>> {
+  for secs in [0_u64, 11, 60] {
+    let mut map = base();
+    map.insert("cimd_fetch_timeout_secs".to_owned(), json!(secs));
+    assert!(
+      matches!(try_load(&map), Err(ConfigError::InvalidCimdFetchTimeout)),
+      "timeout {secs} must be rejected"
+    );
+  }
+  for bytes in [0_u64, 5_121, 20_000] {
+    let mut map = base();
+    map.insert("cimd_max_bytes".to_owned(), json!(bytes));
+    assert!(
+      matches!(try_load(&map), Err(ConfigError::InvalidCimdMaxBytes)),
+      "max bytes {bytes} must be rejected"
+    );
+  }
+  let mut ok = base();
+  ok.insert("cimd_fetch_timeout_secs".to_owned(), json!(10));
+  ok.insert("cimd_max_bytes".to_owned(), json!(1_024));
+  let cfg = try_load(&ok)?;
+  assert_eq!(cfg.cimd_fetch_timeout, Duration::from_secs(10));
+  assert_eq!(cfg.cimd_max_bytes, 1_024);
+  Ok(())
+}
+
 #[test]
 fn config_trusted_proxies_default_empty() -> Result<(), Box<dyn Error>> {
   let cfg = try_load(&base())?;

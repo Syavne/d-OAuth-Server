@@ -19,7 +19,7 @@ mod tests;
 
 use serde::Serialize;
 
-use super::super::{ClientKind, Cnf, SenderProof, TokenService};
+use super::super::{ClientKind, Cnf, SenderProof, TokenFormat, TokenService};
 use crate::{
   config::GrantKind,
   crypto::tokens as crypto_tokens,
@@ -56,6 +56,17 @@ pub struct ClientCredentialsInput<'a> {
   pub mtls_bound_x5t_s256: Option<&'a str>,
   /// Freshly verified proofs for this request.
   pub proof: &'a SenderProof,
+  /// Validated RFC 8707 §2 resource audiences for this request, in the
+  /// handler's sorted deduped order; empty when the request carried no
+  /// `resource`. The token handler already rejected a disabled gate, a
+  /// non-`https` value, and any value outside the enabled catalog with
+  /// `invalid_target`, so this set is catalog-bounded on entry. Todo 11 binds
+  /// it at mint through `MintRequest.aud`.
+  pub aud: &'a [String],
+  /// Access-token representation: `Opaque` mints today's token; `Jwt`
+  /// returns a signed RFC 9068 `at+jwt` whose `aud` claim is `aud`. The
+  /// refresh half minted by the service is revoked either way.
+  pub token_format: TokenFormat,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
 }
@@ -78,6 +89,10 @@ pub struct ClientCredentialsTokens {
   pub scope: String,
   /// Recorded sender constraint propagated from the fresh proofs.
   pub cnf: Cnf,
+  /// Catalog-validated RFC 8707 §2 audience set carried from the request;
+  /// Todo 11 binds it at mint through `MintRequest.aud` (never echoed in the
+  /// token response).
+  pub aud: Vec<String>,
   /// Grant chain the new token joins (for revocation wiring).
   pub grant_id: String,
   /// Access-token expiry (Unix seconds).
@@ -132,10 +147,14 @@ pub async fn issue_client_credentials(
       &super::super::MintRequest {
         client_id: input.client_id.trim().to_owned(),
         client_kind: ClientKind::Confidential,
+        dpop_required: false,
         subject: String::new(),
         scope: issued.render(),
         grant_id: grant_id.clone(),
         proof: input.proof.clone(),
+        aud: input.aud.to_vec(),
+        refresh_aud: input.aud.to_vec(),
+        format: input.token_format,
       },
       input.now_unix,
     )
@@ -158,6 +177,7 @@ pub async fn issue_client_credentials(
     expires_in: service.access_ttl().as_secs(),
     scope: issued.render(),
     cnf: minted.cnf,
+    aud: input.aud.to_vec(),
     grant_id,
     access_expires_at: minted.access_expires_at,
   })

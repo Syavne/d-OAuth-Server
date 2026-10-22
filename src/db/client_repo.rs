@@ -23,10 +23,9 @@
 mod tests;
 mod types;
 
-pub use types::{Client, ClientMetadata, ClientRepoError, NewClient, TokenEndpointAuthMethod};
-
 use sqlx::PgPool;
 use time::OffsetDateTime;
+pub use types::{Client, ClientMetadata, ClientRepoError, NewClient, TokenEndpointAuthMethod};
 use uuid::Uuid;
 
 use crate::crypto::field::{
@@ -127,15 +126,15 @@ pub async fn insert(
        tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, \
        tls_client_auth_cert_thumbprint_index, request_uris, request_uris_enc, contacts, \
        contacts_enc, software_id, software_id_enc, registration_access_token_hash, \
-       dpop_bound_access_tokens, created_at, updated_at) \
+       dpop_bound_access_tokens, access_token_format, created_at, updated_at) \
      VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-       $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, now(), now()) \
+       $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, now(), now()) \
      RETURNING id, client_id, client_secret_expires_at, client_id_issued_at, client_name, \
        client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, \
        jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, \
        tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, \
        request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, \
-       dpop_bound_access_tokens, active, created_at, updated_at",
+       dpop_bound_access_tokens, access_token_format, active, created_at, updated_at",
     new.id,
     &new.client_id,
     new.client_secret_hash.as_deref(),
@@ -163,6 +162,7 @@ pub async fn insert(
     sealed.software_enc,
     new.registration_access_token_hash.as_deref(),
     new.dpop_bound_access_tokens,
+    &new.access_token_format,
   )
   .fetch_one(pool)
   .await?;
@@ -192,6 +192,7 @@ pub async fn insert(
     contacts: decrypt_optional_json(keys, row.contacts_enc, row.contacts)?,
     software_id: decrypt_optional_text(keys, row.software_id_enc, row.software_id)?,
     dpop_bound_access_tokens: row.dpop_bound_access_tokens,
+    access_token_format: row.access_token_format,
     active: row.active,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -215,7 +216,7 @@ pub async fn find_active_by_client_id(
        jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, \
        tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, \
        request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, \
-       dpop_bound_access_tokens, active, created_at, updated_at \
+       dpop_bound_access_tokens, access_token_format, active, created_at, updated_at \
      FROM oauth_clients WHERE client_id = $1 AND active = true",
     client_id,
   )
@@ -249,6 +250,7 @@ pub async fn find_active_by_client_id(
         contacts: decrypt_optional_json(keys, row.contacts_enc, row.contacts)?,
         software_id: decrypt_optional_text(keys, row.software_id_enc, row.software_id)?,
         dpop_bound_access_tokens: row.dpop_bound_access_tokens,
+        access_token_format: row.access_token_format,
         active: row.active,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -274,7 +276,7 @@ pub async fn find_by_id(
        jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, \
        tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, \
        request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, \
-       dpop_bound_access_tokens, active, created_at, updated_at \
+       dpop_bound_access_tokens, access_token_format, active, created_at, updated_at \
      FROM oauth_clients WHERE id = $1",
     id,
   )
@@ -308,6 +310,7 @@ pub async fn find_by_id(
         contacts: decrypt_optional_json(keys, row.contacts_enc, row.contacts)?,
         software_id: decrypt_optional_text(keys, row.software_id_enc, row.software_id)?,
         dpop_bound_access_tokens: row.dpop_bound_access_tokens,
+        access_token_format: row.access_token_format,
         active: row.active,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -333,7 +336,7 @@ pub async fn list(
        jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, \
        tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, \
        request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, \
-       dpop_bound_access_tokens, active, created_at, updated_at \
+       dpop_bound_access_tokens, access_token_format, active, created_at, updated_at \
      FROM oauth_clients WHERE ($1 OR active = true) ORDER BY created_at, client_id",
     include_inactive,
   )
@@ -368,6 +371,7 @@ pub async fn list(
         contacts: decrypt_optional_json(keys, row.contacts_enc, row.contacts)?,
         software_id: decrypt_optional_text(keys, row.software_id_enc, row.software_id)?,
         dpop_bound_access_tokens: row.dpop_bound_access_tokens,
+        access_token_format: row.access_token_format,
         active: row.active,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -482,7 +486,7 @@ pub async fn update_metadata(
        jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, \
        tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, \
        request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, \
-       dpop_bound_access_tokens, active, created_at, updated_at",
+       dpop_bound_access_tokens, access_token_format, active, created_at, updated_at",
     current.id,
     name_plain,
     sealed.name_enc,
@@ -537,6 +541,7 @@ pub async fn update_metadata(
         contacts: decrypt_optional_json(keys, row.contacts_enc, row.contacts)?,
         software_id: decrypt_optional_text(keys, row.software_id_enc, row.software_id)?,
         dpop_bound_access_tokens: row.dpop_bound_access_tokens,
+        access_token_format: row.access_token_format,
         active: row.active,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -581,6 +586,31 @@ pub async fn rotate_secret_hash(
     client_id,
     new_hash,
     expires_at,
+  )
+  .execute(pool)
+  .await?;
+  Ok(result.rows_affected() > 0)
+}
+
+/// Set an active client's access-token format (`opaque` or `jwt`).
+///
+/// Returns `true` only when the stored value actually changed, so a
+/// declarative `config sync` re-run stays a true no-op. The operator CLI is
+/// the only caller; dynamic registration always inserts `opaque`.
+///
+/// # Errors
+///
+/// Returns a database error if the update fails.
+pub async fn set_access_token_format(
+  pool: &PgPool,
+  client_id: &str,
+  format: &str,
+) -> Result<bool, sqlx::Error> {
+  let result = sqlx::query!(
+    "UPDATE oauth_clients SET access_token_format = $2, updated_at = now() \
+     WHERE client_id = $1 AND active = true AND access_token_format IS DISTINCT FROM $2",
+    client_id,
+    format,
   )
   .execute(pool)
   .await?;

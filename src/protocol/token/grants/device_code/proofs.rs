@@ -81,7 +81,7 @@ pub(super) async fn fresh_proofs(
     }
   };
   let dpop_jkt = match method {
-    TokenEndpointAuthMethod::None => Some(
+    TokenEndpointAuthMethod::None if client.dpop_bound_access_tokens => Some(
       dpop_jkt
         .filter(|jkt| !jkt.is_empty())
         .ok_or_else(|| AppError::invalid_dpop_proof("DPoP proof is required"))?,
@@ -121,6 +121,7 @@ async fn authenticate_confidential(
   let auth_ctx = AuthContext {
     token_endpoint: endpoint.as_str(),
     now: OffsetDateTime::from_unix_timestamp(state.now_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH),
+    cimd: state.cimd,
   };
   client_auth::authenticate_client(&mut auth, &auth_ctx, &request).await?;
   Ok(())

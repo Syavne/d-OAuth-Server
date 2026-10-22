@@ -8,6 +8,10 @@ CLI/Job only.
 > Task 48 owns `SECURITY.md`; this file is the task-47 operator runbook.
 > The threat model and the replace-immediately rationale live there.
 
+This file covers admin bootstrap and breach response only. Onboarding a resource
+server (RFC 9728) is a separate operator runbook in
+[docs/OPERATIONS.md](docs/OPERATIONS.md#resource-server-onboarding-rfc-9728).
+
 ## Prerequisites
 
 - Migrations applied exactly once via the migration Job (never per replica):

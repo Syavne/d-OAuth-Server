@@ -1743,7 +1743,11 @@ async fn resolve_post_logout_target(
     Err(_) => return Ok(None),
   };
   let registered: Vec<&str> = effective.iter().map(String::as_str).collect();
-  match redirect_match::match_redirect_uri(&registered, bound) {
+  match redirect_match::match_redirect_uri(
+    &registered,
+    bound,
+    state.config.allow_localhost_redirect,
+  ) {
     redirect_match::RedirectDecision::Exact | redirect_match::RedirectDecision::Loopback => {
       Ok(Some(bound.to_owned()))
     }

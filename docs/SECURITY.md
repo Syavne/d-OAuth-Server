@@ -60,21 +60,56 @@ class, or runtime setting).
 
 | Vector | Existing controls | Residual risk |
 | --- | --- | --- |
-| Application-level RCE in a parser (form bodies, DPoP/JAR/`private_key_jwt` JWTs, DCR JSON, `jwks_uri`/`request_uri` fetches) | `#![forbid(unsafe_code)]`, no `unwrap`/`panic` in request paths, rustls/ring (no OpenSSL), fuzz targets for token-form/DCR-JSON/JAR-claims plus DPoP-JWK/assertion-verify/redirect-URI/scope-parse, with continuous ClusterFuzzLite coverage (`.clusterfuzzlite/`, `cflite_*.yml`) | Fuzzing is not exhaustive. |
+| Application-level RCE in a parser (form bodies, DPoP/JAR/`private_key_jwt` JWTs, DCR JSON, CIMD documents, `jwks_uri`/`request_uri` fetches) | `#![forbid(unsafe_code)]`, no `unwrap`/`panic` in request paths, rustls/ring (no OpenSSL), fuzz targets for token-form/DCR-JSON/JAR-claims plus DPoP-JWK/assertion-verify/redirect-URI/scope-parse, with continuous ClusterFuzzLite coverage (`.clusterfuzzlite/`, `cflite_*.yml`) | Fuzzing is not exhaustive. |
 | Dependency / supply-chain compromise | Committed `Cargo.lock`, `cargo deny`/`cargo audit` in CI, SBOM + provenance + keyless cosign, digest-pinned bases | A zero-day in a trusted crate. |
 | Container escape via kernel or runtime bug | Non-root UID 65532, read-only root filesystem, all capabilities dropped, `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault` | A kernel LPE or runc bug, mitigated but not eliminated. |
 | Secret exfiltration from the process environment | Secrets are injected at runtime, not baked into image layers; the pepper/TOTP/PII keys live outside the database; the Deployment mounts every secret — pepper, TOTP key, PII key, and the database/Redis passwords — as `0400` tmpfs files under `/run/secrets` (read through their `*_FILE` variables), and the passwordless DSNs come from the ConfigMap, so no secret enters the environment | An attacker with code execution can still read the mounted secret files under `/run/secrets`; that is the same capability the server has. |
 | Exposed management surface | The plaintext health listener (8081) is unauthenticated but not published in the Service (only 8080 is) | A misconfigured Service/Ingress could expose it; it must never be internet-facing. |
 | Host access via mounted volumes | `/certs` is mounted read-only at mode `0400`; no Docker socket is mounted | Operator misconfiguration. |
-| Unrestricted pod egress (SSRF to metadata, exfiltration) | `networkpolicy.yaml` default-denies egress except DNS (53 to `kube-system`) and Postgres/Redis (5432/6379) scoped to the namespace hosting them — no internet-wide `0.0.0.0/0` peer; any `ipBlock` peer excludes `169.254.0.0/16`; ingress is limited to pod ports 8080/8081 | Enforcement depends on a NetworkPolicy-capable CNI; a cluster that ignores NetworkPolicy gets no benefit. A managed database outside the cluster needs a specific CIDR or a CNI FQDN policy. The default-deny also blocks the JAR `request_uri` HTTPS fetch — remote request objects are unsupported unless the deployment adds a scoped allowance (see `docs/DEPLOYMENT.md`). |
+| Unrestricted pod egress (SSRF to metadata, exfiltration) | `networkpolicy.yaml` default-denies egress except DNS (53 to `kube-system`) and Postgres/Redis (5432/6379) scoped to the namespace hosting them — no internet-wide `0.0.0.0/0` peer; any `ipBlock` peer excludes `169.254.0.0/16`; ingress is limited to pod ports 8080/8081 | Enforcement depends on a NetworkPolicy-capable CNI; a cluster that ignores NetworkPolicy gets no benefit. A managed database outside the cluster needs a specific CIDR or a CNI FQDN policy. The default-deny also blocks the JAR `request_uri` HTTPS fetch and the CIMD `client_id` document fetch, so remote request objects and CIMD are unsupported unless the deployment adds a scoped allowance (see `docs/DEPLOYMENT.md`). |
 | Operator `exec` into a running pod | No shell and a non-root, read-only-rootfs container limit what runs; every secret is a file the container user already reads, and no secret is in the environment | `pods/exec` (and `docker exec`) bypass the application's own authorization; restrict it with RBAC and audit it (`docs/OPERATIONS.md`). |
 | Kubernetes API access from the pod | `automountServiceAccountToken: false`; the binary never calls the API | A future feature that needs the API would have to re-enable it deliberately. |
 | Image/registry compromise | Keyless cosign v3 signing (OCI 1.1 referrer bundles) in the `supply-chain.yml` `merge` job (`Keyless sign (cosign, OIDC)`), verify-before-rollout with `cosign verify` on `ghcr.io/syavne/d-oauth-server:latest` (see `docs/DEPLOYMENT.md`), a mutable `:latest` reference that trades immutability for a simple admin flow, and a local-build fallback that still signs (`cosign sign`) and verifies (`cosign verify`) before loading; each rollout records the digest the tag resolved to in `RUNBOOK.md` | A registry compromise of the mutable `:latest` tag ships if the operator skips the verify step, and the tag can move between verify and pull (TOCTOU), so the verified digest may not be the one a node pulls; an unsigned `docker save \\| docker load` tarball bypasses every control, so it is forbidden except through the documented local sign/verify fallback. |
 | Rate-limit evasion via spoofed `X-Forwarded-For` behind an L7 proxy | Default-empty   `rate_limit.trusted_proxies` (headers ignored unless the TCP peer is an allowlisted proxy IP/CIDR); rightmost-untrusted selection; malformed headers fall back to the verified peer; attribution is bucket selection only, never authentication | An allowlist entry that is too broad (or a compromised proxy) attributes attacker-chosen IPs; keep entries to the proxy peers and never a `/0` (rejected at load). Proxies must emit bare IPs (no port/brackets/`unknown`); anything else is skipped, and only the rightmost 32 entries are considered. |
 
-Last reviewed: 2026-10-13. File-mounted DB/Redis passwords, a mutable `:latest`
-image reference, NetworkPolicy, `automountServiceAccountToken: false`, and
-scheduled fuzzing are implemented in the shipped manifests and workflows.
+`GET /jwks.json` is the only public endpoint the JWT access-token feature adds.
+The AS metadata document advertises it as `jwks_uri`, together with the exact
+configured signing algorithm, only while `jwt_access_tokens_enabled` is on, so a
+disabled deployment exposes neither a key set nor an algorithm claim.
+Its body is public verification material by construction: a JWK Set carrying
+`kid`, `kty`, `crv`, `x` (and `y` for EC), `use: "sig"`, and `alg` for the
+current and retained signing keys, with no private member (`d`, CRT parameters,
+or `k`) ever rendered. Endpoint enumeration therefore reveals no client, token,
+or subject existence; with `jwt_access_tokens_enabled` off it is an empty
+`{"keys":[]}`, and the short cache window bounds how long a rotated-out key
+stays reachable through an intermediary.
+
+CIMD adds a client class fetched from the internet, so it is a deployment-surface
+change, not just an endpoint change. With `cimd_enabled` on, the authorization
+server makes outbound HTTPS requests to a host chosen by the caller (the
+`client_id` URL). The shipped NetworkPolicy default-denies that egress; a
+deployment that enables CIMD must add a scoped allowance for the document hosts
+it intends to trust. The guard blocks internal targets, but it cannot make an
+untrusted origin trustworthy: the document decides the redirect set, scope
+bound, grant allowlist, and DPoP flag within the validation rules described in
+[Client ID metadata documents (CIMD)](#client-id-metadata-documents-cimd). Do not
+enable CIMD in a deployment that cannot enforce egress policy.
+
+This server is the authorization server and hosts no resource server: it adds
+no `/.well-known/oauth-protected-resource` route and no RS route to
+`src/routes.rs`, and its AS metadata document never carries a `resource_metadata`
+member. The resource-server side of discovery, the
+`WWW-Authenticate: Bearer resource_metadata="..."` challenge, and the audience
+and scope checks that stop a token minted for one resource from being replayed
+at another (RFC 9728 §7.4) are a separate deployable's responsibility. That
+contract is in [RS-CONTRACT.md](RS-CONTRACT.md); a resource server that skips the
+audience check re-opens the cross-resource replay this server's audience binding
+is meant to close.
+
+Last reviewed: 2026-10-21. File-mounted DB/Redis passwords, a mutable `:latest`
+image reference, NetworkPolicy, `automountServiceAccountToken: false`, scheduled
+fuzzing, and the CIMD outbound fetch surface are implemented in the shipped
+manifests and workflows.
 Deploy provenance is a documented verify-before-rollout path
 (`docs/DEPLOYMENT.md`, `RUNBOOK.md`): the signed `ghcr.io` image verified with
 `cosign verify` and a recorded digest, with local builds kept only as a signed
@@ -95,11 +130,20 @@ fallback.
 
 ## Browser and intermediary caching
 
-- Every response except `/.well-known/…` metadata carries
+- Every response except `/.well-known/…` metadata and `GET /jwks.json` carries
   `Cache-Control: no-store` (+ `Pragma: no-cache` for legacy clients). An
   authorization page, consent page, token body, request handle, or error is
   therefore never reused by a browser, the back/forward cache, or a shared
   intermediary.
+- `GET /jwks.json` is deliberately cacheable with `public, max-age=300`: the
+  advertised members (`kid`, `kty`, `crv`, `x`, and `y` for EC, `use: "sig"`,
+  `alg`) are public verification coordinates, never private key material. The
+  five-minute window is a revocation trade-off: a rotated-out key stays
+  available for resource servers still checking old tokens, but caches drop it
+  ten times faster than the one-hour metadata document.
+- `/jwks.json` is a new public, unauthenticated path: it returns only public
+  key coordinates, and it is the only addition to the routing table for the
+  JWT feature. It does not reveal whether any client or token exists.
 - This covers the `GET /login` and `GET /consent` pages (which carry a
   session-bound CSRF token and the bound `request_id`), the `/authorize`
   redirects and error responses, the token endpoint (success and error), PAR,
@@ -138,6 +182,67 @@ fallback.
 
 See [REDIS.md](REDIS.md) for the barrier modes.
 
+## JWT access-token signing and revocation
+
+Reference: RFC 9068 §2.1, §2.2, §4; RFC 7517 §5.
+
+The signer is off by default and is separate from the pepper/TOTP/PII master
+chains. When `jwt_access_tokens_enabled` is on, exactly 32 bytes of raw key
+material (`jwt_signing_key` or its `*_file` mount) become a PKCS#8 signing key
+for `ES256` (P-256 scalar) or `EdDSA` (Ed25519 seed), chosen by
+`jwt_access_token_signing_alg`. There is no RSA path and no PEM handling. A
+probe signature is produced at load, so an all-zero or out-of-range scalar fails
+at boot rather than at the first mint, and enabling the feature without a key is
+a load-time error.
+
+Threat model for the signer:
+
+- The algorithm is pinned by configuration, never taken from the token. A JWT
+  whose header names any other `alg` is rejected, including `none` and HS
+  variants, so there is no algorithm-confusion path and no symmetric key to
+  confuse with a public one.
+- The header `typ` must be exactly `at+jwt`, and `kid` must name the current or
+  a retained previous key. An unknown `kid` fails with no fallback.
+- `iss` and `exp` are enforced with zero clock-skew leeway. `aud` containment is
+  applied when the caller supplies an expected audience.
+- Key material never appears in `Debug`, an error, a metric label, or a log.
+  `Config` and `JwtSigningKey` print only the key id and algorithm; `/jwks.json`
+  carries public coordinates only (`kid`, `kty`, `crv`, `x`, and `y` for EC).
+- Rotation is verify-only for the old key: the current key signs, every
+  `jwt_signing_previous_keys` entry verifies. Kids must be distinct, and a
+  previous key cannot be configured without a current key. Retain the old key at
+  least until every token it signed has reached `exp` (`ttl.access_secs`, 300 s
+  by default). The JWKS route advertises current first, then retained keys, and
+  intermediaries may cache that document for 300 s, so a removed key can remain
+  visible for up to that window.
+
+Revocation is an allowlist, not a denylist. Every minted JWT writes a
+`jwt:<jti-hash>` marker (fields `grant_id`, `client_id`, `subject`; TTL equal to
+the access TTL) in the same atomic script as its grant membership. A token is
+live only while its marker exists and, for introspection, while the marker's own
+grant set still contains it. `POST /introspect` also re-checks the current
+account status, so a disabled subject reports inactive. The server fails closed
+(`503`) if Redis or Postgres cannot answer that liveness question.
+
+The marker is torn down by every revocation path:
+
+- A grant cascade deletes `jwt:<hash>` markers as its third ARGV, alongside the
+  access records and grant set members.
+- `user disable` sweeps `jwt:` keys by their `subject` field before flipping
+  `users.disabled`.
+- `POST /revoke` accepts a JWT-shaped token directly: it verifies signature and
+  `iss`, requires both the signed `client_id` and the marker's `client_id` to
+  match the caller, then deletes marker, record, and grant membership with a
+  durability barrier. A failed ownership check is a uniform no-op (`200`).
+
+A resource server that verifies locally against `/jwks.json` cannot observe any
+of this: it sees the signature, `iss`, `exp`, and its own audience binding, so it
+accepts a revoked or disabled user's token until `exp`. That is the exp-bounded
+trade-off of a self-contained token. A resource server that needs immediate
+revocation must use `POST /introspect`; one that verifies locally must keep the
+access TTL short. The same trade-off is stated from the protocol side in
+[OAUTH.md](OAUTH.md#the-resource-server-trade-off).
+
 ## Sender constraints
 
 Reference: RFC 9449 (DPoP), RFC 8705 (mTLS).
@@ -146,8 +251,15 @@ Every sender-constrained grant requires a freshly verified proof on every use.
 
 | Client class | Required binding |
 | --- | --- |
-| Public | DPoP only. A missing proof fails with `invalid_grant`. |
+| Public, DPoP-bound (`dpop_bound_access_tokens: true`) | DPoP only. A missing proof fails with `invalid_grant`. |
+| Public, unbound (default) | None: the client mints `Bearer` tokens. A presented DPoP proof is still verified and recorded. |
 | Confidential | mTLS and/or DPoP. The confirmation records each proven component. |
+
+Rollout note: `dpop_bound_access_tokens` defaults to false, so upgrading
+makes an existing public client bearer-capable; a client that must stay
+DPoP-mandatory has to be registered (or updated via RFC 7592) with
+`dpop_bound_access_tokens: true`. A presented bad proof is still rejected for
+both classes, and scope and disabled-subject rules are unchanged.
 
 - `cnf` propagates to every newly minted token.
 - A stored `cnf` alone never mints: the proof is re-verified per use.
@@ -186,6 +298,77 @@ Reference: RFC 9126, RFC 9101.
   blocked address.
 - PAR credentials are read from the header and body only, never the query.
 
+## Client ID metadata documents (CIMD)
+
+Reference: `draft-ietf-oauth-client-id-metadata-document-02` §3 through §5,
+§8.6, §8.7.
+
+CIMD is a registration-free client class: an `https://` URL used as the
+`client_id` is fetched and validated, and the result is used as client metadata
+for that request. The trust model is remote-document trust with strict
+validation. The server does fetch, and it does not treat the client as trusted
+because "it registered"; there is no row and no initial-access token. The
+feature is off by default (`cimd_enabled`); with it off, an `https://`
+`client_id` with no registered row is still an unknown client.
+
+Fetch boundary:
+
+- One guarded fetch, the same fetcher used for `request_uri` and `jwks_uri`:
+  `https` only, redirects disabled (a 3xx fails closed), DNS pinned to the
+  validated addresses, proxy disabled, and special-use, private, and loopback
+  targets rejected before any connection.
+- The body is capped by `cimd_max_bytes` (default `5120`, allowed `1`-`5120`)
+  and the whole request by `cimd_fetch_timeout_secs` (default `5`, allowed
+  `1`-`10`). A non-2xx status or a non-JSON body fails closed.
+- A fetch or document-validation failure is a client error
+  (`invalid_client_metadata`, or `invalid_redirect_uri` for the redirect set),
+  never a fail-open success. A Redis or Postgres outage on the same path is a
+  fail-closed `503`.
+
+Threat notes:
+
+- **Document substitution.** The document must echo the fetched URL in
+  `client_id` byte for byte, so a document hosted at one URL cannot claim to be
+  another. The remaining trust is the origin itself: whoever controls the URL
+  controls the redirect set, scope bound, grant allowlist, and DPoP flag,
+  within the server's validation rules and the enabled scope catalog. Use only
+  URLs whose origin you control; the consent page shows the client and its
+  redirect target before approval.
+- **Cache poisoning window.** A validated document is cached for 15 minutes as
+  `cimd:<sha256(url)>` under the `{state}` keyspace. Only the raw document is
+  cached, and it is revalidated on every read, so a disabled scope or removed
+  catalog entry takes effect on the next request. A malformed cache entry is
+  deleted and treated as a miss. A document changed at its origin can still be
+  served from cache for up to the TTL, because a cache hit performs no fetch.
+  Redis write access is therefore equivalent to control of client metadata for
+  that window; treat Redis as trusted infrastructure exactly as for every other
+  security record.
+- **Inline-only `jwks`.** A CIMD `private_key_jwt` client must carry its key set
+  inline, and any `jwks_uri` member is rejected even alongside an inline
+  `jwks`. Client authentication therefore never triggers a second network
+  fetch on the token or assertion path, which removes a second SSRF surface and
+  a key-substitution race between the fetched document and a separately fetched
+  key set.
+- **No shared secret or mTLS.** Only `none` and `private_key_jwt` are accepted.
+  A remote document cannot hold a shared secret or attest a client certificate,
+  and CIMD §4.1 defines these clients as unable to do so. `private_key_jwt` is
+  authentication only and never a sender constraint.
+- **DPoP and Bearer.** `dpop_bound_access_tokens` absent or `false` produces
+  Bearer tokens; `true` requires a fresh DPoP proof at every gate. A CIMD
+  `none` client is therefore bearer-capable by default, the same as an unbound
+  registered public client, and a stolen Bearer token is usable until it
+  expires or is revoked. The document author chooses the flag, not the
+  operator. PKCE `S256` and exact redirect matching still bound the code path.
+- **No row, no operator controls.** A CIMD client has no `oauth_clients` row,
+  so it cannot be given JWT access tokens (`access_token_format` stays
+  `opaque`), attached to the redirect catalog, or edited through RFC 7592. A
+  CIMD `none` client can revoke its own token but cannot introspect; a CIMD
+  `private_key_jwt` client can do both.
+- **The DCR gate is unchanged.** CIMD adds a resolution fallback only when no
+  registered row exists. `POST /register` still requires a one-time
+  initial-access token unless `allow_open_registration` is set, and that gate
+  has no CIMD branch.
+
 ## Key ring and rotation
 
 - One versioned `KeyRing` holds three independent chains, newest first: the
@@ -200,8 +383,10 @@ Reference: RFC 9126, RFC 9101.
   (`totp rewrap`). See
   [OPERATIONS.md](OPERATIONS.md#pii-and-totp-key-rotation).
 - `Debug` prints key ids only, never key material.
-- There is no authorization-server JWT-signing key and no `jwks_uri`. The
-  `keygen` command emits keys for test fixtures and client-side DPoP only.
+- There is a separate, opt-in JWT access-token signer (`jwt_signing_key` plus
+  `jwt_signing_previous_keys`), not part of the three master chains. The
+  `keygen` command still emits ES256 keys only for test fixtures and
+  client-side DPoP; it does not manage the server's JWT signing key.
 
 ## PII field encryption
 
@@ -325,6 +510,17 @@ configure one as fail-open is a load-time error.
   There are no wildcards and no prefix matches. A private-use scheme must
   contain reverse-DNS dot notation (draft-16 §2.3.1): `com.example.app:/` is
   accepted, `myapp:/` is rejected; `https` and loopback are unaffected.
+- The loopback exception covers the literal hosts `127.0.0.1` and `[::1]`
+  unconditionally. The host `localhost` is covered only when
+  `allow_localhost_redirect` is set (default off). RFC 8252 §8.3 warns that a
+  hostname such as `localhost` is resolution-dependent: `/etc/hosts`, DNS, or
+  a search suffix can point it away from the loopback interface, so enabling
+  the flag widens the exception to whatever `localhost` resolves to on the
+  user agent. It is an explicit operator opt-in, never a default, and it does
+  not change the literal-IP behavior. OAuth clients such as MCP servers that
+  use `http://localhost:{port}/…` redirects rely on this flag; the consent
+  page shows the client and its redirect target, so a user can see where the
+  authorization code will be delivered before approving.
 - PKCE is `S256` only. A verifier cannot be omitted to downgrade.
 - Scope is intersected: `requested ∩ client-registered ∩ user-entitled ∩
   enabled`. Refresh re-checks the current `enabled` catalog, the client's

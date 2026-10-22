@@ -56,6 +56,9 @@ pub struct PendingAuth {
   /// Recorded at validation time so a later logout can return the browser to
   /// the client without accepting any redirect target from the request.
   pub post_logout_uri: Option<String>,
+  /// Resource audiences (RFC 8707) pinned to the request; empty when unbound.
+  #[serde(default)]
+  pub aud: Vec<String>,
 }
 
 impl PendingAuth {
@@ -298,6 +301,7 @@ mod tests {
       dpop_jkt: Some("thumbprint-123".to_owned()),
       iss: "https://as.example.test".to_owned(),
       post_logout_uri: Some("https://client.example.test/signed-out".to_owned()),
+      aud: vec!["https://api.example.test".to_owned()],
     }
   }
 
@@ -446,6 +450,48 @@ mod tests {
       Err(PendingError::Unknown) => Ok(()),
       _ => Err(TestError::Unexpected(
         "expired request must be rejected as unknown".to_owned(),
+      )),
+    }
+  }
+
+  /// A pending record serialized before audiences (no `aud` member — a rolling
+  /// deploy from a pre-audience replica) still reads, defaulting `aud` to empty;
+  /// a new record round-trips its audience set.
+  #[tokio::test]
+  async fn pending_auth_legacy_decodes() -> TestResult {
+    let (mut conn, store) = direct_store(crate::test_support::unique_prefixes()).await?;
+    let legacy_id = unique("legacy");
+    let legacy = r#"{"client_id":"client-abc","redirect_uri":"https://client.example.test/cb","scope":"orders:read","code_challenge":"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM","state":null,"dpop_jkt":null,"iss":"https://as.example.test","post_logout_uri":null}"#;
+    crate::store::hset_record(
+      &mut conn,
+      &pending_key(&store, &legacy_id),
+      &[("record".to_owned(), legacy.to_owned())],
+      Duration::from_secs(300),
+    )
+    .await?;
+    match get(&mut conn, &store, &legacy_id).await? {
+      Some(record) if record.aud.is_empty() => {}
+      _ => {
+        return Err(TestError::Unexpected(
+          "legacy pending JSON must decode aud to empty".to_owned(),
+        ));
+      }
+    }
+
+    let new_id = unique("new");
+    let record = sample_record();
+    put(
+      &mut conn,
+      &store,
+      &new_id,
+      &record,
+      Duration::from_secs(300),
+    )
+    .await?;
+    match get(&mut conn, &store, &new_id).await? {
+      Some(loaded) if loaded == record && !loaded.aud.is_empty() => Ok(()),
+      _ => Err(TestError::Unexpected(
+        "new pending record must round-trip aud".to_owned(),
       )),
     }
   }

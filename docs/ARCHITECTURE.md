@@ -25,9 +25,11 @@ the library.
 | `src/crypto/` | Constant-time comparison, PKCE, opaque token mint/hash, TOTP, and password/client-secret hashing. |
 | `src/crypto/field.rs` | Versioned AES-256-GCM field codec and keyed-HMAC blind index for the PII columns. |
 | `src/jose/` | DPoP proof verification, JAR request objects, `private_key_jwt` client assertions, and JWK parsing. |
-| `src/db/` | Postgres repositories for the six domain tables. See [DATABASE.md](DATABASE.md). |
+| `src/db/` | Postgres repositories for the seven domain tables, including `resource_repo` for the RFC 8707 resource-server catalog. See [DATABASE.md](DATABASE.md). |
+| `src/db/resource_repo.rs` | Exact-match CRUD for the `resource_servers` catalog: `upsert` preserves `id`/`enabled`, `find_enabled`, `list_enabled`, and `disable`. |
 | `src/store/` | Redis ephemeral state and the durability barrier. See [REDIS.md](REDIS.md). |
 | `src/protocol/` | OAuth endpoints and grants, plus the subject-scoped Redis purges (`src/protocol/purge.rs`: `purge_subject` for `user disable`, `purge_sibling_sessions` on credential change). |
+| `src/protocol/params.rs` | Shared raw-parameter parsing (`parse_pairs`, `repeated_values`, the form-content-type gate) and fail-closed RFC 8707 audience validation (`validate_resources`, `audience_binds`). |
 | `src/ui/` | Server-rendered login, consent, and device pages (Askama templates) plus the embedded same-origin stylesheet served at `/assets/app.css`. |
 | `src/middleware/` | Request id, tracing and redaction, rate limiting, security headers, and audit. |
 | `src/resilience.rs` | Load-shed, timeout, and concurrency-limit guard between CORS and rate limiting. |
@@ -50,7 +52,9 @@ is fixed in `build_router_with_options` in `src/routes.rs`:
    `http_request` tracing span. Tracing and redaction live here.
 2. Security headers: adds `Referrer-Policy`, `X-Content-Type-Options`, a CSP
    with `frame-ancestors 'none'`, HSTS on the TLS listener, and
-   `Cache-Control: no-store` on every response except `/.well-known/…` metadata.
+   `Cache-Control: no-store` on every response except `/.well-known/…` metadata
+   and `GET /jwks.json`, which carries its own short `public, max-age=300`
+   window (a rotated-out key must leave intermediary caches quickly).
    Sits just inside the request-id layer so short-circuiting layers below
    (CORS preflights, resilience 503s, rate-limit 429/503s, body-limit 413s)
    still carry the headers.
@@ -71,6 +75,17 @@ store. Errors are converted to `AppError`, which maps to an OAuth error body and
 the correct HTTP status. A dependency outage on a security path maps to `503`
 with `Retry-After`; it never fails open.
 
+Five parameter-carrying endpoints parse the raw query or body instead of using
+`Query<HashMap>` or `Form<...>`, because those extractors consume the raw input
+and cannot see a repeated `resource`: `GET /authorize`, `POST /par`,
+`POST /token`, `POST /device_authorization`, and `POST /introspect`.
+`src/protocol/params.rs` captures repeats in wire order while keeping the
+single-valued map last-wins. For the body endpoints it preserves the prior
+transport contract (`415` on a non-urlencoded body, `400` on a malformed or
+non-UTF-8 body, and the documented `invalid_request` mapping for a duplicated
+known field). `/token` rejects a `resource` on token exchange before any catalog
+lookup.
+
 ## The two listeners
 
 - The public listener binds `bind_addr` (default `0.0.0.0:8080`) and speaks TLS
@@ -90,9 +105,10 @@ network namespace and cannot reach pod-loopback, so `serve` refuses a loopback
 
 The split is strict and drives the whole design:
 
-- PostgreSQL holds durable domain state only: `oauth_clients`, `users`,
-  `scopes`, `user_scopes`, `redirect_uris`, `client_redirect_uris`, plus sqlx's
-  `_sqlx_migrations`. Nothing is written to Postgres per request. A failed login
+- PostgreSQL holds durable domain state only, in seven tables: `oauth_clients`,
+  `users`, `scopes`, `user_scopes`, `redirect_uris`, `client_redirect_uris`,
+  and `resource_servers`, plus sqlx's `_sqlx_migrations`. Nothing is written to
+  Postgres per request. A failed login
   does not touch Postgres; the counter lives in Redis. Introspection and refresh
   do re-read Postgres on every use: a non-empty subject resolving to a disabled
   user yields inactive (introspection) or `invalid_grant` (refresh) without
@@ -146,6 +162,13 @@ so they stay on a single slot. See [REDIS.md](REDIS.md).
   a CLI catalog mutation is visible immediately on every replica; when Postgres
   is down it returns `503` rather than advertising an empty or unknown scope
   list.
+- `GET /jwks.json` (public JWT access-token verification keys) serves a JWK Set
+  built from the configured signing ring: the current key first, then every
+  retained verify-only key. It is the single cacheable path outside
+  `/.well-known/`: keys are public by definition, and the shorter 300-second
+  window bounds how long a rotated-out key stays cached. With
+  `jwt_access_tokens_enabled` off it returns `{"keys":[]}` deterministically
+  rather than a cacheable `404`.
 - Migrations are applied out of band. A replica whose schema version is behind
   the binary reports not ready and is pulled from service.
 

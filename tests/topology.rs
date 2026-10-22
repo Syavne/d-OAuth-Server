@@ -261,6 +261,7 @@ async fn topology_single_node_store_roundtrip() -> TestResult {
     scope: "read".to_owned(),
     subject: "user-1".to_owned(),
     cnf: String::new(),
+    aud: Vec::new(),
   };
   put_access(
     &mut conn,

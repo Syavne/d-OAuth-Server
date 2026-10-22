@@ -24,25 +24,24 @@ mod proofs;
 #[cfg(test)]
 mod tests;
 
-pub use error::DevicePollError;
-
 use std::time::Duration;
 
+pub use error::DevicePollError;
 use secrecy::SecretString;
 use serde::Serialize;
 use sqlx::PgPool;
 
+use super::super::TokenFormat;
+use super::super::dispatch::require_dpop_binding;
 use crate::{
   config::TtlConfig,
-  db::{TokenEndpointAuthMethod, client_repo},
+  db::TokenEndpointAuthMethod,
   error::AppError,
   protocol::device::{DEVICE_GRANT, hash_token},
   state::RedisConn,
   store::{Store, device as device_store},
   tls::PeerCertificates,
 };
-
-use super::super::dispatch::require_dpop_binding;
 
 /// Everything one device-code poll needs: datastores plus request values.
 ///
@@ -65,6 +64,15 @@ pub struct PollState<'a> {
   pub interval: Duration,
   /// Token lifetimes used for the minted pair.
   pub ttl: &'a TtlConfig,
+  /// Access-token representation for the minted pair, resolved by the
+  /// dispatcher gate (`None` there means the grant never mints).
+  pub token_format: TokenFormat,
+  /// JWT signer for `TokenFormat::Jwt` mints, built by the dispatcher from
+  /// the validated config; attached to the service before minting.
+  pub jwt_signer: Option<crate::jose::jwt_access::JwtAccessSigner>,
+  /// CIMD resolution settings for a registration-free fallback; `None` when
+  /// `config.cimd_enabled` is off.
+  pub cimd: Option<crate::protocol::cimd::CimdSettings<'a>>,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
 }
@@ -87,6 +95,11 @@ pub struct DevicePollInputs<'a> {
   pub dpop_proof: Option<&'a str>,
   /// Verified peer chain injected by the TLS accept loop, when present.
   pub peer_certs: Option<&'a PeerCertificates>,
+  /// Validated resource audiences (RFC 8707 §2) presented with this poll,
+  /// sorted and deduped by the token handler; empty when the poll carried no
+  /// `resource`. Must equal the set pinned at authorization time (or be
+  /// inherited when empty: RFC 8707 §2.2).
+  pub aud: &'a [String],
 }
 
 /// Successful device-code redemption (RFC 8628 §3.5).
@@ -136,10 +149,16 @@ pub async fn poll_device(
       AppError::invalid_client_non_basic()
     }
   };
-  let client =
-    client_repo::find_active_by_client_id(state.pool, state.keys, inputs.client_id.trim())
-      .await?
-      .ok_or_else(unknown_client)?;
+  let client = crate::protocol::cimd::resolve_client(
+    state.pool,
+    state.keys,
+    state.conn,
+    state.cimd,
+    inputs.client_id.trim(),
+  )
+  .await
+  .map_err(AppError::from)?
+  .ok_or_else(unknown_client)?;
   let method = client.auth_method().map_err(|_| unknown_client())?;
   if !client.grant_types.iter().any(|grant| grant == DEVICE_GRANT) {
     return Err(AppError::unauthorized_client("client may not use the device grant").into());
@@ -173,7 +192,11 @@ pub async fn poll_device(
           device_hash: &device_hash,
           client: &client,
           kind,
+          dpop_required: client.dpop_bound_access_tokens,
           proofs,
+          aud: inputs.aud,
+          token_format: state.token_format,
+          jwt_signer: state.jwt_signer.clone(),
         },
       )
       .await

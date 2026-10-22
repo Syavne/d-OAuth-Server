@@ -51,6 +51,7 @@ async fn grant_refresh_lost_reply_replays_same_tokens() -> TestResult {
       scope: "read".to_owned(),
       subject: found.record.subject.clone(),
       cnf: cnf.clone(),
+      aud: Vec::new(),
     },
     new_access: AccessRecord {
       client_id: client.clone(),
@@ -58,10 +59,12 @@ async fn grant_refresh_lost_reply_replays_same_tokens() -> TestResult {
       scope: "read".to_owned(),
       subject: found.record.subject.clone(),
       cnf,
+      aud: Vec::new(),
     },
     new_refresh_ttl: service.refresh_ttl(),
     new_access_ttl: service.access_ttl(),
     request_id: Some(service.request_id_for(&found.hash)?),
+    jwt_jti_hash: None,
   };
 
   let first = service.rotate(&mut conn, &store, &input).await?;

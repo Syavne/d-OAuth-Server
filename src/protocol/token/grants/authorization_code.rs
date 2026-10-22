@@ -5,7 +5,9 @@
 //! client, atomically consumes the code (exactly one redemption; a wrong,
 //! expired, or already-used code fails with `invalid_grant` and is never
 //! re-consumed), then verifies — against the consumed record — the client id,
-//! the redirect URI, the PKCE verifier, and the sender binding: a stored
+//! the redirect URI, the PKCE verifier, the pinned resource audience
+//! (RFC 8707 §2: the token request must present the same set the
+//! authorization request bound), and the sender binding: a stored
 //! DPoP `jkt` must be matched by a freshly verified DPoP proof on this
 //! request, and an mTLS-registered client must freshly authenticate its leaf
 //! (task-27 records carry no mTLS binding, so mTLS is proven, not matched).
@@ -19,7 +21,8 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use super::super::dispatch::require_dpop_binding;
-use super::super::{ClientKind, MintRequest, SenderProof, TokenService};
+use super::super::{ClientKind, MintRequest, SenderProof, TokenFormat, TokenService};
+use crate::jose::jwt_access::JwtAccessSigner;
 use crate::{
   config::TtlConfig,
   crypto::{pkce, tokens as crypto_tokens},
@@ -28,6 +31,7 @@ use crate::{
   jose::dpop::{DpopRequest, verify_dpop},
   keys::KeyRing,
   protocol::{
+    cimd,
     client_auth::{self, AuthContext, AuthStores, ClientAuthRequest},
     mtls,
   },
@@ -55,6 +59,15 @@ pub struct CodeGrantState<'a> {
   pub issuer: &'a str,
   /// Token lifetimes used for the minted pair.
   pub ttl: &'a TtlConfig,
+  /// Access-token representation for the minted pair, resolved by the
+  /// dispatcher gate (`None` there means the grant never mints).
+  pub token_format: TokenFormat,
+  /// JWT signer for `TokenFormat::Jwt` mints, built by the dispatcher from
+  /// the validated config; attached to the service before minting.
+  pub jwt_signer: Option<JwtAccessSigner>,
+  /// CIMD resolution settings for a registration-free fallback; `None` when
+  /// `config.cimd_enabled` is off.
+  pub cimd: Option<cimd::CimdSettings<'a>>,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
 }
@@ -81,6 +94,10 @@ pub struct CodeGrantInputs<'a> {
   pub dpop_proof: Option<&'a str>,
   /// Verified peer chain injected by the TLS accept loop, when present.
   pub peer_certs: Option<&'a PeerCertificates>,
+  /// Validated resource audiences (RFC 8707) presented with this token
+  /// request, sorted and deduped by the handler; empty when the request
+  /// carried no `resource`. Must equal the set pinned into the code.
+  pub aud: &'a [String],
 }
 
 /// Successful authorization-code redemption (RFC 6749 §5.1).
@@ -107,8 +124,10 @@ pub struct CodeTokenResponse {
 /// mismatched presentation observes `Mismatched` and the victim record
 /// survives for its legitimate presenter, so a wrong, expired, or
 /// already-redeemed code fails with `invalid_grant` without ever burning a
-/// live value. The consumed record then feeds the sender-binding checks
-/// before anything is minted. Tokens join the code's `grant_id` chain.
+/// live value. The consumed record then feeds the resource-audience binding
+/// check (RFC 8707 §2: a token request must present the same resource set
+/// the authorization request pinned into the code) and the sender-binding
+/// checks before anything is minted. Tokens join the code's `grant_id` chain.
 ///
 /// # Errors
 ///
@@ -141,9 +160,19 @@ pub async fn redeem_code(
   };
 
   let candidate_id = candidate_client_id(inputs).ok_or_else(unknown_client)?;
-  let client = client_repo::find_active_by_client_id(state.pool, state.keys, candidate_id.as_str())
-    .await?
-    .ok_or_else(unknown_client)?;
+  // Registered row wins; a registration-free CIMD document materializes a
+  // synthetic client (CIMD draft §3). A failed fetch/validation maps per
+  // `CimdError`, never to `invalid_client`.
+  let client = cimd::resolve_client(
+    state.pool,
+    state.keys,
+    state.conn,
+    state.cimd,
+    candidate_id.as_str(),
+  )
+  .await
+  .map_err(AppError::from)?
+  .ok_or_else(unknown_client)?;
   if !client
     .grant_types
     .iter()
@@ -169,6 +198,16 @@ pub async fn redeem_code(
   )
   .await?;
 
+  // RFC 8707 §2: the token request's resource indicators must equal the set
+  // the authorization request pinned into the code. The code was consumed
+  // above (single use), so a mismatch is terminal for it: fail closed with
+  // `invalid_grant`, never mint.
+  if !crate::protocol::params::audience_binds(&record.aud, inputs.aud) {
+    return Err(AppError::invalid_grant(
+      "resource indicators do not match this authorization code",
+    ));
+  }
+
   let proofs = fresh_proofs(state, &client, inputs, used_basic).await?;
   require_dpop_binding(&client, &proofs)?;
   if let Some(want) = non_empty(&record.cnf) {
@@ -177,14 +216,21 @@ pub async fn redeem_code(
         "DPoP binding does not match this grant",
       ));
     }
-  } else if client_kind_of(&client)? == ClientKind::Public {
+  } else if client_kind_of(&client)? == ClientKind::Public && client.dpop_bound_access_tokens {
     return Err(AppError::invalid_grant(
       "public client grant is missing its DPoP binding",
     ));
   }
 
   let kind = client_kind_of(&client)?;
-  let service = TokenService::new(state.ttl, state.keys).map_err(AppError::internal)?;
+  let mut service = TokenService::new(state.ttl, state.keys).map_err(AppError::internal)?;
+  if state.token_format == TokenFormat::Jwt {
+    let signer = state
+      .jwt_signer
+      .clone()
+      .ok_or_else(AppError::server_error)?;
+    service = service.with_jwt_signer(signer);
+  }
   let minted = service
     .mint(
       state.conn,
@@ -192,10 +238,14 @@ pub async fn redeem_code(
       &MintRequest {
         client_id: client.client_id.clone(),
         client_kind: kind,
+        dpop_required: client.dpop_bound_access_tokens,
         subject: record.subject.clone(),
         scope: record.scope.clone(),
         grant_id: record.grant_id.clone(),
         proof: proofs,
+        aud: record.aud.clone(),
+        refresh_aud: record.aud.clone(),
+        format: state.token_format,
       },
       state.now_unix,
     )
@@ -375,7 +425,7 @@ async fn fresh_proofs(
     }
   };
   let dpop_jkt = match method {
-    TokenEndpointAuthMethod::None => Some(
+    TokenEndpointAuthMethod::None if client.dpop_bound_access_tokens => Some(
       dpop_jkt
         .filter(|jkt| !jkt.is_empty())
         .ok_or_else(|| AppError::invalid_dpop_proof("DPoP proof is required"))?,
@@ -415,6 +465,7 @@ async fn authenticate_confidential(
   let auth_ctx = AuthContext {
     token_endpoint: endpoint.as_str(),
     now: OffsetDateTime::from_unix_timestamp(state.now_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH),
+    cimd: state.cimd,
   };
   client_auth::authenticate_client(&mut auth, &auth_ctx, &request).await?;
   Ok(())
@@ -431,6 +482,7 @@ mod tests {
   //! fresh code because redemption consumes exactly once.
 
   use std::{
+    collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
   };
@@ -439,21 +491,28 @@ mod tests {
 
   use super::{CodeGrantInputs, CodeGrantState, CodeTokenResponse, GRANT_TYPE_REFRESH_TOKEN};
   use crate::{
-    config::{DurabilityMode, TtlConfig},
+    config::{DurabilityMode, JwtSigningAlg, JwtSigningKey, TtlConfig},
     crypto::{
       secret::{Argon2Params, hash_secret},
       tokens as crypto_tokens,
     },
-    db::{NewClient, TokenEndpointAuthMethod, client_repo},
+    db::{
+      NewClient, TokenEndpointAuthMethod, client_repo, redirect_repo, resource_repo, scope_repo,
+    },
     error::{AppError, OAuthErrorCode},
+    jose::jwt_access::JwtAccessSigner,
     keys::{KeyId, KeyRing, KeyRingError},
+    protocol::token::TokenFormat,
     protocol::{
+      authorize::{self, AuthorizeInput},
+      client_auth::ClientAuthRequest,
       code::{CodeClientKind, CodeIssueRequest, CodeIssuer, IssuedCode},
+      par::{self, ParContext, ParStores},
       scope::ScopeSet,
       token::TokenService,
     },
     state::RedisConn,
-    store::Store,
+    store::{Store, codes, par as par_store, pending},
   };
 
   /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -505,6 +564,10 @@ mod tests {
   const REDIRECT: &str = "https://app.example.test/cb";
   /// Public issuer scoping DPoP `htu` values.
   const ISSUER: &str = "https://auth.example.test";
+  /// Resource audiences used by the RFC 8707 binding tests (public values).
+  const AUD_ONE: &str = "https://api.example.test/";
+  const AUD_TWO: &str = "https://other.example.test/";
+  const AUD_OTHER: &str = "https://ghost.example.test/";
 
   static NONCE: AtomicU64 = AtomicU64::new(31_000);
 
@@ -561,6 +624,18 @@ mod tests {
     secret: Option<&str>,
     grants: &[&str],
   ) -> TestResult {
+    insert_client_bound(h, client_id, method, secret, grants, false).await
+  }
+
+  /// Register a client with an explicit `dpop_bound_access_tokens` flag.
+  async fn insert_client_bound(
+    h: &Harness,
+    client_id: &str,
+    method: TokenEndpointAuthMethod,
+    secret: Option<&str>,
+    grants: &[&str],
+    dpop_bound: bool,
+  ) -> TestResult {
     let params =
       Argon2Params::new(8, 1, 1, 32).map_err(|error| TestError::KeyGen(format!("{error:?}")))?;
     let secret_hash = secret
@@ -584,7 +659,8 @@ mod tests {
       request_uris: None,
       contacts: None,
       software_id: None,
-      dpop_bound_access_tokens: false,
+      dpop_bound_access_tokens: dpop_bound,
+      access_token_format: "opaque".to_owned(),
       registration_access_token_hash: None,
     };
     client_repo::insert(&h.pool, &h.ring, false, &new).await?;
@@ -597,6 +673,7 @@ mod tests {
     client_id: &str,
     kind: CodeClientKind,
     jkt: Option<&str>,
+    aud: &[String],
   ) -> Result<IssuedCode, TestError> {
     let issuer = CodeIssuer::new(&h.ttl, &h.ring)?;
     let approved = ScopeSet::parse("orders:read")?;
@@ -604,6 +681,7 @@ mod tests {
     let request = CodeIssueRequest {
       client_id,
       client_kind: kind,
+      dpop_required: kind == CodeClientKind::Public,
       user_id: "user-1",
       redirect_uri: REDIRECT,
       approved_scope: &approved,
@@ -611,6 +689,7 @@ mod tests {
       code_challenge: CHALLENGE,
       dpop_jkt: jkt,
       state: None,
+      aud,
       issuer: ISSUER,
     };
     Ok(issuer.issue(&mut h.conn, &h.store, &request).await?)
@@ -629,6 +708,9 @@ mod tests {
       keys: &h.ring,
       issuer: ISSUER,
       ttl: &h.ttl,
+      token_format: TokenFormat::Opaque,
+      jwt_signer: None,
+      cimd: None,
       now_unix: now,
     };
     super::redeem_code(&mut state, inputs).await
@@ -636,6 +718,27 @@ mod tests {
 
   fn secret(value: &str) -> SecretString {
     SecretString::from(value.to_owned())
+  }
+
+  /// Redemption inputs for a confidential client at a given audience set.
+  fn code_inputs<'a>(
+    issued: &'a IssuedCode,
+    client_id: &'a str,
+    aud: &'a [String],
+  ) -> CodeGrantInputs<'a> {
+    CodeGrantInputs {
+      code: issued.code.as_str(),
+      redirect_uri: REDIRECT,
+      code_verifier: Some(VERIFIER),
+      client_id: Some(client_id),
+      basic_header: None,
+      body_secret: Some(secret("code-secret")),
+      assertion_type: None,
+      assertion: None,
+      dpop_proof: None,
+      peer_certs: None,
+      aud,
+    }
   }
 
   /// A fresh ES256 signing key plus its public JWK for DPoP proofs.
@@ -707,7 +810,7 @@ mod tests {
       ],
     )
     .await?;
-    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None).await?;
+    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None, &[]).await?;
     let now = now_unix();
 
     let inputs = CodeGrantInputs {
@@ -721,6 +824,7 @@ mod tests {
       assertion: None,
       dpop_proof: None,
       peer_certs: None,
+      aud: &[],
     };
     let tokens = redeem_once(&mut h, &inputs, now)
       .await
@@ -782,7 +886,7 @@ mod tests {
     .await?;
     let key = fresh_key()?;
     let jkt = crate::jose::jwk::thumbprint(&key.jwk)?;
-    let issued = issue_code(&mut h, &client_id, CodeClientKind::Public, Some(&jkt)).await?;
+    let issued = issue_code(&mut h, &client_id, CodeClientKind::Public, Some(&jkt), &[]).await?;
     let now = now_unix();
 
     let proof = mint_proof(&key, &unique("jti"), now)?;
@@ -797,6 +901,7 @@ mod tests {
       assertion: None,
       dpop_proof: Some(proof.as_str()),
       peer_certs: None,
+      aud: &[],
     };
     let tokens = redeem_once(&mut h, &inputs, now)
       .await
@@ -837,6 +942,7 @@ mod tests {
       assertion: inputs.assertion,
       dpop_proof: inputs.dpop_proof,
       peer_certs: inputs.peer_certs,
+      aud: inputs.aud,
     }
   }
 
@@ -855,7 +961,7 @@ mod tests {
       ],
     )
     .await?;
-    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None).await?;
+    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None, &[]).await?;
     let now = now_unix();
 
     let inputs = CodeGrantInputs {
@@ -869,6 +975,7 @@ mod tests {
       assertion: None,
       dpop_proof: None,
       peer_certs: None,
+      aud: &[],
     };
     match redeem_once(&mut h, &inputs, now).await {
       Err(error) if is_invalid_grant(&error) => {}
@@ -913,7 +1020,7 @@ mod tests {
     )
     .await?;
     for redirect_uri in ["", "   "] {
-      let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None).await?;
+      let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None, &[]).await?;
       let inputs = CodeGrantInputs {
         code: issued.code.as_str(),
         redirect_uri,
@@ -925,6 +1032,7 @@ mod tests {
         assertion: None,
         dpop_proof: None,
         peer_certs: None,
+        aud: &[],
       };
       redeem_once(&mut h, &inputs, now_unix())
         .await
@@ -953,7 +1061,7 @@ mod tests {
       )
       .await?;
     }
-    let issued = issue_code(&mut h, &client_a, CodeClientKind::Confidential, None).await?;
+    let issued = issue_code(&mut h, &client_a, CodeClientKind::Confidential, None, &[]).await?;
 
     let inputs = CodeGrantInputs {
       code: issued.code.as_str(),
@@ -966,6 +1074,7 @@ mod tests {
       assertion: None,
       dpop_proof: None,
       peer_certs: None,
+      aud: &[],
     };
     match redeem_once(&mut h, &inputs, now_unix()).await {
       Err(error) if is_invalid_grant(&error) => Ok(()),
@@ -996,7 +1105,7 @@ mod tests {
       )
       .await?;
     }
-    let issued = issue_code(&mut h, &client_a, CodeClientKind::Confidential, None).await?;
+    let issued = issue_code(&mut h, &client_a, CodeClientKind::Confidential, None, &[]).await?;
     let now = now_unix();
 
     let foreign = CodeGrantInputs {
@@ -1010,6 +1119,7 @@ mod tests {
       assertion: None,
       dpop_proof: None,
       peer_certs: None,
+      aud: &[],
     };
     match redeem_once(&mut h, &foreign, now).await {
       Err(error) if is_invalid_grant(&error) => {}
@@ -1036,6 +1146,7 @@ mod tests {
       assertion: None,
       dpop_proof: None,
       peer_certs: None,
+      aud: &[],
     };
     redeem_once(&mut h, &legitimate, now + 1)
       .await
@@ -1063,7 +1174,7 @@ mod tests {
     let now = now_unix();
 
     for verifier in [Some("aBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), None] {
-      let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None).await?;
+      let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None, &[]).await?;
       let inputs = CodeGrantInputs {
         code: issued.code.as_str(),
         redirect_uri: REDIRECT,
@@ -1075,6 +1186,7 @@ mod tests {
         assertion: None,
         dpop_proof: None,
         peer_certs: None,
+        aud: &[],
       };
       match redeem_once(&mut h, &inputs, now).await {
         Err(error) if is_invalid_grant(&error) => {}
@@ -1111,7 +1223,7 @@ mod tests {
     let bound = fresh_key()?;
     let other = fresh_key()?;
     let jkt = crate::jose::jwk::thumbprint(&bound.jwk)?;
-    let issued = issue_code(&mut h, &client_id, CodeClientKind::Public, Some(&jkt)).await?;
+    let issued = issue_code(&mut h, &client_id, CodeClientKind::Public, Some(&jkt), &[]).await?;
     let now = now_unix();
 
     let proof = mint_proof(&other, &unique("jti"), now)?;
@@ -1126,6 +1238,7 @@ mod tests {
       assertion: None,
       dpop_proof: Some(proof.as_str()),
       peer_certs: None,
+      aud: &[],
     };
     match redeem_once(&mut h, &inputs, now).await {
       Err(error) if is_invalid_grant(&error) => Ok(()),
@@ -1165,6 +1278,7 @@ mod tests {
       assertion: None,
       dpop_proof: None,
       peer_certs: None,
+      aud: &[],
     };
     match redeem_once(&mut h, &inputs, now_unix()).await {
       Err(error) if is_invalid_grant(&error) => Ok(()),
@@ -1189,7 +1303,7 @@ mod tests {
       &[super::GRANT_TYPE_AUTHORIZATION_CODE],
     )
     .await?;
-    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None).await?;
+    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None, &[]).await?;
 
     let inputs = CodeGrantInputs {
       code: issued.code.as_str(),
@@ -1202,6 +1316,7 @@ mod tests {
       assertion: None,
       dpop_proof: None,
       peer_certs: None,
+      aud: &[],
     };
     let tokens = redeem_once(&mut h, &inputs, now_unix())
       .await
@@ -1223,6 +1338,95 @@ mod tests {
     }
     Ok(())
   }
+  #[tokio::test]
+  async fn public_unbound_redeems_and_refreshes() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("public-unbound");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::None,
+      None,
+      &[
+        super::GRANT_TYPE_AUTHORIZATION_CODE,
+        GRANT_TYPE_REFRESH_TOKEN,
+      ],
+    )
+    .await?;
+    let issuer = CodeIssuer::new(&h.ttl, &h.ring)?;
+    let approved = ScopeSet::parse("orders:read")?;
+    let entitled = ScopeSet::parse("orders:read orders:admin")?;
+    let request = CodeIssueRequest {
+      client_id: &client_id,
+      client_kind: CodeClientKind::Public,
+      dpop_required: false,
+      user_id: "user-1",
+      redirect_uri: REDIRECT,
+      approved_scope: &approved,
+      user_entitled: &entitled,
+      code_challenge: CHALLENGE,
+      dpop_jkt: None,
+      state: None,
+      aud: &[],
+      issuer: ISSUER,
+    };
+    let issued = issuer.issue(&mut h.conn, &h.store, &request).await?;
+    let now = now_unix();
+    let inputs = CodeGrantInputs {
+      code: issued.code.as_str(),
+      redirect_uri: REDIRECT,
+      code_verifier: Some(VERIFIER),
+      client_id: Some(client_id.as_str()),
+      basic_header: None,
+      body_secret: None,
+      assertion_type: None,
+      assertion: None,
+      dpop_proof: None,
+      peer_certs: None,
+      aud: &[],
+    };
+    let tokens = redeem_once(&mut h, &inputs, now)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("unbound redemption rejected: {error}")))?;
+    if tokens.token_type != "Bearer" || tokens.refresh_token.is_none() {
+      return Err(TestError::Unexpected(
+        "unbound redemption must return a Bearer pair".to_owned(),
+      ));
+    }
+    let refresh_token = tokens
+      .refresh_token
+      .ok_or_else(|| TestError::Unexpected("unbound redemption must issue refresh".to_owned()))?;
+    let enabled = ScopeSet::parse("orders:read")?;
+    let no_proof = crate::protocol::token::SenderProof::none();
+    let service = TokenService::new(&h.ttl, &h.ring)?;
+    let refreshed = crate::protocol::token::grants::refresh_token::refresh(
+      &mut h.conn,
+      &h.store,
+      &service,
+      &crate::protocol::token::grants::refresh_token::RefreshInput {
+        client_id: &client_id,
+        client_kind: crate::protocol::token::ClientKind::Public,
+        dpop_required: false,
+        refresh_token: &refresh_token,
+        requested_scope: None,
+        requested_resources: &[],
+        proof: &no_proof,
+        enabled: &enabled,
+        client_registered: &enabled,
+        user_entitled: &enabled,
+        token_format: TokenFormat::Opaque,
+        now_unix: now + 1,
+      },
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("unbound refresh rejected: {error}")))?;
+    if refreshed.token_type != "Bearer" {
+      return Err(TestError::Unexpected(
+        "unbound refresh must stay Bearer".to_owned(),
+      ));
+    }
+    Ok(())
+  }
 
   #[tokio::test]
   async fn test_grant_code_public_empty_cnf_is_invalid_grant() -> TestResult {
@@ -1230,12 +1434,13 @@ mod tests {
 
     let mut h = harness().await?;
     let client_id = unique("public-empty-cnf");
-    insert_client(
+    insert_client_bound(
       &h,
       &client_id,
       TokenEndpointAuthMethod::None,
       None,
       &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+      true,
     )
     .await?;
     let key = fresh_key()?;
@@ -1259,6 +1464,7 @@ mod tests {
       subject: "user-1".to_owned(),
       grant_id: "grant-empty-cnf".to_owned(),
       cnf: String::new(),
+      aud: Vec::new(),
     };
     crate::store::codes::issue(
       &mut h.conn,
@@ -1282,6 +1488,7 @@ mod tests {
       assertion: None,
       dpop_proof: Some(proof.as_str()),
       peer_certs: None,
+      aud: &[],
     };
     match redeem_once(&mut h, &inputs, now).await {
       Err(error) if is_invalid_grant(&error) => Ok(()),
@@ -1292,5 +1499,454 @@ mod tests {
         "an empty public binding must never mint".to_owned(),
       )),
     }
+  }
+
+  /// Baseline characterization: a code issued and redeemed with no resource
+  /// indicator anywhere keeps working exactly as before audience binding.
+  #[tokio::test]
+  async fn code_without_audience_redeems_unchanged() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("no-audience");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::ClientSecretPost,
+      Some("code-secret"),
+      &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+    )
+    .await?;
+    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None, &[]).await?;
+
+    let inputs = CodeGrantInputs {
+      code: issued.code.as_str(),
+      redirect_uri: REDIRECT,
+      code_verifier: Some(VERIFIER),
+      client_id: Some(client_id.as_str()),
+      basic_header: None,
+      body_secret: Some(secret("code-secret")),
+      assertion_type: None,
+      assertion: None,
+      dpop_proof: None,
+      peer_certs: None,
+      aud: &[],
+    };
+    let tokens = redeem_once(&mut h, &inputs, now_unix())
+      .await
+      .map_err(|error| TestError::Unexpected(format!("baseline redemption rejected: {error}")))?;
+    if tokens.access_token.is_empty() {
+      return Err(TestError::Unexpected(
+        "baseline redemption must mint an access token".to_owned(),
+      ));
+    }
+    let service = TokenService::new(&h.ttl, &h.ring)?;
+    if service
+      .find_access(&mut h.conn, &h.store, &tokens.access_token)
+      .await?
+      .is_none()
+    {
+      return Err(TestError::Unexpected(
+        "baseline access token must resolve".to_owned(),
+      ));
+    }
+    Ok(())
+  }
+
+  /// RFC 8707 §2: a code pinned to an audience set only redeems for that
+  /// exact set, in any order; subset, superset, and differing members fail.
+  #[tokio::test]
+  async fn code_pins_audience() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("audience");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::ClientSecretPost,
+      Some("code-secret"),
+      &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+    )
+    .await?;
+    let pinned = vec![AUD_ONE.to_owned(), AUD_TWO.to_owned()];
+    let now = now_unix();
+
+    let different = vec![AUD_ONE.to_owned(), AUD_OTHER.to_owned()];
+    let issued = issue_code(
+      &mut h,
+      &client_id,
+      CodeClientKind::Confidential,
+      None,
+      &pinned,
+    )
+    .await?;
+    expect_audience_rejected(&mut h, &code_inputs(&issued, &client_id, &different), now).await?;
+
+    let subset = vec![AUD_ONE.to_owned()];
+    let issued = issue_code(
+      &mut h,
+      &client_id,
+      CodeClientKind::Confidential,
+      None,
+      &pinned,
+    )
+    .await?;
+    expect_audience_rejected(&mut h, &code_inputs(&issued, &client_id, &subset), now).await?;
+
+    let superset = vec![AUD_ONE.to_owned(), AUD_TWO.to_owned(), AUD_OTHER.to_owned()];
+    let issued = issue_code(
+      &mut h,
+      &client_id,
+      CodeClientKind::Confidential,
+      None,
+      &pinned,
+    )
+    .await?;
+    expect_audience_rejected(&mut h, &code_inputs(&issued, &client_id, &superset), now).await?;
+
+    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None, &[]).await?;
+    expect_audience_rejected(&mut h, &code_inputs(&issued, &client_id, &pinned), now).await?;
+
+    let reordered = vec![AUD_TWO.to_owned(), AUD_ONE.to_owned()];
+    let issued = issue_code(
+      &mut h,
+      &client_id,
+      CodeClientKind::Confidential,
+      None,
+      &pinned,
+    )
+    .await?;
+    let tokens = redeem_once(&mut h, &code_inputs(&issued, &client_id, &reordered), now)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("matching audience set rejected: {error}")))?;
+    if tokens.access_token.is_empty() {
+      return Err(TestError::Unexpected(
+        "matching audience set must mint".to_owned(),
+      ));
+    }
+    Ok(())
+  }
+
+  /// A pinned code presented without any `resource` must fail closed.
+  #[tokio::test]
+  async fn code_pinned_audience_cannot_be_dropped() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("audience-drop");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::ClientSecretPost,
+      Some("code-secret"),
+      &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+    )
+    .await?;
+    let pinned = vec![AUD_ONE.to_owned(), AUD_TWO.to_owned()];
+    let issued = issue_code(
+      &mut h,
+      &client_id,
+      CodeClientKind::Confidential,
+      None,
+      &pinned,
+    )
+    .await?;
+    expect_audience_rejected(&mut h, &code_inputs(&issued, &client_id, &[]), now_unix()).await
+  }
+
+  /// Assert an audience mismatch fails as `invalid_grant` and never mints.
+  async fn expect_audience_rejected(
+    h: &mut Harness,
+    inputs: &CodeGrantInputs<'_>,
+    now: i64,
+  ) -> TestResult {
+    match redeem_once(h, inputs, now).await {
+      Err(error) if is_invalid_grant(&error) => Ok(()),
+      Err(other) => Err(TestError::Unexpected(format!(
+        "audience mismatch must be invalid_grant, got {other}"
+      ))),
+      Ok(_) => Err(TestError::Unexpected(
+        "an audience mismatch must never mint".to_owned(),
+      )),
+    }
+  }
+
+  /// Convergence: a PAR-pushed resource set survives `ParRecord.aud`, the
+  /// authorize re-validation, the pending record, and the code record.
+  #[tokio::test]
+  async fn par_resource_pins_code_audience() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("par-audience");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::None,
+      None,
+      &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+    )
+    .await?;
+    let (redirect, _) = redirect_repo::upsert(
+      &h.pool,
+      &h.ring,
+      false,
+      &redirect_repo::NewRedirectUri {
+        id: uuid::Uuid::new_v4(),
+        uri: REDIRECT,
+        kind: redirect_repo::RedirectKind::Authorize,
+        description: "par audience test",
+        created_by: None,
+      },
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("redirect: {}", error.code())))?;
+    redirect_repo::attach(&h.pool, &client_id, redirect.id, None).await?;
+    scope_repo::upsert(&h.pool, "orders:read", "orders")
+      .await
+      .map_err(|error| TestError::Unexpected(format!("scope: {}", error.code())))?;
+    resource_repo::upsert(&h.pool, AUD_ONE, "one")
+      .await
+      .map_err(|error| TestError::Unexpected(format!("resource: {}", error.code())))?;
+    resource_repo::upsert(&h.pool, AUD_TWO, "two")
+      .await
+      .map_err(|error| TestError::Unexpected(format!("resource: {}", error.code())))?;
+
+    let params = HashMap::from([
+      ("client_id".to_owned(), client_id.clone()),
+      ("response_type".to_owned(), "code".to_owned()),
+      ("redirect_uri".to_owned(), REDIRECT.to_owned()),
+      ("scope".to_owned(), "orders:read".to_owned()),
+      ("code_challenge".to_owned(), CHALLENGE.to_owned()),
+      ("code_challenge_method".to_owned(), "S256".to_owned()),
+    ]);
+    let resources = vec![AUD_TWO.to_owned(), AUD_ONE.to_owned()];
+    let auth = ClientAuthRequest {
+      basic_header: None,
+      client_id: Some(client_id.as_str()),
+      body_secret: None,
+      assertion_type: None,
+      assertion: None,
+      peer_certs: None,
+    };
+    let endpoint = crate::protocol::client_auth::token_endpoint(ISSUER);
+    let ctx = ParContext {
+      token_endpoint: &endpoint,
+      now: time::OffsetDateTime::now_utc(),
+      par_ttl: Duration::from_secs(90),
+      allow_localhost_redirect: false,
+      cimd: None,
+      resource_indicators_enabled: true,
+    };
+    let mut stores = ParStores {
+      pool: &h.pool,
+      keys: &h.ring,
+      conn: &mut h.conn,
+      store: &h.store,
+    };
+    let pushed = par::push_authorization_request(&mut stores, &ctx, &auth, &params, &resources)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("PAR push: {}", error.code())))?;
+
+    let request_id = pushed
+      .request_uri
+      .strip_prefix(crate::jose::jar::PAR_REQUEST_URI_PREFIX)
+      .ok_or_else(|| TestError::Unexpected("PAR request_uri lacks its prefix".to_owned()))?;
+    // Read the one-time record, assert the pin, then restore it so the
+    // authorize consume below still sees the handle.
+    let record = par_store::consume(&mut h.conn, &h.store, request_id)
+      .await?
+      .ok_or_else(|| TestError::Unexpected("PAR record missing".to_owned()))?;
+    let pinned = vec![AUD_ONE.to_owned(), AUD_TWO.to_owned()];
+    if record.aud != pinned {
+      return Err(TestError::Unexpected(format!(
+        "PAR record audience not pinned: {:?}",
+        record.aud
+      )));
+    }
+    par_store::put(
+      &mut h.conn,
+      &h.store,
+      request_id,
+      &record,
+      Duration::from_secs(90),
+    )
+    .await?;
+
+    let query = HashMap::from([
+      ("client_id".to_owned(), client_id.clone()),
+      ("request_uri".to_owned(), pushed.request_uri.clone()),
+    ]);
+    let validated = authorize::validate(AuthorizeInput {
+      pool: &h.pool,
+      keys: &h.ring,
+      conn: &mut h.conn,
+      store: &h.store,
+      issuer: ISSUER,
+      allow_localhost_redirect: false,
+      cimd: None,
+      query: &query,
+      resources: Vec::new(),
+      resource_indicators_enabled: true,
+    })
+    .await
+    .map_err(|failure| TestError::Unexpected(format!("authorize: {failure:?}")))?;
+    if validated.aud != pinned {
+      return Err(TestError::Unexpected(format!(
+        "authorize did not re-pin the PAR audience: {:?}",
+        validated.aud
+      )));
+    }
+
+    let pending_id = unique("par-aud-pending");
+    let pending = pending::PendingAuth {
+      client_id: validated.client_id.clone(),
+      redirect_uri: validated.redirect_uri.clone(),
+      scope: validated.scope.render(),
+      code_challenge: validated.code_challenge.clone(),
+      state: validated.state.clone(),
+      dpop_jkt: None,
+      iss: ISSUER.to_owned(),
+      post_logout_uri: validated.post_logout_uri.clone(),
+      aud: validated.aud.clone(),
+    };
+    pending::put(
+      &mut h.conn,
+      &h.store,
+      &pending_id,
+      &pending,
+      Duration::from_secs(60),
+    )
+    .await?;
+    let stored_pending = pending::get(&mut h.conn, &h.store, &pending_id)
+      .await?
+      .ok_or_else(|| TestError::Unexpected("pending record missing".to_owned()))?;
+
+    let approved = ScopeSet::parse(&stored_pending.scope)?;
+    let entitled = ScopeSet::parse("orders:read")?;
+    let issuer = CodeIssuer::new(&h.ttl, &h.ring)?;
+    let issued = issuer
+      .issue(
+        &mut h.conn,
+        &h.store,
+        &CodeIssueRequest {
+          client_id: &stored_pending.client_id,
+          client_kind: CodeClientKind::Public,
+          dpop_required: false,
+          user_id: "user-1",
+          redirect_uri: &stored_pending.redirect_uri,
+          approved_scope: &approved,
+          user_entitled: &entitled,
+          code_challenge: &stored_pending.code_challenge,
+          dpop_jkt: None,
+          state: stored_pending.state.as_deref(),
+          aud: &stored_pending.aud,
+          issuer: ISSUER,
+        },
+      )
+      .await?;
+    let code_record = codes::consume(&mut h.conn, &h.store, &issued.code_hash)
+      .await?
+      .ok_or_else(|| TestError::Unexpected("code record missing".to_owned()))?;
+    if code_record.aud != pinned {
+      return Err(TestError::Unexpected(format!(
+        "code audience did not inherit the PAR set: {:?}",
+        code_record.aud
+      )));
+    }
+    Ok(())
+  }
+
+  /// An unbound public client with `access_token_format=jwt` mints a JWT
+  /// whose `cnf` is absent and whose `token_type` is `Bearer`: no proof was
+  /// presented, none is required, and none is recorded (RFC 9068 §2.2).
+  #[tokio::test]
+  async fn jwt_unbound_public_mints_with_no_cnf() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("public-unbound-jwt");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::None,
+      None,
+      &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+    )
+    .await?;
+    let issuer = CodeIssuer::new(&h.ttl, &h.ring)?;
+    let approved = ScopeSet::parse("orders:read")?;
+    let entitled = ScopeSet::parse("orders:read orders:admin")?;
+    let issued = issuer
+      .issue(
+        &mut h.conn,
+        &h.store,
+        &CodeIssueRequest {
+          client_id: &client_id,
+          client_kind: CodeClientKind::Public,
+          dpop_required: false,
+          user_id: "user-1",
+          redirect_uri: REDIRECT,
+          approved_scope: &approved,
+          user_entitled: &entitled,
+          code_challenge: CHALLENGE,
+          dpop_jkt: None,
+          state: None,
+          aud: &[],
+          issuer: ISSUER,
+        },
+      )
+      .await?;
+    let now = now_unix();
+    let raw = secret("bcdefghijklmnopqrstuvwxyzabcdefg");
+    let key = JwtSigningKey::from_raw(
+      KeyId::new("test-kid"),
+      JwtSigningAlg::Es256,
+      &raw,
+      "jwt_signing_key",
+    )
+    .map_err(|error| TestError::Unexpected(format!("signing key rejected: {error:?}")))?;
+    let signer = JwtAccessSigner::new(ISSUER.to_owned(), key, Vec::new());
+    let inputs = CodeGrantInputs {
+      code: issued.code.as_str(),
+      redirect_uri: REDIRECT,
+      code_verifier: Some(VERIFIER),
+      client_id: Some(client_id.as_str()),
+      basic_header: None,
+      body_secret: None,
+      assertion_type: None,
+      assertion: None,
+      dpop_proof: None,
+      peer_certs: None,
+      aud: &[],
+    };
+    let mut state = CodeGrantState {
+      pool: &h.pool,
+      conn: &mut h.conn,
+      store: &h.store,
+      keys: &h.ring,
+      issuer: ISSUER,
+      ttl: &h.ttl,
+      now_unix: now,
+      token_format: TokenFormat::Jwt,
+      jwt_signer: Some(signer.clone()),
+      cimd: None,
+    };
+    let tokens = super::redeem_code(&mut state, &inputs)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("unbound jwt redemption rejected: {error}"))
+      })?;
+    if tokens.token_type != "Bearer" {
+      return Err(TestError::Unexpected(format!(
+        "unbound jwt redemption must be Bearer, got {}",
+        tokens.token_type
+      )));
+    }
+    if tokens.refresh_token.is_some() {
+      return Err(TestError::Unexpected(
+        "a client without the refresh grant must receive no refresh token".to_owned(),
+      ));
+    }
+    let verified = signer
+      .verify(&tokens.access_token, None)
+      .map_err(|error| TestError::Unexpected(format!("fresh jwt rejected: {error:?}")))?;
+    if verified.claims.cnf.is_some() {
+      return Err(TestError::Unexpected(
+        "an unbound public jwt must carry no cnf".to_owned(),
+      ));
+    }
+    Ok(())
   }
 }

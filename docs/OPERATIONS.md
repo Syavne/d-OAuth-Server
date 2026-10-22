@@ -13,8 +13,9 @@ the audit stream, key and certificate rotation, and backup and restore.
 
 - The `migrate` subcommand owns the schema and is the only writer of it.
 - The `serve` subcommand serves OAuth and never migrates and never provisions.
-- Every mutation (scopes, users, entitlements, redirect URIs, client
-  attachments) is audited on the `audit` tracing target.
+- Every mutation (scopes, users, entitlements, redirect URIs, resource
+  servers, client attachments, client access-token format) is audited on the
+  `audit` tracing target.
 - Secrets are read from stdin, a file, or the environment, never from argv. A
   secret is printed only when the operator asked for a one-time value.
 
@@ -106,6 +107,7 @@ d-oauth-server redirect-uri delete <uri> [--kind authorize|post_logout]
 d-oauth-server client attach-redirect-uri --client-id <id> --uri <uri> [--kind authorize|post_logout]
 d-oauth-server client detach-redirect-uri --client-id <id> --uri <uri> [--kind authorize|post_logout]
 d-oauth-server client redirect-uris --client-id <id>
+d-oauth-server client set-access-token-format --client-id <id> --format opaque|jwt
 ```
 
 A redirect URI is a global catalog entry; a client attaches to it. `/authorize`
@@ -132,6 +134,34 @@ registered for the client and the client is active. Zero registered enabled URIs
 or more than one, and `POST /logout` performs no redirect: the target must be
 unambiguous or nothing happens. Registering a second enabled `post_logout` URI
 is a configuration error, not a silent last-writer-wins.
+
+### Resource servers and client access-token format
+
+```bash
+d-oauth-server resource-server create <identifier> [--description <text>]
+d-oauth-server resource-server list
+d-oauth-server resource-server enable <identifier>
+d-oauth-server resource-server disable <identifier>
+d-oauth-server resource-server delete <identifier>
+```
+
+A resource server is an RFC 8707 resource indicator (the `resource` parameter
+and the `aud` target of an access token). `identifier` matches exactly — no
+normalization, sub-path, or wildcard. A `*` anywhere in the identifier is
+rejected, so one catalog row can never stand for an entire origin. `create`
+upserts: it creates the row, updates its description, or leaves an unchanged
+row alone; it never silently re-enables an operator-disabled row, and `list`
+shows both states. `delete` removes the row outright (nothing references the
+catalog directly).
+
+`client set-access-token-format --client-id <id> --format opaque|jwt` is the
+OPERATOR-ONLY opt-in to JWT access tokens for one client; `opaque` (the OAuth
+2.1 baseline and column default) is what every dynamically registered client
+gets. `--format` accepts exactly `opaque` or `jwt`, and `jwt` is honored only
+while JWT access tokens are enabled by configuration. Dynamic client
+registration can never set this: a registration (`POST /register`) body that
+carries `access_token_format` is rejected with `invalid_client_metadata`. The
+JWT signing key is never printed by any command.
 
 ### Declarative config
 
@@ -235,6 +265,212 @@ it `false` they write v3 TOTP blobs, which a version N-1 replica cannot read, so
 the user's next TOTP check fails on an old replica. Keep dual-write on for the
 whole window; turn it off only at the scale-to-zero step above.
 
+## Resource-server onboarding (RFC 9728)
+
+This is the operator-side companion to [RS-CONTRACT.md](RS-CONTRACT.md), the
+normative contract for the resource server (RS). The AS hosts no RS route and
+publishes no protected-resource metadata: onboarding an RS is a catalog step on
+the AS plus a publish, challenge, and rotation step the RS team owns. Do the four
+steps in order; the RS team can follow [RS-CONTRACT.md](RS-CONTRACT.md) from the
+document alone once the identifier and issuer below are fixed.
+
+### 1. Register the resource identifier in the AS catalog
+
+The catalog is the RFC 8707 resource-indicator allowlist and the `aud` target of
+an access token. Register the RS's exact identifier (an absolute `https` URL, no
+fragment, no wildcard):
+
+```bash
+d-oauth-server resource-server create https://api.example.com --description "Orders API"
+d-oauth-server resource-server list
+```
+
+`identifier` matches exactly, with no normalization, sub-path, or wildcard; a
+`*` anywhere is rejected at creation, so one catalog row can never stand for an
+entire origin. `create` upserts (it creates the row, updates its description, or
+leaves an unchanged row alone) and never silently re-enables an
+operator-disabled row. `list` shows both the `enabled` and `disabled` states.
+Use `resource-server enable|disable <identifier>` to flip a row and
+`resource-server delete <identifier>` to remove it. All four mutations are
+audited (`resource_server.create|enable|disable|delete`).
+
+The same steps are declarative through `config sync`; a `resource_servers` entry
+with the identifier, description, and `enabled` flag is applied idempotently
+(see [config sync file format](#config-sync-file-format)).
+
+For tokens to be audience-restricted, set `resource_indicators_enabled=true` so
+the AS honors the RFC 8707 `resource` parameter at the authorization, PAR, token,
+and device endpoints; otherwise the RS cannot rely on the `aud` check alone
+(RFC 9728 §7.4). See [CONFIGURATION.md](CONFIGURATION.md).
+
+### 2. Publish the RS protected-resource metadata document
+
+The RS team publishes `GET /.well-known/oauth-protected-resource` at the
+resource host (RFC 9728 §3); when the identifier carries a path, the terminating
+slash is removed and the path suffix is appended
+(`/.well-known/oauth-protected-resource/resource1`). The document is served as
+`application/json` with a `200 OK` (RFC 9728 §3.2) and its `resource` member must
+be byte-for-byte identical to the identifier registered in step 1 (RFC 9728 §3.3,
+§7.3). The operator's job is to hand the RS team two values:
+
+- `authorization_servers`: the AS `issuer` value (for example
+  `https://auth.example.com`).
+- `scopes_supported`: the runtime scope catalog this AS actually enables, read
+  with `scope list`. It is a supported set, not a request-everything hint
+  (RFC 9728 §7.2); advertising a scope the AS does not enable only misleads
+  clients.
+
+The full member set and an example document are in
+[RS-CONTRACT.md](RS-CONTRACT.md#the-protected-resource-metadata-document).
+
+Optionally, advertise the RS identifier on the AS side through the RFC 9728 §4
+`protected_resources` member: set `protected_resources_enabled=true` and list the
+identifier in `protected_resource_ids`. Both default off and empty, so the AS
+advertises no `protected_resources` until enabled. `resource_metadata` is never
+an AS metadata member (RFC 9728 §4, §5.1); it belongs only on the RS challenge in
+step 3.
+
+### 3. Set the `WWW-Authenticate` challenge on the RS
+
+The RS returns the challenge on an unauthenticated or unacceptable request
+(RFC 9728 §5.1, RFC 6750 §3):
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://api.example.com/.well-known/oauth-protected-resource"
+```
+
+The parameter value is the absolute `https` URL of the document from step 2,
+derived from the same identifier; the RS never invents it ad hoc, and it is never
+sent alongside a success. When the RS later needs clients to pick up a changed
+metadata document, it re-sends a fresh challenge and clients re-fetch and
+re-validate on receipt (RFC 9728 §5.2). The challenge may be combined with other
+parameters (for example `max_age`, RFC 9470) and with schemes other than
+`Bearer` such as `DPoP` (RFC 9449).
+
+### 4. Rotate the identifier and keys
+
+- Resource identifier: register the new identifier with
+  `resource-server create` and keep the old row `enable`d until no live token
+  references it, then `resource-server delete` the old identifier. The RS team
+  re-publishes its metadata document with the new `resource` and re-sends the
+  challenge; clients re-validate against the new value (RFC 9728 §3.3, §5.2).
+  Never leave two enabled identifiers standing for the same deployment if the
+  audience check is meant to be exact.
+- AS token pepper: rotating the pepper invalidates every live opaque token. For
+  an RS that introspects (RFC 7662), that means re-authentication, not a silent
+  accept; overlap the old pepper for at least `ttl.refresh_secs` (see
+  [Key and certificate rotation](#key-and-certificate-rotation)).
+- JWT signing keys: when JWT access tokens are enabled, retain the previous
+  `jwt_signing_previous_keys` across the rotation window so the RS can still
+  verify in-flight tokens; the RS caches the AS JWKS with a positive lifetime and
+  re-fetches on a fresh challenge (RFC 9728 §7.10, §5.2). Never rotate to an
+  empty key set.
+- After any rotation, re-run the discovery flow end to end: call the resource
+  with no token, read the challenge, fetch and validate the metadata, then
+  re-authenticate. The full flow is in [RS-CONTRACT.md](RS-CONTRACT.md#discovery-flow).
+
+## MCP client registration
+
+An MCP client needs a client identity at the authorization server. There are
+three supported paths, in order of preference. They are per-client choices; the
+one server-wide setting they share is whether the host `localhost` counts as an
+RFC 8252 loopback redirect (`allow_localhost_redirect`).
+
+### 1. CIMD (primary, no registration)
+
+Client ID metadata documents let a client identify itself with an `https://`
+URL and skip registration entirely.
+
+1. Set `cimd_enabled=true`. If the client redirects to `http://localhost:{port}`,
+   also set `allow_localhost_redirect=true`.
+2. Restart the server, then confirm the advertised capability:
+
+```bash
+curl -s https://auth.example.com/.well-known/oauth-authorization-server \
+  | jq '{client_id_metadata_document_supported, token_endpoint_auth_methods_supported}'
+```
+
+The output must carry `client_id_metadata_document_supported: true` and `none`
+inside `token_endpoint_auth_methods_supported`. With `cimd_enabled` off the
+first member is absent, not `false`.
+
+3. The client hosts a JSON document at an `https://` URL and uses that exact URL
+   as its `client_id`. The document must validate. A minimal accepted example:
+
+```json
+{
+  "client_id": "https://mcp.example.com/oauth/client-metadata.json",
+  "client_name": "Example MCP client",
+  "redirect_uris": ["https://mcp.example.com/oauth/callback"],
+  "token_endpoint_auth_method": "none",
+  "grant_types": ["authorization_code", "refresh_token"],
+  "scope": "api:read",
+  "dpop_bound_access_tokens": false
+}
+```
+
+Every `scope` token must already be enabled in the runtime catalog
+(`scope list`). `client_id` must equal the URL byte for byte. The authorization
+server fetches the document on the first request and caches it for 15 minutes;
+a changed document is picked up after that window. No `/register` call and no
+initial-access token are involved. A `private_key_jwt` document must carry an
+inline `jwks`; `jwks_uri` is rejected. See
+[OAUTH.md](OAUTH.md#client-id-metadata-documents-cimd).
+
+### 2. Open dynamic client registration
+
+This lets any caller register a client with `POST /register` and no token. It
+needs all of the following:
+
+- `allow_open_registration=true`.
+- A non-`catalog` `dcr_redirect_policy`: `catalog_loopback` or `open`.
+- For an `http://localhost:{port}` callback, `allow_localhost_redirect=true`.
+
+The default `dcr_redirect_policy = catalog` rejects any redirect URI that is
+not already in the redirect catalog, even when open registration is on. Choose
+`catalog_loopback` for catalog URIs plus dynamic loopback URIs, or `open` for
+any absolute `https` URI plus loopback. Literal `127.0.0.1` and `[::1]` are
+always loopback; `localhost` is loopback only with the flag on. Open
+registration is anonymous client creation, so prefer it only where that risk is
+acceptable.
+
+### 3. IAT-gated dynamic client registration
+
+With `allow_open_registration=false` (the default), the client must present a
+one-time initial-access token:
+
+```bash
+d-oauth-server initial-access-token issue --uses <n> --ttl <seconds> --label mcp
+```
+
+The raw token prints once, and only to an interactive terminal unless
+`--show-secret` is passed. The client calls `POST /register` with
+`Authorization: Bearer <token>`:
+
+```bash
+curl -s https://auth.example.com/register \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "redirect_uris": ["https://mcp.example.com/oauth/callback"],
+    "token_endpoint_auth_method": "none",
+    "grant_types": ["authorization_code", "refresh_token"],
+    "scope": "api:read"
+  }' | jq .
+```
+
+Each use authorizes one registration call, whether or not the metadata later
+validates. The redirect policy still applies: with the default `catalog` policy,
+the redirect URI must already be cataloged. For a `localhost` callback, use a
+non-`catalog` policy and set `allow_localhost_redirect=true`.
+
+There is no client-create command in the CLI. A client is created only by
+`POST /register` (with an IAT or under open registration), and the CLI manages
+existing clients through `client attach-redirect-uri`, `client
+detach-redirect-uri`, `client redirect-uris`, and `client
+set-access-token-format`.
+
 ## config sync file format
 
 The file is JSON. Every section is optional and defaults to empty.
@@ -248,12 +484,18 @@ The file is JSON. Every section is optional and defaults to empty.
     { "uri": "https://app.example.com/callback", "enabled": true },
     { "uri": "https://app.example.com/signed-out", "kind": "post_logout", "enabled": true }
   ],
+  "resource_servers": [
+    { "identifier": "https://api.example.com", "description": "Orders API", "enabled": true }
+  ],
   "user_scopes": [
     { "email": "operator@example.com", "scope": "orders:read" }
   ],
   "client_redirect_uris": [
     { "client_id": "example-client", "uri": "https://app.example.com/callback" },
     { "client_id": "example-client", "uri": "https://app.example.com/signed-out", "kind": "post_logout" }
+  ],
+  "client_access_token_formats": [
+    { "client_id": "example-client", "access_token_format": "jwt" }
   ]
 }
 ```
@@ -261,6 +503,10 @@ The file is JSON. Every section is optional and defaults to empty.
 Scope names must match the RFC 6749 scope-token grammar. `openid` is reserved.
 Redirect URIs must be absolute and are matched exactly at `/authorize` (or, for
 `kind: post_logout`, at `POST /logout`). `kind` defaults to `authorize`.
+Resource identifiers are exact RFC 8707 resource indicators; a `*` wildcard is
+rejected. `client_access_token_formats` sets the operator-only per-client
+access-token format (`opaque` or `jwt`); it is the same operator opt-in as
+`client set-access-token-format` (dynamic registration can never set it).
 
 Apply and re-apply:
 
@@ -280,8 +526,10 @@ CLI mutations go to the `audit` target with `event = "cli.mutation"`, an
 `user.grant_scope`,
 `user.revoke_scope`, `scope.create`, `scope.enable`, `scope.disable`,
 `scope.delete`, `redirect_uri.create`, `redirect_uri.enable`,
-`redirect_uri.disable`, `redirect_uri.delete`, `client.attach_redirect_uri`,
-`client.detach_redirect_uri`, `initial_access_token.issue`,
+`redirect_uri.disable`, `redirect_uri.delete`, `resource_server.create`,
+`resource_server.enable`, `resource_server.disable`, `resource_server.delete`,
+`client.attach_redirect_uri`, `client.detach_redirect_uri`,
+`client.set_access_token_format`, `initial_access_token.issue`,
 `pii.backfill`, `pii.rotate`, `totp.rewrap`, `admin.count.changed`, and the
 `admin.bootstrap.*` family. `pii verify` and `user scopes` are read-only and
 emit no mutation event.
@@ -310,6 +558,97 @@ minted under the active pepper.
 `serve` loads the certificate chain and key once at startup. Rotate by
 replacing the mounted material and performing a rolling restart; there is no
 hot reload, by design.
+
+### JWT access-token signing key
+
+Reference: RFC 9068 §2.1, §4; RFC 7517 §5.
+
+This key is optional and off by default. It is unrelated to `keygen`, which
+emits ES256 material for test fixtures and client-side DPoP only; do not use
+`keygen` output here unless it happens to be exactly 32 bytes.
+
+`jwt_signing_key` is consumed as the literal UTF-8 bytes of the configured
+string, not decoded as base64 or hex. It must be exactly 32 bytes. Generate
+printable material with:
+
+```bash
+openssl rand -hex 16
+```
+
+That prints 32 hexadecimal characters, which are 32 bytes of key material. The
+inline value is trimmed of leading and trailing whitespace; a `*_FILE` mount is
+read verbatim except that trailing CR/LF are removed, so do not add spaces. An
+all-zero or out-of-range P-256 scalar still fails at load with
+`InvalidJwtSigningKey`.
+
+To enable the feature and mint JWTs for one client:
+
+1. Set the environment:
+
+   ```bash
+   export D_OAUTH_JWT_ACCESS_TOKENS_ENABLED=true
+   export D_OAUTH_JWT_SIGNING_KEY="$(openssl rand -hex 16)"
+   export D_OAUTH_JWT_SIGNING_KID=v1
+   export D_OAUTH_JWT_ACCESS_TOKEN_SIGNING_ALG=ES256
+   ```
+
+   `D_OAUTH_JWT_SIGNING_KEY_FILE` mounts the same material as a file. The
+   algorithm is `ES256` (default) or `EdDSA`; both use 32 raw bytes and there is
+   no RSA option. Enabling the switch without a key fails at boot with
+   `MissingJwtSigningKey`.
+
+2. Roll the replicas and confirm the public key set:
+
+   ```bash
+   curl -fsS "$D_OAUTH_ISSUER/jwks.json" | jq -r '.keys[] | "\(.kid) \(.alg) \(.kty)"'
+   ```
+
+   The current key appears first. While the feature is off, the route still
+   answers `200` with `{"keys":[]}`; it is cached for 300 s.
+
+3. Opt a client in, per client, only after the deployment is ready:
+
+   ```bash
+   d-oauth-server client set-access-token-format --client-id <id> --format jwt
+   ```
+
+   Registration can never set this; `opaque` remains the column default.
+
+To rotate:
+
+1. Generate a new key and a new `kid`.
+2. Make the new key active. Move the old key into `jwt_signing_previous_keys`,
+   a list of `{kid, key}` objects supplied in the `D_OAUTH_CONFIG` file (the
+   loader does not accept this list as one environment string):
+
+   ```yaml
+   jwt_access_tokens_enabled: true
+   jwt_signing_key: "<new 32-byte key>"
+   jwt_signing_kid: v2
+   jwt_signing_previous_keys:
+     - kid: v1
+       key: "<old 32-byte key>"
+   ```
+
+   Keep `jwt_access_token_signing_alg` unchanged unless every retained key is
+   regenerated: all entries in the ring share that one value.
+3. Roll every replica, so each one signs with `v2` and verifies `v1`.
+4. Confirm both kids are published, current first:
+
+   ```bash
+   curl -fsS "$D_OAUTH_ISSUER/jwks.json" | jq -r '.keys[].kid'
+   ```
+
+5. Keep the previous key until every token it signed has expired. Access tokens
+   live `ttl.access_secs` (300 s by default); refresh tokens stay opaque and do
+   not use this key. After that window, remove the previous entry and roll the
+   replicas again. A JWKS document cached by a resource server can lag the
+   removal by up to 300 s, which is harmless because no new token names the old
+   kid.
+
+The old key verifies only. It never signs once it is in
+`jwt_signing_previous_keys`, and a duplicate kid (active or previous) is
+rejected at load.
 
 ## PII and TOTP key rotation
 
@@ -425,8 +764,8 @@ survives a Redis loss.
 
 - `src/cli.rs` for the command tree and flags.
 - `src/cli/ops.rs`, `src/cli/user.rs`, `src/cli/scope.rs`,
-  `src/cli/redirect.rs`, `src/cli/sync.rs`, `src/cli/admin.rs`,
-  `src/cli/secret.rs` for implementations.
+  `src/cli/redirect.rs`, `src/cli/resource.rs`, `src/cli/sync.rs`,
+  `src/cli/admin.rs`, `src/cli/secret.rs` for implementations.
 - `src/cli/pii/` for `pii backfill|verify|rotate` and `src/cli/totp.rs` for
   `totp rewrap`.
 - `src/crypto/field.rs` for the PII field codec and blind index.

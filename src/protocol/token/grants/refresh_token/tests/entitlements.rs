@@ -21,7 +21,7 @@ use crate::{
   protocol::{
     scope::ScopeSet,
     token::{
-      ClientKind, MintRequest, MintedTokens, SenderProof, TokenService,
+      ClientKind, MintRequest, MintedTokens, SenderProof, TokenFormat, TokenService,
       grants::refresh_token::{RefreshInput, RefreshUserStores, refresh_with_subject_check},
     },
   },
@@ -85,10 +85,14 @@ async fn mint_subject(
         &MintRequest {
           client_id: client.to_owned(),
           client_kind: ClientKind::Public,
+          dpop_required: true,
           subject: subject.to_owned(),
           scope: scope.to_owned(),
           grant_id: unique("grant"),
           proof,
+          aud: Vec::new(),
+          refresh_aud: Vec::new(),
+          format: TokenFormat::Opaque,
         },
         now_unix(),
       )
@@ -111,12 +115,15 @@ fn entitled_input<'a>(
   RefreshInput {
     client_id: client,
     client_kind: ClientKind::Public,
+    dpop_required: true,
     refresh_token: token,
     requested_scope: scope,
+    requested_resources: &[],
     proof,
     enabled,
     client_registered: registered,
     user_entitled: entitled,
+    token_format: TokenFormat::Opaque,
     now_unix: now_unix(),
   }
 }

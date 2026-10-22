@@ -6,6 +6,7 @@ mod rules;
 
 use std::{collections::HashMap, time::Duration};
 
+use secrecy::SecretString;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -22,7 +23,6 @@ use crate::{
   store::Store,
   test_guard::Lease,
 };
-use secrecy::SecretString;
 
 /// Test scaffolding failures (no `unwrap`/`expect` under the deny lints).
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +99,9 @@ fn ctx_of(endpoint: &str) -> ParContext<'_> {
     token_endpoint: endpoint,
     now: OffsetDateTime::now_utc(),
     par_ttl: Duration::from_secs(90),
+    allow_localhost_redirect: false,
+    cimd: None,
+    resource_indicators_enabled: false,
   }
 }
 
@@ -134,6 +137,7 @@ async fn insert_client(
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   };
   client_repo::insert(pool, keys, false, &new).await?;

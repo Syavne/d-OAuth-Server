@@ -3,11 +3,13 @@
 //! Child suites drive the public [`super::super::refresh`] API. Every test
 //! uses unique client/grant labels so the shared keyspace never collides.
 
+mod audience;
 mod barrier;
 mod concurrent;
 mod disabled_subject;
 mod entitlements;
 mod failover;
+mod jwt;
 mod proofs;
 mod recovery;
 mod reuse;
@@ -26,7 +28,7 @@ use testcontainers::{
   runners::AsyncRunner as _,
 };
 
-use super::RefreshInput;
+use super::{RefreshInput, TokenFormat};
 use crate::{
   config::{DurabilityMode, TtlConfig},
   error::{AppError, OAuthErrorCode},
@@ -174,10 +176,14 @@ async fn mint_grant(
       &MintRequest {
         client_id: client.to_owned(),
         client_kind: kind,
+        dpop_required: kind == ClientKind::Public,
         subject: unique("subject"),
         scope: scope.to_owned(),
         grant_id: unique("grant"),
         proof,
+        aud: Vec::new(),
+        refresh_aud: Vec::new(),
+        format: TokenFormat::Opaque,
       },
       now_unix(),
     )
@@ -202,12 +208,15 @@ fn input<'a>(
   RefreshInput {
     client_id: client,
     client_kind: kind,
+    dpop_required: kind == ClientKind::Public,
     refresh_token: token,
     requested_scope: scope,
+    requested_resources: &[],
     proof,
     enabled,
     client_registered: enabled,
     user_entitled: enabled,
+    token_format: TokenFormat::Opaque,
     now_unix: now_unix(),
   }
 }

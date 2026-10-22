@@ -9,15 +9,15 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::merge::merge_claims;
+use super::verify::verify_request_object;
+use super::{PAR_REQUEST_URI_PREFIX, fetch::fetch_request_object, merge::MergedClaims};
 use crate::{
   db::client_repo::Client,
   error::AppError,
   state::RedisConn,
   store::{Store, par},
 };
-
-use super::verify::verify_request_object;
-use super::{PAR_REQUEST_URI_PREFIX, fetch::fetch_request_object, merge::merge_claims};
 
 /// Resolve a `request_uri`: PAR URN or pre-registered URI.
 ///
@@ -32,7 +32,7 @@ pub(crate) async fn resolve_uri(
   issuer: &str,
   query: &HashMap<String, String>,
   uri: &str,
-) -> Result<HashMap<String, String>, AppError> {
+) -> Result<MergedClaims, AppError> {
   if let Some(id) = uri.strip_prefix(PAR_REQUEST_URI_PREFIX) {
     return resolve_par(conn, store, client, query, id).await;
   }
@@ -72,7 +72,7 @@ async fn resolve_par(
   client: &Client,
   query: &HashMap<String, String>,
   id: &str,
-) -> Result<HashMap<String, String>, AppError> {
+) -> Result<MergedClaims, AppError> {
   if id.is_empty() {
     return Err(AppError::invalid_request("request_uri is malformed"));
   }
@@ -96,7 +96,12 @@ async fn resolve_par(
       "stored PAR record is not a JSON object",
     )));
   };
-  merge_claims(query, object, &client.client_id)
+  // The PAR-pinned audience rides out-of-band (record `aud`, validated at
+  // push and re-validated by the authorize caller); the stored JSON object
+  // itself carries no `resource` (stripped at push, stripped by the merge).
+  let mut merged = merge_claims(query, object, &client.client_id)?;
+  merged.resource = record.aud;
+  Ok(merged)
 }
 
 #[cfg(test)]
@@ -122,6 +127,7 @@ mod tests {
       contacts: None,
       software_id: None,
       dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
       active: true,
       created_at: time::OffsetDateTime::UNIX_EPOCH,
       updated_at: time::OffsetDateTime::UNIX_EPOCH,

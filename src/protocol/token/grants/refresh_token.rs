@@ -25,7 +25,9 @@
 #[cfg(test)]
 mod tests;
 
-use super::super::{ClientKind, Cnf, MintRequest, MintedTokens, SenderProof, TokenService};
+use super::super::{
+  ClientKind, Cnf, MintRequest, MintedTokens, SenderProof, TokenFormat, TokenService,
+};
 use crate::{
   db::{
     user_repo::{self, SubjectAccountStatus},
@@ -36,7 +38,7 @@ use crate::{
   protocol::scope::{ScopeSet, refresh_scopes},
   state::RedisConn,
   store::{
-    Store,
+    Store, StoreError, durability_barrier,
     grants::revoke_by_token_hash,
     tokens::{AccessRecord, RefreshRecord, RotateOutcome, RotationInput},
   },
@@ -51,10 +53,20 @@ pub struct RefreshInput<'a> {
   pub client_id: &'a str,
   /// Public or confidential: selects the `cnf` matrix on the new token.
   pub client_kind: ClientKind,
+  /// Whether a public client must present a DPoP proof: mirrors the
+  /// client's `dpop_bound_access_tokens` registration.
+  pub dpop_required: bool,
   /// Raw presented refresh token.
   pub refresh_token: &'a str,
   /// Raw `scope` parameter, or `None` when omitted (keeps the grant scope).
   pub requested_scope: Option<&'a str>,
+  /// Validated RFC 8707 §2 `resource` set for this request, in the handler's
+  /// sorted deduped order; empty when the request carried no `resource`
+  /// (RFC 8707 §2.2: the grant keeps its full original audience, NOT §3's
+  /// empty set). The token handler already rejected a disabled gate, a
+  /// non-`https` value, and any value outside the enabled catalog with
+  /// `invalid_target`, so this set is catalog-bounded on entry.
+  pub requested_resources: &'a [String],
   /// Freshly verified proofs for this request (never a stored binding).
   pub proof: &'a SenderProof,
   /// Enabled catalog rows, freshly read at issuance.
@@ -66,6 +78,10 @@ pub struct RefreshInput<'a> {
   /// with a fresh Postgres read for real users; direct [`refresh`] callers
   /// (Redis-only tests) supply the term themselves.
   pub user_entitled: &'a ScopeSet,
+  /// Access-token representation for the rotated pair: `Opaque` reproduces
+  /// today's behavior; `Jwt` returns a signed RFC 9068 `at+jwt` whose `aud`
+  /// claim is the narrowed access set. The refresh half stays opaque.
+  pub token_format: TokenFormat,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
 }
@@ -155,12 +171,15 @@ pub async fn refresh_with_subject_check(
   let fresh = RefreshInput {
     client_id: input.client_id,
     client_kind: input.client_kind,
+    dpop_required: input.dpop_required,
     refresh_token: input.refresh_token,
     requested_scope: input.requested_scope,
+    requested_resources: input.requested_resources,
     proof: input.proof,
     enabled: input.enabled,
     client_registered: input.client_registered,
     user_entitled: &entitled,
+    token_format: input.token_format,
     now_unix: input.now_unix,
   };
   refresh(conn, store, service, &fresh).await
@@ -214,7 +233,12 @@ pub async fn refresh(
       "refresh token was issued to another client",
     ));
   }
-  check_proofs(input.client_kind, &found.record.cnf, input.proof)?;
+  check_proofs(
+    input.client_kind,
+    input.dpop_required,
+    &found.record.cnf,
+    input.proof,
+  )?;
   let previous = ScopeSet::parse(&found.record.scope).map_err(|_| AppError::server_error())?;
   // An empty subject is a client-credentials-style principal with no user
   // term; the previous grant itself stands in so only the client and catalog
@@ -233,6 +257,13 @@ pub async fn refresh(
   )?;
   let retained = scopes.retained;
   let access = scopes.access;
+  // RFC 8707 §2 audience propagation: the consumed refresh record's `aud`
+  // is the FULL ORIGINAL grant set. An omitted `resource` (§2.2) keeps that
+  // set on both records; a present `resource` MUST be a subset of it (else
+  // `invalid_target`) and narrows only the access token — the rotated
+  // refresh token stays bound to the full original set (NOT §3).
+  let original_aud = found.record.aud.clone();
+  let (access_aud, refresh_aud) = resolve_audience(&original_aud, input.requested_resources)?;
   let minted = service
     .mint_for_rotation(
       conn,
@@ -240,10 +271,14 @@ pub async fn refresh(
       &MintRequest {
         client_id: client_id.to_owned(),
         client_kind: input.client_kind,
+        dpop_required: input.dpop_required,
         subject: found.record.subject.clone(),
         scope: retained.render(),
         grant_id: found.record.grant_id.clone(),
         proof: input.proof.clone(),
+        aud: access_aud.clone(),
+        refresh_aud: refresh_aud.clone(),
+        format: input.token_format,
       },
       input.now_unix,
     )
@@ -264,6 +299,7 @@ pub async fn refresh(
       scope: retained.render(),
       subject: found.record.subject.clone(),
       cnf: cnf_json.clone(),
+      aud: refresh_aud,
     },
     new_access: AccessRecord {
       client_id: client_id.to_owned(),
@@ -271,10 +307,12 @@ pub async fn refresh(
       scope: access.render(),
       subject: found.record.subject.clone(),
       cnf: cnf_json,
+      aud: access_aud,
     },
     new_refresh_ttl: service.refresh_ttl(),
     new_access_ttl: service.access_ttl(),
     request_id: Some(request_id),
+    jwt_jti_hash: minted.jwt_jti_hash().map(str::to_owned),
   };
   match service
     .rotate(conn, store, &rotation)
@@ -299,6 +337,38 @@ pub async fn refresh(
   }
 }
 
+/// Resolve the audience pair for one rotation (RFC 8707 §2 and §2.2).
+///
+/// The consumed refresh record's `aud` is the FULL ORIGINAL grant set. An
+/// omitted `resource` keeps that set on both records; a present `resource`
+/// narrows only the access token while the rotated refresh token stays bound
+/// to the full original set (NOT §3). Widening is rejected with
+/// `invalid_target` BEFORE anything is minted or rotated.
+///
+/// Returns `(access_aud, refresh_aud)`, each sorted and deduped per the
+/// store contract.
+fn resolve_audience(
+  original: &[String],
+  requested: &[String],
+) -> Result<(Vec<String>, Vec<String>), AppError> {
+  if requested.is_empty() {
+    return Ok((original.to_vec(), original.to_vec()));
+  }
+  // Every requested member must already bind the grant: a superset, a
+  // differing member, or any member against an unbound grant widens the
+  // audience and is `invalid_target`. Members are public URIs, so a plain
+  // membership check is exact (both sides are sorted and deduped upstream).
+  if requested.iter().any(|member| !original.contains(member)) {
+    return Err(AppError::invalid_target(
+      "resource exceeds the grant's audience",
+    ));
+  }
+  let mut access = requested.to_vec();
+  access.sort();
+  access.dedup();
+  Ok((access, original.to_vec()))
+}
+
 /// Reject an unknown refresh token; when the raw value resolves to a rotation
 /// tombstone, cascade-revoke the grant family first.
 async fn unknown_or_tombstoned(
@@ -321,18 +391,26 @@ async fn unknown_or_tombstoned(
 
 /// Match freshly verified proofs against the stored `cnf` binding.
 ///
-/// At least one proof must be present on this request, and every bound
-/// component of the stored claim must equal its fresh counterpart. A public
-/// grant always carries a `jkt` (mint-enforced); its absence here is a
-/// fail-closed invariant violation.
-fn check_proofs(kind: ClientKind, stored: &str, proof: &SenderProof) -> Result<(), AppError> {
+/// A DPoP-bound public client must present a matching `jkt`; an unbound
+/// public client with an empty stored binding rotates proof-free (a stored
+/// binding, when present, must still be matched). A bearer grant therefore
+/// stays bearer across rotations while a bound grant can never downgrade.
+///
+/// A public grant minted bound always carries a `jkt` (mint-enforced); its
+/// absence here is a fail-closed invariant violation.
+fn check_proofs(
+  kind: ClientKind,
+  dpop_required: bool,
+  stored: &str,
+  proof: &SenderProof,
+) -> Result<(), AppError> {
   let bound = Cnf::parse_storage(stored).map_err(AppError::from)?;
   let jkt = proof.dpop_jkt.clone().filter(|value| !value.is_empty());
   let x5t = proof
     .mtls_x5t_s256
     .clone()
     .filter(|value| !value.is_empty());
-  if jkt.is_none() && x5t.is_none() {
+  if jkt.is_none() && x5t.is_none() && (bound.is_bound() || dpop_required) {
     return Err(AppError::invalid_grant(
       "refresh requires a freshly verified proof of possession",
     ));
@@ -343,7 +421,7 @@ fn check_proofs(kind: ClientKind, stored: &str, proof: &SenderProof) -> Result<(
         "DPoP binding does not match this grant",
       ));
     }
-  } else if kind == ClientKind::Public {
+  } else if kind == ClientKind::Public && dpop_required {
     return Err(AppError::server_error());
   }
   if let Some(want) = bound.x5t_s256.as_deref()
@@ -361,6 +439,13 @@ fn check_proofs(kind: ClientKind, stored: &str, proof: &SenderProof) -> Result<(
 /// The mint stored both records before the script ran; leaving them live
 /// would fork the grant chain. On the reuse path the cascade already wiped
 /// the grant, so these deletes are no-ops there.
+///
+/// JWT mints are invisible to [`TokenService::revoke_token`] (the dotted JWT
+/// shape fails the well-formed gate by design, and the hash identity is the
+/// `jwt:<jti-hash>` member, not a pepper hash): delete the allowlist marker,
+/// the access record, and the grant-set member by key here, so every
+/// REUSE/REPLAY/ABSENT/MISMATCH outcome leaves no live `jwt:` marker for the
+/// discarded `jti`.
 async fn discard_orphan(
   conn: &mut RedisConn,
   store: &Store,
@@ -375,6 +460,35 @@ async fn discard_orphan(
     .revoke_token(conn, store, &minted.access_token)
     .await
     .map_err(AppError::from)?;
+  if let Some(jti_hash) = minted.jwt_jti_hash() {
+    let member = minted.access_hash.clone();
+    let record_key = store.access_key(&member);
+    let grant_id = crate::store::tokens::get_access(conn, store, &member)
+      .await
+      .map_err(AppError::from)?
+      .map(|record| record.grant_id);
+    let _: () = redis::cmd("DEL")
+      .arg(&record_key)
+      .query_async(conn)
+      .await
+      .map_err(StoreError::Redis)?;
+    if let Some(grant_id) = grant_id {
+      let _: () = redis::cmd("SREM")
+        .arg(store.grant_tokens_key(&grant_id))
+        .arg(&member)
+        .query_async(conn)
+        .await
+        .map_err(StoreError::Redis)?;
+    }
+    let _: () = redis::cmd("DEL")
+      .arg(store.jwt_marker_key(jti_hash))
+      .query_async(conn)
+      .await
+      .map_err(StoreError::Redis)?;
+    durability_barrier(conn, store)
+      .await
+      .map_err(AppError::from)?;
+  }
   Ok(())
 }
 

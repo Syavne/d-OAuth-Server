@@ -24,7 +24,7 @@ use crate::{
   protocol::{
     scope::ScopeSet,
     token::{
-      ClientKind, MintRequest, MintedTokens, SenderProof, TokenService,
+      ClientKind, MintRequest, MintedTokens, SenderProof, TokenFormat, TokenService,
       grants::refresh_token::{RefreshUserStores, refresh_with_subject_check},
     },
   },
@@ -77,10 +77,14 @@ async fn mint_subject(
         &MintRequest {
           client_id: client.to_owned(),
           client_kind: ClientKind::Public,
+          dpop_required: true,
           subject: subject.to_owned(),
           scope: "read".to_owned(),
           grant_id: unique("grant"),
           proof,
+          aud: Vec::new(),
+          refresh_aud: Vec::new(),
+          format: TokenFormat::Opaque,
         },
         now_unix(),
       )

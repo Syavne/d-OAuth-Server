@@ -55,6 +55,7 @@ async fn token_service_rotation_replay_returns_same_tokens() -> TestResult {
       scope: "orders:read".to_owned(),
       subject: "user-1".to_owned(),
       cnf: String::new(),
+      aud: Vec::new(),
     },
     new_access: low::AccessRecord {
       client_id: client.clone(),
@@ -62,10 +63,12 @@ async fn token_service_rotation_replay_returns_same_tokens() -> TestResult {
       scope: "orders:read".to_owned(),
       subject: "user-1".to_owned(),
       cnf: String::new(),
+      aud: Vec::new(),
     },
     new_refresh_ttl: Duration::from_secs(2_592_000),
     new_access_ttl: Duration::from_secs(300),
     request_id: Some(request_id),
+    jwt_jti_hash: None,
   };
 
   let outcome = service.rotate(&mut conn, &store, &input).await?;

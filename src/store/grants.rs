@@ -21,6 +21,9 @@ pub struct GrantRecord {
   pub subject: String,
   /// Space-joined scope.
   pub scope: String,
+  /// Resource audiences (RFC 8707) pinned to the grant; empty when unbound.
+  #[serde(default)]
+  pub aud: Vec<String>,
 }
 
 impl GrantRecord {
@@ -30,6 +33,7 @@ impl GrantRecord {
       ("client_id".to_owned(), self.client_id.clone()),
       ("subject".to_owned(), self.subject.clone()),
       ("scope".to_owned(), self.scope.clone()),
+      ("aud".to_owned(), super::aud::encode(&self.aud)),
     ]
   }
 
@@ -40,6 +44,7 @@ impl GrantRecord {
       client_id: get("client_id")?,
       subject: get("subject")?,
       scope: get("scope")?,
+      aud: super::aud::decode(map.get("aud"))?,
     })
   }
 }
@@ -110,7 +115,9 @@ pub async fn members(
 /// same way — a late `SADD` can never leave a live TTL-less member behind
 /// quietly.
 ///
-/// Returns the number of token keys deleted. Unknown grants revoke to zero.
+/// Returns the number of keys deleted: member record keys plus JWT allowlist
+/// markers (one `DEL` per member per prefix, plus the stripped marker key for
+/// `jwt:`-tagged members). Unknown grants revoke to zero.
 pub async fn revoke(
   conn: &mut RedisConn,
   store: &Store,
@@ -135,6 +142,7 @@ pub(crate) async fn revoke_with_passes(
   let grant_key = store.grant_key(grant_id);
   let refresh_prefix = store.refresh_key_prefix();
   let access_prefix = store.access_key_prefix();
+  let jwt_prefix = store.jwt_key_prefix();
   let mut total = 0_u64;
   let mut drained = false;
   for _ in 0..max_passes {
@@ -142,7 +150,8 @@ pub(crate) async fn revoke_with_passes(
     invocation.key(set_key.as_str()).key(grant_key.as_str());
     invocation
       .arg(refresh_prefix.as_str())
-      .arg(access_prefix.as_str());
+      .arg(access_prefix.as_str())
+      .arg(jwt_prefix.as_str());
     let deleted: u64 = invocation
       .invoke_async(conn)
       .await

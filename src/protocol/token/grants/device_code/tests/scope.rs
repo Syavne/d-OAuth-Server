@@ -37,6 +37,7 @@ async fn test_grant_device_unentitled_scope_rejected() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -94,6 +95,7 @@ async fn test_grant_device_scope_reduced_to_user_entitlement() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)

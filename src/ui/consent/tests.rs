@@ -139,6 +139,7 @@ async fn provision(h: &mut Harness) -> Result<Fixture, TestError> {
       contacts: None,
       software_id: None,
       dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
       registration_access_token_hash: None,
     },
   )
@@ -173,6 +174,7 @@ async fn provision(h: &mut Harness) -> Result<Fixture, TestError> {
     dpop_jkt: Some("test-jkt".to_owned()),
     iss: "https://auth.example.test".to_owned(),
     post_logout_uri: None,
+    aud: Vec::new(),
   };
   pending::put(
     &mut h.conn,
@@ -390,6 +392,7 @@ async fn consent_session_request_mismatch_rejected() -> TestResult {
     dpop_jkt: Some("other-jkt".to_owned()),
     iss: "https://auth.example.test".to_owned(),
     post_logout_uri: None,
+    aud: Vec::new(),
   };
   pending::put(
     &mut h.conn,

@@ -17,6 +17,7 @@ mod keys;
 mod matrix;
 mod poll;
 mod race;
+mod resource;
 mod scope;
 mod setup;
 

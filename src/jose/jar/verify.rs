@@ -108,9 +108,10 @@ fn key_alg_compatible(key: &Jwk, alg: Algorithm) -> bool {
 
 #[cfg(test)]
 mod tests {
+  use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
   use super::*;
   use crate::error::OAuthErrorCode;
-  use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
   /// Test body result (no `unwrap`/`expect` under the deny lints).
   type TestResult = Result<(), TestError>;
@@ -145,6 +146,7 @@ mod tests {
       contacts: None,
       software_id: None,
       dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
       active: true,
       created_at: time::OffsetDateTime::UNIX_EPOCH,
       updated_at: time::OffsetDateTime::UNIX_EPOCH,

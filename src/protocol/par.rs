@@ -10,7 +10,6 @@
 use std::{collections::HashMap, time::Duration};
 
 use axum::{
-  Form,
   extract::State,
   http::{HeaderMap, StatusCode},
 };
@@ -20,12 +19,14 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use super::{
+  authorize::CimdRequest,
+  cimd,
   client_auth::{AuthContext, AuthStores, ClientAuthRequest, authenticate_client},
   redirect_repo::{RedirectDecision, match_redirect_uri},
 };
 use crate::{
   crypto::tokens::mint_token,
-  db::redirect_repo,
+  db::{client_repo, redirect_repo},
   error::AppError,
   jose::jar::PAR_REQUEST_URI_PREFIX,
   middleware::{
@@ -59,6 +60,15 @@ pub struct ParContext<'a> {
   pub now: OffsetDateTime,
   /// PAR `request_uri` lifetime (90 s per the plan).
   pub par_ttl: Duration,
+  /// Config `allow_localhost_redirect`: treat the exact host `localhost` as
+  /// an RFC 8252 §7.3 loopback redirect host when matching the pushed
+  /// `redirect_uri`.
+  pub allow_localhost_redirect: bool,
+  /// CIMD resolution settings; `None` when `config.cimd_enabled` is off.
+  pub cimd: Option<CimdRequest<'a>>,
+  /// Config `resource_indicators_enabled`: off + any `resource` present is
+  /// `invalid_target` (fail-closed, no silent drop).
+  pub resource_indicators_enabled: bool,
 }
 
 /// Successful PAR response body (RFC 9126 §2.4).
@@ -90,6 +100,7 @@ pub async fn push_authorization_request(
   ctx: &ParContext<'_>,
   auth: &ClientAuthRequest<'_>,
   params: &HashMap<String, String>,
+  resources: &[String],
 ) -> Result<ParResponse, AppError> {
   let mut auth_stores = AuthStores {
     pool: stores.pool,
@@ -100,17 +111,30 @@ pub async fn push_authorization_request(
   let auth_ctx = AuthContext {
     token_endpoint: ctx.token_endpoint,
     now: ctx.now,
+    cimd: ctx.cimd.as_ref().map(|settings| cimd::CimdSettings {
+      token_prefix: settings.token_prefix,
+      max_bytes: settings.max_bytes,
+      timeout: settings.timeout,
+      allow_localhost: ctx.allow_localhost_redirect,
+    }),
   };
   let authenticated = authenticate_client(&mut auth_stores, &auth_ctx, auth).await?;
-  validate_request_rules(
+  let aud = validate_request_rules(
     stores.pool,
     stores.keys,
+    stores.conn,
     &authenticated.client.client_id,
     params,
+    resources,
+    ctx,
   )
   .await?;
 
+  // The pinned audience travels in the record `aud`, never in the stored
+  // JSON: a single-valued map cannot hold repeats, and a joined string
+  // would collide with comma-bearing URIs.
   let mut stored = params.clone();
+  stored.remove("resource");
   for member in CREDENTIAL_PARAMS {
     stored.remove(member);
   }
@@ -119,6 +143,7 @@ pub async fn push_authorization_request(
   let record = par::ParRecord {
     client_id: authenticated.client.client_id.clone(),
     request,
+    aud,
   };
   par::put(stores.conn, stores.store, &id, &record, ctx.par_ttl).await?;
 
@@ -128,13 +153,17 @@ pub async fn push_authorization_request(
   })
 }
 
-/// Enforce the pushed-request rules (RFC 9126 §2).
+/// Enforce the pushed-request rules (RFC 9126 §2), returning the validated
+/// resource audience set (RFC 8707) for the PAR record.
 async fn validate_request_rules(
   pool: &PgPool,
   keys: &crate::keys::KeyRing,
+  conn: &mut RedisConn,
   client_id: &str,
   params: &HashMap<String, String>,
-) -> Result<(), AppError> {
+  resources: &[String],
+  ctx: &ParContext<'_>,
+) -> Result<Vec<String>, AppError> {
   match params.get("client_id") {
     Some(presented) if presented == client_id => {}
     _ => {
@@ -169,14 +198,48 @@ async fn validate_request_rules(
       "pushed request redirect_uri is required",
     ));
   };
-  let effective = redirect_repo::effective_for_client(pool, keys, client_id).await?;
-  let registered: Vec<&str> = effective.iter().map(|entry| entry.uri.as_str()).collect();
-  if match_redirect_uri(&registered, redirect_uri) == RedirectDecision::Reject {
+  let registered_uris: Vec<String> =
+    match client_repo::find_active_by_client_id(pool, keys, client_id).await? {
+      Some(_) => redirect_repo::effective_for_client(pool, keys, client_id)
+        .await?
+        .into_iter()
+        .map(|entry| entry.uri)
+        .collect(),
+      // No registered row: a CIMD `client_id` uses its document redirect set
+      // (CIMD draft §5); the catalog is never consulted.
+      None => match ctx.cimd {
+        Some(settings) if client_id.starts_with("https://") => {
+          let limits = cimd::CimdLimits {
+            max_bytes: settings.max_bytes,
+            timeout: settings.timeout,
+          };
+          cimd::resolve_with_catalog(
+            conn,
+            settings.token_prefix,
+            pool,
+            client_id,
+            ctx.allow_localhost_redirect,
+            limits,
+          )
+          .await
+          .map_err(AppError::from)?
+          .redirect_uris
+        }
+        _ => Vec::new(),
+      },
+    };
+  let registered: Vec<&str> = registered_uris.iter().map(String::as_str).collect();
+  if match_redirect_uri(&registered, redirect_uri, ctx.allow_localhost_redirect)
+    == RedirectDecision::Reject
+  {
     return Err(AppError::invalid_request(
       "pushed request redirect_uri is not registered for this client",
     ));
   }
-  Ok(())
+  // Resource indicators (RFC 8707) validate fail-closed: off + present is
+  // `invalid_target`, and every value must be an absolute `https` URI with
+  // an exact enabled-catalog match. No silent drop, no scope widening.
+  super::params::validate_resources(pool, ctx.resource_indicators_enabled, resources).await
 }
 
 /// `POST /par` (RFC 9126 §2.1).
@@ -193,8 +256,28 @@ async fn validate_request_rules(
 pub async fn par_handler(
   State(state): State<AppState>,
   headers: HeaderMap,
-  Form(form): Form<HashMap<String, String>>,
-) -> Result<(StatusCode, axum::Json<ParResponse>), AppError> {
+  body: axum::body::Bytes,
+) -> axum::response::Response {
+  use axum::response::IntoResponse as _;
+  // `Bytes` + a manual parse replaces `Form<HashMap>`: the extractor
+  // consumed the raw body, hiding repeats — the repeated `resource`
+  // indicator (RFC 8707) is captured in order by `params::repeated_values`
+  // while the single-valued map keeps last-wins absorption. The explicit
+  // content-type gate preserves the 415 `Form` rendered (`Bytes` never
+  // fails on content-type), and a malformed body is the same 400.
+  if let Err(reject) = super::params::require_form_content_type(&headers) {
+    return reject.into_response();
+  }
+  let pairs = match super::params::form_pairs(&body) {
+    Ok(pairs) => pairs,
+    Err(reject) => return reject.into_response(),
+  };
+  let form = super::params::single_valued_map(&pairs);
+  let text = match super::params::form_text(&body) {
+    Ok(text) => text,
+    Err(reject) => return reject.into_response(),
+  };
+  let resources = super::params::repeated_values(text, super::params::RESOURCE_PARAM);
   let header_value = headers
     .get(axum::http::header::AUTHORIZATION)
     .and_then(|value| value.to_str().ok());
@@ -220,15 +303,23 @@ pub async fn par_handler(
     token_endpoint: &super::client_auth::token_endpoint(&state.config.issuer),
     now: state.clock.now(),
     par_ttl: state.config.ttl.par,
+    allow_localhost_redirect: state.config.allow_localhost_redirect,
+    cimd: state.config.cimd_enabled.then(|| CimdRequest {
+      token_prefix: &state.config.redis.token_key_prefix,
+      max_bytes: state.config.cimd_max_bytes,
+      timeout: state.config.cimd_fetch_timeout,
+    }),
+    resource_indicators_enabled: state.config.resource_indicators_enabled,
   };
-  let response = match push_authorization_request(&mut stores, &ctx, &auth, &form).await {
+  let response = match push_authorization_request(&mut stores, &ctx, &auth, &form, &resources).await
+  {
     Ok(response) => response,
     Err(error) => {
       emit_pii_decrypt(&headers, &error);
-      return Err(error);
+      return error.into_response();
     }
   };
-  Ok((StatusCode::CREATED, axum::Json(response)))
+  (StatusCode::CREATED, axum::Json(response)).into_response()
 }
 
 fn emit_pii_decrypt(headers: &HeaderMap, error: &AppError) {

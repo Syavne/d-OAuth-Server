@@ -31,6 +31,7 @@ mod context;
 mod ops;
 mod pii;
 mod redirect;
+mod resource;
 mod scope;
 mod secret;
 mod sync;
@@ -89,6 +90,12 @@ pub enum Command {
     /// Redirect-URI subcommand.
     #[command(subcommand)]
     command: RedirectUriCommand,
+  },
+  /// Manage the runtime RFC 8707 resource-server (resource indicator) catalog.
+  ResourceServer {
+    /// Resource-server subcommand.
+    #[command(subcommand)]
+    command: ResourceServerCommand,
   },
   /// Manage per-client redirect-URI attachments.
   Client {
@@ -318,6 +325,45 @@ pub enum ClientCommand {
     #[arg(long)]
     client_id: String,
   },
+  /// Set a client's access-token format (operator-only opt-in to JWT).
+  SetAccessTokenFormat {
+    /// OAuth client identifier.
+    #[arg(long)]
+    client_id: String,
+    /// Access-token format: `opaque` (default) or `jwt`.
+    #[arg(long, value_parser = ["opaque", "jwt"])]
+    format: String,
+  },
+}
+
+/// `resource-server` subcommands (RFC 8707 resource indicator catalog).
+#[derive(Debug, Subcommand)]
+pub enum ResourceServerCommand {
+  /// Create a resource server (or update its description when it exists).
+  Create {
+    /// Exact RFC 8707 resource identifier.
+    identifier: String,
+    /// Optional human description.
+    #[arg(long)]
+    description: Option<String>,
+  },
+  /// List the resource-server catalog.
+  List,
+  /// Enable a resource server.
+  Enable {
+    /// Exact RFC 8707 resource identifier.
+    identifier: String,
+  },
+  /// Disable a resource server.
+  Disable {
+    /// Exact RFC 8707 resource identifier.
+    identifier: String,
+  },
+  /// Delete a resource server.
+  Delete {
+    /// Exact RFC 8707 resource identifier.
+    identifier: String,
+  },
 }
 
 /// `config` subcommands.
@@ -444,6 +490,11 @@ pub async fn run(cli: Cli) -> Result<i32, CliError> {
     Command::RedirectUri { command } => {
       let context = context::Context::from_env().await?;
       redirect::run_uri(&context, command).await?;
+      Ok(0)
+    }
+    Command::ResourceServer { command } => {
+      let context = context::Context::from_env().await?;
+      resource::run(&context, command).await?;
       Ok(0)
     }
     Command::Client { command } => {

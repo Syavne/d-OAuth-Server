@@ -9,9 +9,9 @@
 //! on the plaintext listener by construction.
 
 use std::collections::HashSet;
-
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -22,7 +22,6 @@ use tokio::time::timeout;
 use tower::{Layer, Service};
 
 use super::{AppState, MIGRATOR, READINESS_TIMEOUT};
-use std::sync::atomic::Ordering;
 
 /// Liveness body.
 #[derive(Serialize)]

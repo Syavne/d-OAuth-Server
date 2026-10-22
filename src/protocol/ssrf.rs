@@ -58,14 +58,31 @@ pub enum SsrfError {
   /// The response status was not successful.
   #[error("fetch returned an unsuccessful status")]
   BadStatus,
-  /// The response exceeded [`SSRF_MAX_BYTES`].
+  /// The response exceeded the configured size cap.
   #[error("fetch response exceeds the size limit")]
   TooLarge,
 }
 
-/// Whether `ip` is forbidden as a server-side fetch target: loopback,
-/// unspecified, multicast, broadcast, RFC 1918 private, CGNAT, link-local,
-/// unique-local, documentation, reserved, or a cloud-metadata address.
+/// Whether `ip` is forbidden as a server-side fetch target.
+///
+/// The blocked set is the IANA special-purpose ranges that are never a
+/// legitimate public fetch target, plus the cloud-metadata IPs:
+///
+/// - IPv4: `0.0.0.0/8` (this network), `10/8`, `100.64.0.0/10` (CGNAT),
+///   `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`
+///   (IETF protocol assignments), `192.0.2.0/24`, `192.88.99.0/24` (6to4
+///   relay anycast), `192.168.0.0/16`, `198.18.0.0/15` (benchmarking),
+///   `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4` (multicast),
+///   `240.0.0.0/4` (reserved, incl. broadcast), and the Azure/Alibaba
+///   metadata addresses.
+/// - IPv6: `::1`, `::`, `fc00::/7`, `fe80::/10`, `ff00::/8`, `2001:db8::/32`,
+///   `100::/64` (discard-only), `2001:2::/48` (benchmarking), `2001:10::/28`
+///   and `2001:20::/28` (ORCHID/ORCHIDv2 identifiers), `2001::/32` (Teredo),
+///   `2002::/16` (6to4), and `64:ff9b::/96` / `64:ff9b:1::/48` (NAT64
+///   translation — can reach an embedded private IPv4 target).
+///
+/// IPv4-mapped addresses (`::ffff:a.b.c.d`) are judged by the embedded IPv4
+/// address.
 #[must_use]
 pub fn is_blocked_ip(ip: &IpAddr) -> bool {
   match ip {
@@ -86,7 +103,22 @@ pub fn is_blocked_ip(ip: &IpAddr) -> bool {
         // documentation (2001:db8::/32).
         || (v6.segments()[0] & 0xfe00) == 0xfc00
         || (v6.segments()[0] & 0xffc0) == 0xfe80
-        || v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8
+        || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8)
+        // Discard-only (100::/64) and benchmarking (2001:2::/48).
+        || (v6.segments()[0] == 0x0100
+          && v6.segments()[1] == 0
+          && v6.segments()[2] == 0
+          && v6.segments()[3] == 0)
+        || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0002 && v6.segments()[2] == 0)
+        // Non-routable identifier prefixes: ORCHID (2001:10::/28) and
+        // ORCHIDv2 (2001:20::/28).
+        || (v6.segments()[0] == 0x2001 && (v6.segments()[1] & 0xfff0) == 0x0010)
+        || (v6.segments()[0] == 0x2001 && (v6.segments()[1] & 0xfff0) == 0x0020)
+        // IPv4 transition/translation: Teredo (2001::/32), 6to4 (2002::/16),
+        // NAT64 well-known (64:ff9b::/96) and local-use (64:ff9b:1::/48).
+        || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0)
+        || v6.segments()[0] == 0x2002
+        || (v6.segments()[0] == 0x0064 && v6.segments()[1] == 0xff9b)
     }
   }
 }
@@ -101,9 +133,18 @@ fn is_blocked_v4(v4: &std::net::Ipv4Addr) -> bool {
     || v4.is_private()
     || v4.is_link_local()
     || v4.is_documentation()
+    // "This network" (0.0.0.0/8): a Linux host can reach loopback through
+    // `0.x.y.z`, and only the all-zero address is caught by `is_unspecified`.
+    || o[0] == 0
     // CGNAT shared space (RFC 6598): never a public JWKS host.
     || (o[0] == 100 && o[1] >= 64 && o[1] <= 127)
-    // Reserved benchmarking/reserved ranges.
+    // IETF protocol assignments (192.0.0.0/24) and 6to4 relay anycast
+    // (192.88.99.0/24, deprecated) — no public fetch target lives here.
+    || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+    || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+    // Benchmarking (RFC 2544): 198.18.0.0/15.
+    || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+    // Reserved (240.0.0.0/4, includes 255.255.255.255 broadcast).
     || o[0] >= 240
     || o == AZURE_METADATA_V4
     || o == ALIBABA_METADATA_V4
@@ -155,37 +196,66 @@ pub async fn check_fetch_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, 
   Ok(addrs)
 }
 
-/// Fetch `raw` through the full SSRF guard: URL policy, DNS target check,
-/// then an `https` GET with redirects disabled, a total timeout of
-/// [`SSRF_TIMEOUT`], and a body cap of [`SSRF_MAX_BYTES`].
-///
-/// The connection is pinned to the addresses validated by the DNS check
-/// (`resolve_to_addrs` for hostnames; IP literals need no DNS and connect
-/// directly to the validated literal), closing the DNS-rebinding window
-/// between validation and connect time.
+/// Fetch `raw` through the full SSRF guard with the default `jwks_uri`/
+/// `request_uri` caps: a total timeout of [`SSRF_TIMEOUT`] and a body cap of
+/// [`SSRF_MAX_BYTES`].
 ///
 /// # Errors
 ///
 /// Returns [`SsrfError`] when the URL policy, DNS check, fetch, status, or
 /// size cap fails.
 pub async fn fetch_guarded_bytes(raw: &str) -> Result<Vec<u8>, SsrfError> {
+  fetch_guarded_bytes_with(raw, SSRF_MAX_BYTES, SSRF_TIMEOUT).await
+}
+
+/// Fetch `raw` through the full SSRF guard with per-call limits.
+///
+/// Same policy as [`fetch_guarded_bytes`] — `https`-only, no redirects, a
+/// pre-flight DNS target check pinned to the validated addresses, success
+/// statuses only — but the response body cap and total timeout are the
+/// caller's, so a tighter caller (for example CIMD's 5120-byte cap and
+/// configured timeout) reuses the one fetcher instead of adding a second.
+///
+/// # Errors
+///
+/// Returns [`SsrfError`] when the URL policy, DNS check, fetch, status, or
+/// `max_bytes` cap fails.
+pub async fn fetch_guarded_bytes_with(
+  raw: &str,
+  max_bytes: usize,
+  timeout: Duration,
+) -> Result<Vec<u8>, SsrfError> {
   let url = validate_fetch_url(raw)?;
   let host = url.host_str().unwrap_or_default().to_owned();
   let port = url.port_or_known_default().unwrap_or(443);
   let addrs = check_fetch_host(&host, port).await?;
+  fetch_pinned(&url, &host, &addrs, max_bytes, timeout).await
+}
 
+/// The post-guard network step shared by every guarded fetch: an `https` GET
+/// with redirects disabled, `timeout` as the total budget, and a `max_bytes`
+/// body cap. The connection is pinned to `addrs` for a hostname
+/// (`resolve_to_addrs`); an IP literal needs no DNS and connects to the
+/// already-validated literal.
+async fn fetch_pinned(
+  url: &reqwest::Url,
+  host: &str,
+  addrs: &[SocketAddr],
+  max_bytes: usize,
+  timeout: Duration,
+) -> Result<Vec<u8>, SsrfError> {
   let builder = reqwest::Client::builder()
     .redirect(Policy::none())
-    .timeout(SSRF_TIMEOUT)
+    .timeout(timeout)
     .no_proxy();
   let builder = if host.parse::<IpAddr>().is_ok() {
     builder
   } else {
-    builder.resolve_to_addrs(&host, &addrs)
+    builder.resolve_to_addrs(host, addrs)
   };
   let client = builder.build().map_err(|_| SsrfError::FetchFailed)?;
   let mut response = client
-    .get(url)
+    .get(url.clone())
     .send()
     .await
     .map_err(|_| SsrfError::FetchFailed)?;
@@ -195,7 +265,7 @@ pub async fn fetch_guarded_bytes(raw: &str) -> Result<Vec<u8>, SsrfError> {
   let mut body = Vec::new();
   while let Some(chunk) = response.chunk().await.map_err(|_| SsrfError::FetchFailed)? {
     body.extend_from_slice(&chunk);
-    if body.len() > SSRF_MAX_BYTES {
+    if body.len() > max_bytes {
       return Err(SsrfError::TooLarge);
     }
   }

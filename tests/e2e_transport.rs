@@ -49,6 +49,24 @@ async fn setup() -> Result<World, TestError> {
   Ok(world)
 }
 
+/// `POST {path}` with raw bytes and an optional explicit content type.
+async fn post_body(
+  world: &World,
+  path: &str,
+  content_type: Option<&str>,
+  body: Vec<u8>,
+) -> Result<(StatusCode, HeaderMap, String), TestError> {
+  let mut request = world.client.post(format!("{}{path}", world.base));
+  if let Some(content_type) = content_type {
+    request = request.header(header::CONTENT_TYPE, content_type);
+  }
+  let response = request.body(body).send().await?;
+  let status = response.status();
+  let headers = response.headers().clone();
+  let body = response.text().await?;
+  Ok((status, headers, body))
+}
+
 /// `POST {path}` with a raw body and an explicit content type.
 async fn post_raw(
   world: &World,
@@ -56,17 +74,7 @@ async fn post_raw(
   content_type: &str,
   body: &str,
 ) -> Result<(StatusCode, HeaderMap, String), TestError> {
-  let response = world
-    .client
-    .post(format!("{}{path}", world.base))
-    .header(header::CONTENT_TYPE, content_type)
-    .body(body.to_owned())
-    .send()
-    .await?;
-  let status = response.status();
-  let headers = response.headers().clone();
-  let body = response.text().await?;
-  Ok((status, headers, body))
+  post_body(world, path, Some(content_type), body.as_bytes().to_vec()).await
 }
 
 /// Assert the documented `invalid_request` 400 JSON error, and no token.
@@ -150,6 +158,62 @@ async fn e2e_transport_token_wrong_content_type_rejected_cleanly() -> Result<(),
     )?;
   }
   Ok(())
+}
+
+/// Anti-regression gate for the `Form<TokenForm>` → `Bytes` swap: `/token`
+/// keeps the exact pre-swap transport contract. A non-form or missing
+/// content type is 415, a body past `MAX_BODY_BYTES` is the layer's 413, a
+/// repeated known field is `invalid_request` 400, and a structurally
+/// unreadable (non-UTF-8) body is `invalid_request` 400. Percent escapes
+/// stay lossy (pre-swap `serde_urlencoded` parity): `%ZZ` reaches grant
+/// validation and fails cleanly, never the parse.
+#[tokio::test]
+async fn token_extractor_preserves_415_and_body_limit() -> Result<(), TestError> {
+  let world = setup().await?;
+  let body = format!("grant_type=client_credentials&client_id={CLIENT_ID}");
+
+  for content_type in [Some("application/json"), Some("text/plain"), None] {
+    let (status, _, response_body) =
+      post_body(&world, "/token", content_type, body.as_bytes().to_vec()).await?;
+    ensure(
+      status == StatusCode::UNSUPPORTED_MEDIA_TYPE,
+      format!("{content_type:?} must 415, got {status}: {response_body}"),
+    )?;
+  }
+
+  let padding = "a".repeat(MAX_BODY_BYTES + 1024);
+  let oversized = format!("grant_type=client_credentials&client_id={CLIENT_ID}&padding={padding}");
+  let (status, _, response_body) =
+    post_body(&world, "/token", Some(FORM), oversized.into_bytes()).await?;
+  ensure(
+    status == StatusCode::PAYLOAD_TOO_LARGE,
+    format!("oversized token body must 413, got {status}: {response_body}"),
+  )?;
+
+  let duplicate =
+    format!("grant_type=client_credentials&grant_type=refresh_token&client_id={CLIENT_ID}");
+  let (status, _, response_body) =
+    post_body(&world, "/token", Some(FORM), duplicate.into_bytes()).await?;
+  ensure_invalid_request(status, &response_body)?;
+
+  let (status, _, response_body) = post_body(&world, "/token", Some(FORM), vec![0xFF]).await?;
+  ensure_invalid_request(status, &response_body)?;
+
+  let (status, _, response_body) = post_body(
+    &world,
+    "/token",
+    Some(FORM),
+    b"grant_type=%ZZ&client_id=e2e-transport-client".to_vec(),
+  )
+  .await?;
+  ensure(
+    status == StatusCode::BAD_REQUEST,
+    format!("lossy percent escape must stay a clean 400, got {status}: {response_body}"),
+  )?;
+  ensure(
+    !response_body.contains("access_token"),
+    "a rejected request must not carry an access token",
+  )
 }
 
 /// Malformed percent-encoding decodes lossily into an unknown `grant_type`

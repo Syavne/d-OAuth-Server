@@ -15,9 +15,8 @@ use d_oauth::{
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
-use time::OffsetDateTime;
-
 use support::{CLIENT_ID, ISSUER, KEY_ID, TestError, TestResult, code_of, store_conn, test_client};
+use time::OffsetDateTime;
 
 /// PKCS#8 DER (base64) of the client's RSA signing key (test-only fixture).
 const CLIENT_KEY_B64: &str = concat!(
@@ -101,9 +100,10 @@ async fn jar_valid_signed_request_merged() -> TestResult {
   let merged = resolve(&mut conn, &store, &input)
     .await
     .map_err(|error| TestError::Unexpected(error.to_string()))?;
-  if merged.get("scope").map(String::as_str) != Some("read")
-    || merged.get("redirect_uri").map(String::as_str) != Some("https://client.example.test/cb")
-    || merged.get("state").map(String::as_str) != Some("xyz")
+  if merged.params.get("scope").map(String::as_str) != Some("read")
+    || merged.params.get("redirect_uri").map(String::as_str)
+      != Some("https://client.example.test/cb")
+    || merged.params.get("state").map(String::as_str) != Some("xyz")
   {
     return Err(TestError::Unexpected("merged params mismatch".to_owned()));
   }
@@ -265,9 +265,14 @@ async fn jar_public_client_without_request_object_uses_query() -> TestResult {
   let merged = resolve(&mut conn, &store, &input)
     .await
     .map_err(|error| TestError::Unexpected(error.to_string()))?;
-  if merged != query {
+  if merged.params != query {
     return Err(TestError::Unexpected(
       "public query passthrough altered".to_owned(),
+    ));
+  }
+  if !merged.resource.is_empty() {
+    return Err(TestError::Unexpected(
+      "plain query must pin no resource".to_owned(),
     ));
   }
   Ok(())

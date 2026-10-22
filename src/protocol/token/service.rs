@@ -17,11 +17,12 @@ use secrecy::ExposeSecret;
 use zeroize::Zeroizing;
 
 use super::types::{
-  FoundAccess, FoundRefresh, MintRequest, MintedTokens, TokenServiceError, resolve_cnf,
+  FoundAccess, FoundRefresh, MintRequest, MintedTokens, TokenFormat, TokenServiceError, resolve_cnf,
 };
 use crate::{
   config::TtlConfig,
   crypto::tokens as crypto_tokens,
+  jose::jwt_access::{JwtAccessSigner, JwtClaims, jti_hash},
   keys::KeyRing,
   state::RedisConn,
   store::{Store, StoreError, durability_barrier, grants, tokens as low},
@@ -65,6 +66,10 @@ pub struct TokenService {
   /// Retained peppers, newest-first, bounded by
   /// [`crypto_tokens::MAX_RETAINED_KEYS`].
   keys: Vec<PepperKey>,
+  /// JWT signer for `TokenFormat::Jwt` mints, attached per request by the
+  /// dispatcher (which owns the config). `None` mints opaque only; a `Jwt`
+  /// mint without a signer fails closed instead of minting opaque.
+  jwt: Option<JwtAccessSigner>,
 }
 
 impl fmt::Debug for TokenService {
@@ -76,6 +81,7 @@ impl fmt::Debug for TokenService {
       .field("refresh_ttl", &self.refresh_ttl)
       .field("key_labels", &key_labels)
       .field("secret_lens", &secret_lens)
+      .field("jwt_configured", &self.jwt.is_some())
       .finish()
   }
 }
@@ -105,7 +111,19 @@ impl TokenService {
       access_ttl: ttl.access,
       refresh_ttl: ttl.refresh,
       keys,
+      jwt: None,
     })
+  }
+
+  /// Attach the JWT signer for `TokenFormat::Jwt` mints on this request.
+  ///
+  /// The dispatcher builds the signer from the validated config; the service
+  /// never touches [`crate::config::Config`], so key selection stays in one
+  /// place. Opaque mints ignore the signer.
+  #[must_use]
+  pub fn with_jwt_signer(mut self, signer: JwtAccessSigner) -> Self {
+    self.jwt = Some(signer);
+    self
   }
 
   /// The access-token lifetime.
@@ -197,7 +215,12 @@ impl TokenService {
     now_unix: i64,
     apply_barrier: bool,
   ) -> Result<MintedTokens, TokenServiceError> {
-    let cnf = resolve_cnf(request.client_kind, &request.proof)?;
+    if request.format == TokenFormat::Jwt {
+      return self
+        .mint_jwt(conn, store, request, now_unix, apply_barrier)
+        .await;
+    }
+    let cnf = resolve_cnf(request.client_kind, &request.proof, request.dpop_required)?;
     let cnf_json = cnf.to_storage()?;
     let access_raw = crypto_tokens::mint_token()?;
     let refresh_raw = crypto_tokens::mint_token()?;
@@ -210,6 +233,7 @@ impl TokenService {
       scope: request.scope.clone(),
       subject: request.subject.clone(),
       cnf: cnf_json.clone(),
+      aud: request.aud.clone(),
     };
     let refresh = low::RefreshRecord {
       client_id: request.client_id.clone(),
@@ -217,6 +241,7 @@ impl TokenService {
       scope: request.scope.clone(),
       subject: request.subject.clone(),
       cnf: cnf_json,
+      aud: request.refresh_aud.clone(),
     };
     grants::create(
       conn,
@@ -226,6 +251,7 @@ impl TokenService {
         client_id: request.client_id.clone(),
         subject: request.subject.clone(),
         scope: request.scope.clone(),
+        aud: request.refresh_aud.clone(),
       },
       self.refresh_ttl,
     )
@@ -245,6 +271,114 @@ impl TokenService {
       cnf,
       issued_at: now_unix,
       access_expires_at: now_unix.saturating_add(self.access_ttl.as_secs() as i64),
+      refresh_expires_at: now_unix.saturating_add(self.refresh_ttl.as_secs() as i64),
+    })
+  }
+
+  /// Mint the JWT branch: the access token returned to the client is a
+  /// signed RFC 9068 `at+jwt` (JOSE header `typ`/`kid`/`alg` from the
+  /// signer, claims `iss`/`sub`/`aud`/`scope`/`exp`/`iat`/`jti`/`client_id`
+  /// plus `cnf` when the sender-constraint matrix bound one; RFC 9068
+  /// §2.1/§2.2/§4, audience from RFC 8707 §2). `aud` is the narrowed access
+  /// set ([`MintRequest::aud`]), never the refresh/grant set.
+  ///
+  /// Storage design: the access RECORD is still written (same fields as the
+  /// opaque path) under the member identity `jwt:<jti-hash>` — a value
+  /// derived from the returned token's own `jti`, never a pepper hash of a
+  /// value the client never sees — plus the grant-set `SADD` and the
+  /// `jwt:<jti-hash>` allowlist marker hash (`grant_id`/`client_id`/`subject`,
+  /// TTL = `access_ttl`), all in ONE Lua script on the barriered fresh path
+  /// ([`low::put_access_jwt`]). The rotation pre-mint
+  /// (`apply_barrier == false`) writes the record plus the `SADD` through
+  /// the pending pair and writes NO marker: a marker must only exist next to
+  /// a committed membership, so the pre-mint cannot create one for a pair a
+  /// later REUSE/REPLAY/ABSENT/MISMATCH outcome discards. The refresh half
+  /// stays an opaque token in every format; rotation semantics are
+  /// unchanged. The `jti` comes from the existing token RNG (never a
+  /// counter or a value predictable from the record), and the marker stores
+  /// the raw subject string (empty for client-credentials) with no JWT bytes.
+  async fn mint_jwt(
+    &self,
+    conn: &mut RedisConn,
+    store: &Store,
+    request: &MintRequest,
+    now_unix: i64,
+    apply_barrier: bool,
+  ) -> Result<MintedTokens, TokenServiceError> {
+    let signer = self
+      .jwt
+      .as_ref()
+      .ok_or(TokenServiceError::JwtSignerMissing)?;
+    let cnf = resolve_cnf(request.client_kind, &request.proof, request.dpop_required)?;
+    let cnf_json = cnf.to_storage()?;
+    let jti_raw = crypto_tokens::mint_token()?;
+    let member = format!("jwt:{}", jti_hash(&jti_raw));
+    let issued_at = now_unix;
+    let access_expires_at = now_unix.saturating_add(self.access_ttl.as_secs() as i64);
+    let claims = JwtClaims {
+      iss: signer.issuer().to_owned(),
+      sub: request.subject.clone(),
+      aud: request.aud.clone(),
+      scope: request.scope.clone(),
+      exp: access_expires_at,
+      iat: issued_at,
+      jti: jti_raw,
+      client_id: request.client_id.clone(),
+      cnf: if cnf.is_bound() {
+        Some(cnf.clone())
+      } else {
+        None
+      },
+      act: None,
+    };
+    let access_token = signer.sign(&claims)?;
+    let refresh_raw = crypto_tokens::mint_token()?;
+    let active = self.active()?;
+    let refresh_hash = self.hash_under(active, &refresh_raw);
+    let access = low::AccessRecord {
+      client_id: request.client_id.clone(),
+      grant_id: request.grant_id.clone(),
+      scope: request.scope.clone(),
+      subject: request.subject.clone(),
+      cnf: cnf_json.clone(),
+      aud: request.aud.clone(),
+    };
+    let refresh = low::RefreshRecord {
+      client_id: request.client_id.clone(),
+      grant_id: request.grant_id.clone(),
+      scope: request.scope.clone(),
+      subject: request.subject.clone(),
+      cnf: cnf_json,
+      aud: request.refresh_aud.clone(),
+    };
+    grants::create(
+      conn,
+      store,
+      &grants::GrantRecord {
+        grant_id: request.grant_id.clone(),
+        client_id: request.client_id.clone(),
+        subject: request.subject.clone(),
+        scope: request.scope.clone(),
+        aud: request.refresh_aud.clone(),
+      },
+      self.refresh_ttl,
+    )
+    .await?;
+    if apply_barrier {
+      low::put_access_jwt(conn, store, &member, &access, self.access_ttl).await?;
+      low::put_refresh(conn, store, &refresh_hash, &refresh, self.refresh_ttl).await?;
+    } else {
+      low::put_access_pending(conn, store, &member, &access, self.access_ttl).await?;
+      low::put_refresh_pending(conn, store, &refresh_hash, &refresh, self.refresh_ttl).await?;
+    }
+    Ok(MintedTokens {
+      access_token,
+      refresh_token: refresh_raw,
+      access_hash: member,
+      refresh_hash,
+      cnf,
+      issued_at,
+      access_expires_at,
       refresh_expires_at: now_unix.saturating_add(self.refresh_ttl.as_secs() as i64),
     })
   }
@@ -526,6 +660,7 @@ mod debug_redaction_tests {
         scope: "orders:read".to_owned(),
         subject: "user-a".to_owned(),
         cnf: String::new(),
+        aud: Vec::new(),
       },
       hash: "v1.test-access-hash".to_owned(),
       key_label: "v1".to_owned(),
@@ -542,6 +677,7 @@ mod debug_redaction_tests {
         scope: "orders:read".to_owned(),
         subject: "user-a".to_owned(),
         cnf: String::new(),
+        aud: Vec::new(),
       },
       hash: "v1.test-refresh-hash".to_owned(),
       key_label: "v1".to_owned(),

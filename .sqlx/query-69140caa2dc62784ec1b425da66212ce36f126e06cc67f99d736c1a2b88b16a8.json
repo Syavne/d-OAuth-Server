@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE oauth_clients SET client_name = $2, client_name_enc = $3, grant_types = $4, response_types = $5, scope = $6, token_endpoint_auth_method = $7, jwks = $8, jwks_uri = $9, jwks_uri_enc = $10, tls_client_auth_subject_dn = $11, tls_client_auth_subject_dn_enc = $12, tls_client_auth_subject_dn_index = $13, tls_client_auth_cert_thumbprint = $14, tls_client_auth_cert_thumbprint_enc = $15, tls_client_auth_cert_thumbprint_index = $16, request_uris = $17, request_uris_enc = $18, contacts = $19, contacts_enc = $20, software_id = $21, software_id_enc = $22, dpop_bound_access_tokens = $23, updated_at = now() WHERE id = $1 RETURNING id, client_id, client_secret_expires_at, client_id_issued_at, client_name, client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, dpop_bound_access_tokens, active, created_at, updated_at",
+  "query": "SELECT id, client_id, client_secret_expires_at, client_id_issued_at, client_name, client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, dpop_bound_access_tokens, access_token_format, active, created_at, updated_at FROM oauth_clients WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -269,6 +269,17 @@
       },
       {
         "ordinal": 24,
+        "name": "access_token_format",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "access_token_format"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
         "name": "active",
         "type_info": "Bool",
         "origin": {
@@ -279,7 +290,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -290,7 +301,7 @@
         }
       },
       {
-        "ordinal": 26,
+        "ordinal": 27,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -303,29 +314,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Bytea",
-        "TextArray",
-        "TextArray",
-        "Text",
-        "Text",
-        "Jsonb",
-        "Text",
-        "Bytea",
-        "Text",
-        "Bytea",
-        "Text",
-        "Text",
-        "Bytea",
-        "Text",
-        "Jsonb",
-        "Bytea",
-        "Jsonb",
-        "Bytea",
-        "Text",
-        "Bytea",
-        "Bool"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -355,8 +344,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "1cf0676f9a41ce8b8e07e77673d31d225ec331c2fbfc7d6e6ac9fe9598570a21"
+  "hash": "69140caa2dc62784ec1b425da66212ce36f126e06cc67f99d736c1a2b88b16a8"
 }

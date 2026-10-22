@@ -36,12 +36,13 @@ use super::{
 };
 use crate::{
   error::AppError,
+  jose::jwt_access::{JwtAccessSigner, is_jwt_shape, jti_hash},
   middleware::{
     audit::AuditEvent,
     request_id::{REQUEST_ID_HEADER, RequestId},
   },
   state::{AppState, RedisConn},
-  store::Store,
+  store::{Store, StoreError, durability_barrier},
   tls::PeerCertificates,
 };
 
@@ -75,6 +76,10 @@ pub struct RevokeContext<'a> {
   pub token_endpoint: &'a str,
   /// Current time for client-secret expiry enforcement.
   pub now: OffsetDateTime,
+  /// CIMD resolution settings for a registration-free fallback; `None` when
+  /// `config.cimd_enabled` is off (RFC 7009 §2.1: a registration-free
+  /// client revokes its own token through this same path).
+  pub cimd: Option<crate::protocol::cimd::CimdSettings<'a>>,
   /// Correlating request id for the audit event, when present.
   pub request_id: Option<&'a str>,
 }
@@ -117,6 +122,11 @@ struct OwnedToken<'a> {
 /// secret, client assertion, or `client_id`) is `401` + `WWW-Authenticate`,
 /// because the endpoint is a protected resource (RFC 7009 §2.1).
 ///
+/// `jwt_signer` carries the AS access-token signer for the JWT allowlist path
+/// (built from the config by the handler only when the presented token has
+/// JWT shape and the operator switch is on); `None` leaves a JWT-shaped token
+/// as a silent no-op. It is never consulted on the opaque path.
+///
 /// # Errors
 ///
 /// Returns `invalid_request` for a missing token, `invalid_client` for failed
@@ -125,6 +135,7 @@ pub async fn revoke_tokens(
   stores: &mut RevokeStores<'_>,
   ctx: &RevokeContext<'_>,
   request: &RevokeRequest<'_>,
+  jwt_signer: Option<&JwtAccessSigner>,
 ) -> Result<RevokeOutcome, AppError> {
   if request.token.is_empty() {
     return Err(AppError::invalid_request("token is required"));
@@ -142,6 +153,7 @@ pub async fn revoke_tokens(
     let auth_ctx = AuthContext {
       token_endpoint: ctx.token_endpoint,
       now: ctx.now,
+      cimd: ctx.cimd,
     };
     authenticate_client(&mut auth_stores, &auth_ctx, request.auth).await?
   };
@@ -151,7 +163,14 @@ pub async fn revoke_tokens(
     token: request.token,
     token_type_hint: request.token_type_hint,
   };
-  let outcome = revoke_owned(stores.conn, stores.store, stores.service, &owned).await?;
+  let outcome = revoke_owned(
+    stores.conn,
+    stores.store,
+    stores.service,
+    &owned,
+    jwt_signer,
+  )
+  .await?;
   if matches!(outcome, RevokeOutcome::Revoked) {
     AuditEvent::TokenRevoke {
       request_id: ctx.request_id,
@@ -176,11 +195,21 @@ fn is_unauthenticated(auth: &ClientAuthRequest<'_>) -> bool {
 /// lookup is uniform; a foreign owner returns [`RevokeOutcome::NoOp`] without
 /// touching the store. A refresh token revokes the whole grant chain; an access
 /// token revokes only itself.
+///
+/// A JWT-shaped token (RFC 9068 §4 allowlist) misses both opaque slots by
+/// construction and falls through to [`revoke_jwt_owned`]: signature plus
+/// `iss` are verified, ownership is enforced from the verified `client_id`
+/// (and the marker's own `client_id` field), and only then are the marker and
+/// the access record/member deleted. Every miss — malformed, foreign-key,
+/// expired, wrong-issuer, foreign-owner, or already revoked — collapses to
+/// [`RevokeOutcome::NoOp`] (uniform HTTP 200 per RFC 7009 §2.2); a foreign
+/// token is never revoked.
 async fn revoke_owned(
   conn: &mut RedisConn,
   store: &Store,
   service: &TokenService,
   owned: &OwnedToken<'_>,
+  jwt_signer: Option<&JwtAccessSigner>,
 ) -> Result<RevokeOutcome, AppError> {
   match owned.token_type_hint.filter(|hint| !hint.is_empty()) {
     None | Some(HINT_ACCESS | HINT_REFRESH) => {}
@@ -206,7 +235,76 @@ async fn revoke_owned(
       .await?;
     return Ok(RevokeOutcome::Revoked);
   }
+  if is_jwt_shape(owned.token) {
+    return revoke_jwt_owned(conn, store, owned, jwt_signer).await;
+  }
   Ok(RevokeOutcome::NoOp)
+}
+
+/// Revoke a JWT access token owned by `owner_client_id` (RFC 7009 §2.1).
+///
+/// The token must verify under the AS signer (header `typ`/`alg`/`kid`,
+/// signature, `iss`, `exp`; `expected_aud` is `None` because revocation is
+/// audience-agnostic) and the verified `client_id` must equal the caller. The
+/// `jwt:<jti-hash>` marker is then read: an absent marker means the token is
+/// already revoked (`NoOp`), and a marker whose `client_id` names another
+/// client is never touched (`NoOp`). Otherwise the marker hash, the
+/// `access:jwt:<jti-hash>` record, and the grant-set member are deleted — the
+/// honest equivalent of [`TokenService::revoke_token`] for the member identity
+/// `jwt:<jti-hash>` (a `SREM` from the grant set plus `DEL` of the record
+/// key), barriered before returning.
+async fn revoke_jwt_owned(
+  conn: &mut RedisConn,
+  store: &Store,
+  owned: &OwnedToken<'_>,
+  jwt_signer: Option<&JwtAccessSigner>,
+) -> Result<RevokeOutcome, AppError> {
+  let signer = match jwt_signer {
+    Some(signer) => signer,
+    None => return Ok(RevokeOutcome::NoOp),
+  };
+  let verified = match signer.verify(owned.token, None) {
+    Ok(verified) => verified,
+    Err(_) => return Ok(RevokeOutcome::NoOp),
+  };
+  if verified.claims.client_id != owned.owner_client_id {
+    return Ok(RevokeOutcome::NoOp);
+  }
+  let hash = jti_hash(&verified.claims.jti);
+  let marker_key = store.jwt_marker_key(&hash);
+  let fields: HashMap<String, String> = redis::cmd("HGETALL")
+    .arg(&marker_key)
+    .query_async(conn)
+    .await
+    .map_err(StoreError::Redis)?;
+  if fields.is_empty() {
+    return Ok(RevokeOutcome::NoOp);
+  }
+  if fields.get("client_id").map(String::as_str) != Some(owned.owner_client_id) {
+    return Ok(RevokeOutcome::NoOp);
+  }
+  let member = format!("jwt:{hash}");
+  let record_key = store.access_key(&member);
+  let grant_id = fields.get("grant_id").cloned().unwrap_or_default();
+  let set_key = store.grant_tokens_key(&grant_id);
+  let _: () = redis::cmd("DEL")
+    .arg(&record_key)
+    .arg(&marker_key)
+    .query_async(conn)
+    .await
+    .map_err(StoreError::Redis)?;
+  if !grant_id.is_empty() {
+    let _: () = redis::cmd("SREM")
+      .arg(&set_key)
+      .arg(&member)
+      .query_async(conn)
+      .await
+      .map_err(StoreError::Redis)?;
+  }
+  durability_barrier(conn, store)
+    .await
+    .map_err(AppError::from)?;
+  Ok(RevokeOutcome::Revoked)
 }
 
 /// Render a revocation outcome: `200 OK` with an empty body for success and
@@ -293,6 +391,15 @@ pub async fn revoke_handler(
   let ctx = RevokeContext {
     token_endpoint: &token_endpoint,
     now: state.clock.now(),
+    cimd: state
+      .config
+      .cimd_enabled
+      .then(|| crate::protocol::cimd::CimdSettings {
+        token_prefix: &state.config.redis.token_key_prefix,
+        max_bytes: state.config.cimd_max_bytes,
+        timeout: state.config.cimd_fetch_timeout,
+        allow_localhost: state.config.allow_localhost_redirect,
+      }),
     request_id: request_id.as_ref().map(RequestId::as_str),
   };
   let request = RevokeRequest {
@@ -300,7 +407,15 @@ pub async fn revoke_handler(
     token_type_hint: form.get("token_type_hint").map(String::as_str),
     auth: &auth,
   };
-  let outcome = revoke_tokens(&mut stores, &ctx, &request).await?;
+  // The signer is built only on the JWT-shaped path: opaque revocations never
+  // touch the signing config. A missing key or a disabled switch leaves a
+  // JWT-shaped token as a silent no-op.
+  let jwt_signer = if is_jwt_shape(request.token) && state.config.jwt_access_tokens_enabled {
+    JwtAccessSigner::from_config(&state.config).ok()
+  } else {
+    None
+  };
+  let outcome = revoke_tokens(&mut stores, &ctx, &request, jwt_signer.as_ref()).await?;
   Ok(outcome_response(outcome))
 }
 

@@ -18,7 +18,9 @@ mod dpop;
 #[path = "e2e/clients.rs"]
 mod clients;
 
-use d_oauth::db::{TokenEndpointAuthMethod, user_repo, user_scope_repo};
+use d_oauth::db::{
+  TokenEndpointAuthMethod, client_repo, resource_repo, user_repo, user_scope_repo,
+};
 use d_oauth::protocol::code::{CodeClientKind, CodeIssueRequest, CodeIssuer, IssuedCode};
 use d_oauth::protocol::device::hash_token;
 use d_oauth::protocol::scope::ScopeSet;
@@ -39,10 +41,31 @@ const CLIENT_SECRET: &str = "e2e-grant-secret-1a2b3c4d5e6f708192";
 const PUBLIC_ID: &str = "e2e-grant-public";
 /// Registered loopback redirect.
 const REDIRECT_URI: &str = "http://127.0.0.1:9/cb";
+/// First catalog-registered resource indicator (RFC 8707).
+const RESOURCE_A: &str = "https://rs-a.example.test/api";
+/// Second catalog-registered resource indicator (RFC 8707).
+const RESOURCE_B: &str = "https://rs-b.example.test/api";
 
 /// One world plus seeded confidential + public clients, scopes, redirect.
 async fn setup() -> Result<World, TestError> {
-  let world = World::start(open_rate_limit()).await?;
+  setup_with_resource_indicators(false).await
+}
+
+/// [`setup`] with the `resource_indicators_enabled` gate pinned.
+///
+/// The RFC 8707 catalog always holds [`RESOURCE_A`] and [`RESOURCE_B`]; the
+/// flag decides whether a token request may pin them.
+async fn setup_with_resource_indicators(enabled: bool) -> Result<World, TestError> {
+  let world = World::start_with(
+    open_rate_limit(),
+    serde_json::json!({"resource_indicators_enabled": enabled}),
+  )
+  .await?;
+  for resource in [RESOURCE_A, RESOURCE_B] {
+    resource_repo::upsert(&world.pool, resource, "e2e resource server")
+      .await
+      .map_err(|error| fail(format!("resource upsert failed: {error}")))?;
+  }
   seed_client(
     &world.pool,
     &world.state.keys,
@@ -970,6 +993,143 @@ async fn e2e_grant_client_credentials_oauth2_issues_token() -> Result<(), TestEr
   Ok(())
 }
 
+/// RFC 8707 §2: two repeated `resource` values on a `client_credentials`
+/// request are captured from the raw body and accepted; the token response
+/// never echoes the audience.
+#[tokio::test]
+async fn token_accepts_repeated_resource() -> Result<(), TestError> {
+  let world = setup_with_resource_indicators(true).await?;
+  let (status, _, body) = world
+    .post_form(
+      "/token",
+      &[
+        ("grant_type", "client_credentials"),
+        ("resource", RESOURCE_A),
+        ("resource", RESOURCE_B),
+      ],
+      Some((CLIENT_ID, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure(
+    status == reqwest::StatusCode::OK,
+    format!("two catalog resources must mint: {status} {body}"),
+  )?;
+  let response = json_body(&body)?;
+  ensure(
+    response["access_token"]
+      .as_str()
+      .is_some_and(|value| !value.is_empty()),
+    format!("must return an access token: {body}"),
+  )?;
+  for member in ["resource", "audience", "aud"] {
+    ensure(
+      response.get(member).is_none(),
+      format!("the token response must not echo {member}: {body}"),
+    )?;
+  }
+  // The minted token really carries the audience: the stored access record
+  // pins the sorted catalog set.
+  let raw = response["access_token"]
+    .as_str()
+    .ok_or_else(|| fail(format!("must return an access token: {body}")))?;
+  let mut conn = world.state.redis.clone();
+  let found = world
+    .service
+    .find_access(&mut conn, &world.store, raw)
+    .await
+    .map_err(|error| fail(format!("access record lookup failed: {error}")))?
+    .ok_or_else(|| fail(format!("minted access token not found: {body}")))?;
+  ensure(
+    found.record.aud == [RESOURCE_A.to_owned(), RESOURCE_B.to_owned()],
+    format!("access record audience not pinned: {:?}", found.record.aud),
+  )?;
+  Ok(())
+}
+
+/// RFC 8707 §2 fail-closed rules: a resource outside the enabled catalog, a
+/// non-`https` resource, and any resource while the gate is off are all
+/// `invalid_target` 400 with nothing minted.
+#[tokio::test]
+async fn token_rejects_unpinned_resource() -> Result<(), TestError> {
+  let enabled = setup_with_resource_indicators(true).await?;
+  for resource in [
+    "https://unknown.example.test/api",
+    "http://rs-a.example.test/api",
+  ] {
+    let (status, _, body) = enabled
+      .post_form(
+        "/token",
+        &[("grant_type", "client_credentials"), ("resource", resource)],
+        Some((CLIENT_ID, CLIENT_SECRET)),
+        &[],
+      )
+      .await?;
+    ensure_error(status, &body, "invalid_target")?;
+  }
+
+  let disabled = setup_with_resource_indicators(false).await?;
+  let (status, _, body) = disabled
+    .post_form(
+      "/token",
+      &[
+        ("grant_type", "client_credentials"),
+        ("resource", RESOURCE_A),
+      ],
+      Some((CLIENT_ID, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure_error(status, &body, "invalid_target")
+}
+
+/// Token exchange keeps its RFC 8693 semantics: a `resource` member is
+/// `invalid_request` before any catalog lookup (so a bogus value can never
+/// surface `invalid_target`), while the resource-free request reaches the
+/// existing exchange gate unchanged.
+#[tokio::test]
+async fn exchange_rejects_resource() -> Result<(), TestError> {
+  let world = setup_with_resource_indicators(true).await?;
+  for resource in [RESOURCE_A, "https://unknown.example.test/api"] {
+    let (status, _, body) = world
+      .post_form(
+        "/token",
+        &[
+          (
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+          ),
+          ("subject_token", "opaque-subject"),
+          ("resource", resource),
+        ],
+        Some((CLIENT_ID, CLIENT_SECRET)),
+        &[],
+      )
+      .await?;
+    ensure_error(status, &body, "invalid_request")?;
+    ensure(
+      json_body(&body)?["error"] != "invalid_target",
+      format!("a resource on exchange must never be invalid_target: {body}"),
+    )?;
+  }
+
+  let (status, _, body) = world
+    .post_form(
+      "/token",
+      &[
+        (
+          "grant_type",
+          "urn:ietf:params:oauth:grant-type:token-exchange",
+        ),
+        ("subject_token", "opaque-subject"),
+      ],
+      Some((CLIENT_ID, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure_error(status, &body, "invalid_grant")
+}
+
 /// Baseline authorization-code + PKCE exchange via the `oauth2` crate
 /// redeems a real code issued through [`CodeIssuer`].
 #[tokio::test]
@@ -986,6 +1146,7 @@ async fn e2e_grant_authorization_code_oauth2_issues_token() -> Result<(), TestEr
     let request = CodeIssueRequest {
       client_id: CLIENT_ID,
       client_kind: CodeClientKind::Confidential,
+      dpop_required: false,
       user_id: "e2e-subject",
       redirect_uri: REDIRECT_URI,
       approved_scope: &approved,
@@ -993,6 +1154,7 @@ async fn e2e_grant_authorization_code_oauth2_issues_token() -> Result<(), TestEr
       code_challenge: &challenge,
       dpop_jkt: None,
       state: None,
+      aud: &[],
       issuer: &world.state.config.issuer,
     };
     issuer
@@ -1159,6 +1321,7 @@ async fn issue_conf_code(
   let request = CodeIssueRequest {
     client_id,
     client_kind: CodeClientKind::Confidential,
+    dpop_required: false,
     user_id: "e2e-subject",
     redirect_uri: REDIRECT_URI,
     approved_scope: &approved,
@@ -1166,6 +1329,7 @@ async fn issue_conf_code(
     code_challenge: challenge,
     dpop_jkt: None,
     state: None,
+    aud: &[],
     issuer: &world.state.config.issuer,
   };
   issuer
@@ -1194,4 +1358,226 @@ fn location_of(headers: &reqwest::header::HeaderMap) -> Result<String, TestError
     .and_then(|value| value.to_str().ok())
     .map(str::to_owned)
     .ok_or_else(|| fail("response lacks location header"))
+}
+
+/// 32-byte ASCII JWT signing key, mirroring the config-test fixture material.
+const JWT_TEST_KEY: &str = "bcdefghijklmnopqrstuvwxyzabcdefg";
+
+/// One world with the global JWT switch pinned and the confidential fixture
+/// client seeded. The client's stored `access_token_format` stays at the
+/// column default (`opaque`) so each test opts in explicitly.
+async fn setup_with_jwt_flag(enabled: bool) -> Result<World, TestError> {
+  let overrides = if enabled {
+    serde_json::json!({
+      "jwt_access_tokens_enabled": true,
+      "jwt_signing_key": JWT_TEST_KEY,
+    })
+  } else {
+    serde_json::json!({})
+  };
+  let world = World::start_with(open_rate_limit(), overrides).await?;
+  seed_client(
+    &world.pool,
+    &world.state.keys,
+    CLIENT_ID,
+    Some(CLIENT_SECRET),
+    &["authorization_code", "refresh_token", "client_credentials"],
+    "read write",
+    TokenEndpointAuthMethod::ClientSecretBasic,
+  )
+  .await?;
+  seed_scope(&world.pool, "read").await?;
+  seed_scope(&world.pool, "write").await?;
+  Ok(world)
+}
+
+/// Assert a response is the fail-closed 503 for JWT access tokens and mints
+/// nothing (never the 500 `server_error`).
+fn ensure_temporarily_unavailable(
+  status: reqwest::StatusCode,
+  body: &str,
+) -> Result<(), TestError> {
+  ensure(
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+    format!("jwt client with the global switch off must be 503, got {status}: {body}"),
+  )?;
+  ensure(
+    status != reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+    "the gate must never surface server_error/500",
+  )?;
+  let value = json_body(body)?;
+  ensure(
+    value["error"] == "temporarily_unavailable",
+    format!("failure must be temporarily_unavailable, got {value}"),
+  )?;
+  ensure(
+    value.get("access_token").is_none(),
+    "a failed format gate must mint nothing",
+  )?;
+  Ok(())
+}
+
+/// An opaque client never enters the JWT stack: with the global switch off
+/// and on (with a fully valid signing key configured) `client_credentials`
+/// still mints the same opaque, dot-free token.
+#[tokio::test]
+async fn opaque_default_ignores_jwt_stack() -> Result<(), TestError> {
+  for jwt_enabled in [false, true] {
+    let world = setup_with_jwt_flag(jwt_enabled).await?;
+    let (status, _, body) = world
+      .post_form(
+        "/token",
+        &[("grant_type", "client_credentials")],
+        Some((CLIENT_ID, CLIENT_SECRET)),
+        &[],
+      )
+      .await?;
+    ensure(
+      status == reqwest::StatusCode::OK,
+      format!("flag={jwt_enabled}: an opaque client must mint: {status} {body}"),
+    )?;
+    let value = json_body(&body)?;
+    let token = value["access_token"]
+      .as_str()
+      .ok_or_else(|| fail("success body lacks access_token"))?;
+    ensure(
+      !token.is_empty()
+        && !token.contains('.')
+        && token
+          .bytes()
+          .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+      "opaque tokens are base64url without a JOSE segment separator",
+    )?;
+    ensure(
+      value["token_type"] == "Bearer",
+      "the opaque response shape is unchanged",
+    )?;
+  }
+  Ok(())
+}
+
+/// A client switched to `jwt` while the global kill-switch is off fails
+/// closed with `temporarily_unavailable` (HTTP 503, never 500) and mints
+/// nothing; both dispatcher-authenticated and internally authenticated grants
+/// observe the same gate.
+#[tokio::test]
+async fn jwt_client_flag_off_is_503() -> Result<(), TestError> {
+  let world = setup_with_jwt_flag(false).await?;
+  ensure(
+    client_repo::set_access_token_format(&world.pool, CLIENT_ID, "jwt").await?,
+    "the fixture client must switch to jwt",
+  )?;
+
+  let (status, _, body) = world
+    .post_form(
+      "/token",
+      &[("grant_type", "client_credentials")],
+      Some((CLIENT_ID, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure_temporarily_unavailable(status, &body)?;
+
+  // `authorization_code` authenticates inside the grant module; the
+  // dispatcher resolves the candidate client id and applies the same gate.
+  let (status, _, body) = world
+    .post_form(
+      "/token",
+      &[
+        ("grant_type", "authorization_code"),
+        ("code", "stale-code"),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", CLIENT_ID),
+      ],
+      Some((CLIENT_ID, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure_temporarily_unavailable(status, &body)?;
+  Ok(())
+}
+
+/// The positive branch: `jwt` + the global switch on + a valid signing key
+/// passes the format gate instead of 503.
+///
+/// Todo 26 turns the mint into a real JWT; until then the gate is the only
+/// behavior this test pins, so a 200 opaque token is expected here.
+#[tokio::test]
+async fn jwt_client_with_flag_on_resolves_jwt() -> Result<(), TestError> {
+  let world = setup_with_jwt_flag(true).await?;
+  ensure(
+    client_repo::set_access_token_format(&world.pool, CLIENT_ID, "jwt").await?,
+    "the fixture client must switch to jwt",
+  )?;
+  let (status, _, body) = world
+    .post_form(
+      "/token",
+      &[("grant_type", "client_credentials")],
+      Some((CLIENT_ID, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure(
+    status != reqwest::StatusCode::SERVICE_UNAVAILABLE,
+    format!("jwt with the switch on must pass the gate, got 503: {body}"),
+  )?;
+  ensure(
+    status == reqwest::StatusCode::OK,
+    format!("the gate's positive branch must reach minting: {status} {body}"),
+  )?;
+  ensure(
+    json_body(&body)?["access_token"]
+      .as_str()
+      .is_some_and(|token| !token.is_empty()),
+    "the positive branch mints a token",
+  )?;
+  Ok(())
+}
+
+/// Token exchange never mints a JWT: a `jwt`-format caller fails closed with
+/// `temporarily_unavailable` (503) and no token, even with the global switch
+/// on and a valid signing key configured.
+#[tokio::test]
+async fn jwt_exchange_format_rejected() -> Result<(), TestError> {
+  const EXCHANGE_CLIENT: &str = "e2e-exchange-jwt-client";
+  let world = setup_with_jwt_flag(true).await?;
+  seed_client(
+    &world.pool,
+    &world.state.keys,
+    EXCHANGE_CLIENT,
+    Some(CLIENT_SECRET),
+    &["urn:ietf:params:oauth:grant-type:token-exchange"],
+    "read write",
+    TokenEndpointAuthMethod::ClientSecretBasic,
+  )
+  .await?;
+  ensure(
+    client_repo::set_access_token_format(&world.pool, EXCHANGE_CLIENT, "jwt").await?,
+    "the fixture client must switch to jwt",
+  )?;
+  let (status, _, body) = world
+    .post_form(
+      "/token",
+      &[(
+        "grant_type",
+        "urn:ietf:params:oauth:grant-type:token-exchange",
+      )],
+      Some((EXCHANGE_CLIENT, CLIENT_SECRET)),
+      &[],
+    )
+    .await?;
+  ensure(
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+    format!("a jwt exchange caller must be 503, got {status}: {body}"),
+  )?;
+  let value = json_body(&body)?;
+  ensure(
+    value["error"] == "temporarily_unavailable",
+    format!("failure must be temporarily_unavailable, got {value}"),
+  )?;
+  ensure(
+    value.get("access_token").is_none(),
+    "a rejected exchange must mint nothing",
+  )?;
+  Ok(())
 }

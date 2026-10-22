@@ -3,19 +3,24 @@
 use std::{collections::HashMap, time::Duration};
 
 use axum::http::{StatusCode, header};
+use secrecy::SecretString;
 use uuid::Uuid;
 
 use super::{AuthorizeFailure, AuthorizeInput, validate};
 use crate::{
   config::DurabilityMode,
   crypto::pkce::challenge_from_verifier,
-  db::{client_repo::NewClient, redirect_repo, scope_repo, test_support::migrated_pool},
+  db::{
+    client_repo, client_repo::NewClient, redirect_repo, resource_repo, scope_repo,
+    test_support::migrated_pool,
+  },
   error::{AppError, OAuthErrorCode},
   keys::{KeyId, KeyRing},
+  protocol::cimd,
   state::RedisConn,
   store::Store,
+  test_support,
 };
-use secrecy::SecretString;
 
 /// Boxed test error (no `unwrap`/`expect` under the crate deny lints).
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -56,6 +61,7 @@ fn fixture(client_id: &str, public: bool) -> NewClient {
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   }
 }
@@ -161,7 +167,11 @@ async fn authorize_validate_public_client_plain_query_proceeds() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   .map_err(|failure| format!("valid request rejected: {}", failure.code()))?;
@@ -190,7 +200,11 @@ async fn authorize_validate_unknown_client_shows_page() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -225,7 +239,11 @@ async fn authorize_validate_unregistered_redirect_shows_page() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -258,7 +276,11 @@ async fn authorize_validate_token_response_type_redirects() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -317,7 +339,11 @@ async fn authorize_validate_unknown_scope_redirects() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -376,7 +402,11 @@ async fn authorize_validate_confidential_plain_query_rejected() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -409,7 +439,11 @@ async fn authorize_redirect_exact_match() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   .map_err(|failure| format!("exact redirect rejected: {}", failure.code()))?;
@@ -427,7 +461,11 @@ async fn authorize_redirect_exact_match() -> TestResult {
       conn: &mut conn,
       store: &store,
       issuer: ISSUER,
+      allow_localhost_redirect: false,
+      cimd: None,
       query: &params,
+      resources: Vec::new(),
+      resource_indicators_enabled: false,
     })
     .await
     {
@@ -453,7 +491,11 @@ async fn authorize_redirect_exact_match() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -491,7 +533,11 @@ async fn authorize_loopback_allows_port() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   .map_err(|failure| format!("loopback port rejected: {}", failure.code()))?;
@@ -507,7 +553,11 @@ async fn authorize_loopback_allows_port() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -537,7 +587,11 @@ async fn authorize_validate_missing_challenge_redirects() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -624,7 +678,11 @@ async fn authorize_post_logout_outage_redirects() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -664,7 +722,11 @@ async fn authorize_error_iss() -> TestResult {
     conn: &mut conn,
     store: &store,
     issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
     query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
   })
   .await
   {
@@ -734,7 +796,11 @@ async fn authorize_validate_missing_response_type_redirects() -> TestResult {
       conn: &mut conn,
       store: &store,
       issuer: ISSUER,
+      allow_localhost_redirect: false,
+      cimd: None,
       query: &params,
+      resources: Vec::new(),
+      resource_indicators_enabled: false,
     })
     .await
     {
@@ -775,6 +841,288 @@ async fn authorize_validate_missing_response_type_redirects() -> TestResult {
         return Err(format!("expected a redirect, got {}", other.code()).into());
       }
     }
+  }
+  Ok(())
+}
+
+/// Seed the CIMD document cache for `url`, so a resolve is served from Redis
+/// without a network fetch (a cache miss would fail against `.invalid`).
+async fn seed_cimd(
+  conn: &mut RedisConn,
+  prefix: &str,
+  url: &str,
+  document: &cimd::CimdDocument,
+) -> TestResult {
+  let payload = serde_json::to_string(document)?;
+  redis::cmd("SET")
+    .arg(cimd::cache_key(prefix, url))
+    .arg(payload)
+    .arg("EX")
+    .arg(900)
+    .query_async::<()>(conn)
+    .await?;
+  Ok(())
+}
+
+/// A minimal `none`-method CIMD document (CIMD draft §4.1).
+fn cimd_document(url: &str, redirect_uris: &[&str], scope: &str) -> cimd::CimdDocument {
+  cimd::CimdDocument {
+    client_id: url.to_owned(),
+    redirect_uris: redirect_uris.iter().map(|uri| (*uri).to_owned()).collect(),
+    token_endpoint_auth_method: Some("none".to_owned()),
+    grant_types: Some(vec!["authorization_code".to_owned()]),
+    scope: Some(scope.to_owned()),
+    jwks: None,
+    jwks_uri: None,
+    client_name: None,
+    dpop_bound_access_tokens: None,
+  }
+}
+
+/// A shared-Redis connection plus its unique `{state}`/`{rl}` prefix pair.
+async fn shared_redis() -> TestResult<(RedisConn, String, String)> {
+  let manager = test_support::redis_manager()
+    .await
+    .map_err(|error| format!("shared redis: {error}"))?;
+  let (token_prefix, ratelimit_prefix) = test_support::unique_prefixes();
+  Ok((RedisConn::Single(manager), token_prefix, ratelimit_prefix))
+}
+
+/// CIMD settings pointing at this test's cache prefix.
+fn cimd_settings(prefix: &str) -> super::CimdRequest<'_> {
+  super::CimdRequest {
+    token_prefix: prefix,
+    max_bytes: 5_120,
+    timeout: Duration::from_secs(2),
+  }
+}
+
+/// A client metadata document client completes `/authorize` with no row and
+/// no catalog redirect; a redirect outside the document and a shared-secret
+/// document both fail closed (CIMD draft §4.1/§5).
+#[tokio::test]
+async fn authorize_accepts_cimd_public() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  scope_repo::upsert(&pool, "api:read", "read api").await?;
+  let (mut conn, prefix, ratelimit) = shared_redis().await?;
+  let store = Store::from_parts(prefix.clone(), ratelimit, DurabilityMode::WaitAof);
+
+  let url = "https://client.invalid/cimd.json";
+  seed_cimd(
+    &mut conn,
+    &prefix,
+    url,
+    &cimd_document(url, &["https://app.example.test/cb"], "api:read"),
+  )
+  .await?;
+
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let params = query(&[
+    ("client_id", url),
+    ("redirect_uri", "https://app.example.test/cb"),
+    ("response_type", "code"),
+    ("scope", "api:read"),
+    ("code_challenge", challenge.as_str()),
+    ("code_challenge_method", "S256"),
+    ("state", "xyz-state"),
+  ]);
+
+  let validated = validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: Some(cimd_settings(&prefix)),
+    query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
+  })
+  .await
+  .map_err(|failure| format!("CIMD request rejected: {}", failure.code()))?;
+  assert_eq!(validated.client_id, url);
+  assert_eq!(validated.redirect_uri, "https://app.example.test/cb");
+  assert_eq!(validated.scope.render(), "api:read");
+  assert_eq!(validated.state.as_deref(), Some("xyz-state"));
+
+  // A registration-free client writes no row and attaches no catalog redirect.
+  assert!(
+    client_repo::find_active_by_client_id(&pool, &keys, url)
+      .await?
+      .is_none(),
+    "CIMD must not persist a client row"
+  );
+
+  // A redirect outside the document is refused (untrusted: page, no Location).
+  let mut mismatch = params.clone();
+  mismatch.insert(
+    "redirect_uri".to_owned(),
+    "https://evil.example.test/cb".to_owned(),
+  );
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: Some(cimd_settings(&prefix)),
+    query: &mismatch,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
+  })
+  .await
+  {
+    Ok(_) => return Err("document redirect mismatch was accepted".into()),
+    Err(failure) => assert_eq!(failure.code(), OAuthErrorCode::InvalidRequest),
+  }
+
+  // A document declaring a shared-secret method is invalid metadata.
+  let shared_url = "https://client.invalid/secret.json";
+  let mut shared = cimd_document(shared_url, &["https://app.example.test/cb"], "api:read");
+  shared.token_endpoint_auth_method = Some("client_secret_basic".to_owned());
+  seed_cimd(&mut conn, &prefix, shared_url, &shared).await?;
+  let mut shared_params = params.clone();
+  shared_params.insert("client_id".to_owned(), shared_url.to_owned());
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: Some(cimd_settings(&prefix)),
+    query: &shared_params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
+  })
+  .await
+  {
+    Ok(_) => Err("shared-secret CIMD document was accepted".into()),
+    Err(failure) => {
+      assert_eq!(failure.code(), OAuthErrorCode::InvalidClientMetadata);
+      Ok(())
+    }
+  }
+}
+
+/// A document `http://localhost` redirect is accepted only while
+/// `allow_localhost_redirect` is on; the request's random port is matched by
+/// the RFC 8252 §7.3 loopback rule. With the flag off the document itself is
+/// invalid, because `http://localhost` is not a loopback host.
+#[tokio::test]
+async fn authorize_accepts_cimd_localhost_when_flag_on() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  scope_repo::upsert(&pool, "api:read", "read api").await?;
+  let (mut conn, prefix, ratelimit) = shared_redis().await?;
+  let store = Store::from_parts(prefix.clone(), ratelimit, DurabilityMode::WaitAof);
+
+  let url = "https://client.invalid/loopback.json";
+  seed_cimd(
+    &mut conn,
+    &prefix,
+    url,
+    &cimd_document(url, &["http://localhost/cb"], "api:read"),
+  )
+  .await?;
+
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let params = query(&[
+    ("client_id", url),
+    ("redirect_uri", "http://localhost:51234/cb"),
+    ("response_type", "code"),
+    ("scope", "api:read"),
+    ("code_challenge", challenge.as_str()),
+    ("code_challenge_method", "S256"),
+  ]);
+
+  let validated = validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    allow_localhost_redirect: true,
+    cimd: Some(cimd_settings(&prefix)),
+    query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
+  })
+  .await
+  .map_err(|failure| {
+    format!(
+      "CIMD loopback rejected with the flag on: {}",
+      failure.code()
+    )
+  })?;
+  assert_eq!(validated.redirect_uri, "http://localhost:51234/cb");
+  assert_eq!(validated.scope.render(), "api:read");
+
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: Some(cimd_settings(&prefix)),
+    query: &params,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
+  })
+  .await
+  {
+    Ok(_) => Err("CIMD localhost redirect was accepted with the flag off".into()),
+    Err(failure) => {
+      assert_eq!(failure.code(), OAuthErrorCode::InvalidRedirectUri);
+      Ok(())
+    }
+  }
+}
+
+/// Two catalog resources presented as repeated query indicators validate and
+/// pin as a sorted deduped audience set on the validated request.
+#[tokio::test]
+async fn authorize_accepts_repeated_resource() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  provision(&pool, &keys, "authz-resource", true).await?;
+  resource_repo::upsert(&pool, "https://b.example.test/", "b").await?;
+  resource_repo::upsert(&pool, "https://a.example.test/", "a").await?;
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let params = valid_query("authz-resource", &challenge);
+  let mut conn = offline_redis()?;
+  let store = test_store();
+
+  let validated = validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
+    query: &params,
+    resources: vec![
+      "https://b.example.test/".to_owned(),
+      "https://a.example.test/".to_owned(),
+      "https://b.example.test/".to_owned(),
+    ],
+    resource_indicators_enabled: true,
+  })
+  .await
+  .map_err(|failure| format!("repeated resource rejected: {}", failure.code()))?;
+
+  if validated.aud
+    != vec![
+      "https://a.example.test/".to_owned(),
+      "https://b.example.test/".to_owned(),
+    ]
+  {
+    return Err(format!("aud not pinned sorted deduped: {:?}", validated.aud).into());
   }
   Ok(())
 }

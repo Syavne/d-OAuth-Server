@@ -10,11 +10,12 @@
 //! when the router serves the TLS public listener (`hsts: true`); the
 //! plaintext health listener never claims HSTS.
 //!
-//! Every response that is not OAuth metadata discovery is marked
-//! `Cache-Control: no-store` (+ `Pragma: no-cache` for legacy clients), so an
-//! authorization page, consent page, token body, or error is never reused by a
-//! browser, the back/forward cache, or an intermediary. `/.well-known/…`
-//! metadata stays cacheable.
+//! Every response that is not OAuth metadata discovery or the public JWK Set
+//! is marked `Cache-Control: no-store` (+ `Pragma: no-cache` for legacy
+//! clients), so an authorization page, consent page, token body, or error is
+//! never reused by a browser, the back/forward cache, or an intermediary.
+//! `/.well-known/…` metadata stays cacheable, and `/jwks.json` gets its own
+//! shorter window: a rotated-out key must leave intermediary caches quickly.
 //!
 //! [`cors_layer`] builds the explicit browser-facing CORS policy from
 //! `config.cors_allowed_origins`: an empty allowlist yields `None` (no CORS
@@ -52,6 +53,14 @@ pub const NO_CACHE_VALUE: &str = "no-cache";
 /// so caching it is intentional and safe. The explicit directive replaces
 /// browser heuristic freshness with a tunable, reviewable policy.
 pub const METADATA_CACHE_VALUE: &str = "public, max-age=3600";
+/// Positive `Cache-Control` for the public JWK Set (`GET /jwks.json`).
+///
+/// Shorter than [`METADATA_CACHE_VALUE`] on purpose: a rotated-out key is
+/// retained in the JWK Set for resource servers still checking old tokens, so
+/// the cache window bounds how long a revoked key can linger in an
+/// intermediary cache. Five minutes keeps JWKS fetch traffic low without
+/// pinning a dead key for an hour.
+pub const JWKS_CACHE_VALUE: &str = "public, max-age=300";
 
 /// Whether `path` serves a server-rendered page (strict script policy).
 ///
@@ -63,14 +72,21 @@ pub fn is_page_path(path: &str) -> bool {
   matches!(first, "login" | "consent" | "device")
 }
 
-/// Whether `path`'s response may be cached: OAuth metadata discovery only.
+/// The exact `Cache-Control` value for `path`.
 ///
-/// Every other response is marked `no-store`, so credentials, tokens, request
-/// handles, and server-rendered pages never survive in a browser or an
-/// intermediary cache.
+/// The mapping is per-path, not a boolean: OAuth metadata discovery keeps the
+/// one-hour value, the public JWK Set gets a shorter window, and everything
+/// else forbids storage entirely. A single "cacheable" flag would force JWKS
+/// onto the metadata window and keep a rotated-out key cached for an hour.
 #[must_use]
-pub fn is_cacheable_path(path: &str) -> bool {
-  path.starts_with("/.well-known/")
+pub fn cache_control_value(path: &str) -> &'static str {
+  if path == "/jwks.json" {
+    JWKS_CACHE_VALUE
+  } else if path.starts_with("/.well-known/") {
+    METADATA_CACHE_VALUE
+  } else {
+    NO_STORE_VALUE
+  }
 }
 
 /// Tower layer decorating responses with the security-header set.
@@ -130,20 +146,25 @@ where
 
   fn call(&mut self, request: Request<B>) -> Self::Future {
     let page = is_page_path(request.uri().path());
-    let cacheable = is_cacheable_path(request.uri().path());
+    let cache = cache_control_value(request.uri().path());
     let hsts = self.hsts;
     let mut inner = self.inner.clone();
     Box::pin(async move {
       let mut response = inner.call(request).await?;
-      insert_headers(response.headers_mut(), page, hsts, cacheable);
+      insert_headers(response.headers_mut(), page, hsts, cache);
       Ok(response)
     })
   }
 }
 
 /// Insert the header set on an outbound response (`page` selects the CSP;
-/// `cacheable` is true only for metadata, so everything else is `no-store`).
-fn insert_headers(headers: &mut axum::http::HeaderMap, page: bool, hsts: bool, cacheable: bool) {
+/// `cache` is the exact `Cache-Control` value for the request path).
+fn insert_headers(
+  headers: &mut axum::http::HeaderMap,
+  page: bool,
+  hsts: bool,
+  cache: &'static str,
+) {
   let csp = if page { PAGE_CSP_VALUE } else { API_CSP_VALUE };
   for (name, value) in [
     (
@@ -161,18 +182,9 @@ fn insert_headers(headers: &mut axum::http::HeaderMap, page: bool, hsts: bool, c
   ] {
     headers.insert(name, value);
   }
-  if !cacheable {
-    headers.insert(
-      header::CACHE_CONTROL,
-      HeaderValue::from_static(NO_STORE_VALUE),
-    );
+  headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+  if cache == NO_STORE_VALUE {
     headers.insert(header::PRAGMA, HeaderValue::from_static(NO_CACHE_VALUE));
-  }
-  if cacheable {
-    headers.insert(
-      header::CACHE_CONTROL,
-      HeaderValue::from_static(METADATA_CACHE_VALUE),
-    );
   }
   if hsts {
     headers.insert(
@@ -224,8 +236,8 @@ mod tests {
   use axum::http::header;
 
   use super::{
-    HSTS_VALUE, METADATA_CACHE_VALUE, NO_CACHE_VALUE, NO_STORE_VALUE, insert_headers,
-    is_cacheable_path, is_page_path,
+    HSTS_VALUE, JWKS_CACHE_VALUE, METADATA_CACHE_VALUE, NO_CACHE_VALUE, NO_STORE_VALUE,
+    cache_control_value, insert_headers, is_page_path,
   };
 
   #[test]
@@ -239,17 +251,27 @@ mod tests {
   }
 
   #[test]
-  fn only_metadata_is_cacheable() {
-    assert!(is_cacheable_path("/.well-known/oauth-authorization-server"));
+  fn cache_control_is_per_path() {
+    assert_eq!(
+      cache_control_value("/.well-known/oauth-authorization-server"),
+      METADATA_CACHE_VALUE
+    );
+    assert_eq!(cache_control_value("/jwks.json"), JWKS_CACHE_VALUE);
+    assert_ne!(JWKS_CACHE_VALUE, METADATA_CACHE_VALUE);
+    assert_ne!(JWKS_CACHE_VALUE, NO_STORE_VALUE);
     for path in ["/login", "/authorize", "/token", "/par", "/health/live"] {
-      assert!(!is_cacheable_path(path), "{path} must not be cacheable");
+      assert_eq!(
+        cache_control_value(path),
+        NO_STORE_VALUE,
+        "{path} must not be cacheable"
+      );
     }
   }
 
   #[test]
   fn non_cacheable_response_forbids_storage() {
     let mut headers = axum::http::HeaderMap::new();
-    insert_headers(&mut headers, true, true, false);
+    insert_headers(&mut headers, true, true, NO_STORE_VALUE);
     let value = |name: header::HeaderName| {
       headers
         .get(name)
@@ -265,7 +287,7 @@ mod tests {
   #[test]
   fn cacheable_metadata_sets_positive_cache_control() {
     let mut headers = axum::http::HeaderMap::new();
-    insert_headers(&mut headers, false, false, true);
+    insert_headers(&mut headers, false, false, METADATA_CACHE_VALUE);
     let cache_control = headers
       .get(header::CACHE_CONTROL)
       .and_then(|value| value.to_str().ok())

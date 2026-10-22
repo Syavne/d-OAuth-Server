@@ -88,6 +88,7 @@ fn request<'a>(
   CodeIssueRequest {
     client_id: "client-abc",
     client_kind: kind,
+    dpop_required: kind == CodeClientKind::Public,
     user_id: "user-1",
     redirect_uri: REDIRECT,
     approved_scope: approved,
@@ -95,6 +96,7 @@ fn request<'a>(
     code_challenge: CHALLENGE,
     dpop_jkt: jkt,
     state,
+    aud: &[],
     issuer: ISSUER,
   }
 }
@@ -205,6 +207,52 @@ async fn code_issue_redirect_carries_code_state_iss() -> TestResult {
         "redirect must never carry tokens".to_owned(),
       ));
     }
+  }
+  Ok(())
+}
+
+/// An unbound public client is issued a bearer-capable code with no DPoP
+/// proof: issuance succeeds and the stored binding is empty.
+#[tokio::test]
+async fn public_unbound_code_issuance_succeeds() -> TestResult {
+  let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
+  let (mut conn, store) = direct_store(
+    crate::test_support::redis_manager()
+      .await
+      .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?,
+    &state_prefix,
+    &ratelimit_prefix,
+  )
+  .await?;
+  let issuer = CodeIssuer::new(&TtlConfig::default(), &test_ring()?)?;
+  let approved = ScopeSet::parse("api:read")?;
+  let entitled = ScopeSet::parse("api:read api:admin")?;
+
+  let issued = issuer
+    .issue(
+      &mut conn,
+      &store,
+      &CodeIssueRequest {
+        client_id: "client-abc",
+        client_kind: CodeClientKind::Public,
+        dpop_required: false,
+        user_id: "user-1",
+        redirect_uri: REDIRECT,
+        approved_scope: &approved,
+        user_entitled: &entitled,
+        code_challenge: CHALLENGE,
+        dpop_jkt: None,
+        state: None,
+        aud: &[],
+        issuer: ISSUER,
+      },
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("unbound issuance rejected: {error}")))?;
+  if issued.code.is_empty() {
+    return Err(TestError::Unexpected(
+      "unbound issuance must return a code".to_owned(),
+    ));
   }
   Ok(())
 }

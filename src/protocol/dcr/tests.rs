@@ -1,6 +1,15 @@
 //! `test(dcr_register)` container suite: `POST /register` against real
 //! Postgres and Redis (IAT enforcement, metadata validation, the
 //! confidential sender-constraint rule, and hash-only persistence).
+//!
+//! C5c runbook coupling pinned here: a DCR client can register
+//! `http://localhost:{port}/cb` only with open registration
+//! (`allow_open_registration=true`), or an IAT-gated registration, AND a
+//! non-`catalog` `dcr_redirect_policy` (`catalog_loopback` or `open`), AND
+//! `allow_localhost_redirect=true`. The `catalog` policy rejects any
+//! non-cataloged redirect, so it rejects `localhost` even with the other two
+//! on; `localhost` is not an RFC 8252 §7.3 loopback host unless the flag is
+//! set. Enabling CIMD never changes any of this (CIMD is not DCR).
 
 use std::time::Duration;
 
@@ -65,6 +74,18 @@ struct Harness {
 /// The Postgres container is owned by the shared `db` lease; Redis comes from
 /// the shared compose service, isolated per test by [`unique_prefixes`].
 async fn harness(open: bool, policy: &str) -> Result<Harness, TestError> {
+  harness_with(open, policy, false, false).await
+}
+
+/// Like [`harness`], with the RFC 8252 §7.3 `localhost` flag and the CIMD
+/// feature flag pinned. CIMD is irrelevant to the `/register` gate; it is a
+/// parameter so the no-regression tests can prove that independence.
+async fn harness_with(
+  open: bool,
+  policy: &str,
+  allow_localhost: bool,
+  cimd: bool,
+) -> Result<Harness, TestError> {
   let (_db, pool) = crate::db::test_support::migrated_pool()
     .await
     .map_err(|error| TestError::Unexpected(format!("{error}")))?;
@@ -79,6 +100,8 @@ async fn harness(open: bool, policy: &str) -> Result<Harness, TestError> {
     "redis://127.0.0.1:1",
     open,
     policy,
+    allow_localhost,
+    cimd,
   )?;
   let (state_prefix, rl_prefix) = crate::test_support::unique_prefixes();
   let store = Store::from_parts(state_prefix, rl_prefix, DurabilityMode::WaitAof);
@@ -97,6 +120,8 @@ fn test_config(
   redis_url: &str,
   open: bool,
   policy: &str,
+  allow_localhost: bool,
+  cimd: bool,
 ) -> Result<Config, TestError> {
   let fixture = serde_json::json!({
     "issuer": "https://auth.example.test",
@@ -110,6 +135,8 @@ fn test_config(
     "argon2": {"memory_kib": 8192, "iterations": 1, "parallelism": 1},
     "allow_open_registration": open,
     "dcr_redirect_policy": policy,
+    "allow_localhost_redirect": allow_localhost,
+    "cimd_enabled": cimd,
   });
   let source = ::config::Config::try_from(&fixture)?;
   Ok(Config::from_source(source)?)
@@ -175,6 +202,15 @@ async fn issue_iat(harness: &mut Harness, uses: u64) -> Result<String, TestError
   .await
   .map_err(|error| TestError::Unexpected(format!("{error}")))?;
   Ok(token)
+}
+
+/// Number of client rows in this test's fresh database.
+async fn client_count(pool: &PgPool) -> Result<i64, TestError> {
+  Ok(
+    sqlx::query_scalar("SELECT COUNT(*) FROM oauth_clients")
+      .fetch_one(pool)
+      .await?,
+  )
 }
 
 /// A registration request against `redirect_uri` with DPoP binding.
@@ -491,6 +527,186 @@ async fn dcr_register_invalid_iat_401() -> TestResult {
   }
 }
 
+/// CIMD is not DCR: enabling it must not touch the RFC 7591 §2 gate. With
+/// `allow_open_registration=false` an anonymous call is still
+/// `invalid_client` (401) and writes no client row, with CIMD off or on; the
+/// open flag still admits an anonymous caller; an IAT still registers exactly
+/// as before.
+#[tokio::test]
+async fn dcr_gate_unchanged_with_cimd_on() -> TestResult {
+  let redirect = "https://app.example.test/cb";
+  let request = dpop_request(redirect, None);
+  let mut closed_off = harness_with(false, "catalog", false, false).await?;
+  let mut closed_on = harness_with(false, "catalog", false, true).await?;
+
+  for (label, harness) in [("cimd off", &mut closed_off), ("cimd on", &mut closed_on)] {
+    {
+      let (mut stores, ctx) = parts_of(harness);
+      match register_client(&mut stores, &ctx, None, &request).await {
+        Ok(_) => {
+          return Err(TestError::Unexpected(format!(
+            "anonymous registration succeeded while closed ({label})"
+          )));
+        }
+        Err(error) => expect_error(error, OAuthErrorCode::InvalidClient, 401)?,
+      }
+    }
+    if client_count(&harness.pool).await? != 0 {
+      return Err(TestError::Unexpected(format!(
+        "rejected anonymous registration wrote a client row ({label})"
+      )));
+    }
+  }
+
+  // The open flag still admits an anonymous caller with CIMD on.
+  let mut open_on = harness_with(true, "catalog", false, true).await?;
+  seed_redirect(&open_on.pool, &open_on.config.keys, redirect).await?;
+  {
+    let (mut stores, ctx) = parts_of(&mut open_on);
+    register_client(&mut stores, &ctx, None, &request)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("open anonymous registration failed: {error}"))
+      })?;
+  }
+  if client_count(&open_on.pool).await? != 1 {
+    return Err(TestError::Unexpected(
+      "open anonymous registration did not write exactly one client".to_owned(),
+    ));
+  }
+
+  // An IAT still registers in both CIMD states.
+  for (label, harness) in [("cimd off", &mut closed_off), ("cimd on", &mut closed_on)] {
+    seed_redirect(&harness.pool, &harness.config.keys, redirect).await?;
+    let iat = issue_iat(harness, 3).await?;
+    {
+      let (mut stores, ctx) = parts_of(harness);
+      register_client(&mut stores, &ctx, Some(&iat), &request)
+        .await
+        .map_err(|error| {
+          TestError::Unexpected(format!("IAT registration failed ({label}): {error}"))
+        })?;
+    }
+    if client_count(&harness.pool).await? != 1 {
+      return Err(TestError::Unexpected(format!(
+        "IAT registration wrote an unexpected client count ({label})"
+      )));
+    }
+  }
+  Ok(())
+}
+
+/// C5c triple: `http://localhost:{port}/cb` registers ONLY with open
+/// registration OR an IAT, AND a non-`catalog` `dcr_redirect_policy`, AND
+/// `allow_localhost_redirect=true`, even with CIMD enabled. Each negative
+/// asserts the exact error and that no client row was created.
+#[tokio::test]
+async fn dcr_open_registration_localhost_when_flag_on() -> TestResult {
+  let loopback = "http://localhost:6420/cb";
+  let request = dpop_request(loopback, None);
+
+  // All three on: open registration admits it.
+  let mut open_ok = harness_with(true, "catalog_loopback", true, true).await?;
+  let response = {
+    let (mut stores, ctx) = parts_of(&mut open_ok);
+    register_client(&mut stores, &ctx, None, &request)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("localhost open registration failed: {error}"))
+      })?
+  };
+  let effective =
+    redirect_repo::effective_for_client(&open_ok.pool, &open_ok.config.keys, &response.client_id)
+      .await?;
+  if effective.len() != 1 || effective[0].uri != loopback {
+    return Err(TestError::Unexpected(format!(
+      "localhost URI not attached: {:?}",
+      effective.iter().map(|row| &row.uri).collect::<Vec<_>>()
+    )));
+  }
+
+  // The `open` policy also admits it (non-`catalog` policy class).
+  let mut open_policy = harness_with(true, "open", true, true).await?;
+  {
+    let (mut stores, ctx) = parts_of(&mut open_policy);
+    register_client(&mut stores, &ctx, None, &request)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("localhost under open policy failed: {error}"))
+      })?;
+  }
+
+  // IAT-gated (open registration off) is the other admissible path.
+  let mut iat_ok = harness_with(false, "catalog_loopback", true, true).await?;
+  let iat = issue_iat(&mut iat_ok, 3).await?;
+  {
+    let (mut stores, ctx) = parts_of(&mut iat_ok);
+    register_client(&mut stores, &ctx, Some(&iat), &request)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("localhost IAT registration failed: {error}"))
+      })?;
+  }
+
+  // Negative: open registration off and no IAT.
+  let mut closed = harness_with(false, "catalog_loopback", true, true).await?;
+  {
+    let (mut stores, ctx) = parts_of(&mut closed);
+    match register_client(&mut stores, &ctx, None, &request).await {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "localhost registered with open registration off".to_owned(),
+        ));
+      }
+      Err(error) => expect_error(error, OAuthErrorCode::InvalidClient, 401)?,
+    }
+  }
+  if client_count(&closed.pool).await? != 0 {
+    return Err(TestError::Unexpected(
+      "rejected localhost registration wrote a client row".to_owned(),
+    ));
+  }
+
+  // Negative: default `catalog` policy rejects any non-cataloged redirect.
+  let mut catalog = harness_with(true, "catalog", true, true).await?;
+  {
+    let (mut stores, ctx) = parts_of(&mut catalog);
+    match register_client(&mut stores, &ctx, None, &request).await {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "localhost registered under the catalog policy".to_owned(),
+        ));
+      }
+      Err(error) => expect_error(error, OAuthErrorCode::InvalidRedirectUri, 400)?,
+    }
+  }
+  if client_count(&catalog.pool).await? != 0 {
+    return Err(TestError::Unexpected(
+      "catalog-policy rejection wrote a client row".to_owned(),
+    ));
+  }
+
+  // Negative: `localhost` is not loopback without the flag.
+  let mut no_host = harness_with(true, "catalog_loopback", false, true).await?;
+  {
+    let (mut stores, ctx) = parts_of(&mut no_host);
+    match register_client(&mut stores, &ctx, None, &request).await {
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "localhost registered without allow_localhost_redirect".to_owned(),
+        ));
+      }
+      Err(error) => expect_error(error, OAuthErrorCode::InvalidRedirectUri, 400)?,
+    }
+  }
+  if client_count(&no_host.pool).await? != 0 {
+    return Err(TestError::Unexpected(
+      "localhost-flag rejection wrote a client row".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
 #[tokio::test]
 async fn dcr_register_bad_redirect_rejected() -> TestResult {
   let mut harness = harness(false, "catalog").await?;
@@ -504,7 +720,6 @@ async fn dcr_register_bad_redirect_rejected() -> TestResult {
     Err(error) => expect_error(error, OAuthErrorCode::InvalidRedirectUri, 400),
   }
 }
-
 #[tokio::test]
 async fn dcr_register_bad_auth_method_rejected() -> TestResult {
   let mut harness = harness(false, "catalog").await?;
@@ -836,44 +1051,121 @@ async fn dcr_register_jwks_xor_rejected() -> TestResult {
 
 #[test]
 fn dcr_register_loopback_shapes() {
-  assert!(is_loopback_uri("http://127.0.0.1/cb"));
-  assert!(is_loopback_uri("http://127.0.0.1:6420/cb"));
-  assert!(is_loopback_uri("http://[::1]/cb"));
-  assert!(is_loopback_uri("http://[::1]:8080/cb"));
-  assert!(!is_loopback_uri("https://127.0.0.1/cb"));
-  assert!(!is_loopback_uri("http://localhost/cb"));
-  assert!(!is_loopback_uri("http://127.0.0.1/cb?x=1"));
-  assert!(!is_loopback_uri("http://127.0.0.1/cb#frag"));
-  assert!(!is_loopback_uri("http://user@127.0.0.1/cb"));
-  assert!(!is_loopback_uri("http://192.168.1.1/cb"));
-  assert!(!is_loopback_uri("not a uri"));
+  assert!(is_loopback_uri("http://127.0.0.1/cb", false));
+  assert!(is_loopback_uri("http://127.0.0.1:6420/cb", false));
+  assert!(is_loopback_uri("http://[::1]/cb", false));
+  assert!(is_loopback_uri("http://[::1]:8080/cb", false));
+  assert!(!is_loopback_uri("https://127.0.0.1/cb", false));
+  assert!(!is_loopback_uri("http://localhost/cb", false));
+  assert!(!is_loopback_uri("http://127.0.0.1/cb?x=1", false));
+  assert!(!is_loopback_uri("http://127.0.0.1/cb#frag", false));
+  assert!(!is_loopback_uri("http://user@127.0.0.1/cb", false));
+  assert!(!is_loopback_uri("http://192.168.1.1/cb", false));
+  assert!(!is_loopback_uri("not a uri", false));
+
+  // The flag widens the exception to the exact host `localhost` only.
+  assert!(is_loopback_uri("http://localhost/cb", true));
+  assert!(is_loopback_uri("http://localhost:5173/cb", true));
+  assert!(!is_loopback_uri("http://localhost.evil.example/cb", true));
+  assert!(!is_loopback_uri("http://localhost/cb?x=1", true));
+  assert!(!is_loopback_uri("http://user@localhost/cb", true));
 }
 
 #[test]
 fn dcr_register_open_redirect_shapes() {
-  assert!(is_open_redirect_uri("https://app.example.com/cb"));
-  assert!(is_open_redirect_uri("https://app.example.com/cb?x=1"));
-  assert!(is_open_redirect_uri("https://app.example.com:8443/cb"));
-  assert!(is_open_redirect_uri("HTTPS://APP.EXAMPLE.COM/cb"));
-  assert!(is_open_redirect_uri("https://[2001:db8::1]/cb"));
-  assert!(is_open_redirect_uri("http://127.0.0.1:1234/cb"));
-  assert!(is_open_redirect_uri("http://[::1]:1234/cb"));
-  assert!(!is_open_redirect_uri("http://evil.example.com/cb"));
-  assert!(!is_open_redirect_uri("myapp://cb"));
-  assert!(!is_open_redirect_uri("//app.example.com/cb"));
-  assert!(!is_open_redirect_uri("https://app.example.com/cb?x=1#frag"));
-  assert!(!is_open_redirect_uri("https://app.example.com/cb#frag"));
-  assert!(!is_open_redirect_uri("https://user@app.example.com/cb"));
-  assert!(!is_open_redirect_uri("https:///cb"));
-  assert!(!is_open_redirect_uri("https://"));
-  assert!(!is_open_redirect_uri("https:app.example.com/cb"));
-  assert!(!is_open_redirect_uri("https://[]/cb"));
-  assert!(!is_open_redirect_uri("https://app.example.com/cb "));
-  assert!(!is_open_redirect_uri("not a uri"));
+  assert!(is_open_redirect_uri("https://app.example.com/cb", false));
+  assert!(is_open_redirect_uri(
+    "https://app.example.com/cb?x=1",
+    false
+  ));
+  assert!(is_open_redirect_uri(
+    "https://app.example.com:8443/cb",
+    false
+  ));
+  assert!(is_open_redirect_uri("HTTPS://APP.EXAMPLE.COM/cb", false));
+  assert!(is_open_redirect_uri("https://[2001:db8::1]/cb", false));
+  assert!(is_open_redirect_uri("http://127.0.0.1:1234/cb", false));
+  assert!(is_open_redirect_uri("http://[::1]:1234/cb", false));
+  assert!(!is_open_redirect_uri("http://evil.example.com/cb", false));
+  assert!(!is_open_redirect_uri("myapp://cb", false));
+  assert!(!is_open_redirect_uri("//app.example.com/cb", false));
+  assert!(!is_open_redirect_uri(
+    "https://app.example.com/cb?x=1#frag",
+    false
+  ));
+  assert!(!is_open_redirect_uri(
+    "https://app.example.com/cb#frag",
+    false
+  ));
+  assert!(!is_open_redirect_uri(
+    "https://user@app.example.com/cb",
+    false
+  ));
+  assert!(!is_open_redirect_uri("https:///cb", false));
+  assert!(!is_open_redirect_uri("https://", false));
+  assert!(!is_open_redirect_uri("https:app.example.com/cb", false));
+  assert!(!is_open_redirect_uri("https://[]/cb", false));
+  assert!(!is_open_redirect_uri("https://app.example.com/cb ", false));
+  assert!(!is_open_redirect_uri("not a uri", false));
+
+  assert!(!is_open_redirect_uri("http://localhost/cb", false));
+  assert!(is_open_redirect_uri("http://localhost/cb", true));
 }
 
 #[test]
 fn dcr_register_bearer_exposes_nothing_secret() {
   let exposed = format!("{:?}", AppError::invalid_client_bearer());
   assert!(!exposed.to_ascii_lowercase().contains("pepper"));
+}
+
+/// Dynamic registration is self-service: a body carrying `access_token_format`
+/// fails closed with `invalid_client_metadata` (400), and a registered client
+/// always stores `opaque` (the column default), never `jwt`.
+#[tokio::test]
+async fn dcr_cannot_set_jwt_format() -> TestResult {
+  let mut harness = harness(false, "catalog").await?;
+  seed_redirect(
+    &harness.pool,
+    &harness.config.keys,
+    "https://app.example.test/cb",
+  )
+  .await?;
+  let iat = issue_iat(&mut harness, 3).await?;
+
+  let body = serde_json::json!({
+    "redirect_uris": ["https://app.example.test/cb"],
+    "client_name": "jwt wannabe",
+    "token_endpoint_auth_method": "client_secret_basic",
+    "grant_types": ["authorization_code"],
+    "response_types": ["code"],
+    "dpop_bound_access_tokens": true,
+    "access_token_format": "jwt",
+  });
+  match super::parse_register_request(body) {
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "registration body with access_token_format was accepted".to_owned(),
+      ));
+    }
+    Err(error) => expect_error(error, OAuthErrorCode::InvalidClientMetadata, 400)?,
+  }
+
+  let request = dpop_request("https://app.example.test/cb", None);
+  let response = {
+    let (mut stores, ctx) = parts_of(&mut harness);
+    register_client(&mut stores, &ctx, Some(&iat), &request)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("register failed: {error}")))?
+  };
+  let stored: String =
+    sqlx::query_scalar("SELECT access_token_format FROM oauth_clients WHERE client_id = $1")
+      .bind(&response.client_id)
+      .fetch_one(&harness.pool)
+      .await?;
+  if stored != "opaque" {
+    return Err(TestError::Unexpected(format!(
+      "registered client format is {stored}, want opaque"
+    )));
+  }
+  Ok(())
 }

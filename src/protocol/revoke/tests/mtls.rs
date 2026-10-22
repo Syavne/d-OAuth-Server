@@ -55,6 +55,7 @@ async fn insert_mtls_client(pool: &sqlx::PgPool, client_id: &str, thumbprint: &s
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   };
   client_repo::insert(pool, &keys, false, &new).await?;

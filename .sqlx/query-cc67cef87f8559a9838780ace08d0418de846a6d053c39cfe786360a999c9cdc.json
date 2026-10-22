@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO oauth_clients (id, client_id, client_secret_hash, client_secret_expires_at, client_id_issued_at, client_name, client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, tls_client_auth_subject_dn_index, tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, tls_client_auth_cert_thumbprint_index, request_uris, request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, registration_access_token_hash, dpop_bound_access_tokens, created_at, updated_at) VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, now(), now()) RETURNING id, client_id, client_secret_expires_at, client_id_issued_at, client_name, client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, dpop_bound_access_tokens, active, created_at, updated_at",
+  "query": "SELECT id, client_id, client_secret_expires_at, client_id_issued_at, client_name, client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, dpop_bound_access_tokens, access_token_format, active, created_at, updated_at FROM oauth_clients WHERE client_id = $1 AND active = true",
   "describe": {
     "columns": [
       {
@@ -269,6 +269,17 @@
       },
       {
         "ordinal": 24,
+        "name": "access_token_format",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_clients",
+            "name": "access_token_format"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
         "name": "active",
         "type_info": "Bool",
         "origin": {
@@ -279,7 +290,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -290,7 +301,7 @@
         }
       },
       {
-        "ordinal": 26,
+        "ordinal": 27,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -303,33 +314,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Text",
-        "Timestamptz",
-        "Text",
-        "Bytea",
-        "TextArray",
-        "TextArray",
-        "Text",
-        "Text",
-        "Jsonb",
-        "Text",
-        "Bytea",
-        "Text",
-        "Bytea",
-        "Text",
-        "Text",
-        "Bytea",
-        "Text",
-        "Jsonb",
-        "Bytea",
-        "Jsonb",
-        "Bytea",
-        "Text",
-        "Bytea",
-        "Text",
-        "Bool"
+        "Text"
       ]
     },
     "nullable": [
@@ -359,8 +344,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "f85e57a560d33626ceb5b28030d25d6f982f8e781ccf7b3e3b3c8fb61e7eed8b"
+  "hash": "cc67cef87f8559a9838780ace08d0418de846a6d053c39cfe786360a999c9cdc"
 }

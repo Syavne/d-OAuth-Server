@@ -203,8 +203,9 @@ async fn drain_guard(
 
 #[cfg(test)]
 mod bootstrap_tests {
-  use super::{DRAIN_DEADLINE, PROPAGATION_GRACE, drain_guard, ensure_health_not_loopback};
   use std::{sync::Arc, sync::atomic::AtomicBool, time::Duration};
+
+  use super::{DRAIN_DEADLINE, PROPAGATION_GRACE, drain_guard, ensure_health_not_loopback};
 
   /// Test body result (no `unwrap`/`expect` under the deny lints).
   type TestResult = Result<(), Box<dyn std::error::Error>>;

@@ -63,5 +63,14 @@ expression: rendered
   "scopes_supported": [
     "api:read",
     "orders:write"
+  ],
+  "protected_resources": [
+    "https://api.example.test"
+  ],
+  "resource_indicators_supported": true,
+  "client_id_metadata_document_supported": true,
+  "jwks_uri": "https://auth.example.test/jwks.json",
+  "access_token_signing_alg_values_supported": [
+    "ES256"
   ]
 }

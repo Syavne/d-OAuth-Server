@@ -7,8 +7,9 @@
 
 use uuid::Uuid;
 
-use super::super::super::{ClientKind, MintRequest, SenderProof, TokenService};
+use super::super::super::{ClientKind, MintRequest, SenderProof, TokenFormat, TokenService};
 use super::{DevicePollError, DeviceTokenResponse, PollState};
+use crate::jose::jwt_access::JwtAccessSigner;
 use crate::{
   config::GrantKind,
   db::{scope_repo, user_scope_repo},
@@ -28,8 +29,18 @@ pub(super) struct Redemption<'x> {
   pub(super) client: &'x crate::db::Client,
   /// Public or confidential: selects the constraint matrix.
   pub(super) kind: ClientKind,
+  /// Whether a public client must present a DPoP proof: mirrors the
+  /// client's `dpop_bound_access_tokens` registration.
+  pub(super) dpop_required: bool,
   /// Freshly verified proofs from this poll request.
   pub(super) proofs: SenderProof,
+  /// Validated resource audiences (RFC 8707 §2) presented with this poll;
+  /// empty means inherit the set pinned at authorization time (§2.2).
+  pub(super) aud: &'x [String],
+  /// Access-token representation for the minted pair.
+  pub(super) token_format: TokenFormat,
+  /// JWT signer for `TokenFormat::Jwt` mints.
+  pub(super) jwt_signer: Option<JwtAccessSigner>,
 }
 
 /// Consume an approved grant exactly once and mint its token pair.
@@ -48,7 +59,7 @@ pub(super) async fn issue_approved(
     if redemption.proofs.dpop_jkt.as_deref().unwrap_or("") != want {
       return Err(AppError::invalid_grant("DPoP binding does not match this grant").into());
     }
-  } else if redemption.kind == ClientKind::Public {
+  } else if redemption.kind == ClientKind::Public && redemption.dpop_required {
     return Err(AppError::server_error().into());
   }
   if let Some(want) = stored.x5t_s256.as_deref()
@@ -68,12 +79,35 @@ pub(super) async fn issue_approved(
       return Err(DevicePollError::AuthorizationPending);
     }
   }
+  // RFC 8707 §2: the poll's resource set must equal the set pinned at
+  // authorization time. RFC 8707 §2.2 / RFC 8628 §3.4: a device client never
+  // re-sends `resource`, so an empty presentation inherits `consumed.aud`;
+  // an empty pinned set keeps the unchanged no-audience behavior. A mismatch
+  // is a grant-binding failure (`invalid_grant`), never `invalid_target`: the
+  // request values were already catalog-validated by the token handler.
+  //
+  // Todo 11 binds the enforced set (`consumed.aud`) through `MintRequest.aud`;
+  // nothing is written onto the token record here.
+  if !redemption.aud.is_empty()
+    && !crate::protocol::params::audience_binds(&consumed.aud, redemption.aud)
+  {
+    return Err(
+      AppError::invalid_grant("resource indicators do not match this device authorization").into(),
+    );
+  }
   if consumed.grant_id.is_empty() || consumed.subject.is_empty() {
     return Err(AppError::server_error().into());
   }
 
   let effective = approved_scope(state, redemption.client, &consumed).await?;
-  let tokens = TokenService::new(state.ttl, state.keys).map_err(AppError::internal)?;
+  let mut tokens = TokenService::new(state.ttl, state.keys).map_err(AppError::internal)?;
+  if redemption.token_format == TokenFormat::Jwt {
+    let signer = redemption
+      .jwt_signer
+      .clone()
+      .ok_or_else(AppError::server_error)?;
+    tokens = tokens.with_jwt_signer(signer);
+  }
   let minted = tokens
     .mint(
       state.conn,
@@ -81,10 +115,14 @@ pub(super) async fn issue_approved(
       &MintRequest {
         client_id: redemption.client.client_id.clone(),
         client_kind: redemption.kind,
+        dpop_required: redemption.dpop_required,
         subject: consumed.subject.clone(),
         scope: effective.clone(),
         grant_id: consumed.grant_id.clone(),
         proof: redemption.proofs.clone(),
+        aud: consumed.aud.clone(),
+        refresh_aud: consumed.aud.clone(),
+        format: redemption.token_format,
       },
       state.now_unix,
     )

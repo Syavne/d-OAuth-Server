@@ -28,9 +28,10 @@ fn registered_uri() -> impl Strategy<Value = String> {
     })
 }
 
-/// Whether `requested` has the loopback request shape the matcher demands:
-/// `http` scheme (any ASCII case), loopback-literal host, no userinfo,
-/// query, or fragment (mirrors `parse_uri` + the §7.3 arm, not its code).
+/// Whether `requested` has the loopback request shape the matcher demands
+/// with the flag off: `http` scheme (any ASCII case), loopback-literal host,
+/// no userinfo, query, or fragment (mirrors `parse_uri` + the §7.3 arm, not
+/// its code). `localhost` is excluded because the flag is off here.
 fn is_loopback_shaped(requested: &str) -> bool {
   let Some((scheme, rest)) = requested.split_once(':') else {
     return false;
@@ -50,7 +51,7 @@ proptest! {
   #[test]
   fn redirect_exact_self_match(uri in registered_uri()) {
     prop_assert_eq!(
-      match_redirect_uri(std::slice::from_ref(&uri), &uri),
+      match_redirect_uri(std::slice::from_ref(&uri), &uri, false),
       RedirectDecision::Exact
     );
   }
@@ -59,7 +60,7 @@ proptest! {
   fn redirect_empty_set_always_rejects(requested in "\\PC*") {
     let empty: Vec<String> = vec![];
     prop_assert_eq!(
-      match_redirect_uri(&empty, &requested),
+      match_redirect_uri(&empty, &requested, false),
       RedirectDecision::Reject
     );
   }
@@ -69,7 +70,7 @@ proptest! {
     registered in proptest::collection::vec(registered_uri(), 0..4),
     requested in "\\PC*",
   ) {
-    if match_redirect_uri(&registered, &requested) == RedirectDecision::Exact {
+    if match_redirect_uri(&registered, &requested, false) == RedirectDecision::Exact {
       prop_assert!(registered.iter().any(|candidate| candidate == &requested));
     }
   }
@@ -79,7 +80,7 @@ proptest! {
     registered in proptest::collection::vec(registered_uri(), 0..4),
     requested in "\\PC*",
   ) {
-    if match_redirect_uri(&registered, &requested) == RedirectDecision::Loopback {
+    if match_redirect_uri(&registered, &requested, false) == RedirectDecision::Loopback {
       prop_assert!(
         is_loopback_shaped(&requested),
         "loopback match needs a loopback request: {:?}",
@@ -96,13 +97,36 @@ proptest! {
     // The exact registration wins when it matches byte-for-byte, even with
     // a loopback candidate that would also match its own request shape.
     prop_assert_eq!(
-      match_redirect_uri(&[loopback_reg.clone(), exact.clone()], &exact),
+      match_redirect_uri(&[loopback_reg.clone(), exact.clone()], &exact, false),
       RedirectDecision::Exact
     );
     // And the loopback arm still fires for the port-flexible request.
     prop_assert_eq!(
-      match_redirect_uri(&[loopback_reg, exact], &requested_loopback),
+      match_redirect_uri(&[loopback_reg, exact], &requested_loopback, false),
       RedirectDecision::Loopback
     );
+  }
+
+  #[test]
+  fn redirect_localhost_loopback_requires_the_flag(
+    reg_port in 1024..65535_u16,
+    req_port in 1024..65535_u16,
+    path in "[a-z]{1,8}",
+  ) {
+    let registered = vec![format!("http://localhost:{reg_port}/{path}")];
+    let requested = format!("http://localhost:{req_port}/{path}");
+    // Flag off: `localhost` is never loopback, even for an identical request.
+    prop_assert_eq!(
+      match_redirect_uri(&registered, &requested, false),
+      RedirectDecision::Reject
+    );
+    // Flag on: same host+path matches with the port ignored; the same port is
+    // still an exact byte-for-byte match.
+    let expected = if reg_port == req_port {
+      RedirectDecision::Exact
+    } else {
+      RedirectDecision::Loopback
+    };
+    prop_assert_eq!(match_redirect_uri(&registered, &requested, true), expected);
   }
 }

@@ -47,6 +47,13 @@ pub struct AccessRecord {
   pub subject: String,
   /// Sender-constraint binding (`cnf`), empty when unconstrained.
   pub cnf: String,
+  /// Resource audiences (RFC 8707) bound to this token; empty when unbound.
+  #[serde(
+    default,
+    serialize_with = "super::aud::serialize",
+    deserialize_with = "super::aud::deserialize"
+  )]
+  pub aud: Vec<String>,
 }
 
 /// A stored refresh-token record (or tombstone), keyed by the token hash.
@@ -67,6 +74,13 @@ pub struct RefreshRecord {
   pub subject: String,
   /// Sender-constraint binding (`cnf`), empty when unconstrained.
   pub cnf: String,
+  /// Resource audiences (RFC 8707) bound to this token; empty when unbound.
+  #[serde(
+    default,
+    serialize_with = "super::aud::serialize",
+    deserialize_with = "super::aud::deserialize"
+  )]
+  pub aud: Vec<String>,
 }
 
 impl AccessRecord {
@@ -103,6 +117,12 @@ pub struct RotationInput {
   /// Explicit request id; `None` derives it deterministically from the old
   /// token hash (the only production path).
   pub request_id: Option<String>,
+  /// JWT allowlist binding: `Some(jti-hash)` when the new access token is a
+  /// JWT, so the rotation script writes the `jwt:<jti-hash>` marker hash in
+  /// the SAME script as its `SADD`. `None` for opaque rotations (behavior
+  /// unchanged). The pre-mint never sets this through the pending pair;
+  /// only the committed rotation writes a marker.
+  pub jwt_jti_hash: Option<String>,
 }
 
 /// Outcome of a refresh rotation attempt.
@@ -161,6 +181,26 @@ pub fn derive_rotation_id(pepper: &[u8], old_refresh_hash: &str) -> Result<Strin
   Ok(out)
 }
 
+/// JWT marker write for one atomic member script invocation.
+///
+/// `Some` carries the marker key plus the fields the script stores
+/// (`grant_id`/`client_id`/`subject`) and the marker TTL (the access TTL).
+/// Only the barriered fresh JWT path passes `Some`
+/// ([`put_access_jwt`]); the rotation pre-mint pair and every opaque write
+/// pass `None` with a dummy marker key, so they can never write a marker.
+struct JwtMarker<'a> {
+  /// Allowlist marker key (`{state}jwt:<jti-hash>`).
+  key: &'a str,
+  /// Marker TTL (the access-token TTL).
+  ttl: Duration,
+  /// Marker `grant_id` field.
+  grant_id: &'a str,
+  /// Marker `client_id` field.
+  client_id: &'a str,
+  /// Marker `subject` field (raw; empty for client-credentials).
+  subject: &'a str,
+}
+
 /// Store an access-token record and index it in its grant set, then apply the
 /// durability barrier before returning.
 pub async fn put_access(
@@ -170,7 +210,35 @@ pub async fn put_access(
   record: &AccessRecord,
   ttl: Duration,
 ) -> Result<(), StoreError> {
-  put_access_inner(conn, store, token_hash, record, ttl, true).await
+  put_access_inner(conn, store, token_hash, record, ttl, true, None).await
+}
+
+/// Store a JWT access-token record, `SADD` its `jwt:<jti-hash>` member, and
+/// write the `jwt:<jti-hash>` allowlist marker hash (`grant_id`/`client_id`/
+/// `subject`, TTL = access TTL) in ONE script, then apply the durability
+/// barrier before returning.
+///
+/// Only the barriered fresh mint reaches this: `token_hash` is the member
+/// identity `jwt:<jti-hash>` (the record key is `access:<member>`), and the
+/// marker fields come from the record itself. The pending pre-mint must use
+/// [`put_access_pending`], which writes no marker by construction.
+pub async fn put_access_jwt(
+  conn: &mut RedisConn,
+  store: &Store,
+  member: &str,
+  record: &AccessRecord,
+  ttl: Duration,
+) -> Result<(), StoreError> {
+  let marker_key =
+    store.jwt_marker_key(member.strip_prefix("jwt:").ok_or(StoreError::InvalidData)?);
+  let marker = JwtMarker {
+    key: &marker_key,
+    ttl,
+    grant_id: &record.grant_id,
+    client_id: &record.client_id,
+    subject: &record.subject,
+  };
+  put_access_inner(conn, store, member, record, ttl, true, Some(&marker)).await
 }
 
 /// Store an access-token record and index it in its grant set WITHOUT the
@@ -186,7 +254,7 @@ pub async fn put_access_pending(
   record: &AccessRecord,
   ttl: Duration,
 ) -> Result<(), StoreError> {
-  put_access_inner(conn, store, token_hash, record, ttl, false).await
+  put_access_inner(conn, store, token_hash, record, ttl, false, None).await
 }
 
 async fn put_access_inner(
@@ -196,6 +264,7 @@ async fn put_access_inner(
   record: &AccessRecord,
   ttl: Duration,
   apply_barrier: bool,
+  jwt: Option<&JwtMarker<'_>>,
 ) -> Result<(), StoreError> {
   let key = store.access_key(token_hash);
   let set_key = store.grant_tokens_key(&record.grant_id);
@@ -205,9 +274,10 @@ async fn put_access_inner(
     &record.scope,
     &record.subject,
     &record.cnf,
+    &record.aud,
   );
   retry_op!(conn, store.retry_budget(), async {
-    put_member(conn, &key, &pairs, ttl, &set_key, token_hash)
+    put_member(conn, &key, &pairs, ttl, &set_key, token_hash, jwt)
       .await
       .map_err(store_redis)
   })
@@ -263,9 +333,11 @@ async fn put_refresh_inner(
     &record.scope,
     &record.subject,
     &record.cnf,
+    &record.aud,
   );
+  // Refresh records never carry a JWT marker: the flag is always clear.
   retry_op!(conn, store.retry_budget(), async {
-    put_member(conn, &key, &pairs, ttl, &set_key, token_hash)
+    put_member(conn, &key, &pairs, ttl, &set_key, token_hash, None)
       .await
       .map_err(store_redis)
   })
@@ -365,6 +437,14 @@ pub async fn rotate(
   let new_access_json = input.new_access.to_json()?;
   let map_ttl = ROTATION_MAP_GRACE.min(input.new_refresh_ttl);
 
+  let (marker_key, jwt_flag, marker_subject) = match &input.jwt_jti_hash {
+    Some(hash) => (
+      store.jwt_marker_key(hash),
+      "1",
+      input.new_access.subject.clone(),
+    ),
+    None => (grant_record_key.clone(), "0", String::new()),
+  };
   let outcome: Result<Vec<String>, StoreError> = retry_op!(conn, store.retry_budget(), async {
     invoke_rotate(
       conn,
@@ -375,6 +455,7 @@ pub async fn rotate(
         grant_key: &grant_key,
         grant_record_key: &grant_record_key,
         map_key: &map_key,
+        marker_key: &marker_key,
         expected_client: &input.expected_client_id,
         new_refresh_json: &new_refresh_json,
         new_refresh_ttl: input.new_refresh_ttl,
@@ -386,6 +467,8 @@ pub async fn rotate(
         new_access_hash: &input.new_access_hash,
         tombstone_ttl: input.new_refresh_ttl,
         map_ttl,
+        jwt_flag,
+        marker_subject: &marker_subject,
       },
     )
     .await
@@ -410,7 +493,8 @@ async fn invoke_rotate(
     .key(args.new_access_key)
     .key(args.grant_key)
     .key(args.map_key)
-    .key(args.grant_record_key);
+    .key(args.grant_record_key)
+    .key(args.marker_key);
   invocation
     .arg(args.expected_client)
     .arg(args.new_refresh_json)
@@ -422,7 +506,10 @@ async fn invoke_rotate(
     .arg(args.new_refresh_hash)
     .arg(args.new_access_hash)
     .arg(args.tombstone_ttl.as_millis() as u64)
-    .arg(args.map_ttl.as_millis() as u64);
+    .arg(args.map_ttl.as_millis() as u64)
+    .arg(args.jwt_flag)
+    .arg(args.new_access_ttl.as_millis() as u64)
+    .arg(args.marker_subject);
   let parts: Vec<String> = invocation
     .invoke_async(conn)
     .await
@@ -431,7 +518,7 @@ async fn invoke_rotate(
 }
 
 /// Arguments for one rotation-script invocation, bundled so the call stays
-/// reviewable (seventeen positional arguments would not be).
+/// reviewable.
 struct InvokeRotate<'a> {
   old_key: &'a str,
   new_refresh_key: &'a str,
@@ -439,6 +526,7 @@ struct InvokeRotate<'a> {
   grant_key: &'a str,
   grant_record_key: &'a str,
   map_key: &'a str,
+  marker_key: &'a str,
   expected_client: &'a str,
   new_refresh_json: &'a str,
   new_refresh_ttl: Duration,
@@ -450,6 +538,8 @@ struct InvokeRotate<'a> {
   new_access_hash: &'a str,
   tombstone_ttl: Duration,
   map_ttl: Duration,
+  jwt_flag: &'a str,
+  marker_subject: &'a str,
 }
 
 /// Settle a script reply: barrier first for token-bearing outcomes, cascade
@@ -589,6 +679,7 @@ fn record_pairs(
   scope: &str,
   subject: &str,
   cnf: &str,
+  aud: &[String],
 ) -> Vec<(String, String)> {
   vec![
     ("client_id".to_owned(), client_id.to_owned()),
@@ -596,10 +687,12 @@ fn record_pairs(
     ("scope".to_owned(), scope.to_owned()),
     ("subject".to_owned(), subject.to_owned()),
     ("cnf".to_owned(), cnf.to_owned()),
+    ("aud".to_owned(), super::aud::encode(aud)),
   ]
 }
 
-/// Write one grant member (record + index entry) in a single Lua script.
+/// Write one grant member (record + index entry, plus the JWT marker when
+/// `jwt` is `Some`) in a single Lua script.
 ///
 /// Previously this was three round-trips (`HSET`+`PEXPIRE`, `SADD`,
 /// arm-or-extend the set TTL), so a revoke drain could interleave between the
@@ -609,12 +702,19 @@ fn record_pairs(
 /// script closes that post-barrier late-`SADD` orphan window at the producer:
 /// the record and its index entry become visible together.
 ///
+/// The `jwt` flag threads the Todo 26 atomicity rule: only the barriered
+/// fresh JWT path passes `Some` (record, `SADD`, and marker in one script);
+/// the rotation pre-mint (`put_access_pending`/`put_refresh_pending`) and
+/// every opaque write pass `None`, so they can never write a marker. A
+/// `None` invocation still passes a dummy marker key (the record key: the
+/// guarded script block never touches it).
+///
 /// Residual limits (by design, not by omission): the script is atomic but a
 /// revoke drain is still `SMEMBERS`-then-delete, so a member `SADD`ed after
 /// the drain's snapshot still survives that pass — the drain therefore loops
 /// until the set reads empty and re-reads after the barrier (see
-/// [`super::grants::revoke`]). A mint that lands after the final pass leaves
-/// a live record the cascade never saw; that survivor is contained, not
+/// [`super::grants::revoke`]). A mint landing after the final pass leaves a
+/// live record the cascade never saw; that survivor is contained, not
 /// exploitable: introspection re-checks `users.disabled` (so a
 /// disabled-subject orphan still introspects inactive) and refresh re-checks
 /// current entitlements before minting.
@@ -625,13 +725,32 @@ async fn put_member(
   ttl: Duration,
   set_key: &str,
   member: &str,
+  jwt: Option<&JwtMarker<'_>>,
 ) -> Result<(), StoreError> {
+  let dummy = key.to_owned();
+  let marker_key = jwt.map(|marker| marker.key).unwrap_or(&dummy);
+  let (flag, marker_ttl, grant_id, client_id, subject) = match jwt {
+    Some(marker) => (
+      "1",
+      marker.ttl.as_millis() as u64,
+      marker.grant_id,
+      marker.client_id,
+      marker.subject,
+    ),
+    None => ("0", 0, "", "", ""),
+  };
   let mut invocation = SCRIPT_PUT_MEMBER.prepare_invoke();
   invocation
     .key(key)
     .key(set_key)
+    .key(marker_key)
     .arg(ttl.as_millis() as u64)
-    .arg(member);
+    .arg(member)
+    .arg(flag)
+    .arg(marker_ttl)
+    .arg(grant_id)
+    .arg(client_id)
+    .arg(subject);
   for (field, value) in pairs {
     invocation.arg(field).arg(value);
   }
@@ -650,6 +769,7 @@ fn access_from_map(map: HashMap<String, String>) -> Result<AccessRecord, StoreEr
     scope: get("scope")?,
     subject: get("subject")?,
     cnf: get("cnf")?,
+    aud: super::aud::decode(map.get("aud"))?,
   })
 }
 
@@ -661,6 +781,7 @@ fn refresh_from_map(map: HashMap<String, String>) -> Result<RefreshRecord, Store
     scope: get("scope")?,
     subject: get("subject")?,
     cnf: get("cnf")?,
+    aud: super::aud::decode(map.get("aud"))?,
   })
 }
 
@@ -734,6 +855,7 @@ mod put_member_tests {
         scope: "orders:read".to_owned(),
         subject: "user-1".to_owned(),
         cnf: String::new(),
+        aud: Vec::new(),
       },
       Duration::from_secs(3600),
     )
@@ -748,6 +870,7 @@ mod put_member_tests {
         scope: "orders:read".to_owned(),
         subject: "user-1".to_owned(),
         cnf: String::new(),
+        aud: Vec::new(),
       },
       Duration::from_secs(300),
     )

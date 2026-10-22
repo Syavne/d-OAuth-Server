@@ -241,6 +241,7 @@ pub async fn submit_consent(
   let request = code::CodeIssueRequest {
     client_id: &pending.client_id,
     client_kind: client_kind_of(&client),
+    dpop_required: client.dpop_bound_access_tokens,
     user_id: &live.record.subject,
     redirect_uri: &pending.redirect_uri,
     approved_scope: &effective,
@@ -248,6 +249,7 @@ pub async fn submit_consent(
     code_challenge: &pending.code_challenge,
     dpop_jkt: pending.dpop_jkt.as_deref(),
     state: pending.state.as_deref(),
+    aud: &pending.aud,
     issuer: &pending.iss,
   };
   let issued = issuer.issue(deps.conn, deps.store, &request).await?;

@@ -36,6 +36,7 @@ async fn revoke_access_token_removes_only_it() -> TestResult {
       token: &minted.access_token,
       token_type_hint: Some(HINT_ACCESS),
     },
+    None,
   )
   .await?;
   if outcome != RevokeOutcome::Revoked {
@@ -89,6 +90,7 @@ async fn revoke_refresh_token_cascades_to_grant_chain() -> TestResult {
       token: &minted.refresh_token,
       token_type_hint: Some(HINT_REFRESH),
     },
+    None,
   )
   .await?;
   if outcome != RevokeOutcome::Revoked {
@@ -131,6 +133,7 @@ async fn revoke_unknown_token_is_noop_200() -> TestResult {
       token: "no-such-token",
       token_type_hint: None,
     },
+    None,
   )
   .await?;
   if outcome != RevokeOutcome::NoOp {
@@ -169,6 +172,7 @@ async fn revoke_foreign_token_is_noop_and_untouched() -> TestResult {
       token: &minted.access_token,
       token_type_hint: Some(HINT_ACCESS),
     },
+    None,
   )
   .await?;
   if outcome != RevokeOutcome::NoOp {
@@ -202,6 +206,7 @@ async fn revoke_unsupported_hint_is_rejected() -> TestResult {
       token: "some-token",
       token_type_hint: Some("password"),
     },
+    None,
   )
   .await?;
   if outcome != RevokeOutcome::UnsupportedHint {
@@ -252,6 +257,7 @@ async fn revoke_refresh_hint_on_access_token_still_revokes_it() -> TestResult {
       token: &minted.access_token,
       token_type_hint: Some(HINT_REFRESH),
     },
+    None,
   )
   .await?;
   if outcome != RevokeOutcome::Revoked {
@@ -306,6 +312,7 @@ async fn revoke_foreign_refresh_token_is_noop_and_untouched() -> TestResult {
       token: &minted.refresh_token,
       token_type_hint: Some(HINT_REFRESH),
     },
+    None,
   )
   .await?;
   if outcome != RevokeOutcome::NoOp {

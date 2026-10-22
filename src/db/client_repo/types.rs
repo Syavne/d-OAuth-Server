@@ -73,6 +73,9 @@ pub struct Client {
   pub software_id: Option<String>,
   /// Whether the client registered DPoP-bound access tokens (RFC 9449 §5).
   pub dpop_bound_access_tokens: bool,
+  /// Access-token format: `opaque` (the OAuth 2.1 baseline and default) or
+  /// `jwt`. Operator-only; dynamic registration always stores `opaque`.
+  pub access_token_format: String,
   /// Whether the client is active (soft-delete flag).
   pub active: bool,
   /// Row creation timestamp.
@@ -104,6 +107,7 @@ impl fmt::Debug for Client {
       .field("contacts", &"[REDACTED]")
       .field("software_id", &"[REDACTED]")
       .field("dpop_bound_access_tokens", &self.dpop_bound_access_tokens)
+      .field("access_token_format", &self.access_token_format)
       .field("active", &self.active)
       .field("created_at", &self.created_at)
       .field("updated_at", &self.updated_at)
@@ -223,6 +227,9 @@ pub struct NewClient {
   pub software_id: Option<String>,
   /// Whether the client registers DPoP-bound access tokens (RFC 9449 §5).
   pub dpop_bound_access_tokens: bool,
+  /// Access-token format: `opaque` (default) or `jwt`. Dynamic registration
+  /// always inserts `opaque`; only an operator may opt a client into `jwt`.
+  pub access_token_format: String,
   /// Keyed hash of the RFC 7592 registration access token, if issued.
   pub registration_access_token_hash: Option<String>,
 }

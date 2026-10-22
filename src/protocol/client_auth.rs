@@ -27,7 +27,7 @@ use crate::{
   db::{Client, TokenEndpointAuthMethod, client_repo},
   error::AppError,
   keys::KeyRing,
-  protocol::mtls,
+  protocol::{cimd, mtls},
   state::RedisConn,
   store::Store,
   tls::PeerCertificates,
@@ -143,6 +143,10 @@ pub struct AuthContext<'a> {
   pub token_endpoint: &'a str,
   /// Current time for secret-expiry enforcement.
   pub now: OffsetDateTime,
+  /// CIMD resolution settings for a registration-free fallback; `None` when
+  /// `config.cimd_enabled` is off, so an `https://` `client_id` with no
+  /// registered row keeps the existing unknown-client behavior.
+  pub cimd: Option<cimd::CimdSettings<'a>>,
 }
 
 /// Authenticate a token-request client.
@@ -186,7 +190,7 @@ pub async fn authenticate_client(
     {
       return Err(invalid_client_for(true));
     }
-    let client = lookup_client(stores.pool, stores.keys, &creds.client_id, true).await?;
+    let client = lookup_client(stores, ctx.cimd, &creds.client_id, true).await?;
     require_method(&client, TokenEndpointAuthMethod::ClientSecretBasic, true)?;
     authenticate_secret(
       stores.pool,
@@ -200,7 +204,7 @@ pub async fn authenticate_client(
     let Some(client_id) = req.client_id else {
       return Err(invalid_client_for(false));
     };
-    let client = lookup_client(stores.pool, stores.keys, client_id, false).await?;
+    let client = lookup_client(stores, ctx.cimd, client_id, false).await?;
     require_method(&client, TokenEndpointAuthMethod::ClientSecretPost, false)?;
     authenticate_secret(stores.pool, &client, secret.expose_secret(), ctx.now, false).await
   } else if let Some(assertion_str) = req.assertion {
@@ -213,11 +217,11 @@ pub async fn authenticate_client(
       (None, Some(iss)) => iss,
       (None, None) => return Err(invalid_client_for(false)),
     };
-    let client = lookup_client(stores.pool, stores.keys, &client_id, false).await?;
+    let client = lookup_client(stores, ctx.cimd, &client_id, false).await?;
     require_method(&client, TokenEndpointAuthMethod::PrivateKeyJwt, false)?;
     assertion::authenticate(stores, &client, assertion_str, ctx).await
   } else if let Some(client_id) = req.client_id {
-    let client = lookup_client(stores.pool, stores.keys, client_id, false).await?;
+    let client = lookup_client(stores, ctx.cimd, client_id, false).await?;
     match client.auth_method() {
       Ok(TokenEndpointAuthMethod::None) => Ok(AuthenticatedClient {
         client,
@@ -242,18 +246,24 @@ fn invalid_client_for(used_basic: bool) -> AppError {
   }
 }
 
-/// Load an active client or fail closed as `invalid_client` (never reveal
-/// whether the id exists).
+/// Load the client principal: a registered row wins, else a validated CIMD
+/// document materialized as a synthetic client (CIMD draft §3/§4.1), else
+/// `invalid_client` (never reveal whether the id exists).
+///
+/// A CIMD fetch or validation failure maps per [`cimd::CimdError`]
+/// (`invalid_client_metadata`, `invalid_redirect_uri`, or fail-closed `503`),
+/// not to `invalid_client`: the id named a document, but the document itself
+/// is unusable.
 async fn lookup_client(
-  pool: &PgPool,
-  keys: &KeyRing,
+  stores: &mut AuthStores<'_>,
+  cimd: Option<cimd::CimdSettings<'_>>,
   client_id: &str,
   used_basic: bool,
 ) -> Result<Client, AppError> {
-  match client_repo::find_active_by_client_id(pool, keys, client_id).await {
+  match cimd::resolve_client(stores.pool, stores.keys, stores.conn, cimd, client_id).await {
     Ok(Some(client)) => Ok(client),
     Ok(None) => Err(invalid_client_for(used_basic)),
-    Err(error) => Err(error),
+    Err(error) => Err(AppError::from(error)),
   }
 }
 

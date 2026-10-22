@@ -29,7 +29,9 @@ use d_oauth::{
   config::{Config, ConfigError},
   crypto::secret::{Argon2Params, hash_secret},
   db::{NewClient, TokenEndpointAuthMethod, client_repo, redirect_repo, scope_repo},
-  protocol::token::{ClientKind, MintRequest, MintedTokens, SenderProof, TokenService},
+  protocol::token::{
+    ClientKind, MintRequest, MintedTokens, SenderProof, TokenFormat, TokenService,
+  },
   routes::build_router,
   state::{AppState, RedisConn, StateError},
   store::Store,
@@ -132,12 +134,24 @@ impl Drop for World {
 }
 
 impl World {
-  /// Start one world: fresh DB + unique Redis prefixes on the shared
-  /// services, migrations, connected state, live router.
+  /// Start one world with the default config fixture.
   ///
   /// `rate_limit` is the `rate_limit` table of the config fixture, so the
   /// abuse suite can pin tiny budgets while conformance runs wide open.
   pub async fn start(rate_limit: serde_json::Value) -> Result<Self, TestError> {
+    Self::start_with(rate_limit, serde_json::json!({})).await
+  }
+
+  /// Start one world with top-level config keys overridden.
+  ///
+  /// Every key in `overrides` replaces the matching top-level member of the
+  /// config fixture (for example `resource_indicators_enabled`), so a suite
+  /// can exercise a feature gate without duplicating the fixture. An empty
+  /// object is exactly [`World::start`].
+  pub async fn start_with(
+    rate_limit: serde_json::Value,
+    overrides: serde_json::Value,
+  ) -> Result<Self, TestError> {
     let pg_url = fresh_db_url().await?;
     let redis_url = redis_url();
     let (token_prefix, ratelimit_prefix) = unique_prefixes();
@@ -155,7 +169,7 @@ impl World {
       .await
       .map_err(|error| TestError::Failed(format!("migrations failed to apply: {error}")))?;
 
-    let fixture = serde_json::json!({
+    let mut fixture = serde_json::json!({
       "issuer": "https://auth.example.test",
       "environment": "development",
       "bind_addr": "127.0.0.1:0",
@@ -180,6 +194,11 @@ impl World {
       "rate_limit": rate_limit,
       "cors_allowed_origins": [],
     });
+    if let (Some(base), Some(extra)) = (fixture.as_object_mut(), overrides.as_object()) {
+      for (key, value) in extra {
+        base.insert(key.clone(), value.clone());
+      }
+    }
     let config =
       Config::from_source(::config::Config::try_from(&fixture).map_err(ConfigError::from)?)?;
     let state = AppState::connect(std::sync::Arc::new(config))
@@ -277,6 +296,7 @@ impl World {
         &MintRequest {
           client_id: client_id.to_owned(),
           client_kind: kind,
+          dpop_required: kind == ClientKind::Public,
           subject: "e2e-subject".to_owned(),
           scope: scope.to_owned(),
           grant_id: uuid::Uuid::new_v4().to_string(),
@@ -284,6 +304,9 @@ impl World {
             dpop_jkt: jkt.map(str::to_owned),
             mtls_x5t_s256: None,
           },
+          aud: Vec::new(),
+          refresh_aud: Vec::new(),
+          format: TokenFormat::Opaque,
         },
         time::OffsetDateTime::now_utc().unix_timestamp(),
       )
@@ -397,6 +420,7 @@ pub async fn seed_client_bound(
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: opts.dpop_bound,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   };
   client_repo::insert(pool, keys, false, &new).await?;

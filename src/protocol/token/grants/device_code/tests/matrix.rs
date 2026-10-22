@@ -9,20 +9,23 @@ use super::flows::{authorize, decide, now_unix, poll_once, public_inputs, secret
 use super::{TestError, TestResult, harness, unique};
 use super::{keys, setup};
 use crate::{
-  db::TokenEndpointAuthMethod, error::OAuthErrorCode, protocol::device::DeviceHttpInputs,
+  db::TokenEndpointAuthMethod,
+  error::OAuthErrorCode,
+  protocol::{device::DeviceHttpInputs, token::TokenFormat},
 };
 
 #[tokio::test]
 async fn test_grant_device_public_without_dpop_rejected() -> TestResult {
   let mut h = harness().await?;
   let client_id = unique("public");
-  setup::insert_client(
+  setup::insert_client_bound(
     &h.pool,
     &h.config,
     &client_id,
     TokenEndpointAuthMethod::None,
     None,
     "orders:read",
+    true,
   )
   .await?;
   let t0 = now_unix();
@@ -38,6 +41,7 @@ async fn test_grant_device_public_without_dpop_rejected() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -60,6 +64,95 @@ async fn test_grant_device_public_without_dpop_rejected() -> TestResult {
     ))),
     Ok(_) => Err(TestError::Unexpected(
       "a public client must never receive an unbound token".to_owned(),
+    )),
+  }
+}
+
+/// An unbound public client completes the device flow with no DPoP proof:
+/// authorization, approval, and poll all succeed with a `Bearer` token.
+#[tokio::test]
+async fn public_unbound_device_authorization_and_poll_succeeds() -> TestResult {
+  let mut h = harness().await?;
+  let client_id = unique("public-unbound");
+  setup::insert_client(
+    &h.pool,
+    &h.config,
+    &client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+    "orders:read",
+  )
+  .await?;
+  setup::enable_scopes(&h.pool, &["orders:read"]).await?;
+  let user_id = setup::entitled_user(&h.pool, &h.config, &["orders:read"]).await?;
+  let t0 = now_unix();
+
+  let authorize_inputs = DeviceHttpInputs {
+    client_id: client_id.as_str(),
+    scope: Some("orders:read"),
+    basic_header: None,
+    body_secret: None,
+    assertion_type: None,
+    assertion: None,
+    dpop_proof: None,
+    resource: &[],
+    peer_certs: None,
+  };
+  let issued = authorize(&mut h, &authorize_inputs, t0)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("unbound authorize rejected: {error}")))?;
+  if !decide(&mut h, &issued.device_code, true, &user_id.to_string()).await? {
+    return Err(TestError::Unexpected("decide must apply".to_owned()));
+  }
+  let tokens = poll_once(
+    &mut h,
+    &public_inputs(&client_id, &issued.device_code, None),
+    t0 + 6,
+  )
+  .await
+  .map_err(|error| TestError::Unexpected(format!("unbound poll rejected: {}", error.code())))?;
+  if tokens.token_type != "Bearer" || tokens.scope != "orders:read" {
+    return Err(TestError::Unexpected(
+      "unbound device redemption must be a Bearer token".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// A DPoP-bound public client cannot start the device flow without a proof:
+/// authorization itself is `invalid_dpop_proof` before any state is written.
+#[tokio::test]
+async fn public_bound_device_poll_requires_dpop() -> TestResult {
+  let mut h = harness().await?;
+  let client_id = unique("public-bound");
+  setup::insert_client_bound(
+    &h.pool,
+    &h.config,
+    &client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+    "orders:read",
+    true,
+  )
+  .await?;
+  let authorize_inputs = DeviceHttpInputs {
+    client_id: client_id.as_str(),
+    scope: None,
+    basic_header: None,
+    body_secret: None,
+    assertion_type: None,
+    assertion: None,
+    dpop_proof: None,
+    resource: &[],
+    peer_certs: None,
+  };
+  match authorize(&mut h, &authorize_inputs, now_unix()).await {
+    Err(error) if error.code() == OAuthErrorCode::InvalidDpopProof => Ok(()),
+    Err(other) => Err(TestError::Unexpected(format!(
+      "bound authorize without proof must be invalid_dpop_proof, got {other}"
+    ))),
+    Ok(_) => Err(TestError::Unexpected(
+      "a bound client must never start a proof-free device flow".to_owned(),
     )),
   }
 }
@@ -89,6 +182,7 @@ async fn test_grant_device_confidential_secret_redeems_bearer() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: None,
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -107,6 +201,7 @@ async fn test_grant_device_confidential_secret_redeems_bearer() -> TestResult {
     assertion: None,
     dpop_proof: None,
     peer_certs: None,
+    aud: &[],
   };
   let mut state = PollState {
     pool: &h.pool,
@@ -117,6 +212,9 @@ async fn test_grant_device_confidential_secret_redeems_bearer() -> TestResult {
     device_ttl: h.config.ttl.device,
     interval: Duration::from_secs(crate::protocol::device::DEVICE_INTERVAL_SECS),
     ttl: &h.config.ttl,
+    token_format: TokenFormat::Opaque,
+    jwt_signer: None,
+    cimd: None,
     now_unix: t0 + 6,
   };
   let tokens = poll_device(&mut state, &poll_inputs)
@@ -158,6 +256,7 @@ async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> Tes
     assertion_type: None,
     assertion: None,
     dpop_proof: None,
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)
@@ -176,6 +275,7 @@ async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> Tes
     assertion: None,
     dpop_proof: None,
     peer_certs: None,
+    aud: &[],
   };
   let mut state = PollState {
     pool: &h.pool,
@@ -186,6 +286,9 @@ async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> Tes
     device_ttl: h.config.ttl.device,
     interval: Duration::from_secs(crate::protocol::device::DEVICE_INTERVAL_SECS),
     ttl: &h.config.ttl,
+    token_format: TokenFormat::Opaque,
+    jwt_signer: None,
+    cimd: None,
     now_unix: t0 + 6,
   };
   match poll_device(&mut state, &poll_inputs).await {
@@ -265,6 +368,7 @@ async fn test_grant_device_cross_client_poll_is_invalid_grant() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let issued = authorize(&mut h, &authorize_inputs, t0)

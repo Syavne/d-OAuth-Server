@@ -42,11 +42,48 @@ differ.
 | `oauth:{state}:loginfail:ip:<sha256>:<sha256>` | Composite failed-login counter for one source IP and one account (both halves hashed; locks that IP only). | `ui::login::LOCKOUT_WINDOW` (15 min) |
 | `oauth:{state}:loginfail:unknown:<sha256>` | Unknown-label bucket for one source IP (hashed IP only; no per-label keys, so label enumeration cannot spray the keyspace). | `ui::login::LOCKOUT_WINDOW` (15 min) |
 | `oauth:{state}:totp_replay:<fingerprint>` | TOTP used-code replay marker. The fingerprint is an HMAC under the token pepper (never the code itself), so a dump does not reveal the code. | 180 s (`USED_CODE_TTL`; fixed, 6× the 30 s step) |
+| `oauth:{state}:jwt:<jti-hash>` | JWT access-token kill marker (allowlist: a signed token is valid only while this hash is live). Carries `grant_id`, `client_id`, and the raw `subject` (email/user-id; empty for client-credentials), matching the `purge_subject` `subject` decoder. | `ttl.access` (300s) |
+| `oauth:{state}:cimd:<sha256>` | Cached client-id-metadata document (keyed by a hash of the URL, never the raw URL). | Bounded cache lifetime |
 | `oauth:{rl}:ratelimit:<bucket-hash>` | Fixed-window rate-limit counter. | `rate_limit.window` (60s) |
 
 `<hash>` is always a keyed hash. Tokens are opaque, so the server can look a
 record up by re-hashing the presented value but cannot recover the raw value
 from storage.
+
+Resource audiences (`aud`, RFC 8707) ride on seven record families as a field
+named `aud`: `code:`, `access:`, `refresh:`, `grant:`, `par:`, `device:`, and
+`pending:` (the last is a JSON blob, not a hash). The value is a JSON array of
+strings, so a URI that itself contains a comma can never collide with a
+delimiter join. In the hash-backed records it is stored as a JSON string field,
+so the rotation Lua script's `cjson.decode` sees a string rather than a Lua
+table. A record written by a replica that predates audiences carries no `aud`
+field and decodes back to an empty audience, so in-flight records survive a
+rolling deploy; a present-but-malformed field fails closed as `InvalidData`.
+
+The audience is `{state}`-keyspace metadata only. Resource indicators add no key
+family and no `{rl}` counter; the durable catalog of allowed identifiers lives in
+Postgres, not Redis.
+
+JWT access tokens use an allowlist, not a denylist. Each mint writes a
+`jwt:<jti-hash>` marker (`grant_id`, `client_id`, `subject`, TTL
+`ttl.access`) in the same atomic script as the grant membership, and a token is
+live only while that hash exists. Because the marker rides the `{state}` tag, it
+is single-slot with the access record and the grant set. Three paths delete it:
+
+- A grant cascade deletes `jwt:<hash>` markers through the third ARGV of the
+  revoke script, together with the member access records and the grant set.
+- `user disable` sweeps `jwt:` keys by their `subject` field. Grant-bound
+  markers are also covered by the cascade; markers for client-credentials
+  tokens (empty subject) and any marker left outside a live grant rely on this
+  sweep.
+- `POST /revoke` with a JWT-shaped token deletes the marker, the
+  `access:jwt:<hash>` record, and the grant membership after verifying the
+  signature, `iss`, and ownership, then runs a durability barrier.
+
+A resource server that verifies locally against `/jwks.json` never reads this
+keyspace, so it cannot observe a deletion. See
+[OAUTH.md](OAUTH.md#the-resource-server-trade-off) for that exp-bounded
+trade-off.
 
 ## Hash tags and single-slot atomicity
 
@@ -201,6 +238,11 @@ field is the canonical email or the user-id string:
 - `grant:<id>` families via the grant cascade (member token keys, the
   `:tokens` set, the record, and member `:act` sidecars), plus standalone
   `access:<hash>` (with `:act`) and `refresh:<hash>` records.
+- `jwt:<jti-hash>` allowlist markers whose `subject` field matches. The grant
+  cascade already removes markers for grant-bound tokens; this sweep covers a
+  marker whose grant set is already gone. Client-credentials markers carry an
+  empty subject, so the subject decoder never matches them; they expire with
+  `ttl.access`.
 
 Records without a `subject` field are never touched: `par:`, `pending:`,
 `dpop_jti:`, `client_assertion_jti:`, `rotation:`, `totp_replay:`, and the

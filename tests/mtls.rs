@@ -31,6 +31,10 @@ const OAUTH_CLIENTS_SQL: &str = include_str!("../migrations/1791072000_oauth_cli
 /// The forward-only client column additions the repository queries need.
 const CLIENT_DPOP_BOUND_SQL: &str = include_str!("../migrations/1791244800_client_dpop_bound.sql");
 
+/// The resource-server catalog plus the `oauth_clients.access_token_format`
+/// column the repository SELECT/INSERT needs.
+const RESOURCE_SERVERS_SQL: &str = include_str!("../migrations/1791504000_resource_servers.sql");
+
 /// Start a fresh database on the shared test Postgres and connect a pool
 /// to it (see `tests/common/mod.rs`). Each test migrates its own database,
 /// so parallel tests never share state.
@@ -40,10 +44,13 @@ async fn mtls_postgres() -> Result<sqlx::PgPool, TestError> {
     .map_err(|error| TestError::Setup(error.to_string()))
 }
 
-/// Apply the embedded migration script exactly as the migrator would.
+/// Apply the embedded forward-only client migrations exactly as the migrator
+/// would, including the resource-server/JWT-format migration, so the harness
+/// schema cannot silently diverge when a column is added.
 async fn mtls_migrate(pool: &sqlx::PgPool) -> Result<(), TestError> {
   sqlx::raw_sql(OAUTH_CLIENTS_SQL).execute(pool).await?;
   sqlx::raw_sql(CLIENT_DPOP_BOUND_SQL).execute(pool).await?;
+  sqlx::raw_sql(RESOURCE_SERVERS_SQL).execute(pool).await?;
   sqlx::raw_sql(
     "ALTER TABLE oauth_clients ALTER COLUMN client_name DROP NOT NULL;
      ALTER TABLE oauth_clients
@@ -181,6 +188,7 @@ fn fixture_client(method: &str, dn: Option<&str>, thumbprint: Option<&str>) -> C
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     active: true,
     created_at: time::OffsetDateTime::UNIX_EPOCH,
     updated_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -496,6 +504,7 @@ async fn mtls_subject_dn_select() -> TestResult {
       contacts: None,
       software_id: None,
       dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
       registration_access_token_hash: None,
     },
   )

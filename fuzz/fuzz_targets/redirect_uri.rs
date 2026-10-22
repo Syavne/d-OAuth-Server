@@ -24,13 +24,19 @@ fuzz_target!(|data: &[u8]| {
     return;
   };
   let registered: Vec<&str> = lines.take(MAX_REGISTERED).collect();
-  let decision = match_redirect_uri(&registered, requested);
+  // Flag off is the default policy; flag on additionally admits the exact
+  // host `localhost` as a loopback host. Both must hold the same invariants.
+  let decision = match_redirect_uri(&registered, requested, false);
+  let localhost_decision = match_redirect_uri(&registered, requested, true);
   // An empty catalog can never match.
   if registered.is_empty() {
     debug_assert_eq!(decision, RedirectDecision::Reject);
+    debug_assert_eq!(localhost_decision, RedirectDecision::Reject);
   }
   // `Exact` fires only for a character-for-character registered member.
-  if decision == RedirectDecision::Exact {
-    debug_assert!(registered.contains(&requested));
+  for decision in [decision, localhost_decision] {
+    if decision == RedirectDecision::Exact {
+      debug_assert!(registered.contains(&requested));
+    }
   }
 });

@@ -4,6 +4,7 @@
 //! per-test unique `{state}`/`{rl}` prefix pair keeps the keyspace
 //! collision-free, and unique grant/client labels keep lookups distinct.
 
+mod jwt;
 mod matrix;
 mod mint_find;
 mod peppers;
@@ -14,7 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use secrecy::SecretString;
 
-use super::{ClientKind, Cnf, MintRequest, SenderProof, TokenService, TokenServiceError};
+use super::{
+  ClientKind, Cnf, MintRequest, SenderProof, TokenFormat, TokenService, TokenServiceError,
+};
 use crate::{
   config::{DurabilityMode, TtlConfig},
   keys::{KeyId, KeyRing, KeyRingError},
@@ -89,10 +92,14 @@ fn mint_request(client: &str, kind: ClientKind, grant: &str, proof: SenderProof)
   MintRequest {
     client_id: client.to_owned(),
     client_kind: kind,
+    dpop_required: kind == ClientKind::Public,
     subject: "user-1".to_owned(),
     scope: "orders:read".to_owned(),
     grant_id: grant.to_owned(),
     proof,
+    aud: Vec::new(),
+    refresh_aud: Vec::new(),
+    format: TokenFormat::Opaque,
   }
 }
 
@@ -141,4 +148,71 @@ fn token_service_cnf_storage_round_trip() -> TestResult {
     ));
   }
   Ok(())
+}
+
+/// An unbound public client mints a `Bearer` token with no DPoP proof.
+#[tokio::test]
+async fn public_unbound_gets_bearer() -> TestResult {
+  let (mut conn, store) = test_redis().await?;
+  let service = service(&[("v1", "public-unbound-pepper")])?;
+  let minted = service
+    .mint(
+      &mut conn,
+      &store,
+      &MintRequest {
+        client_id: unique("public-unbound"),
+        client_kind: ClientKind::Public,
+        dpop_required: false,
+        subject: "user-1".to_owned(),
+        scope: "orders:read".to_owned(),
+        grant_id: unique("grant"),
+        proof: SenderProof::none(),
+        aud: Vec::new(),
+        refresh_aud: Vec::new(),
+        format: TokenFormat::Opaque,
+      },
+      now_unix(),
+    )
+    .await?;
+  if minted.cnf.is_bound() {
+    return Err(TestError::Unexpected(
+      "unbound public mint must carry no sender constraint".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// A DPoP-bound public client still requires a proof at mint time.
+#[tokio::test]
+async fn public_bound_requires_dpop() -> TestResult {
+  let (mut conn, store) = test_redis().await?;
+  let service = service(&[("v1", "public-bound-pepper")])?;
+  match service
+    .mint(
+      &mut conn,
+      &store,
+      &MintRequest {
+        client_id: unique("public-bound"),
+        client_kind: ClientKind::Public,
+        dpop_required: true,
+        subject: "user-1".to_owned(),
+        scope: "orders:read".to_owned(),
+        grant_id: unique("grant"),
+        proof: SenderProof::none(),
+        aud: Vec::new(),
+        refresh_aud: Vec::new(),
+        format: TokenFormat::Opaque,
+      },
+      now_unix(),
+    )
+    .await
+  {
+    Err(TokenServiceError::MissingDpopBinding) => Ok(()),
+    Err(other) => Err(TestError::Unexpected(format!(
+      "bound public mint without proof must be MissingDpopBinding, got {other}"
+    ))),
+    Ok(_) => Err(TestError::Unexpected(
+      "a bound public client must never mint proof-free".to_owned(),
+    )),
+  }
 }

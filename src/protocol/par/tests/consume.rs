@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, time::Duration};
 
+use super::TestError;
 use super::{
   super::push_authorization_request, attach_redirect, bare_auth, ctx_of, expect_code, harness,
   insert_client, push_params, stores_of,
@@ -13,8 +14,6 @@ use crate::{
   jose::jar::{JarRequest, PAR_REQUEST_URI_PREFIX, resolve},
   store::par,
 };
-
-use super::TestError;
 
 /// Push via a public client and return the issued `request_uri`.
 async fn push_public(
@@ -27,7 +26,7 @@ async fn push_public(
   let auth = bare_auth(client_id);
   let ctx = ctx_of(endpoint);
   let mut stores = stores_of(h);
-  let response = push_authorization_request(&mut stores, &ctx, &auth, &params)
+  let response = push_authorization_request(&mut stores, &ctx, &auth, &params, &[])
     .await
     .map_err(|error| TestError::Unexpected(format!("push failed: {}", error.code())))?;
   if response.expires_in != 90 {
@@ -166,7 +165,7 @@ async fn par_authorize_binds_client_and_rejects_replay() -> Result<(), TestError
   let merged = resolve(&mut h.conn, &h.store, &first)
     .await
     .map_err(|error| TestError::Unexpected(format!("first use failed: {}", error.code())))?;
-  if merged.get("redirect_uri").map(String::as_str) != Some(redirect_uri) {
+  if merged.params.get("redirect_uri").map(String::as_str) != Some(redirect_uri) {
     return Err(TestError::Unexpected("merged params lost".to_owned()));
   }
 
@@ -272,6 +271,7 @@ async fn par_consume_bound_transport_error_recovery() -> Result<(), TestError> {
   let record = par::ParRecord {
     client_id: client_id.to_owned(),
     request: "{\"response_type\":\"code\"}".to_owned(),
+    aud: Vec::new(),
   };
   par::put(
     &mut h.conn,
@@ -334,6 +334,7 @@ async fn par_expired_request_uri_is_rejected() -> Result<(), TestError> {
   let record = par::ParRecord {
     client_id: "par-expiry-client".to_owned(),
     request: "{\"response_type\":\"code\"}".to_owned(),
+    aud: Vec::new(),
   };
   par::put(
     &mut h.conn,

@@ -3,6 +3,7 @@
 
 use secrecy::SecretString;
 
+use super::TestError;
 use super::{
   super::push_authorization_request, attach_redirect, bare_auth, ctx_of, expect_code, harness,
   insert_client, push_params, stores_of,
@@ -12,8 +13,6 @@ use crate::{
   error::{AppError, OAuthErrorCode},
   protocol::client_auth::ClientAuthRequest,
 };
-
-use super::TestError;
 
 #[tokio::test]
 async fn par_rejects_unauthenticated_client() -> Result<(), TestError> {
@@ -36,7 +35,7 @@ async fn par_rejects_unauthenticated_client() -> Result<(), TestError> {
   let endpoint = h.endpoint.clone();
   let ctx = ctx_of(&endpoint);
   let mut stores = stores_of(&mut h);
-  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+  match push_authorization_request(&mut stores, &ctx, &auth, &params, &[]).await {
     Ok(_) => return Err(TestError::Unexpected("ghost push accepted".to_owned())),
     Err(error) => expect_code(&error, OAuthErrorCode::InvalidClient)?,
   }
@@ -47,7 +46,7 @@ async fn par_rejects_unauthenticated_client() -> Result<(), TestError> {
   let endpoint = h.endpoint.clone();
   let ctx = ctx_of(&endpoint);
   let mut stores = stores_of(&mut h);
-  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+  match push_authorization_request(&mut stores, &ctx, &auth, &params, &[]).await {
     Ok(_) => {
       return Err(TestError::Unexpected(
         "credential-free push accepted".to_owned(),
@@ -69,7 +68,7 @@ async fn par_rejects_unauthenticated_client() -> Result<(), TestError> {
   let endpoint = h.endpoint.clone();
   let ctx = ctx_of(&endpoint);
   let mut stores = stores_of(&mut h);
-  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+  match push_authorization_request(&mut stores, &ctx, &auth, &params, &[]).await {
     Ok(_) => {
       return Err(TestError::Unexpected(
         "wrong-secret push accepted".to_owned(),
@@ -102,7 +101,7 @@ async fn par_rejects_invalid_request_rules() -> Result<(), TestError> {
   let endpoint = h.endpoint.clone();
   let ctx = ctx_of(&endpoint);
   let mut stores = stores_of(&mut h);
-  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+  match push_authorization_request(&mut stores, &ctx, &auth, &params, &[]).await {
     Ok(_) => {
       return Err(TestError::Unexpected(
         "missing response_type accepted".to_owned(),
@@ -121,7 +120,7 @@ async fn par_rejects_invalid_request_rules() -> Result<(), TestError> {
   let endpoint = h.endpoint.clone();
   let ctx = ctx_of(&endpoint);
   let mut stores = stores_of(&mut h);
-  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+  match push_authorization_request(&mut stores, &ctx, &auth, &params, &[]).await {
     Ok(_) => {
       return Err(TestError::Unexpected(
         "foreign request_uri accepted".to_owned(),
@@ -137,7 +136,7 @@ async fn par_rejects_invalid_request_rules() -> Result<(), TestError> {
   let endpoint = h.endpoint.clone();
   let ctx = ctx_of(&endpoint);
   let mut stores = stores_of(&mut h);
-  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+  match push_authorization_request(&mut stores, &ctx, &auth, &params, &[]).await {
     Ok(_) => {
       return Err(TestError::Unexpected(
         "unregistered redirect accepted".to_owned(),
@@ -170,7 +169,7 @@ async fn par_redirect_mismatch_rejected() -> Result<(), TestError> {
   let endpoint = h.endpoint.clone();
   let ctx = ctx_of(&endpoint);
   let mut stores = stores_of(&mut h);
-  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+  match push_authorization_request(&mut stores, &ctx, &auth, &params, &[]).await {
     Ok(_) => {
       return Err(TestError::Unexpected("evil redirect accepted".to_owned()));
     }
@@ -187,7 +186,7 @@ async fn par_redirect_mismatch_rejected() -> Result<(), TestError> {
   let endpoint = h.endpoint.clone();
   let ctx = ctx_of(&endpoint);
   let mut stores = stores_of(&mut h);
-  match push_authorization_request(&mut stores, &ctx, &auth, &params).await {
+  match push_authorization_request(&mut stores, &ctx, &auth, &params, &[]).await {
     Ok(_) => {
       return Err(TestError::Unexpected("corrupt uri_enc accepted".to_owned()));
     }
@@ -206,6 +205,130 @@ async fn par_redirect_mismatch_rejected() -> Result<(), TestError> {
         )));
       }
     }
+  }
+  Ok(())
+}
+
+/// An unknown (or non-`https`, or flag-off) `resource` fails the push as
+/// `invalid_target` — fail-closed, never silently dropped. Two catalog
+/// resources push and pin as the sorted deduped record audience.
+#[tokio::test]
+async fn par_rejects_unknown_resource() -> Result<(), TestError> {
+  let mut h = harness().await?;
+  let client_id = "par-resource-client";
+  let redirect_uri = "https://client.example.test/cb";
+  insert_client(
+    &h.pool,
+    &h.keys,
+    client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+  )
+  .await?;
+  attach_redirect(&h.pool, &h.keys, client_id, redirect_uri).await?;
+
+  let params = push_params(client_id, redirect_uri);
+  let auth = bare_auth(client_id);
+  let endpoint = h.endpoint.clone();
+  let mut ctx = ctx_of(&endpoint);
+  ctx.resource_indicators_enabled = true;
+
+  // Unknown catalog entry.
+  let mut stores = stores_of(&mut h);
+  match push_authorization_request(
+    &mut stores,
+    &ctx,
+    &auth,
+    &params,
+    &["https://ghost.example.test/".to_owned()],
+  )
+  .await
+  {
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "unknown resource accepted".to_owned(),
+      ));
+    }
+    Err(error) => expect_code(&error, OAuthErrorCode::InvalidTarget)?,
+  }
+
+  // Non-`https` value: no audience exception (not even loopback-shaped).
+  let mut stores = stores_of(&mut h);
+  match push_authorization_request(
+    &mut stores,
+    &ctx,
+    &auth,
+    &params,
+    &["http://api.example.test/".to_owned()],
+  )
+  .await
+  {
+    Ok(_) => {
+      return Err(TestError::Unexpected("http resource accepted".to_owned()));
+    }
+    Err(error) => expect_code(&error, OAuthErrorCode::InvalidTarget)?,
+  }
+
+  // Flag off + `resource` present: fail-closed, no silent drop.
+  ctx.resource_indicators_enabled = false;
+  let mut stores = stores_of(&mut h);
+  match push_authorization_request(
+    &mut stores,
+    &ctx,
+    &auth,
+    &params,
+    &["https://api.example.test/".to_owned()],
+  )
+  .await
+  {
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "flag-off resource accepted".to_owned(),
+      ));
+    }
+    Err(error) => expect_code(&error, OAuthErrorCode::InvalidTarget)?,
+  }
+
+  // Two catalog resources push and pin as the sorted deduped record audience.
+  ctx.resource_indicators_enabled = true;
+  crate::db::resource_repo::upsert(&h.pool, "https://b.example.test/", "b").await?;
+  crate::db::resource_repo::upsert(&h.pool, "https://a.example.test/", "a").await?;
+  let mut stores = stores_of(&mut h);
+  let pushed = push_authorization_request(
+    &mut stores,
+    &ctx,
+    &auth,
+    &params,
+    &[
+      "https://b.example.test/".to_owned(),
+      "https://a.example.test/".to_owned(),
+      "https://b.example.test/".to_owned(),
+    ],
+  )
+  .await
+  .map_err(|error| {
+    TestError::Unexpected(format!("catalog resources rejected: {}", error.code()))
+  })?;
+  let Some(id) = pushed
+    .request_uri
+    .strip_prefix(crate::jose::jar::PAR_REQUEST_URI_PREFIX)
+  else {
+    return Err(TestError::Unexpected("bad request_uri".to_owned()));
+  };
+  let record = crate::store::par::consume(&mut h.conn, &h.store, id)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("stored PAR record unreadable: {error:?}")))?
+    .ok_or_else(|| TestError::Unexpected("stored PAR record missing".to_owned()))?;
+  if record.aud
+    != vec![
+      "https://a.example.test/".to_owned(),
+      "https://b.example.test/".to_owned(),
+    ]
+  {
+    return Err(TestError::Unexpected(format!(
+      "PAR aud not pinned sorted deduped: {:?}",
+      record.aud
+    )));
   }
   Ok(())
 }

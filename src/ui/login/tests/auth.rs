@@ -1,11 +1,12 @@
 //! `test(login)` authentication suite: cookies, uniform rejects, replay, binding.
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use axum::Extension;
 use axum::extract::{ConnectInfo, Form, Query, State};
 use axum::http::{StatusCode, header};
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 use sqlx::Row as _;
-use std::net::{IpAddr, Ipv4Addr};
 
 use super::super::LOGOUT_ACTION;
 use super::{
@@ -466,6 +467,7 @@ async fn bind_logout_flow(
       contacts: None,
       software_id: None,
       dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
       registration_access_token_hash: None,
     },
   )
@@ -498,6 +500,7 @@ async fn bind_logout_flow(
     dpop_jkt: None,
     iss: "https://auth.example.test".to_owned(),
     post_logout_uri: Some(post_logout_uri.to_owned()),
+    aud: Vec::new(),
   };
   pending::put(
     &mut h.conn,

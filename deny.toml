@@ -12,6 +12,7 @@ yanked = "deny"
 # the padding-timing oracle does not apply. Re-evaluate when rsa ships a fix.
 ignore = [
   { id = "RUSTSEC-2023-0071", reason = "unpatched upstream; RSA verify-only, never decryption" },
+  { id = "RUSTSEC-2026-0374", reason = "unmaintained (no safe upgrade); basic-toml is a compile-time-only dep of the askama_derive proc macro, never in the runtime graph" },
 ]
 
 [bans]

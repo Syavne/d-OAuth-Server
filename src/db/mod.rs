@@ -6,6 +6,7 @@
 
 pub mod client_repo;
 pub mod redirect_repo;
+pub mod resource_repo;
 pub mod scope_repo;
 pub mod user_repo;
 pub mod user_scope_repo;

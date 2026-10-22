@@ -19,7 +19,10 @@ the admin surface.
 | Crypto primitive (hash, compare, PKCE, TOTP) | `src/crypto/` | Constant-time for secret compares. |
 | PII field codec / blind index | `src/crypto/field.rs` | Versioned AES-256-GCM; never log plaintext or key material. |
 | JOSE verification (DPoP, JAR, `private_key_jwt`) | `src/jose/` | Reject fail-closed with the exact error code. |
+| Client ID metadata document (CIMD) fetch, validation, or cache | `src/protocol/cimd.rs` | One guarded `https` fetch (no redirects, byte and time caps); only `none`/`private_key_jwt`, inline `jwks` only, no wildcard redirects; cache under `{state}`. `resolve_client` is the seam: a registered row wins, else the document when `cimd_enabled`. Update [docs/OAUTH.md](docs/OAUTH.md), [docs/SECURITY.md](docs/SECURITY.md), and [docs/OPERATIONS.md](docs/OPERATIONS.md). |
 | Postgres query or repository | `src/db/` | `query!`/`query_as!` macros; regenerate `.sqlx`. |
+| Resource-server (RFC 8707) catalog query | `src/db/resource_repo.rs` | Exact-match only: no wildcard, prefix, or normalization. Update [docs/DATABASE.md](docs/DATABASE.md) and [docs/OAUTH.md](docs/OAUTH.md). |
+| Repeated `resource` parsing or audience binding | `src/protocol/params.rs` | One wire-order capture for the five raw-parameter endpoints; validate fail-closed with `invalid_target`. Update [docs/OAUTH.md](docs/OAUTH.md). |
 | Redis record or Lua script | `src/store/` | Domain keys under `{state}`, rate-limit counters under `{rl}` (must differ); update [docs/REDIS.md](docs/REDIS.md). |
 | OAuth endpoint or grant | `src/protocol/` | Cite the RFC section in a comment. Update [docs/OAUTH.md](docs/OAUTH.md). A subject-scoped Redis purge lives at `src/protocol/purge.rs` (`purge_subject` for `user disable`, `purge_sibling_sessions` on credential change); domain keys under `{state}`, rate-limit counters under `{rl}` and update docs/REDIS.md. |
 | Login, consent, or device page | `src/ui/` | Keep CSP and CSRF intact. |
@@ -27,7 +30,7 @@ the admin surface.
 | Endpoint or layer order | `src/routes.rs` | Update [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). |
 | Listener or shutdown behavior | `src/serve.rs`, `src/tls.rs` | Update [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). |
 | Health or topology behavior | `src/state/` | Readiness is fail-closed. |
-| CLI command or flag | `src/cli.rs`, `src/cli/` | Match the flag exactly in [docs/OPERATIONS.md](docs/OPERATIONS.md). |
+| CLI command or flag | `src/cli.rs`, `src/cli/` | Match the flag exactly in [docs/OPERATIONS.md](docs/OPERATIONS.md). The RFC 8707 catalog lives in `src/cli/resource.rs` (`resource-server create|list|enable|disable|delete`). |
 | Error code or HTTP mapping | `src/error.rs` | Add the variant and its status together. |
 
 If a change spans modules, put the logic in the module that owns the behavior

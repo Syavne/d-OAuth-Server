@@ -31,6 +31,9 @@
 //! - `oauth:{state}:loginfail:ip:<sha256>:<sha256>` — composite per-IP counter.
 //! - `oauth:{state}:loginfail:unknown:<sha256>` — unknown-label IP bucket.
 //! - `oauth:{state}:totp_replay:<fingerprint>` — TOTP used-code replay marker.
+//! - `oauth:{state}:jwt:<jti-hash>` — JWT access-token kill markers (allowlist;
+//!   a signed token is valid only while its marker is live).
+//! - `oauth:{state}:cimd:<sha256>` — cached client-id-metadata document.
 //! - `oauth:{rl}:ratelimit:<bucket-hash>` — rate-limit counters (own keyspace).
 //!
 //! Registration access tokens are NOT here: their hash lives only in Postgres
@@ -471,6 +474,27 @@ impl Store {
     self.token_key("totp_replay", fingerprint)
   }
 
+  /// JWT access-token kill-marker key for a `jti` hash (RFC 9068 allowlist).
+  ///
+  /// A signed access token is valid only while this hash exists, so revoke and
+  /// `user disable` stay effective for the AS path. The marker carries exactly
+  /// `grant_id`, `client_id`, and `subject` (the raw email/user-id string, so
+  /// the [`crate::protocol::purge`] `subject` decoder matches it; empty for
+  /// client-credentials tokens), and shares the access-token TTL.
+  #[must_use]
+  pub fn jwt_marker_key(&self, jti_hash: &str) -> String {
+    self.token_key("jwt", jti_hash)
+  }
+
+  /// CIMD client-id-metadata-document cache key for a URL hash.
+  ///
+  /// Shares the `{state}` keyspace (never `{rl}`), so it stays single-slot
+  /// with the rest of token state.
+  #[must_use]
+  pub fn cimd_cache_key(&self, url_hash: &str) -> String {
+    self.token_key("cimd", url_hash)
+  }
+
   /// Rate-limit counter key for a hashed bucket (own `{rl}` keyspace).
   #[must_use]
   pub fn ratelimit_key(&self, bucket_hash: &str) -> String {
@@ -518,6 +542,70 @@ impl Store {
   pub(crate) fn grant_key_prefix(&self) -> String {
     format!("{}grant:", self.token_prefix)
   }
+
+  /// Key prefix for JWT allowlist marker hashes (`jwt:<jti-hash>`).
+  ///
+  /// The cascade script receives this as its third `ARGV` so a grant revoke
+  /// deletes the marker alongside the member record keys, in the same script.
+  #[must_use]
+  pub(crate) fn jwt_key_prefix(&self) -> String {
+    format!("{}jwt:", self.token_prefix)
+  }
+}
+
+/// Audience codec: a record's `aud` list is stored as a JSON array string so a
+/// URI that itself contains a comma can never collide with a delimiter join.
+///
+/// A record written by a replica that predates audiences carries no `aud`
+/// field; [`decode`] reads that as an empty list (rolling-deploy safe) instead
+/// of failing the record closed. A present-but-malformed field still fails
+/// closed.
+pub(crate) mod aud {
+  use serde::{Deserialize, Deserializer, Serializer};
+
+  use super::StoreError;
+
+  /// Encode an audience list as a JSON array string.
+  #[must_use]
+  pub(crate) fn encode(aud: &[String]) -> String {
+    serde_json::to_string(aud).unwrap_or_else(|_| "[]".to_owned())
+  }
+
+  /// Decode an optional stored `aud` field; absent or empty reads as `[]`.
+  ///
+  /// # Errors
+  ///
+  /// [`StoreError::InvalidData`] when the field is present but not a JSON
+  /// string array.
+  pub(crate) fn decode(raw: Option<&String>) -> Result<Vec<String>, StoreError> {
+    match raw {
+      None => Ok(Vec::new()),
+      Some(value) if value.is_empty() => Ok(Vec::new()),
+      Some(value) => serde_json::from_str(value).map_err(|_| StoreError::InvalidData),
+    }
+  }
+
+  /// `serde(serialize_with)`: emit the string form so the rotation script's
+  /// `cjson.decode` receives a string value, not a Lua table.
+  pub(crate) fn serialize<S, T>(aud: &T, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+    T: AsRef<[String]> + ?Sized,
+  {
+    serializer.serialize_str(&encode(aud.as_ref()))
+  }
+
+  /// `serde(deserialize_with)`: read the string form, absent or empty → `[]`.
+  pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let raw = Option::<String>::deserialize(deserializer)?;
+    match raw.as_deref() {
+      None | Some("") => Ok(Vec::new()),
+      Some(value) => serde_json::from_str(value).map_err(serde::de::Error::custom),
+    }
+  }
 }
 
 /// SHA-256 hex of `input` (key/bucket hashing; never a raw secret or token).
@@ -535,7 +623,6 @@ pub fn sha256_hex(input: &[u8]) -> String {
 /// short peppers zero-padded), infallible by construction.
 pub(crate) fn hmac_sha256(pepper: &[u8], message: &[u8]) -> [u8; 32] {
   use hmac::digest::{KeyInit, Mac as _};
-
   use sha2::digest::Key;
   let mut block = [0u8; 64];
   if pepper.len() > block.len() {
@@ -648,23 +735,43 @@ pub(crate) static HSET_TTL: LazyLock<Script> = LazyLock::new(|| {
 
 /// Atomic grant-member write: `HSET` the record fields, `PEXPIRE` the
 /// record, `SADD` the member into the grant set, then arm-or-extend the set
-/// TTL (never shorten), before the script returns.
+/// TTL (never shorten), before the script returns. When the JWT flag is set,
+/// the `jwt:<jti-hash>` allowlist marker hash (`grant_id`/`client_id`/
+/// `subject`, TTL = access TTL) lands in the SAME script, after the `SADD`,
+/// so a marker can never exist without its membership and a late `SADD` can
+/// never follow a committed marker (marker-after-`SADD` is forbidden: the
+/// post-barrier drain re-read in `grants::revoke` catches a late `SADD` but
+/// not a late marker write).
 ///
-/// KEYS: record, grant token set. ARGV: record TTL ms, member, then the
-/// flattened record field/value pairs. The record and its index entry land
-/// together, so a revoke drain cannot interleave between the record write and
-/// the index write and leave an orphan in either direction.
+/// KEYS: record, grant token set, marker key (a same-slot dummy the caller
+/// passes when the flag is clear; the script never touches it then). ARGV:
+/// record TTL ms, member, JWT flag (`1` writes the marker), marker TTL ms,
+/// marker `grant_id`, marker `client_id`, marker `subject`, then the
+/// flattened record field/value pairs. The record, its index entry, and (for
+/// JWT) its marker land together, so a revoke drain cannot interleave
+/// between the record write and the index write and leave an orphan in
+/// either direction.
+///
+/// Only the barriered fresh JWT path sets the flag
+/// ([`tokens::put_access_jwt`]); the rotation pre-mint pair
+/// (`put_access_pending`/`put_refresh_pending`) always passes the flag
+/// clear with a dummy marker key, so a pre-mint can never write a live
+/// marker for a pair a later REUSE/REPLAY/ABSENT/MISMATCH outcome discards.
 pub(crate) static SCRIPT_PUT_MEMBER: LazyLock<Script> = LazyLock::new(|| {
   Script::new(
     r"
-    if #ARGV > 2 then
-      redis.call('HSET', KEYS[1], unpack(ARGV, 3))
+    if #ARGV > 7 then
+      redis.call('HSET', KEYS[1], unpack(ARGV, 8))
       redis.call('PEXPIRE', KEYS[1], ARGV[1])
     end
     redis.call('SADD', KEYS[2], ARGV[2])
     local set_pttl = redis.call('PTTL', KEYS[2])
     if set_pttl < 0 or set_pttl < tonumber(ARGV[1]) then
       redis.call('PEXPIRE', KEYS[2], ARGV[1])
+    end
+    if ARGV[3] == '1' then
+      redis.call('HSET', KEYS[3], 'grant_id', ARGV[5], 'client_id', ARGV[6], 'subject', ARGV[7])
+      redis.call('PEXPIRE', KEYS[3], ARGV[4])
     end
     return 1
     ",
@@ -746,9 +853,18 @@ pub(crate) static SCRIPT_DEVICE_POLL_CAS: LazyLock<Script> = LazyLock::new(|| {
 /// Refresh rotation compare-and-set.
 ///
 /// KEYS: old refresh, new refresh, new access, grant token set, request map,
-/// grant record. ARGV: expected client, new-refresh JSON, new-refresh TTL ms,
-/// new-access JSON, new-access TTL ms, request id, grant id, new refresh
-/// member, new access member, tombstone TTL ms, map TTL ms.
+/// grant record, JWT marker key (a same-slot dummy when the flag is clear;
+/// the script never touches it then). ARGV: expected client, new-refresh
+/// JSON, new-refresh TTL ms, new-access JSON, new-access TTL ms, request id,
+/// grant id, new refresh member, new access member, tombstone TTL ms, map
+/// TTL ms, JWT flag (`1` writes the marker), marker TTL ms, marker subject.
+///
+/// When the JWT flag is set, the `jwt:<jti-hash>` allowlist marker hash
+/// (`grant_id` from ARGV[7], `client_id` from ARGV[1], `subject` from
+/// ARGV[14], TTL from ARGV[13]) lands in the SAME script as the `SADD`, so
+/// rotation commits marker and membership atomically and a late marker can
+/// never follow a committed membership. The flag is clear for opaque
+/// rotations, whose behavior is unchanged.
 ///
 /// Returns `{TAG, ...}`: `ROTATED`, `REPLAY` (idempotent retry: same tokens),
 /// `REUSE` (tombstoned: rotated-to member), `NOGRANT` (grant record gone: a
@@ -808,6 +924,10 @@ pub(crate) static SCRIPT_ROTATE_REFRESH: LazyLock<Script> = LazyLock::new(|| {
     if set_pttl < 0 or set_pttl < tonumber(ARGV[3]) then
       redis.call('PEXPIRE', KEYS[4], ARGV[3])
     end
+    if ARGV[12] == '1' then
+      redis.call('HSET', KEYS[7], 'grant_id', ARGV[7], 'client_id', ARGV[1], 'subject', ARGV[14])
+      redis.call('PEXPIRE', KEYS[7], ARGV[13])
+    end
     local pttl = redis.call('PTTL', KEYS[1])
     local tomb_ttl = tonumber(ARGV[10])
     if pttl > 0 and pttl < tomb_ttl then
@@ -822,16 +942,27 @@ pub(crate) static SCRIPT_ROTATE_REFRESH: LazyLock<Script> = LazyLock::new(|| {
   )
 });
 
-/// Grant cascade revoke: delete every member token key plus the grant set and
-/// record. Member keys are rebuilt from the key prefixes (same hash slot).
-/// KEYS: grant token set, grant record. ARGV: refresh prefix, access prefix.
+/// Grant cascade revoke: delete every member token key, every JWT allowlist
+/// marker, plus the grant set and record. Member keys are rebuilt from the key
+/// prefixes (same hash slot). KEYS: grant token set, grant record. ARGV:
+/// refresh prefix, access prefix, jwt marker prefix.
+///
+/// A JWT member is `jwt:<jti-hash>`: `ARGV[2] .. member` already deletes its
+/// `access:jwt:<jti-hash>` record, while the marker hash is
+/// `<jwt-prefix><jti-hash>` (the member minus its `jwt:` tag). The script
+/// deletes `ARGV[3] .. member` verbatim (a no-op guard key when the member is
+/// a JWT member) and, for `jwt:`-tagged members, the stripped marker key, so
+/// the marker can never survive the cascade that removed its membership.
 pub(crate) static SCRIPT_GRANT_REVOKE: LazyLock<Script> = LazyLock::new(|| {
   Script::new(
     r"
     local members = redis.call('SMEMBERS', KEYS[1])
     local deleted = 0
     for _, member in ipairs(members) do
-      deleted = deleted + redis.call('DEL', ARGV[1] .. member, ARGV[2] .. member)
+      deleted = deleted + redis.call('DEL', ARGV[1] .. member, ARGV[2] .. member, ARGV[3] .. member)
+      if string.sub(member, 1, 4) == 'jwt:' then
+        deleted = deleted + redis.call('DEL', ARGV[3] .. string.sub(member, 5))
+      end
     end
     redis.call('DEL', KEYS[1], KEYS[2])
     return deleted

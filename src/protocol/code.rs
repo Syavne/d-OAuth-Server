@@ -40,7 +40,8 @@ pub const CODE_TTL_CAP: Duration = Duration::from_secs(60);
 /// Whether the code is issued to a public or a confidential client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeClientKind {
-  /// No client secret: a verified DPoP `jkt` is mandatory.
+  /// No client secret: a verified DPoP `jkt` is mandatory only when the
+  /// client is DPoP-bound; unbound public clients use Bearer.
   Public,
   /// Authenticated client: the DPoP `jkt` is recorded when proven.
   Confidential,
@@ -53,6 +54,10 @@ pub struct CodeIssueRequest<'a> {
   pub client_id: &'a str,
   /// Public or confidential: selects the DPoP matrix.
   pub client_kind: CodeClientKind,
+  /// Whether a public client must present a DPoP proof: mirrors the
+  /// client's `dpop_bound_access_tokens` registration (unbound public
+  /// clients are issued bearer-capable codes). Ignored for confidential.
+  pub dpop_required: bool,
   /// Resource-owner subject the code is authorized for.
   pub user_id: &'a str,
   /// Redirect URI the code is bound to.
@@ -67,6 +72,9 @@ pub struct CodeIssueRequest<'a> {
   pub dpop_jkt: Option<&'a str>,
   /// `state` value to echo in the success redirect, if supplied.
   pub state: Option<&'a str>,
+  /// Validated resource audiences (RFC 8707) pinned from the pending
+  /// request; empty when the authorize request was unbound.
+  pub aud: &'a [String],
   /// Server issuer echoed as the RFC 9207 `iss` parameter.
   pub issuer: &'a str,
 }
@@ -243,7 +251,7 @@ impl CodeIssuer {
     if !request.approved_scope.is_subset_of(request.user_entitled) {
       return Err(CodeIssueError::UnentitledScope);
     }
-    let cnf = resolve_cnf(request.client_kind, request.dpop_jkt)?;
+    let cnf = resolve_cnf(request.client_kind, request.dpop_jkt, request.dpop_required)?;
     let raw = crypto_tokens::mint_token()?;
     let active = self.keys.first().ok_or(CodeIssueError::NoPepper)?;
     let code_hash = crypto_tokens::token_hash(&active.generation, active.secret.as_slice(), &raw)
@@ -257,6 +265,7 @@ impl CodeIssuer {
       subject: request.user_id.to_owned(),
       grant_id: grant_id.clone(),
       cnf,
+      aud: request.aud.to_vec(),
     };
     codes::issue(conn, store, &code_hash, &record, self.ttl).await?;
     let location = success_redirect(request.redirect_uri, &raw, request.state, request.issuer);
@@ -270,14 +279,20 @@ impl CodeIssuer {
   }
 }
 
-/// Apply the DPoP matrix: public clients REQUIRE a `jkt`; confidential
-/// clients record it when proven, else stay unconstrained (empty `cnf`).
-fn resolve_cnf(kind: CodeClientKind, jkt: Option<&str>) -> Result<String, CodeIssueError> {
+/// Apply the DPoP matrix: DPoP-bound public clients REQUIRE a `jkt`;
+/// unbound public clients are issued bearer-capable codes (an empty `cnf`);
+/// confidential clients record the `jkt` when proven, else stay unconstrained.
+fn resolve_cnf(
+  kind: CodeClientKind,
+  jkt: Option<&str>,
+  dpop_required: bool,
+) -> Result<String, CodeIssueError> {
   let bound = jkt.filter(|value| !value.is_empty());
   match kind {
-    CodeClientKind::Public => bound
+    CodeClientKind::Public if dpop_required => bound
       .map(str::to_owned)
       .ok_or(CodeIssueError::MissingDpopBinding),
+    CodeClientKind::Public => Ok(bound.unwrap_or_default().to_owned()),
     CodeClientKind::Confidential => Ok(bound.unwrap_or_default().to_owned()),
   }
 }

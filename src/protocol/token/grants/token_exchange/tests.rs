@@ -18,7 +18,7 @@ use crate::{
   keys::{KeyId, KeyRing, KeyRingError},
   protocol::{
     scope::ScopeSet,
-    token::{ClientKind, MintRequest, SenderProof, TokenService, TokenServiceError},
+    token::{ClientKind, MintRequest, SenderProof, TokenFormat, TokenService, TokenServiceError},
   },
   state::RedisConn,
   store::{Store, StoreError},
@@ -100,10 +100,14 @@ async fn mint_subject(
       &MintRequest {
         client_id: client.to_owned(),
         client_kind: ClientKind::Confidential,
+        dpop_required: false,
         subject: subject.to_owned(),
         scope: scope.to_owned(),
         grant_id: unique("subject-grant"),
         proof,
+        aud: Vec::new(),
+        refresh_aud: Vec::new(),
+        format: TokenFormat::Opaque,
       },
       now_unix(),
     )
@@ -143,6 +147,7 @@ fn input<'a>(
   ExchangeInput {
     caller_client_id: caller,
     caller_kind: ClientKind::Confidential,
+    caller_dpop_required: false,
     caller_registered: ctx.caller_registered,
     subject_token,
     subject_token_type: TOKEN_TYPE_ACCESS_TOKEN,

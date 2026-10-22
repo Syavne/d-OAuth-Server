@@ -9,9 +9,9 @@ This guide describes the schema, the indexes and constraints, the migration
 lifecycle, and the operational rules for applying migrations. It is the
 reference for anyone changing a table or a query.
 
-## The six tables
+## The seven tables
 
-Migrations create exactly six domain tables plus sqlx's `_sqlx_migrations`
+Migrations create exactly seven domain tables plus sqlx's `_sqlx_migrations`
 bookkeeping table. They create schema only and seed zero rows, so a fresh
 install starts empty by design.
 
@@ -50,6 +50,7 @@ One row per registered client (RFC 7591 / RFC 7592).
 | `active` | `bool` | Soft disable, default true. |
 | `registration_access_token_hash` | `text` | Keyed hash of the RFC 7592 management token. |
 | `dpop_bound_access_tokens` | `bool` | Whether this client's tokens require DPoP proof (`migrations/1791244800_client_dpop_bound.sql`). |
+| `access_token_format` | `text` | `opaque` (default) or `jwt`, checked by `ck_oauth_clients_access_token_format`; `jwt` is honored only while JWT access tokens are enabled (`migrations/1791504000_resource_servers.sql`). Dynamic registration always inserts `opaque`; only `client set-access-token-format` changes it. |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
 
 Four partial unique indexes enforce client-identity uniqueness. Two are on the
@@ -165,6 +166,23 @@ The join between a client and a catalog redirect URI.
 | `attached_by` | `uuid` | Optional attacher. |
 
 Composite primary key `(client_id, redirect_uri_id)`.
+
+### resource_servers
+
+The runtime-managed resource-server (RFC 8707 resource indicator) catalog,
+created empty and populated via the CLI / `config sync`.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | `uuid` | Primary key. |
+| `identifier` | `text` | The RFC 8707 resource identifier used as the `resource` parameter and the access-token `aud` target. Globally unique (`ux_resource_servers_identifier`). |
+| `description` | `text` | Default empty. |
+| `enabled` | `bool` | Default true. |
+| `created_at` | `timestamptz` | Creation time. |
+
+The catalog is durable schema only. The access/refresh-token audience a grant
+carries is security-ephemeral and lives in Redis, so there is deliberately no
+grants or audience column here.
 
 ## The citext extension
 
@@ -306,7 +324,7 @@ roles reduce the blast radius:
 | Role | Privileges | Used by |
 | --- | --- | --- |
 | Migration role | Owns the schema and holds the `citext` privilege. `CREATE EXTENSION IF NOT EXISTS citext` needs superuser or trusted-extension rights, so this role must have them (see [The citext extension](#the-citext-extension)). | `migrate` |
-| Runtime role | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the six domain tables, plus read access to `_sqlx_migrations`. No DDL and no superuser. | `serve` |
+| Runtime role | `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the seven domain tables, plus read access to `_sqlx_migrations`. No DDL and no superuser. | `serve` |
 
 The migration role runs once per release; the runtime role is the only one the
 long-lived replicas hold. The server neither creates nor enforces roles. An
@@ -391,7 +409,7 @@ D_OAUTH_DATABASE__URL='postgres://oauth@db.example.com/oauth?sslmode=verify-full
 ```
 
 The command prints `schema current: N known migration(s)`. Run it as a cluster Job and let
-readiness gate the Deployment. To confirm a fresh install, check that the six
+readiness gate the Deployment. To confirm a fresh install, check that the seven
 tables exist and are empty:
 
 ```sql
@@ -408,6 +426,8 @@ SELECT version, success FROM _sqlx_migrations ORDER BY version;
 - `migrations/1791331200_redirect_uri_kind.sql` for `redirect_uris.kind`.
 - `migrations/1791417600_pii_encryption.sql` for the `_enc`/`_index` PII
   columns, their partial unique indexes, and the dropped `NOT NULL`s.
+- `migrations/1791504000_resource_servers.sql` for `resource_servers` and
+  `oauth_clients.access_token_format`.
 - `src/db/` for the repositories.
 - `src/crypto/field.rs` for the field codec and blind index.
 - `src/cli/pii/` for `pii backfill|verify|rotate`.

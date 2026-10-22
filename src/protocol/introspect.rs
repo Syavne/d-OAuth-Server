@@ -21,10 +21,12 @@ mod tests;
 
 use std::time::Duration;
 
-use axum::{Extension, Form, extract::State, http::HeaderMap, response::Json};
+use axum::{Extension, extract::State, http::HeaderMap};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
+use subtle::ConstantTimeEq as _;
 use time::OffsetDateTime;
 
 use super::{
@@ -34,6 +36,7 @@ use super::{
 use crate::{
   db::{Client, TokenEndpointAuthMethod, user_repo},
   error::{AppError, OAuthErrorCode},
+  jose::jwt_access::{JwtAccessSigner, is_jwt_shape, jti_hash, marker_live_strict, subject_active},
   state::{AppState, RedisConn},
   store::{Store, StoreError},
   tls::PeerCertificates,
@@ -70,6 +73,35 @@ pub struct IntrospectForm {
   pub client_assertion: Option<String>,
 }
 
+impl IntrospectForm {
+  /// Fields the extractor recognizes: a repeat of any of these is the
+  /// extractor's 400. Unknown fields (including a repeated `resource`) are
+  /// silently absorbed, as `serde_urlencoded` absorbed them.
+  const KNOWN_FIELDS: [&str; 6] = [
+    "token",
+    "token_type_hint",
+    "client_id",
+    "client_secret",
+    "client_assertion_type",
+    "client_assertion",
+  ];
+
+  /// Build the form from a strict single-valued map (the `Bytes` extractor
+  /// replacement for `Form<IntrospectForm>`). A missing `token` defaults to
+  /// `""` so the core renders the RFC 7662 §2.3 `invalid_request`, exactly
+  /// as the derived `Default` did.
+  fn from_map(map: &std::collections::HashMap<String, String>) -> Self {
+    Self {
+      token: map.get("token").cloned().unwrap_or_default(),
+      token_type_hint: map.get("token_type_hint").cloned(),
+      client_id: map.get("client_id").cloned(),
+      client_secret: map.get("client_secret").cloned(),
+      client_assertion_type: map.get("client_assertion_type").cloned(),
+      client_assertion: map.get("client_assertion").cloned(),
+    }
+  }
+}
+
 /// RFC 7662 §2.2 introspection response.
 ///
 /// Inactive responses serialize to exactly `{"active": false}`: every other
@@ -103,6 +135,14 @@ pub struct IntrospectionResponse {
   /// RFC 8693 actor claim, for token-exchange tokens.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub act: Option<serde_json::Value>,
+  /// Resource audiences bound to the token (RFC 8707), when non-empty.
+  ///
+  /// RFC 7662 §2.2 documents `aud` as a string, but this server follows the
+  /// RFC 9068 §2.2 array shape: the exact stored set is emitted as a JSON
+  /// array, including for a single audience. An empty set omits the member
+  /// entirely, and an inactive response never carries it.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub aud: Option<Vec<String>>,
 }
 
 impl IntrospectionResponse {
@@ -119,6 +159,7 @@ impl IntrospectionResponse {
       sub: None,
       cnf: None,
       act: None,
+      aud: None,
     }
   }
 }
@@ -142,6 +183,15 @@ pub struct IntrospectHttpInputs<'a> {
   pub assertion: Option<&'a str>,
   /// Verified peer chain injected by the TLS accept loop, when present.
   pub peer_certs: Option<&'a PeerCertificates>,
+  /// Validated, sorted, deduped `resource` values from the repeated form
+  /// parameter.
+  ///
+  /// This is a LOCAL EXTENSION to RFC 7662: the RFC defines no `resource`
+  /// parameter for introspection. When non-empty, the located token's `aud`
+  /// must include every requested member (see [`audience_includes`]) or the
+  /// response collapses to the inactive shape. An empty slice keeps
+  /// introspection audience-agnostic, exactly as RFC 7662 specifies.
+  pub resource: &'a [String],
 }
 
 /// Datastore handles needed by [`introspect`].
@@ -162,8 +212,18 @@ pub struct IntrospectContext<'a> {
   pub issuer: &'a str,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
+  /// CIMD resolution settings for a registration-free fallback; `None` when
+  /// `config.cimd_enabled` is off. Only `private_key_jwt` documents may
+  /// introspect (RFC 7662 §2.3): a `none` principal is still rejected in
+  /// [`authenticate`].
+  pub cimd: Option<crate::protocol::cimd::CimdSettings<'a>>,
   /// Token service: pepper-retried lookup plus configured lifetimes.
   pub service: &'a TokenService,
+  /// AS access-token signer for the JWT path, built per request from the
+  /// config (rotation takes effect immediately). `None` covers both the
+  /// feature switch off and a missing key: a JWT-shaped token then
+  /// introspects inactive, never an error.
+  pub jwt_signer: Option<&'a JwtAccessSigner>,
 }
 
 /// Which store record a raw token resolved to.
@@ -187,12 +247,20 @@ struct Located {
   subject: String,
   /// Stored `cnf` (empty when unbound).
   cnf: String,
+  /// Resource audiences bound to the record (RFC 8707).
+  aud: Vec<String>,
   /// Access or refresh record.
   kind: TokenKind,
 }
 
-/// Introspect one token: authenticate the caller, look the token up, enforce
-/// ownership, and report the RFC 7662 §2.2 shape.
+/// Introspect one token: authenticate the caller, route by shape, enforce
+/// ownership and liveness, and report the RFC 7662 §2.2 shape.
+///
+/// A JWT-shaped token (`<b64url>.<b64url>.<b64url>`) takes the JWT path
+/// ([`introspect_jwt`]: RFC 9068 §4 allowlist verification plus the same
+/// request-`resource` filter as the opaque path); anything else takes the
+/// opaque record lookup. `token_type_hint` (RFC 7662 §2.1) only reorders the
+/// opaque lookup and never changes the JWT verdict.
 ///
 /// # Errors
 ///
@@ -200,6 +268,8 @@ struct Located {
 /// uses the public `none` method, `invalid_request` for an empty `token`, and
 /// a masked `5xx` when a datastore fails. Unknown, expired, revoked, foreign,
 /// and inactive tokens are never errors: they return the inactive response.
+/// A backend outage is never masked as `active: false` (that would silently
+/// revoke); it propagates as the 503.
 pub async fn introspect(
   stores: &mut IntrospectStores<'_>,
   ctx: &IntrospectContext<'_>,
@@ -211,6 +281,9 @@ pub async fn introspect(
   }
   let client = authenticate(stores, ctx, inputs).await?;
 
+  if is_jwt_shape(raw) {
+    return introspect_jwt(stores, ctx, inputs, &client, raw).await;
+  }
   let prefer_refresh = inputs.token_type_hint == Some(REFRESH_TOKEN_HINT);
   let located = locate(ctx.service, stores.conn, stores.store, raw, prefer_refresh)
     .await
@@ -241,7 +314,113 @@ pub async fn introspect(
   {
     return Ok(IntrospectionResponse::inactive());
   }
+  // LOCAL EXTENSION to RFC 7662 (which defines no `resource` parameter): a
+  // requested audience set asks whether the token is bound to every member.
+  // A pinned superset stays active; a missing member is indistinguishable
+  // from an unknown token, so it collapses to the §2.2 inactive shape rather
+  // than an error.
+  if !inputs.resource.is_empty() && !audience_includes(&located.aud, inputs.resource) {
+    return Ok(IntrospectionResponse::inactive());
+  }
   active_response(stores, ctx, located).await
+}
+
+/// Whether `bound` includes every member of `requested`.
+///
+/// This is set INCLUSION, not equality, so a token pinned to a superset
+/// satisfies a narrower request (unlike
+/// [`crate::protocol::params::audience_binds`]). Members are SHA-256 hashed
+/// and compared through [`subtle::ConstantTimeEq`]; the scan never exits
+/// early on the data and accumulates a [`subtle::Choice`] per requested
+/// member. Cardinality is public metadata for RFC 8707 audiences, so the
+/// empty-set gating is not secret-dependent.
+fn audience_includes(bound: &[String], requested: &[String]) -> bool {
+  let mut included = subtle::Choice::from(1u8);
+  for wanted in requested {
+    let wanted = Sha256::digest(wanted.as_bytes());
+    let mut found = subtle::Choice::from(0u8);
+    for candidate in bound {
+      let candidate = Sha256::digest(candidate.as_bytes());
+      found |= candidate.as_slice().ct_eq(wanted.as_slice());
+    }
+    included &= found;
+  }
+  bool::from(included)
+}
+
+/// Introspect a JWT-shaped access token (RFC 9068 §4 allowlist model).
+///
+/// Checks, in order: the signer is present (the feature switch off or no key
+/// configured renders inactive, never an error and never a 4xx); signature
+/// plus `iss`/`exp` verify; the verified `client_id` equals the caller
+/// (indistinguishable inactive otherwise, as RFC 7662 §2.2 requires);
+/// liveness holds under the strict rule (allowlist marker exists AND its
+/// `jwt:<jti-hash>` member is still in the marker's own grant set, plus the
+/// disabled-subject re-check); the optional request `resource` set is
+/// contained in the `aud` claim (the same [`audience_includes`] filter as the
+/// opaque path — a LOCAL EXTENSION to RFC 7662, which defines no `resource`
+/// parameter).
+///
+/// The response is shaped from the claims: `token_type: Bearer` (RFC 6749
+/// §5.1), `aud` in the RFC 9068 §2.2 array form, `exp`/`iat` straight from the
+/// claims. JWTs carry no stored PTTL, so no `token_window` read applies here;
+/// likewise there is no `act` sidecar on this path (an exchanged JWT carries
+/// its actor inline in the `act` claim). `token_type_hint` (RFC 7009 §2.1
+/// names the revocation hints; RFC 7662 §2.1 the introspection hint) is
+/// ignored: it only reorders the opaque lookup.
+///
+/// Every verification or liveness miss collapses to the inactive response. A
+/// Redis/Postgres outage propagates as the masked 503, never `active: false`
+/// (that would be a silent revocation) and never a 500 or panic.
+async fn introspect_jwt(
+  stores: &mut IntrospectStores<'_>,
+  ctx: &IntrospectContext<'_>,
+  inputs: &IntrospectHttpInputs<'_>,
+  client: &Client,
+  raw: &str,
+) -> Result<IntrospectionResponse, AppError> {
+  let signer = match ctx.jwt_signer {
+    Some(signer) => signer,
+    None => return Ok(IntrospectionResponse::inactive()),
+  };
+  // `verify` is signature plus `iss`/`exp` only (store-free, so it cannot
+  // fail with a backend error): `aud` containment runs through
+  // `audience_includes` below for exact parity with the opaque path.
+  let verified = match signer.verify(raw, None) {
+    Ok(verified) => verified,
+    Err(_) => return Ok(IntrospectionResponse::inactive()),
+  };
+  let claims = verified.claims;
+  if claims.client_id != client.client_id {
+    return Ok(IntrospectionResponse::inactive());
+  }
+  let live = marker_live_strict(stores.conn, stores.store, &jti_hash(&claims.jti))
+    .await
+    .map_err(|_| AppError::temporarily_unavailable())?;
+  if !live {
+    return Ok(IntrospectionResponse::inactive());
+  }
+  let subject_live = subject_active(stores.pool, stores.keys, &claims.sub)
+    .await
+    .map_err(|_| AppError::temporarily_unavailable())?;
+  if !subject_live {
+    return Ok(IntrospectionResponse::inactive());
+  }
+  if !inputs.resource.is_empty() && !audience_includes(&claims.aud, inputs.resource) {
+    return Ok(IntrospectionResponse::inactive());
+  }
+  Ok(IntrospectionResponse {
+    active: true,
+    scope: Some(claims.scope),
+    client_id: Some(claims.client_id),
+    token_type: Some(BEARER.to_owned()),
+    exp: Some(claims.exp),
+    iat: Some(claims.iat),
+    sub: (!claims.sub.is_empty()).then_some(claims.sub),
+    cnf: claims.cnf,
+    act: claims.act.map(|act| serde_json::json!({"sub": act.sub})),
+    aud: (!claims.aud.is_empty()).then_some(claims.aud),
+  })
 }
 
 /// Authenticate the introspection caller, rejecting the public `none` method.
@@ -272,6 +451,7 @@ async fn authenticate(
   let auth_ctx = AuthContext {
     token_endpoint: &endpoint,
     now,
+    cimd: ctx.cimd,
   };
   let authenticated = client_auth::authenticate_client(&mut auth_stores, &auth_ctx, &request)
     .await
@@ -317,6 +497,7 @@ async fn locate(
           scope: found.record.scope,
           subject: found.record.subject,
           cnf: found.record.cnf,
+          aud: found.record.aud,
           kind: TokenKind::Access,
         }),
       TokenKind::Refresh => service
@@ -328,6 +509,7 @@ async fn locate(
           scope: found.record.scope,
           subject: found.record.subject,
           cnf: found.record.cnf,
+          aud: found.record.aud,
           kind: TokenKind::Refresh,
         }),
     };
@@ -374,6 +556,7 @@ async fn active_response(
     sub: (!located.subject.is_empty()).then_some(located.subject),
     cnf: cnf.is_bound().then_some(cnf),
     act,
+    aud: (!located.aud.is_empty()).then_some(located.aud),
   })
 }
 
@@ -464,18 +647,65 @@ pub async fn read_act(
 
 /// Axum handler for `POST /introspect` (wired by task 40).
 ///
-/// Thin glue: extracts the form, auth headers, and injected peer chain, builds
-/// the token service, then delegates to [`introspect`].
+/// Thin glue: `Bytes` + a manual parse replaces `Form<IntrospectForm>` (the
+/// extractor consumed the raw body, hiding repeats), then builds the token
+/// service and delegates to [`introspect`]. The explicit content-type gate
+/// preserves the 415 `Form` rendered (`Bytes` never fails on
+/// content-type), a malformed body or a repeated known field is the same
+/// 400, and a present `resource` indicator (RFC 8707) validates fail-closed
+/// (`invalid_target`) before any lookup runs.
+///
+/// RFC 7662 defines no `resource` parameter. This endpoint accepts it as a
+/// LOCAL EXTENSION: the validated set is handed to [`introspect`], which
+/// reports a token inactive unless its `aud` includes every requested value.
+/// `revoke` and the token-exchange subject-token lookup stay
+/// audience-agnostic.
 pub async fn handler(
   State(state): State<AppState>,
   peer_certs: Option<Extension<PeerCertificates>>,
   headers: HeaderMap,
-  Form(form): Form<IntrospectForm>,
-) -> Result<Json<IntrospectionResponse>, AppError> {
+  body: axum::body::Bytes,
+) -> axum::response::Response {
+  use axum::response::IntoResponse as _;
+  if let Err(reject) = crate::protocol::params::require_form_content_type(&headers) {
+    return reject.into_response();
+  }
+  let pairs = match crate::protocol::params::form_pairs(&body) {
+    Ok(pairs) => pairs,
+    Err(reject) => return reject.into_response(),
+  };
+  if crate::protocol::params::has_duplicate_field(&pairs, &IntrospectForm::KNOWN_FIELDS) {
+    return (
+      axum::http::StatusCode::BAD_REQUEST,
+      "Failed to deserialize form",
+    )
+      .into_response();
+  }
+  let map = crate::protocol::params::single_valued_map(&pairs);
+  let form = IntrospectForm::from_map(&map);
+  let text = match crate::protocol::params::form_text(&body) {
+    Ok(text) => text,
+    Err(reject) => return reject.into_response(),
+  };
+  let resources =
+    crate::protocol::params::repeated_values(text, crate::protocol::params::RESOURCE_PARAM);
+  let resources = match crate::protocol::params::validate_resources(
+    &state.pool,
+    state.config.resource_indicators_enabled,
+    &resources,
+  )
+  .await
+  {
+    Ok(resources) => resources,
+    Err(error) => return error.into_response(),
+  };
   let basic_header = headers
     .get(axum::http::header::AUTHORIZATION)
     .and_then(|value| value.to_str().ok());
-  let service = TokenService::new(&state.config.ttl, &state.keys)?;
+  let service = match TokenService::new(&state.config.ttl, &state.keys) {
+    Ok(service) => service,
+    Err(error) => return AppError::from(error).into_response(),
+  };
   let store = Store::from_config(&state.config.redis);
   let mut conn = state.redis.clone();
   let mut stores = IntrospectStores {
@@ -484,10 +714,28 @@ pub async fn handler(
     conn: &mut conn,
     store: &store,
   };
+  // The signer is built only for introspection when the operator switch is
+  // on; a missing key (or a disabled switch) leaves a JWT-shaped token
+  // inactive, never an error.
+  let jwt_signer = if state.config.jwt_access_tokens_enabled {
+    JwtAccessSigner::from_config(&state.config).ok()
+  } else {
+    None
+  };
   let ctx = IntrospectContext {
     issuer: &state.config.issuer,
     now_unix: state.clock.now().unix_timestamp(),
+    cimd: state
+      .config
+      .cimd_enabled
+      .then(|| crate::protocol::cimd::CimdSettings {
+        token_prefix: &state.config.redis.token_key_prefix,
+        max_bytes: state.config.cimd_max_bytes,
+        timeout: state.config.cimd_fetch_timeout,
+        allow_localhost: state.config.allow_localhost_redirect,
+      }),
     service: &service,
+    jwt_signer: jwt_signer.as_ref(),
   };
   let inputs = IntrospectHttpInputs {
     token: form.token.as_str(),
@@ -498,7 +746,11 @@ pub async fn handler(
     assertion_type: form.client_assertion_type.as_deref(),
     assertion: form.client_assertion.as_deref(),
     peer_certs: peer_certs.as_deref(),
+    resource: &resources,
   };
-  let response = introspect(&mut stores, &ctx, &inputs).await?;
-  Ok(Json(response))
+  let response = match introspect(&mut stores, &ctx, &inputs).await {
+    Ok(response) => response,
+    Err(error) => return error.into_response(),
+  };
+  axum::Json(response).into_response()
 }

@@ -11,9 +11,12 @@ use super::super::{
 use super::{Harness, TestError};
 use crate::{
   error::AppError,
-  protocol::device::{
-    DEVICE_INTERVAL_SECS, DeviceAuthorizationResponse, DeviceContext, DeviceHttpInputs,
-    DeviceStores, authorize_device, hash_token,
+  protocol::{
+    device::{
+      DEVICE_INTERVAL_SECS, DeviceAuthorizationResponse, DeviceContext, DeviceHttpInputs,
+      DeviceStores, authorize_device, hash_token,
+    },
+    token::TokenFormat,
   },
 };
 
@@ -29,6 +32,16 @@ pub(super) async fn authorize(
   inputs: &DeviceHttpInputs<'_>,
   now: i64,
 ) -> Result<DeviceAuthorizationResponse, AppError> {
+  authorize_with_resources(h, inputs, now, false).await
+}
+
+/// Issue with an explicit `resource_indicators_enabled` flag.
+pub(super) async fn authorize_with_resources(
+  h: &mut Harness,
+  inputs: &DeviceHttpInputs<'_>,
+  now: i64,
+  resource_indicators_enabled: bool,
+) -> Result<DeviceAuthorizationResponse, AppError> {
   let mut stores = DeviceStores {
     pool: &h.pool,
     conn: &mut h.conn,
@@ -39,6 +52,7 @@ pub(super) async fn authorize(
     issuer: &h.config.issuer,
     device_ttl: h.config.ttl.device,
     now_unix: now,
+    resource_indicators_enabled,
   };
   authorize_device(&mut stores, &ctx, inputs).await
 }
@@ -58,6 +72,9 @@ pub(super) async fn poll_once(
     device_ttl: h.config.ttl.device,
     interval: Duration::from_secs(DEVICE_INTERVAL_SECS),
     ttl: &h.config.ttl,
+    token_format: TokenFormat::Opaque,
+    jwt_signer: None,
+    cimd: None,
     now_unix: now,
   };
   poll_device(&mut state, inputs).await
@@ -89,6 +106,7 @@ pub(super) fn public_inputs<'a>(
     assertion: None,
     dpop_proof: proof,
     peer_certs: None,
+    aud: &[],
   }
 }
 

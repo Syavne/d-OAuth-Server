@@ -26,11 +26,13 @@ mod verify;
 
 use std::{collections::HashMap, time::Duration};
 
-use crate::{db::client_repo::Client, error::AppError, state::RedisConn, store::Store};
-
 use merge::merge_claims;
 use request_uri::resolve_uri;
 use verify::verify_request_object;
+
+pub use merge::MergedClaims;
+
+use crate::{db::client_repo::Client, error::AppError, state::RedisConn, store::Store};
 
 /// PAR `request_uri` URN prefix (RFC 9126 §3); the suffix is the PAR id.
 pub const PAR_REQUEST_URI_PREFIX: &str = "urn:ietf:params:oauth:request_uri:";
@@ -61,6 +63,10 @@ pub struct JarRequest<'a> {
 /// neither, a public client falls back to the raw query while a
 /// confidential client is rejected (see [`require_par_or_jar`]).
 ///
+/// The repeated `resource` indicator (RFC 8707) rides out-of-band in
+/// [`MergedClaims::resource`]: the single-valued `params` map never carries
+/// it (see [`merge::merge_claims`]).
+///
 /// # Errors
 ///
 /// Returns `invalid_request_object` for malformed, mis-bound, or
@@ -71,7 +77,7 @@ pub async fn resolve(
   conn: &mut RedisConn,
   store: &Store,
   input: &JarRequest<'_>,
-) -> Result<HashMap<String, String>, AppError> {
+) -> Result<MergedClaims, AppError> {
   match (input.request, input.request_uri) {
     (Some(_), Some(_)) => Err(AppError::invalid_request_object(
       "request and request_uri must not both be present",
@@ -85,7 +91,12 @@ pub async fn resolve(
     }
     (None, None) => {
       require_par_or_jar(input.client)?;
-      Ok(input.query.clone())
+      let mut params = input.query.clone();
+      params.remove("resource");
+      Ok(MergedClaims {
+        params,
+        resource: Vec::new(),
+      })
     }
   }
 }

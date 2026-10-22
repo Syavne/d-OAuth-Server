@@ -37,9 +37,10 @@ A secret may be given inline or as a mounted file. Inline wins when both are
 set. Mounted files are read and trimmed of trailing newlines.
 
 String-list keys (`cors_allowed_origins`, `rate_limit.trusted_proxies`,
-`redis.nodes`, `redis.seeds`) accept a real array in the file and either a
-JSON array string or a comma-separated string from the environment, because
-config-rs 0.15 keeps env values as strings and never coerces arrays. Both
+`protected_resource_ids`, `redis.nodes`, `redis.seeds`) accept a real array in
+the file and either a JSON array string or a comma-separated string from the
+environment, because config-rs 0.15 keeps env values as strings and never
+coerces arrays. Both
 `D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='["10.0.0.5"]'` and
 `D_OAUTH_RATE_LIMIT__TRUSTED_PROXIES='10.0.0.5,10.0.1.0/24'` load; a blank
 string loads as empty, and malformed JSON array text fails the load instead
@@ -75,6 +76,18 @@ which names the offending key.
 | `cors_allowed_origins` | empty | An explicit origin allowlist. Empty means no CORS layer. A lone `*` is silently dropped (no CORS layer, no error). |
 | `allow_token_exchange` | `false` | Enables the token-exchange grant. |
 | `token_exchange_allowlist` | empty | Rules of `{caller, subject, scopes[]}` for token exchange. |
+| `resource_indicators_enabled` | `false` | Honors the RFC 8707 `resource` indicator on the authorization, PAR, token, device, and introspection endpoints. Off plus any `resource` is `invalid_target`, never a silent drop. |
+| `cimd_enabled` | `false` | Enables Client ID Metadata Document lookup (an `https://` `client_id` is fetched and validated per request). When on, the AS metadata advertises `client_id_metadata_document_supported` and keeps `none` advertised. |
+| `protected_resources_enabled` | `false` | Emits the RFC 9728 `protected_resources` metadata member. |
+| `protected_resource_ids` | empty | Identifiers advertised in `protected_resources` when `protected_resources_enabled` is on. |
+| `allow_localhost_redirect` | `false` | Accepts the RFC 8252 host `localhost` loopback redirect (`127.0.0.1`/`[::1]` stay loopback regardless). |
+| `jwt_access_tokens_enabled` | `false` | Global kill-switch for JWT access tokens (`at+jwt`). Opaque tokens remain the only format while off. |
+| `jwt_signing_key` (`_file`) | none | Active JWT signing key: exactly 32 bytes of raw material. Inline wins; a mounted file is trimmed of trailing newlines. |
+| `jwt_signing_kid` | `v1` | Key id placed in the JOSE header; must match `[A-Za-z0-9_-]+`. |
+| `jwt_signing_previous_keys` | empty | Rotated-out keys of `{kid, key}` for verification only; every `key` must be exactly 32 bytes and every `kid` distinct. |
+| `jwt_access_token_signing_alg` | `ES256` | `ES256` or `EdDSA` only. Both take exactly-32-byte raw key material; RSA is not supported. |
+| `cimd_fetch_timeout_secs` | `5` | CIMD document fetch timeout, 1-10 seconds. |
+| `cimd_max_bytes` | `5120` | CIMD document size cap, 1-5120 bytes. |
 
 ## TLS keys
 
@@ -296,6 +309,55 @@ scope-token grammar, may not be `openid`, and may not exceed 128 characters.
 `token_exchange_allowlist` entries are `{caller, subject, scopes[]}`; caller and
 subject may not be empty.
 
+## JWT access tokens and optional-feature keys
+
+Every optional feature is off by default and none of these keys changes
+default-on behavior. The feature flags (`resource_indicators_enabled`,
+`cimd_enabled`, `protected_resources_enabled`, `jwt_access_tokens_enabled`, and
+`allow_localhost_redirect`) default to `false`; `protected_resource_ids` and
+`jwt_signing_previous_keys` default to empty.
+
+CIMD is the registration-free client path. Enabling it does not change the
+`POST /register` gate: `allow_open_registration` and `dcr_redirect_policy` still
+decide dynamically registered clients, and `allow_localhost_redirect` is the
+single server-wide switch that makes the host `localhost` a loopback redirect
+for both registered and CIMD clients. The operator runbook, including a
+validating example document, is in
+[OPERATIONS.md](OPERATIONS.md#mcp-client-registration).
+
+| Key | Default | Rule |
+| --- | --- | --- |
+| `D_OAUTH_JWT_ACCESS_TOKENS_ENABLED` | `false` | Global kill-switch for JWT access tokens. Enabling it requires a signing key; a configured `jwt` client with the switch off gets `503`. |
+| `D_OAUTH_JWT_SIGNING_KEY` | none | Active signing key: the literal UTF-8 bytes of the string, exactly 32 bytes. Shorter or longer material is `WeakKeyMaterial`; unusable EC/EdDSA material is `InvalidJwtSigningKey`. Inline values are whitespace-trimmed. |
+| `D_OAUTH_JWT_SIGNING_KEY_FILE` | none | Mounted form of the active key. Read verbatim except that trailing CR/LF are stripped; the inline form wins when both are set. |
+| `D_OAUTH_JWT_SIGNING_KID` | `v1` | Key id for the active key, `[A-Za-z0-9_-]+`. It is the JOSE `kid` and the JWKS entry id. |
+| `D_OAUTH_JWT_SIGNING_PREVIOUS_KEYS` | empty | Rotated-out keys, a list of `{kid, key}` objects. Each key is validated exactly like the active key (32 bytes); kids must be distinct and different from the active kid (`DuplicateJwtSigningKid`); configuring any entry requires an active key. Supply as a YAML/TOML array in the `D_OAUTH_CONFIG` file, not as one environment string. |
+| `D_OAUTH_JWT_ACCESS_TOKEN_SIGNING_ALG` | `ES256` | `ES256` or `EdDSA` only. Both use 32-byte raw key material, so there is no RSA/`RS256` branch. All retained keys share this algorithm. |
+
+- `jwt_signing_key` is the active JOSE signing key. It must be **exactly** 32
+  bytes of raw material: shorter or longer material is rejected at load with
+  `WeakKeyMaterial` (this is stricter than the pepper/TOTP/PII chains, which
+  enforce only a minimum). A `jwt_signing_key_file` mount works exactly like the
+  other `*_file` keys and is trimmed of trailing newlines; the inline form wins
+  when both are set. The key material is turned into a real JOSE signing key at
+  load, so an all-zero or out-of-range EC scalar fails at boot with
+  `InvalidJwtSigningKey`, not at the first mint. Enabling
+  `jwt_access_tokens_enabled` without a signing key fails closed with
+  `MissingJwtSigningKey`.
+- `jwt_signing_previous_keys` retains rotated-out keys as a list of
+  `{kid, key}` objects so a token signed under an old `kid` can still verify.
+  Each `key` is validated exactly like the active key (exactly 32 bytes) and
+  every `kid` must be distinct and different from the active `jwt_signing_kid`;
+  a duplicate is rejected with `DuplicateJwtSigningKid`.
+- `jwt_access_token_signing_alg` accepts only `ES256` or `EdDSA`. Both use
+  exactly-32-byte raw key material, so there is no RSA / `RS256` branch.
+- No JWT signing key material is ever printed: `Config`'s `Debug` impl and
+  `JwtSigningKey`'s `Debug` impl emit the key id and algorithm only.
+- `cimd_fetch_timeout_secs` must be between 1 and 10 seconds
+  (`InvalidCimdFetchTimeout`) and `cimd_max_bytes` between 1 and 5120
+  (`InvalidCimdMaxBytes`). A malformed value fails the load rather than
+  silently meaning "no limit".
+
 ## The timeout ladder
 
 The four database and request timeouts must satisfy:
@@ -313,9 +375,13 @@ the statement.
 - `catalog`: only redirect URIs present in the runtime catalog may be
   registered. This is the default.
 - `catalog_loopback`: catalog URIs plus dynamic loopback URIs (RFC 8252).
+  The host `localhost` counts as loopback here only when
+  `allow_localhost_redirect` is on.
 - `open`: any absolute `https` redirect URI, or an RFC 8252 loopback URI, may
   be registered. This is an explicit opt-in and is not the default; other
-  schemes and plaintext non-loopback URIs are still rejected.
+  schemes and plaintext non-loopback URIs are still rejected. As with
+  `catalog_loopback`, `localhost` is loopback only when
+  `allow_localhost_redirect` is on.
 
 ## Security properties
 

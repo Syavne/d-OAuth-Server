@@ -4,12 +4,13 @@
 //! these helpers; every test owns a fresh database and a unique Redis prefix
 //! pair on the shared compose Redis.
 
-use serde_json::json;
-use sqlx::PgPool;
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr},
   time::Duration,
 };
+
+use serde_json::json;
+use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -304,6 +305,7 @@ pub(super) async fn pending_request(harness: &mut Harness) -> Result<String, Tes
     dpop_jkt: None,
     iss: "https://auth.example.test".to_owned(),
     post_logout_uri: None,
+    aud: Vec::new(),
   };
   pending::put(
     &mut harness.conn,

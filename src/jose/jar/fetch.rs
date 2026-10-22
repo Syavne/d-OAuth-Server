@@ -5,12 +5,11 @@
 //! statuses only) and then enforces the request-object body cap of
 //! [`MAX_REQUEST_OBJECT_BYTES`] with a UTF-8 requirement.
 
+use super::MAX_REQUEST_OBJECT_BYTES;
 use crate::{
   error::AppError,
   protocol::ssrf::{self, SsrfError},
 };
-
-use super::MAX_REQUEST_OBJECT_BYTES;
 
 /// Fetch a pre-registered request object behind the SSRF guard.
 ///

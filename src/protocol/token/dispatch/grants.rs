@@ -6,8 +6,8 @@ use std::time::Duration;
 use secrecy::SecretString;
 
 use super::{
-  Dispatch, TokenError, TokenResponseBody, basic_header, client_kind, dpop_proof, enabled_scopes,
-  require_dpop_binding, require_grant, token_service,
+  Dispatch, TokenError, TokenFormat, TokenResponseBody, basic_header, client_kind, dpop_proof,
+  enabled_scopes, jwt_signer, require_dpop_binding, require_grant, token_service,
 };
 use crate::{
   db::{user_repo, user_scope_repo},
@@ -53,10 +53,38 @@ pub(super) async fn dispatch_grant(d: &mut Dispatch<'_>) -> Result<TokenResponse
   }
 }
 
+/// The candidate presenter id for `authorization_code`, mirroring the grant's
+/// own resolution so the format gate and the grant agree: Basic wins, and a
+/// disagreeing body id is left to the grant's `invalid_client` path.
+fn authorization_code_candidate_id(form_id: Option<&str>, basic: Option<&str>) -> Option<String> {
+  match basic {
+    Some(header) => {
+      let creds = client_auth::parse_basic_header(header)?;
+      match form_id {
+        Some(body_id) if body_id != creds.client_id => None,
+        _ => Some(creds.client_id),
+      }
+    }
+    None => form_id.map(str::to_owned),
+  }
+}
+
 /// `grant_type=authorization_code`: the grant authenticates the client itself.
 async fn authorization_code(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
   let basic = basic_header(d.headers);
   let proof = dpop_proof(d.headers);
+  let format = d
+    .gate_candidate_client_format(authorization_code_candidate_id(
+      d.form.client_id.as_deref(),
+      basic,
+    ))
+    .await?
+    .unwrap_or(TokenFormat::Opaque);
+  let jwt = if format == TokenFormat::Jwt {
+    Some(jwt_signer(d.state)?)
+  } else {
+    None
+  };
   let body_secret = d.form.client_secret.clone().map(SecretString::from);
   let mut grant = CodeGrantState {
     pool: &d.state.pool,
@@ -65,6 +93,9 @@ async fn authorization_code(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, T
     keys: &d.state.keys,
     issuer: &d.state.config.issuer,
     ttl: &d.state.config.ttl,
+    token_format: format,
+    jwt_signer: jwt,
+    cimd: d.cimd,
     now_unix: d.now_unix,
   };
   let inputs = CodeGrantInputs {
@@ -78,6 +109,7 @@ async fn authorization_code(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, T
     assertion: d.form.client_assertion.as_deref(),
     dpop_proof: proof,
     peer_certs: d.peer_certs,
+    aud: d.resources,
   };
   let tokens = authorization_code::redeem_code(&mut grant, &inputs).await?;
   Ok(TokenResponseBody {
@@ -95,11 +127,15 @@ async fn refresh(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> 
   let authenticated = d.authenticate().await?;
   let client = authenticated.client;
   require_grant(&client, refresh_token::GRANT_TYPE_REFRESH_TOKEN)?;
+  let format = d.require_token_format(&client)?;
   let kind = client_kind(&client)?;
   let proof = d.sender_proof(&client).await?;
   require_dpop_binding(&client, &proof)?;
   let enabled = enabled_scopes(&d.state.pool).await?;
-  let service = token_service(d.state)?;
+  let mut service = token_service(d.state)?;
+  if format == TokenFormat::Jwt {
+    service = service.with_jwt_signer(jwt_signer(d.state)?);
+  }
   let users = refresh_token::RefreshUserStores {
     pool: &d.state.pool,
     keys: &d.state.keys,
@@ -117,12 +153,15 @@ async fn refresh(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> 
     &RefreshInput {
       client_id: &client.client_id,
       client_kind: kind,
+      dpop_required: client.dpop_bound_access_tokens,
       refresh_token: d.form.refresh_token.as_deref().unwrap_or(""),
       requested_scope: d.form.scope.as_deref(),
+      requested_resources: d.resources,
       proof: &proof,
       enabled: &enabled,
       client_registered: &registered,
       user_entitled: &no_user_term,
+      token_format: format,
       now_unix: d.now_unix,
     },
   )
@@ -142,12 +181,16 @@ async fn client_credentials(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, T
   let authenticated = d.authenticate().await?;
   let client = authenticated.client;
   require_grant(&client, client_credentials::GRANT_TYPE_CLIENT_CREDENTIALS)?;
+  let format = d.require_token_format(&client)?;
   let kind = client_kind(&client)?;
   let proof = d.sender_proof(&client).await?;
   require_dpop_binding(&client, &proof)?;
   let registered = ScopeSet::parse(&client.scope).map_err(|_| AppError::server_error())?;
   let enabled = enabled_scopes(&d.state.pool).await?;
-  let service = token_service(d.state)?;
+  let mut service = token_service(d.state)?;
+  if format == TokenFormat::Jwt {
+    service = service.with_jwt_signer(jwt_signer(d.state)?);
+  }
   let issued = client_credentials::issue_client_credentials(
     &mut *d.conn,
     d.store,
@@ -161,6 +204,8 @@ async fn client_credentials(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, T
       dpop_bound_jkt: None,
       mtls_bound_x5t_s256: client.tls_client_auth_cert_thumbprint.as_deref(),
       proof: &proof,
+      aud: d.resources,
+      token_format: format,
       now_unix: d.now_unix,
     },
   )
@@ -188,6 +233,16 @@ async fn device(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
       basic.and_then(|header| client_auth::parse_basic_header(header).map(|creds| creds.client_id))
     })
     .unwrap_or_default();
+  let candidate = (!client_id.is_empty()).then_some(client_id.clone());
+  let format = d
+    .gate_candidate_client_format(candidate)
+    .await?
+    .unwrap_or(TokenFormat::Opaque);
+  let jwt = if format == TokenFormat::Jwt {
+    Some(jwt_signer(d.state)?)
+  } else {
+    None
+  };
   let mut poll = PollState {
     pool: &d.state.pool,
     conn: &mut *d.conn,
@@ -197,6 +252,9 @@ async fn device(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
     device_ttl: d.state.config.ttl.device,
     interval: Duration::from_secs(DEVICE_INTERVAL_SECS),
     ttl: &d.state.config.ttl,
+    token_format: format,
+    jwt_signer: jwt,
+    cimd: d.cimd,
     now_unix: d.now_unix,
   };
   let inputs = DevicePollInputs {
@@ -208,6 +266,7 @@ async fn device(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
     assertion: d.form.client_assertion.as_deref(),
     dpop_proof: proof,
     peer_certs: d.peer_certs,
+    aud: d.resources,
   };
   let tokens = device_code::poll_device(&mut poll, &inputs).await?;
   Ok(TokenResponseBody {
@@ -221,10 +280,21 @@ async fn device(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
 }
 
 /// `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`: policy gate.
+///
+/// Token exchange mints an access token, so it is subject to the same
+/// per-client `access_token_format` gate as every other minting path: a `jwt`
+/// caller while the global switch is off fails closed with
+/// `temporarily_unavailable` (503) rather than exchanging. A `jwt` caller
+/// with the switch on is rejected the same way (Todo 26): exchange never
+/// mints an `act` JWT, so the format gate is a rejection, not a mint branch.
 async fn exchange(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
   let authenticated = d.authenticate().await?;
   let client = authenticated.client;
   require_grant(&client, token_exchange::GRANT_TYPE_TOKEN_EXCHANGE)?;
+  match d.require_token_format(&client)? {
+    TokenFormat::Opaque => {}
+    TokenFormat::Jwt => return Err(AppError::temporarily_unavailable().into()),
+  }
   let kind = client_kind(&client)?;
   let proof = d.sender_proof(&client).await?;
   require_dpop_binding(&client, &proof)?;
@@ -240,6 +310,7 @@ async fn exchange(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError>
     &ExchangeInput {
       caller_client_id: &client.client_id,
       caller_kind: kind,
+      caller_dpop_required: client.dpop_bound_access_tokens,
       caller_registered: &registered,
       subject_token,
       subject_token_type: d.form.subject_token_type.as_deref().unwrap_or(""),

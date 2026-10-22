@@ -69,6 +69,7 @@ async fn insert_client(pool: &PgPool, keys: &KeyRing, client_id: &str) -> Result
       contacts: None,
       software_id: None,
       dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
       registration_access_token_hash: None,
     },
   )

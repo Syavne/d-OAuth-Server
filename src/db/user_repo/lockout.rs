@@ -16,12 +16,11 @@
 
 use std::{net::IpAddr, time::Duration};
 
+use super::normalize_email;
 use crate::{
   state::RedisConn,
   store::{self, Store, StoreError, sessions},
 };
-
-use super::normalize_email;
 
 /// Login lockout policy: after `threshold` failures from one IP for one
 /// account within `lock_duration`, that IP is locked out for the account;

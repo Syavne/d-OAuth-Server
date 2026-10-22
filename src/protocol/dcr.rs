@@ -74,8 +74,10 @@ pub struct RegisterContext<'a> {
 
 /// RFC 7591 §2 registration request body.
 ///
-/// Unknown fields are ignored; client-asserted secrets, ids, or timestamps
-/// are never honored (the server mints every credential it returns).
+/// Unknown fields are ignored, except `access_token_format`: it is
+/// operator-only and a body carrying it is rejected (see
+/// [`parse_register_request`]). Client-asserted secrets, ids, or timestamps are
+/// never honored (the server mints every credential it returns).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterRequest {
   /// Requested redirect URIs (required, non-empty).
@@ -168,6 +170,23 @@ struct ValidatedRegistration {
   redirect_uris: Vec<String>,
 }
 
+/// Deserialize a registration body, rejecting operator-only fields.
+///
+/// RFC 7591 registration is self-service, so it must never let a registrant
+/// opt into JWT access tokens (an operator-only choice exposed solely through
+/// `client set-access-token-format`). A body carrying `access_token_format`
+/// fails closed with `invalid_client_metadata` instead of being silently
+/// ignored; every other DCR field keeps its existing behavior.
+fn parse_register_request(body: serde_json::Value) -> Result<RegisterRequest, AppError> {
+  if body.get("access_token_format").is_some() {
+    return Err(AppError::invalid_client_metadata(
+      "access_token_format is operator-only and cannot be set through dynamic client registration",
+    ));
+  }
+  serde_json::from_value(body)
+    .map_err(|_| AppError::invalid_client_metadata("invalid client metadata"))
+}
+
 /// Axum entry point for `POST /register` (mounted by the router in task 40).
 ///
 /// # Errors
@@ -180,8 +199,9 @@ struct ValidatedRegistration {
 pub async fn register_handler(
   State(state): State<AppState>,
   headers: HeaderMap,
-  Json(request): Json<RegisterRequest>,
+  Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), AppError> {
+  let request = parse_register_request(body)?;
   let token = bearer_token(&headers);
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
@@ -250,6 +270,7 @@ pub async fn register_client(
     contacts: validated.contacts.clone(),
     software_id: validated.software_id.clone(),
     dpop_bound_access_tokens: validated.dpop_bound,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: Some(registration_hash),
   };
   let row = client_repo::insert(
@@ -491,6 +512,15 @@ async fn validate_scope(pool: &PgPool, scope: Option<&str>) -> Result<String, Ap
 /// anything else follows `dcr_redirect_policy` (`open` and dynamic loopback
 /// URIs are upserted into the catalog, then attached). An upsert that lands
 /// on an admin-disabled row is rejected rather than resurrected.
+///
+/// C5c runbook coupling: a DCR client can register
+/// `http://localhost:{port}/cb` only with open registration
+/// (`allow_open_registration=true`) OR an IAT-gated registration (RFC 7591
+/// §2), AND a non-`catalog` `dcr_redirect_policy` (`catalog_loopback` or
+/// `open`), AND `allow_localhost_redirect=true` (RFC 8252 §7.3 makes
+/// `localhost` a loopback host only behind that flag). The default `catalog`
+/// policy rejects every non-cataloged redirect, so it rejects this URI even
+/// when the other two conditions hold.
 async fn resolve_redirects(
   pool: &PgPool,
   config: &Config,
@@ -510,14 +540,14 @@ async fn resolve_redirects(
         ));
       }
       DcrRedirectPolicy::CatalogLoopback => {
-        if !is_loopback_uri(uri) {
+        if !is_loopback_uri(uri, config.allow_localhost_redirect) {
           return Err(AppError::invalid_redirect_uri(
             "redirect URI is not in the catalog or a loopback URI",
           ));
         }
       }
       DcrRedirectPolicy::Open => {
-        if !is_open_redirect_uri(uri) {
+        if !is_open_redirect_uri(uri, config.allow_localhost_redirect) {
           return Err(AppError::invalid_redirect_uri(
             "redirect URI must be an absolute https URI or a loopback URI",
           ));
@@ -548,9 +578,10 @@ async fn resolve_redirects(
 }
 
 /// Whether `uri` is an RFC 8252 §7.3 loopback URI: plaintext `http` to a
-/// loopback literal (`127.0.0.1` or `[::1]`, any port) with no userinfo,
-/// query, or fragment. `localhost` is never loopback here.
-fn is_loopback_uri(uri: &str) -> bool {
+/// loopback host (`127.0.0.1` or `[::1]` at any port, plus the exact host
+/// `localhost` when `allow_localhost` is set) with no userinfo, query, or
+/// fragment. `localhost` is not loopback otherwise.
+fn is_loopback_uri(uri: &str, allow_localhost: bool) -> bool {
   let (before_fragment, fragment) = match uri.split_once('#') {
     Some((before, fragment)) => (before, Some(fragment)),
     None => (uri, None),
@@ -589,9 +620,10 @@ fn is_loopback_uri(uri: &str) -> bool {
       None => false,
     }
   } else {
+    let is_loopback = |host: &str| host == "127.0.0.1" || (allow_localhost && host == "localhost");
     match authority.split_once(':') {
-      Some((host, _)) => host == "127.0.0.1",
-      None => authority == "127.0.0.1",
+      Some((host, _)) => is_loopback(host),
+      None => is_loopback(authority),
     }
   }
 }
@@ -600,9 +632,9 @@ fn is_loopback_uri(uri: &str) -> bool {
 /// RFC 8252 loopback URI, or an absolute `https` URI with a non-empty host
 /// and no userinfo, fragment, or whitespace. Accepting an arbitrary absolute
 /// URI here would turn the opt-in `open` policy into an open-redirect
-/// factory.
-fn is_open_redirect_uri(uri: &str) -> bool {
-  if is_loopback_uri(uri) {
+/// factory. `allow_localhost` is forwarded to [`is_loopback_uri`].
+fn is_open_redirect_uri(uri: &str, allow_localhost: bool) -> bool {
+  if is_loopback_uri(uri, allow_localhost) {
     return true;
   }
   if uri.contains('#') || uri.chars().any(char::is_whitespace) {

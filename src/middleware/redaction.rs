@@ -139,9 +139,10 @@ fn redact_pair(pair: &str) -> String {
 
 #[cfg(test)]
 mod redaction_tests {
-  use super::*;
   use axum::http::{HeaderName, HeaderValue};
   use serde_json::json;
+
+  use super::*;
 
   #[test]
   fn redaction_header_map_masks_authorization_cookie_and_dpop() {

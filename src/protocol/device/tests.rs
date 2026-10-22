@@ -127,6 +127,7 @@ async fn insert_client(
   method: TokenEndpointAuthMethod,
   secret: Option<&str>,
   scope: &str,
+  dpop_bound: bool,
 ) -> TestResult {
   let params =
     Argon2Params::new(8, 1, 1, 32).map_err(|error| TestError::KeyGen(format!("{error:?}")))?;
@@ -151,7 +152,8 @@ async fn insert_client(
     request_uris: None,
     contacts: None,
     software_id: None,
-    dpop_bound_access_tokens: false,
+    dpop_bound_access_tokens: dpop_bound,
+    access_token_format: "opaque".to_owned(),
     registration_access_token_hash: None,
   };
   client_repo::insert(pool, keys, false, &new).await?;
@@ -230,6 +232,7 @@ async fn issue(
     issuer: &h.config.issuer,
     device_ttl: h.config.ttl.device,
     now_unix: now_unix(),
+    resource_indicators_enabled: false,
   };
   authorize_device(&mut stores, &ctx, inputs).await
 }
@@ -245,6 +248,7 @@ async fn test_device_authorize_public_client_issues_code_and_interval() -> TestR
     TokenEndpointAuthMethod::None,
     None,
     "orders:read",
+    false,
   )
   .await?;
 
@@ -259,6 +263,7 @@ async fn test_device_authorize_public_client_issues_code_and_interval() -> TestR
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let ttl = h.config.ttl.device;
@@ -346,6 +351,7 @@ async fn test_device_authorize_confidential_client_secret_post() -> TestResult {
     TokenEndpointAuthMethod::ClientSecretPost,
     Some("post-secret"),
     "orders:read",
+    false,
   )
   .await?;
 
@@ -358,6 +364,7 @@ async fn test_device_authorize_confidential_client_secret_post() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: None,
+    resource: &[],
     peer_certs: None,
   };
   let response = issue(&mut h, &inputs)
@@ -382,6 +389,7 @@ async fn test_device_authorize_confidential_client_secret_post() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: None,
+    resource: &[],
     peer_certs: None,
   };
   match issue(&mut h, &bad).await {
@@ -405,6 +413,7 @@ async fn test_device_authorize_public_client_without_dpop_rejected() -> TestResu
     TokenEndpointAuthMethod::None,
     None,
     "orders:read",
+    true,
   )
   .await?;
 
@@ -416,6 +425,7 @@ async fn test_device_authorize_public_client_without_dpop_rejected() -> TestResu
     assertion_type: None,
     assertion: None,
     dpop_proof: None,
+    resource: &[],
     peer_certs: None,
   };
   match issue(&mut h, &inputs).await {
@@ -441,6 +451,7 @@ async fn test_device_authorize_over_registered_scope_rejected() -> TestResult {
     TokenEndpointAuthMethod::None,
     None,
     "orders:read",
+    false,
   )
   .await?;
 
@@ -455,6 +466,7 @@ async fn test_device_authorize_over_registered_scope_rejected() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   match issue(&mut h, &inputs).await {
@@ -480,6 +492,7 @@ async fn test_device_authorize_approval_transitions_state() -> TestResult {
     TokenEndpointAuthMethod::None,
     None,
     "orders:read",
+    false,
   )
   .await?;
 
@@ -494,6 +507,7 @@ async fn test_device_authorize_approval_transitions_state() -> TestResult {
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let response = issue(&mut h, &inputs)
@@ -561,6 +575,7 @@ async fn test_device_authorize_unknown_and_expired_user_code_rejected() -> TestR
     TokenEndpointAuthMethod::None,
     None,
     "",
+    false,
   )
   .await?;
   let key = fresh_key()?;
@@ -574,6 +589,7 @@ async fn test_device_authorize_unknown_and_expired_user_code_rejected() -> TestR
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let response = issue(&mut h, &inputs)
@@ -639,6 +655,7 @@ async fn test_device_authorize_verification_uri_complete_carries_user_code() -> 
     TokenEndpointAuthMethod::None,
     None,
     "orders:read",
+    false,
   )
   .await?;
 
@@ -653,6 +670,7 @@ async fn test_device_authorize_verification_uri_complete_carries_user_code() -> 
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let response = issue(&mut h, &inputs)
@@ -728,6 +746,7 @@ async fn test_device_authorize_user_code_misses_are_generic_and_normalized() -> 
     TokenEndpointAuthMethod::None,
     None,
     "orders:read",
+    false,
   )
   .await?;
   let key = fresh_key()?;
@@ -741,6 +760,7 @@ async fn test_device_authorize_user_code_misses_are_generic_and_normalized() -> 
     assertion_type: None,
     assertion: None,
     dpop_proof: Some(proof.as_str()),
+    resource: &[],
     peer_certs: None,
   };
   let response = issue(&mut h, &inputs)

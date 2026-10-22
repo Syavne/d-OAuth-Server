@@ -5,6 +5,7 @@
 
 mod binding;
 mod issue;
+mod jwt;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,7 +18,7 @@ use crate::{
   keys::{KeyId, KeyRing, KeyRingError},
   protocol::{
     scope::ScopeSet,
-    token::{ClientKind, SenderProof, TokenService, TokenServiceError},
+    token::{ClientKind, SenderProof, TokenFormat, TokenService, TokenServiceError},
   },
   state::RedisConn,
   store::{Store, StoreError},
@@ -133,6 +134,8 @@ fn input<'a>(
     dpop_bound_jkt: ctx.dpop_bound,
     mtls_bound_x5t_s256: ctx.mtls_bound,
     proof: ctx.proof,
+    aud: &[],
+    token_format: TokenFormat::Opaque,
     now_unix: now_unix(),
   }
 }

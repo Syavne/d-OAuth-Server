@@ -12,7 +12,8 @@
 //!    responses with `Referrer-Policy`, `X-Content-Type-Options`, a CSP with
 //!    `frame-ancestors 'none'` (plus a strict script policy on the
 //!    login/consent/device pages), and HSTS on the TLS listener. Every response
-//!    except `/.well-known/…` metadata is also `Cache-Control: no-store`.
+//!    except `/.well-known/…` metadata and the public JWK Set is also
+//!    `Cache-Control: no-store`; `/jwks.json` carries its own shorter window.
 //! 3. [`middleware::security_headers::cors_layer`] answers CORS preflights
 //!    from the explicit allowlist before the limiter can bill them; mounted
 //!    only when `cors_allowed_origins` is non-empty (default empty: no CORS
@@ -48,11 +49,10 @@
 //! [`state::health_router`]; the plaintext listener serves that router alone
 //! in task 41).
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -68,7 +68,7 @@ use crate::middleware::ratelimit::RateLimitLayer;
 use crate::middleware::request_id::{REQUEST_ID_HEADER, RequestId, RequestIdLayer};
 use crate::middleware::security_headers::{SecurityHeadersLayer, cors_layer};
 use crate::protocol::mtls::{self, MtlsError};
-use crate::protocol::{authorize, dcr, device, introspect, metadata, par, revoke, token};
+use crate::protocol::{authorize, dcr, device, introspect, jwks, metadata, par, revoke, token};
 use crate::resilience::{ResilienceConfig, ResilienceLayer};
 use crate::state::{AppState, health_router};
 use crate::store::pending::PendingAuth;
@@ -130,6 +130,7 @@ pub fn build_router_with_options(state: AppState, options: RouterOptions) -> axu
       "/.well-known/oauth-authorization-server",
       get(metadata::metadata),
     )
+    .route("/jwks.json", get(jwks::handler))
     .route("/authorize", get(authorize_entry))
     .route("/par", post(par::par_handler))
     .route("/token", post(token::handler))
@@ -217,8 +218,21 @@ pub fn build_server_config(
 async fn authorize_entry(
   State(state): State<AppState>,
   headers: HeaderMap,
-  Query(query): Query<HashMap<String, String>>,
+  RawQuery(raw): RawQuery,
 ) -> Response {
+  // `RawQuery` + a manual parse replaces `Query<HashMap>`: the extractor
+  // consumed the raw query, hiding repeats — the repeated `resource`
+  // indicator (RFC 8707) is captured in order by `params::repeated_values`
+  // while the single-valued map keeps last-wins absorption. A malformed
+  // query is the same 400 `Query` rendered.
+  let raw = raw.as_deref().unwrap_or("");
+  let pairs = match crate::protocol::params::query_pairs(Some(raw)) {
+    Ok(pairs) => pairs,
+    Err(reject) => return reject.into_response(),
+  };
+  let query = crate::protocol::params::single_valued_map(&pairs);
+  let resources =
+    crate::protocol::params::repeated_values(raw, crate::protocol::params::RESOURCE_PARAM);
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let input = authorize::AuthorizeInput {
@@ -227,7 +241,15 @@ async fn authorize_entry(
     conn: &mut conn,
     store: &store,
     issuer: &state.config.issuer,
+    allow_localhost_redirect: state.config.allow_localhost_redirect,
+    cimd: state.config.cimd_enabled.then(|| authorize::CimdRequest {
+      token_prefix: &state.config.redis.token_key_prefix,
+      max_bytes: state.config.cimd_max_bytes,
+      timeout: state.config.cimd_fetch_timeout,
+    }),
     query: &query,
+    resources,
+    resource_indicators_enabled: state.config.resource_indicators_enabled,
   };
   let validated = match authorize::validate(input).await {
     Ok(validated) => validated,
@@ -275,6 +297,7 @@ async fn authorize_entry(
     dpop_jkt,
     iss: state.config.issuer.clone(),
     post_logout_uri: validated.post_logout_uri,
+    aud: validated.aud,
   };
   if let Err(error) = pending::put(&mut conn, &store, &request_id, &record, PENDING_TTL).await {
     return AppError::from(error).into_response();
@@ -356,7 +379,7 @@ mod router_tests {
 
   use super::{RouterOptions, build_router, build_router_with_options, build_server_config};
   use crate::config::Config;
-  use crate::middleware::security_headers::cors_layer;
+  use crate::middleware::security_headers::{JWKS_CACHE_VALUE, METADATA_CACHE_VALUE, cors_layer};
   use crate::state::{AppState, Clock, RedisConn};
 
   /// Test body result (no `unwrap`/`expect` under the deny lints).
@@ -404,13 +427,13 @@ mod router_tests {
   /// "handler failed closed on its own").
   const LIMITER_MARKER: &str = "temporarily unable to handle the request";
 
-  /// Validated config over a dead Postgres URL and the given Redis URL.
-  fn test_config(
+  /// Shared raw fixture over a dead Postgres URL and the given Redis URL.
+  fn config_fixture(
     redis_url: &str,
     rate_limit: serde_json::Value,
     cors_origins: Vec<&str>,
-  ) -> Result<Config, crate::config::ConfigError> {
-    let fixture = serde_json::json!({
+  ) -> serde_json::Value {
+    serde_json::json!({
       "issuer": "https://auth.example.test",
       "environment": "development",
       "tls": {"cert_path": "/tmp/router-test-cert.pem", "key_path": "/tmp/router-test-key.pem"},
@@ -421,7 +444,33 @@ mod router_tests {
       "pii_encryption_key": "router-test-pii-key-0123456789abcdef",
       "rate_limit": rate_limit,
       "cors_allowed_origins": cors_origins,
-    });
+    })
+  }
+
+  /// Validated config over a dead Postgres URL and the given Redis URL.
+  fn test_config(
+    redis_url: &str,
+    rate_limit: serde_json::Value,
+    cors_origins: Vec<&str>,
+  ) -> Result<Config, crate::config::ConfigError> {
+    let fixture = config_fixture(redis_url, rate_limit, cors_origins);
+    Config::from_source(::config::Config::try_from(&fixture)?)
+  }
+
+  /// 32-byte ASCII JWT signing keys (valid non-zero P-256 scalars).
+  const JWT_TEST_KEY: &str = "bcdefghijklmnopqrstuvwxyzabcdefg";
+  /// Rotated-out verify-only key, distinct from [`JWT_TEST_KEY`].
+  const JWT_PREVIOUS_KEY: &str = "cdefghijklmnopqrstuvwxyzabcdefgh";
+
+  /// Validated config with the JWT switch on and a current + retained key.
+  fn jwt_config(redis_url: &str) -> Result<Config, crate::config::ConfigError> {
+    let mut fixture = config_fixture(redis_url, serde_json::json!({"enabled": false}), Vec::new());
+    fixture["jwt_access_tokens_enabled"] = serde_json::Value::Bool(true);
+    fixture["jwt_signing_key"] = serde_json::Value::String(JWT_TEST_KEY.to_owned());
+    fixture["jwt_signing_kid"] = serde_json::Value::String("v2".to_owned());
+    fixture["jwt_signing_previous_keys"] = serde_json::json!([
+      {"kid": "v1", "key": JWT_PREVIOUS_KEY}
+    ]);
     Config::from_source(::config::Config::try_from(&fixture)?)
   }
 
@@ -500,14 +549,14 @@ mod router_tests {
     method: &str,
     uri: &str,
     headers: &[(&str, &str)],
-    body: &str,
+    body: impl Into<Body>,
   ) -> TestResult<(StatusCode, HeaderMap, String)> {
     let peer = SocketAddr::from(([127, 0, 0, 1], 40_001));
     let mut builder = Request::builder().method(method).uri(uri);
     for (name, value) in headers {
       builder = builder.header(*name, *value);
     }
-    let mut request = builder.body(Body::from(body.to_owned()))?;
+    let mut request = builder.body(body.into())?;
     request
       .extensions_mut()
       .insert(axum::extract::ConnectInfo(peer));
@@ -705,6 +754,133 @@ mod router_tests {
     }
     if value.contains("no-store") {
       return Err(format!("metadata must stay cacheable, got {value:?}").into());
+    }
+    Ok(())
+  }
+
+  /// The JWK Set advertises the current key first, then every retained key,
+  /// with public members only (RFC 7517 §4/§5, RFC 7518 §6.2.1, RFC 8037 §2).
+  #[tokio::test]
+  async fn jwks_serves_current_and_retained() -> TestResult {
+    let redis_url = "redis://127.0.0.1:1";
+    let router = build_router(lazy_state(jwt_config(redis_url)?, redis_url)?);
+    let (status, headers, body) = drive(router, "GET", "/jwks.json", &[], "").await?;
+    if status != StatusCode::OK {
+      return Err(format!("GET /jwks.json must be 200, got {status}: {body}").into());
+    }
+    let content_type = headers
+      .get(header::CONTENT_TYPE)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or_default();
+    if !content_type.starts_with("application/jwk-set+json") {
+      return Err(format!("JWK Set media type must be pinned, got {content_type:?}").into());
+    }
+    let document: serde_json::Value = serde_json::from_str(&body)?;
+    let keys = document
+      .get("keys")
+      .and_then(serde_json::Value::as_array)
+      .ok_or("JWK Set must carry a keys array")?;
+    if keys.len() != 2 {
+      return Err(format!("expected current + retained key, got {}", keys.len()).into());
+    }
+    let current_kid = keys[0].get("kid").and_then(serde_json::Value::as_str);
+    let retained_kid = keys[1].get("kid").and_then(serde_json::Value::as_str);
+    if current_kid != Some("v2") || retained_kid != Some("v1") {
+      return Err(
+        format!("current key must come first, got {current_kid:?} then {retained_kid:?}").into(),
+      );
+    }
+    for key in keys {
+      if key.get("use").and_then(serde_json::Value::as_str) != Some("sig") {
+        return Err("every JWK must declare use=sig".into());
+      }
+      if key.get("alg").and_then(serde_json::Value::as_str) != Some("ES256") {
+        return Err("every JWK must carry the configured algorithm".into());
+      }
+      if key.get("kty").and_then(serde_json::Value::as_str) != Some("EC") {
+        return Err("ES256 JWKs must be kty=EC".into());
+      }
+      if key.get("crv").and_then(serde_json::Value::as_str) != Some("P-256") {
+        return Err("ES256 JWKs must be crv=P-256".into());
+      }
+      for coordinate in ["x", "y"] {
+        if key
+          .get(coordinate)
+          .and_then(serde_json::Value::as_str)
+          .is_none_or(str::is_empty)
+        {
+          return Err(format!("EC JWK must carry a non-empty {coordinate}").into());
+        }
+      }
+      for private in ["d", "p", "q", "dp", "dq", "qi", "oth", "k"] {
+        if key.get(private).is_some() {
+          return Err(format!("JWK must never carry private member {private}").into());
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// `/jwks.json` gets its own short cache window (rotation/revocation bound),
+  /// distinct from the one-hour metadata value and from the no-store default.
+  #[tokio::test]
+  async fn jwks_cache_control_value() -> TestResult {
+    let redis_url = "redis://127.0.0.1:1";
+    let router = build_router(lazy_state(jwt_config(redis_url)?, redis_url)?);
+    let (_, jwks_headers, _) = drive(router.clone(), "GET", "/jwks.json", &[], "").await?;
+    let jwks_cache = jwks_headers
+      .get(header::CACHE_CONTROL)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or_default();
+    if jwks_cache != JWKS_CACHE_VALUE {
+      return Err(format!("expected pinned {JWKS_CACHE_VALUE:?}, got {jwks_cache:?}").into());
+    }
+    if jwks_cache == "no-store" || jwks_cache == METADATA_CACHE_VALUE {
+      return Err(format!("JWKS cache must be its own value, got {jwks_cache:?}").into());
+    }
+    let (_, metadata_headers, _) = drive(
+      router,
+      "GET",
+      "/.well-known/oauth-authorization-server",
+      &[],
+      "",
+    )
+    .await?;
+    let metadata_cache = metadata_headers
+      .get(header::CACHE_CONTROL)
+      .and_then(|value| value.to_str().ok())
+      .unwrap_or_default();
+    if metadata_cache != METADATA_CACHE_VALUE {
+      return Err(
+        format!("metadata cache must stay {METADATA_CACHE_VALUE:?}, got {metadata_cache:?}").into(),
+      );
+    }
+    Ok(())
+  }
+
+  /// With the switch off the endpoint still exists deterministically: an
+  /// empty JWK Set, never a 404 (which would be cached for the short window)
+  /// and never a 500.
+  #[tokio::test]
+  async fn jwks_empty_when_feature_disabled() -> TestResult {
+    let (status, _, body) = drive(
+      build_router(passthrough_state()?),
+      "GET",
+      "/jwks.json",
+      &[],
+      "",
+    )
+    .await?;
+    if status != StatusCode::OK {
+      return Err(format!("feature-off JWKS must be 200, got {status}: {body}").into());
+    }
+    let document: serde_json::Value = serde_json::from_str(&body)?;
+    let keys = document
+      .get("keys")
+      .and_then(serde_json::Value::as_array)
+      .ok_or("JWK Set must carry a keys array")?;
+    if !keys.is_empty() {
+      return Err(format!("feature-off JWK Set must be empty, got {} keys", keys.len()).into());
     }
     Ok(())
   }
@@ -1021,6 +1197,178 @@ mod router_tests {
     }
     if cors_layer(&[]).is_some() {
       return Err("empty allowlist must yield no CORS layer".into());
+    }
+    Ok(())
+  }
+
+  /// `GET /authorize` with a lossy-encoded query value (`%FF` is a valid
+  /// URI but decodes to U+FFFD, never a parse failure) reaches downstream
+  /// validation: with no `client_id` the 400 page renders, proving the
+  /// `RawQuery` switch neither silently accepts nor parse-rejects
+  /// misencoded input. (A query `&str` is always valid UTF-8 and
+  /// percent-decoding is infallible, so the query layer has no
+  /// encoding-failure path left.)
+  #[tokio::test]
+  async fn router_authorize_malformed_query_is_400() -> TestResult {
+    let (status, _, body) = drive(
+      build_router(passthrough_state()?),
+      "GET",
+      "/authorize?state=%FF",
+      &[],
+      "",
+    )
+    .await?;
+    if status != StatusCode::BAD_REQUEST || !body.contains("invalid_request") {
+      return Err(
+        format!("lossy authorize query must be invalid_request 400, got {status}: {body}").into(),
+      );
+    }
+    Ok(())
+  }
+
+  /// `POST /par` preserves the `Form` transport contract after the `Bytes`
+  /// switch: a structurally unreadable body (raw non-UTF-8 bytes) is the
+  /// same 400 `Form` rendered, a lossy-encoded body (`%FF` decodes to
+  /// U+FFFD) reaches downstream validation (`invalid_client`: no
+  /// credentials name a client), and a non-urlencoded body is 415.
+  #[tokio::test]
+  async fn router_par_transport_contract_preserved() -> TestResult {
+    let urlencoded = [("content-type", "application/x-www-form-urlencoded")];
+    let (bad_status, _, bad_body) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/par",
+      &urlencoded,
+      vec![0xFFu8],
+    )
+    .await?;
+    if bad_status != StatusCode::BAD_REQUEST || !bad_body.contains("Failed to deserialize form") {
+      return Err(format!("non-UTF-8 PAR body must be 400, got {bad_status}: {bad_body}").into());
+    }
+    let (lossy_status, _, lossy_body) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/par",
+      &urlencoded,
+      "scope=%FF",
+    )
+    .await?;
+    if lossy_status != StatusCode::BAD_REQUEST || !lossy_body.contains("invalid_client") {
+      return Err(
+        format!("lossy PAR body must be invalid_client 400, got {lossy_status}: {lossy_body}")
+          .into(),
+      );
+    }
+    let json = [("content-type", "application/json")];
+    let (ctype_status, _, _) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/par",
+      &json,
+      "client_id=nobody",
+    )
+    .await?;
+    if ctype_status != StatusCode::UNSUPPORTED_MEDIA_TYPE {
+      return Err(format!("non-form PAR body must be 415, got {ctype_status}").into());
+    }
+    Ok(())
+  }
+
+  /// `POST /token` preserves the documented duplicate-parameter mapping
+  /// after the `Bytes` switch: a repeated known field is `invalid_request`
+  /// (RFC 6749 §5.2), and a non-urlencoded body is 415.
+  #[tokio::test]
+  async fn router_token_duplicate_param_preserved() -> TestResult {
+    let urlencoded = [("content-type", "application/x-www-form-urlencoded")];
+    let (status, _, body) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/token",
+      &urlencoded,
+      "grant_type=authorization_code&grant_type=refresh_token",
+    )
+    .await?;
+    if status != StatusCode::BAD_REQUEST || !body.contains("invalid_request") {
+      return Err(
+        format!("duplicate token param must be invalid_request, got {status}: {body}").into(),
+      );
+    }
+    let json = [("content-type", "application/json")];
+    let (ctype_status, _, _) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/token",
+      &json,
+      "grant_type=refresh_token",
+    )
+    .await?;
+    if ctype_status != StatusCode::UNSUPPORTED_MEDIA_TYPE {
+      return Err(format!("non-form token body must be 415, got {ctype_status}").into());
+    }
+    Ok(())
+  }
+
+  /// `POST /introspect` and `POST /device_authorization` preserve the
+  /// `Form` transport contract after the `Bytes` switch: a structurally
+  /// unreadable body (raw non-UTF-8 bytes) is the same 400 `Form`
+  /// rendered, a lossy-encoded body (`%FF` decodes to U+FFFD) reaches
+  /// downstream validation, and non-urlencoded bodies are 415. The
+  /// downstream expectation differs per path: introspect has no
+  /// credentials, so `invalid_client` (401); device has an empty
+  /// `client_id`, so `invalid_request` (400).
+  #[tokio::test]
+  async fn router_introspect_and_device_transport_contract_preserved() -> TestResult {
+    let urlencoded = [("content-type", "application/x-www-form-urlencoded")];
+    let json = [("content-type", "application/json")];
+    for path in ["/introspect", "/device_authorization"] {
+      let (bad_status, _, bad_body) = drive(
+        build_router(passthrough_state()?),
+        "POST",
+        path,
+        &urlencoded,
+        vec![0xFFu8],
+      )
+      .await?;
+      if bad_status != StatusCode::BAD_REQUEST || !bad_body.contains("Failed to deserialize form") {
+        return Err(
+          format!("non-UTF-8 {path} body must be 400, got {bad_status}: {bad_body}").into(),
+        );
+      }
+      let (lossy_body, expected_status, expected_code) = match path {
+        "/introspect" => ("token=%FF", StatusCode::UNAUTHORIZED, "invalid_client"),
+        _ => (
+          "client_id=&scope=%FF",
+          StatusCode::BAD_REQUEST,
+          "invalid_request",
+        ),
+      };
+      let (lossy_status, _, lossy_response) = drive(
+        build_router(passthrough_state()?),
+        "POST",
+        path,
+        &urlencoded,
+        lossy_body,
+      )
+      .await?;
+      if lossy_status != expected_status || !lossy_response.contains(expected_code) {
+        return Err(
+          format!(
+            "lossy {path} body must be {expected_code}, got {lossy_status}: {lossy_response}"
+          )
+          .into(),
+        );
+      }
+      let (ctype_status, _, _) = drive(
+        build_router(passthrough_state()?),
+        "POST",
+        path,
+        &json,
+        "token=abc",
+      )
+      .await?;
+      if ctype_status != StatusCode::UNSUPPORTED_MEDIA_TYPE {
+        return Err(format!("non-form {path} body must be 415, got {ctype_status}").into());
+      }
     }
     Ok(())
   }

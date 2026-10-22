@@ -10,9 +10,9 @@ use serde::Deserialize;
 
 use super::{
   context::{CliError, Context, audit},
-  redirect, scope,
+  redirect, resource, scope,
 };
-use crate::db::redirect_repo;
+use crate::db::{client_repo, redirect_repo};
 
 /// Top-level declarative file.
 #[derive(Debug, Default, Deserialize)]
@@ -23,12 +23,18 @@ pub struct SyncFile {
   /// Redirect-URI-catalog entries.
   #[serde(default)]
   pub redirect_uris: Vec<RedirectEntry>,
+  /// Resource-server (RFC 8707 resource indicator) catalog entries.
+  #[serde(default)]
+  pub resource_servers: Vec<ResourceServerEntry>,
   /// Per-user scope entitlements.
   #[serde(default)]
   pub user_scopes: Vec<EntitlementEntry>,
   /// Per-client redirect-URI attachments.
   #[serde(default)]
   pub client_redirect_uris: Vec<AttachmentEntry>,
+  /// Per-client access-token-format overrides (operator-only opt-in to JWT).
+  #[serde(default)]
+  pub client_access_token_formats: Vec<ClientTokenFormatEntry>,
 }
 
 /// A declarative scope.
@@ -69,6 +75,28 @@ pub struct EntitlementEntry {
   pub scope: String,
 }
 
+/// A declarative resource server (RFC 8707 resource indicator).
+#[derive(Debug, Deserialize)]
+pub struct ResourceServerEntry {
+  /// Exact RFC 8707 resource identifier.
+  pub identifier: String,
+  /// Optional description.
+  #[serde(default)]
+  pub description: Option<String>,
+  /// Whether the resource server is enabled (default true).
+  #[serde(default = "default_true")]
+  pub enabled: bool,
+}
+
+/// A declarative per-client access-token format.
+#[derive(Debug, Deserialize)]
+pub struct ClientTokenFormatEntry {
+  /// OAuth client identifier.
+  pub client_id: String,
+  /// Access-token format: `opaque` (default) or `jwt`.
+  pub access_token_format: String,
+}
+
 /// A declarative client attachment.
 #[derive(Debug, Deserialize)]
 pub struct AttachmentEntry {
@@ -93,10 +121,16 @@ pub struct SyncReport {
   pub redirects_created: u64,
   /// Redirect URIs updated.
   pub redirects_updated: u64,
+  /// Resource servers inserted.
+  pub resource_servers_created: u64,
+  /// Resource servers updated.
+  pub resource_servers_updated: u64,
   /// Entitlements inserted.
   pub entitlements_added: u64,
   /// Attachments inserted.
   pub attachments_added: u64,
+  /// Client access-token formats changed.
+  pub client_formats_set: u64,
 }
 
 impl SyncReport {
@@ -107,8 +141,11 @@ impl SyncReport {
       && self.scopes_updated == 0
       && self.redirects_created == 0
       && self.redirects_updated == 0
+      && self.resource_servers_created == 0
+      && self.resource_servers_updated == 0
       && self.entitlements_added == 0
       && self.attachments_added == 0
+      && self.client_formats_set == 0
   }
 }
 
@@ -116,13 +153,17 @@ impl fmt::Display for SyncReport {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(
       f,
-      "config sync: scopes +{} ~{}; redirects +{} ~{}; entitlements +{}; attachments +{}",
+      "config sync: scopes +{} ~{}; redirects +{} ~{}; resource_servers +{} ~{}; \
+       entitlements +{}; attachments +{}; client_formats {}",
       self.scopes_created,
       self.scopes_updated,
       self.redirects_created,
       self.redirects_updated,
+      self.resource_servers_created,
+      self.resource_servers_updated,
       self.entitlements_added,
-      self.attachments_added
+      self.attachments_added,
+      self.client_formats_set
     )
   }
 }
@@ -180,6 +221,21 @@ pub async fn apply(context: &Context, file: &SyncFile) -> Result<SyncReport, Cli
     }
   }
 
+  for entry in &file.resource_servers {
+    match resource::upsert(
+      context,
+      &entry.identifier,
+      entry.description.as_deref(),
+      entry.enabled,
+    )
+    .await?
+    {
+      scope::Upsert::Created => report.resource_servers_created += 1,
+      scope::Upsert::Updated => report.resource_servers_updated += 1,
+      scope::Upsert::Unchanged => {}
+    }
+  }
+
   for entry in &file.user_scopes {
     let user_id = super::user::find_user_id(context, &entry.email).await?;
     report.entitlements_added += sqlx::query(
@@ -199,6 +255,25 @@ pub async fn apply(context: &Context, file: &SyncFile) -> Result<SyncReport, Cli
     let redirect_id = redirect::find_redirect_id(context, &entry.uri, &entry.kind).await?;
     report.attachments_added +=
       u64::from(redirect_repo::attach(context.pool(), &entry.client_id, redirect_id, None).await?);
+  }
+
+  for entry in &file.client_access_token_formats {
+    if !matches!(entry.access_token_format.as_str(), "opaque" | "jwt") {
+      return Err(CliError::Input(format!(
+        "invalid access_token_format {} for client {}",
+        entry.access_token_format, entry.client_id
+      )));
+    }
+    redirect::ensure_client_exists(context, &entry.client_id).await?;
+    if client_repo::set_access_token_format(
+      context.pool(),
+      &entry.client_id,
+      &entry.access_token_format,
+    )
+    .await?
+    {
+      report.client_formats_set += 1;
+    }
   }
 
   audit("config.sync", &report.to_string());

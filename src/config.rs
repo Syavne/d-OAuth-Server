@@ -28,6 +28,7 @@ use crate::keys::KeyRing;
 
 mod build;
 pub mod db;
+mod jwt;
 pub mod policy;
 mod raw;
 pub mod redis;
@@ -36,10 +37,10 @@ pub mod scope;
 mod tests;
 pub mod types;
 
-use raw::RawConfig;
-
 pub use db::DbConfig;
+pub use jwt::{JwtPublicJwk, JwtSigningAlg, JwtSigningKey};
 pub use policy::{FailMode, FailurePolicy, RetryableClass};
+use raw::RawConfig;
 pub use redis::{DurabilityMode, RedisConfig, RedisTopology};
 pub use scope::{ClientClass, GrantKind, ScopeDefinition, TokenExchangeRule};
 pub use types::{
@@ -107,6 +108,29 @@ pub struct Config {
   pub allow_token_exchange: bool,
   /// Explicit `(caller, subject, scopes)` allowlist for token exchange.
   pub token_exchange_allowlist: Vec<TokenExchangeRule>,
+  /// Whether RFC 8707 `resource` indicators are honored (default false).
+  pub resource_indicators_enabled: bool,
+  /// Whether Client ID Metadata Document lookup is enabled (default false).
+  pub cimd_enabled: bool,
+  /// Whether RFC 9728 `protected_resources` metadata is emitted (default false).
+  pub protected_resources_enabled: bool,
+  /// Explicit protected-resource identifiers advertised in metadata.
+  pub protected_resource_ids: Vec<String>,
+  /// Whether the RFC 8252 host `localhost` loopback redirect is accepted
+  /// (default false; `127.0.0.1`/`[::1]` remain loopback regardless).
+  pub allow_localhost_redirect: bool,
+  /// Global kill-switch for JWT access tokens (default false).
+  pub jwt_access_tokens_enabled: bool,
+  /// Active JWT signing key (absent unless configured).
+  pub jwt_signing_key: Option<JwtSigningKey>,
+  /// Rotated-out JWT signing keys retained for verification only.
+  pub jwt_signing_previous_keys: Vec<JwtSigningKey>,
+  /// Algorithm used to sign JWT access tokens (default `ES256`).
+  pub jwt_access_token_signing_alg: JwtSigningAlg,
+  /// CIMD document fetch timeout (default 5 s, allowed 1-10 s).
+  pub cimd_fetch_timeout: std::time::Duration,
+  /// CIMD document byte cap (default 5120, allowed 1-5120).
+  pub cimd_max_bytes: usize,
 }
 
 impl fmt::Debug for Config {
@@ -136,6 +160,29 @@ impl fmt::Debug for Config {
         "token_exchange_allowlist_len",
         &self.token_exchange_allowlist.len(),
       )
+      .field(
+        "resource_indicators_enabled",
+        &self.resource_indicators_enabled,
+      )
+      .field("cimd_enabled", &self.cimd_enabled)
+      .field(
+        "protected_resources_enabled",
+        &self.protected_resources_enabled,
+      )
+      .field("protected_resource_ids", &self.protected_resource_ids)
+      .field("allow_localhost_redirect", &self.allow_localhost_redirect)
+      .field("jwt_access_tokens_enabled", &self.jwt_access_tokens_enabled)
+      .field("jwt_signing_key", &self.jwt_signing_key)
+      .field(
+        "jwt_signing_previous_keys_len",
+        &self.jwt_signing_previous_keys.len(),
+      )
+      .field(
+        "jwt_access_token_signing_alg",
+        &self.jwt_access_token_signing_alg,
+      )
+      .field("cimd_fetch_timeout", &self.cimd_fetch_timeout)
+      .field("cimd_max_bytes", &self.cimd_max_bytes)
       .finish_non_exhaustive()
   }
 }
@@ -358,6 +405,29 @@ pub enum ConfigError {
     /// The configuration key that carried the weak material.
     key: &'static str,
   },
+  /// A configured JWT signing key could not be turned into a usable JOSE
+  /// signing key (all-zero or out-of-range EC scalar, malformed material).
+  #[error("invalid JWT signing key material for {key}")]
+  InvalidJwtSigningKey {
+    /// The configuration key that carried the invalid material.
+    key: &'static str,
+  },
+  /// JWT access tokens were enabled (or previous keys given) without an
+  /// active signing key.
+  #[error("jwt_access_tokens_enabled requires jwt_signing_key")]
+  MissingJwtSigningKey,
+  /// A `jwt_signing_previous_keys` entry reused an active or previous kid.
+  #[error("duplicate JWT signing key id: {kid}")]
+  DuplicateJwtSigningKid {
+    /// The duplicated key id.
+    kid: String,
+  },
+  /// The CIMD fetch timeout was outside the 1-10 second window.
+  #[error("cimd_fetch_timeout_secs must be between 1 and 10 seconds")]
+  InvalidCimdFetchTimeout,
+  /// The CIMD document byte cap was zero or above 5120 bytes.
+  #[error("cimd_max_bytes must be between 1 and 5120 bytes")]
+  InvalidCimdMaxBytes,
   /// Argon2 parameters were outside the safe range.
   #[error("invalid argon2 parameters")]
   InvalidArgon2Params,

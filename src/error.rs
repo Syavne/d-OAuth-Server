@@ -569,11 +569,12 @@ impl From<crate::crypto::field::FieldError> for AppError {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
   use axum::body::Bytes;
   use axum::http::{HeaderMap, header};
   use http_body_util::BodyExt as _;
   use serde_json::Value;
+
+  use super::*;
 
   /// Drive an `AppError` through `IntoResponse` and collect its status,
   /// headers, and parsed JSON body.
