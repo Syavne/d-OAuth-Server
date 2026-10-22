@@ -216,6 +216,7 @@ async fn test_grant_device_concurrent_poll_mints_once() -> TestResult {
     token_format: TokenFormat::Opaque,
     jwt_signer: None,
     cimd: None,
+    resource_indicators_enabled: false,
     now_unix: t1,
   };
   let mut right_state = PollState {
@@ -230,6 +231,7 @@ async fn test_grant_device_concurrent_poll_mints_once() -> TestResult {
     token_format: TokenFormat::Opaque,
     jwt_signer: None,
     cimd: None,
+    resource_indicators_enabled: false,
     now_unix: t1,
   };
   let (left, right) = tokio::join!(

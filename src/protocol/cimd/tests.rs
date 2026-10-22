@@ -708,9 +708,10 @@ async fn cimd_single_flight_waiter_observes_negative() -> TestResult {
   }
 }
 
-/// A fresh-fetch validation failure is short-cached under `cimd:invalid:`: a
-/// later resolve for the same URL fails fast with `Fetch` without a network
-/// fetch, and the marker TTL is the 2-second completion window.
+/// A fresh-fetch validation failure is short-cached under `cimd:invalid:`
+/// with its class marker: a later resolve for the same URL fails fast with
+/// the original error class without a network fetch, and the marker TTL is
+/// the 2-second completion window.
 #[tokio::test]
 async fn cimd_invalid_cache_blocks_fetch() -> TestResult {
   let manager = crate::test_support::redis_manager()
@@ -718,56 +719,60 @@ async fn cimd_invalid_cache_blocks_fetch() -> TestResult {
     .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
   let mut conn = RedisConn::Single(manager);
   let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
-  let url = "https://client.invalid/invalid-cached.json";
-  let key = invalid_cache_key(&prefix, url);
-  if !key.starts_with(&prefix) || !key.contains("cimd:invalid:") || key.contains("client.invalid") {
-    return Err(TestError::Unexpected(format!("bad invalid key {key}")));
-  }
-  redis::cmd("SET")
-    .arg(&key)
-    .arg("1")
-    .arg("EX")
-    .arg(2)
-    .query_async::<()>(&mut conn)
-    .await
-    .map_err(|error| TestError::Unexpected(format!("invalid seed: {error}")))?;
   let enabled = scopes();
-  match resolve(
-    &mut conn,
-    &prefix,
-    url,
-    &CimdValidation {
-      enabled_scopes: &enabled,
-      allow_localhost: false,
-    },
-    CimdLimits {
-      max_bytes: 5_120,
-      timeout: Duration::from_secs(1),
-    },
-  )
-  .await
-  {
-    Err(CimdError::Fetch) => {}
-    Err(other) => {
+  for (marker, expected_redirect) in [("metadata", false), ("redirect", true)] {
+    let url = format!("https://client.invalid/invalid-cached-{marker}.json");
+    let key = invalid_cache_key(&prefix, &url);
+    if !key.starts_with(&prefix) || !key.contains("cimd:invalid:") || key.contains("client.invalid")
+    {
+      return Err(TestError::Unexpected(format!("bad invalid key {key}")));
+    }
+    redis::cmd("SET")
+      .arg(&key)
+      .arg(marker)
+      .arg("EX")
+      .arg(2)
+      .query_async::<()>(&mut conn)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("invalid seed: {error}")))?;
+    match resolve(
+      &mut conn,
+      &prefix,
+      &url,
+      &CimdValidation {
+        enabled_scopes: &enabled,
+        allow_localhost: false,
+      },
+      CimdLimits {
+        max_bytes: 5_120,
+        timeout: Duration::from_secs(1),
+      },
+    )
+    .await
+    {
+      Err(CimdError::InvalidRedirectUri) if expected_redirect => {}
+      Err(CimdError::InvalidJson) if !expected_redirect => {}
+      Err(other) => {
+        return Err(TestError::Unexpected(format!(
+          "{marker}-cache hit must replay its class, got {other}"
+        )));
+      }
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "invalid-cache hit fetched or accepted a document".to_owned(),
+        ));
+      }
+    }
+    let ttl: i64 = redis::cmd("TTL")
+      .arg(&key)
+      .query_async(&mut conn)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("invalid ttl: {error}")))?;
+    if ttl <= 0 || ttl > 2 {
       return Err(TestError::Unexpected(format!(
-        "invalid-cache hit must be Fetch, got {other}"
+        "invalid key must carry a 2 s TTL, got {ttl}"
       )));
     }
-    Ok(_) => {
-      return Err(TestError::Unexpected(
-        "invalid-cache hit fetched or accepted a document".to_owned(),
-      ));
-    }
-  }
-  let ttl: i64 = redis::cmd("TTL")
-    .arg(&key)
-    .query_async(&mut conn)
-    .await
-    .map_err(|error| TestError::Unexpected(format!("invalid ttl: {error}")))?;
-  if ttl <= 0 || ttl > 2 {
-    return Err(TestError::Unexpected(format!(
-      "invalid key must carry a 2 s TTL, got {ttl}"
-    )));
   }
   Ok(())
 }

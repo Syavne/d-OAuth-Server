@@ -284,9 +284,10 @@ pub fn query_pairs(raw: Option<&str>) -> Result<Vec<(String, String)>, Transport
 ///
 /// An empty input pins an empty set without touching the catalog. Otherwise
 /// the flag must be on (off + any `resource` present is `invalid_target`,
-/// never a silent drop), every value must be an absolute `https` URI — no
-/// loopback exception applies to audiences — and must exactly match an
-/// enabled `resource_servers` row. Returns the sorted deduped set for
+/// never a silent drop), every value must be an absolute `https` URI with a
+/// host and no userinfo, query, or fragment — no loopback exception applies
+/// to audiences — and must exactly match an enabled `resource_servers` row.
+/// Returns the sorted deduped set for
 /// pinning into `PendingAuth.aud` / PAR / code / device records; values are
 /// never delimiter-joined and scopes are never widened here.
 ///
@@ -325,13 +326,29 @@ pub async fn validate_resources(
   }
   let mut aud = Vec::with_capacity(distinct.len());
   for value in distinct {
-    let absolute_https = reqwest::Url::parse(value)
-      .ok()
-      .filter(|url| url.scheme() == "https" && url.has_host())
-      .is_some();
-    if !absolute_https {
+    let Ok(url) = reqwest::Url::parse(value) else {
       return Err(AppError::invalid_target(
         "resource must be an absolute https URI",
+      ));
+    };
+    if url.scheme() != "https" || !url.has_host() {
+      return Err(AppError::invalid_target(
+        "resource must be an absolute https URI",
+      ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+      return Err(AppError::invalid_target(
+        "resource must not contain userinfo",
+      ));
+    }
+    if url.fragment().is_some() {
+      return Err(AppError::invalid_target(
+        "resource must not contain a fragment",
+      ));
+    }
+    if url.query().is_some() {
+      return Err(AppError::invalid_target(
+        "resource must not contain a query",
       ));
     }
     let known = resource_repo::find_enabled(pool, value).await?.is_some();

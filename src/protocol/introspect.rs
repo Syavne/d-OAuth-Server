@@ -185,14 +185,15 @@ pub struct IntrospectHttpInputs<'a> {
   pub assertion: Option<&'a str>,
   /// Verified peer chain injected by the TLS accept loop, when present.
   pub peer_certs: Option<&'a PeerCertificates>,
-  /// Validated, sorted, deduped `resource` values from the repeated form
-  /// parameter.
+  /// Raw repeated `resource` values from the form body, in wire order.
   ///
   /// This is a LOCAL EXTENSION to RFC 7662: the RFC defines no `resource`
-  /// parameter for introspection. When non-empty, the located token's `aud`
-  /// must include every requested member (see [`audience_includes`]) or the
-  /// response collapses to the inactive shape. An empty slice keeps
-  /// introspection audience-agnostic, exactly as RFC 7662 specifies.
+  /// parameter for introspection. The core validates the set against the
+  /// catalog AFTER authenticating the caller; when non-empty and valid, the
+  /// located token's `aud` must include every requested member (see
+  /// [`audience_includes`]) or the response collapses to the inactive shape.
+  /// An empty slice keeps introspection audience-agnostic, exactly as
+  /// RFC 7662 specifies.
   pub resource: &'a [String],
 }
 
@@ -214,6 +215,10 @@ pub struct IntrospectContext<'a> {
   pub issuer: &'a str,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
+  /// Config `resource_indicators_enabled`: the presented `resource` set is
+  /// catalog-validated after authentication, so an unauthenticated caller
+  /// observes `invalid_client` (HTTP 401) before any catalog error.
+  pub resource_indicators_enabled: bool,
   /// CIMD resolution settings for a registration-free fallback; `None` when
   /// `config.cimd_enabled` is off. Only `private_key_jwt` documents may
   /// introspect (RFC 7662 §2.3): a `none` principal is still rejected in
@@ -283,8 +288,19 @@ pub async fn introspect(
   }
   let client = authenticate(stores, ctx, inputs).await?;
 
+  // The presented set is catalog-validated AFTER authentication, so an
+  // unauthenticated caller observes `invalid_client` (HTTP 401) before any
+  // catalog error. The validated set feeds both the opaque filter below and
+  // the JWT path.
+  let validated = crate::protocol::params::validate_resources(
+    stores.pool,
+    ctx.resource_indicators_enabled,
+    inputs.resource,
+  )
+  .await?;
+
   if is_jwt_shape(raw) {
-    return introspect_jwt(stores, ctx, inputs, &client, raw).await;
+    return introspect_jwt(stores, ctx, &client, &validated, raw).await;
   }
   let prefer_refresh = inputs.token_type_hint == Some(REFRESH_TOKEN_HINT);
   let located = locate(ctx.service, stores.conn, stores.store, raw, prefer_refresh)
@@ -321,7 +337,7 @@ pub async fn introspect(
   // A pinned superset stays active; a missing member is indistinguishable
   // from an unknown token, so it collapses to the §2.2 inactive shape rather
   // than an error.
-  if !inputs.resource.is_empty() && !audience_includes(&located.aud, inputs.resource) {
+  if !validated.is_empty() && !audience_includes(&located.aud, &validated) {
     return Ok(IntrospectionResponse::inactive());
   }
   active_response(stores, ctx, located).await
@@ -377,8 +393,8 @@ fn audience_includes(bound: &[String], requested: &[String]) -> bool {
 async fn introspect_jwt(
   stores: &mut IntrospectStores<'_>,
   ctx: &IntrospectContext<'_>,
-  inputs: &IntrospectHttpInputs<'_>,
   client: &Client,
+  validated: &[String],
   raw: &str,
 ) -> Result<IntrospectionResponse, AppError> {
   let signer = match ctx.jwt_signer {
@@ -408,7 +424,7 @@ async fn introspect_jwt(
   if !subject_live {
     return Ok(IntrospectionResponse::inactive());
   }
-  if !inputs.resource.is_empty() && !audience_includes(&claims.aud, inputs.resource) {
+  if !validated.is_empty() && !audience_includes(&claims.aud, validated) {
     return Ok(IntrospectionResponse::inactive());
   }
   let token_type = if claims.cnf.as_ref().is_some_and(|cnf| cnf.jkt.is_some()) {
@@ -667,12 +683,14 @@ pub async fn read_act(
 /// lossily accepted raw non-UTF-8 bytes); a repeated known field is JSON
 /// `invalid_request` (the old `Form` returned 422 `Failed to deserialize
 /// form body`, so the new JSON 400 is the intended contract, not parity).
-/// A present `resource` indicator (RFC 8707) validates fail-closed
-/// (`invalid_target`) before any lookup runs.
+/// A present `resource` indicator (RFC 8707) is captured raw and handed to
+/// [`introspect`], which validates it fail-closed (`invalid_target`) only
+/// after authenticating the caller — an unauthenticated caller observes
+/// `invalid_client` (HTTP 401) first.
 ///
 /// RFC 7662 defines no `resource` parameter. This endpoint accepts it as a
-/// LOCAL EXTENSION: the validated set is handed to [`introspect`], which
-/// reports a token inactive unless its `aud` includes every requested value.
+/// LOCAL EXTENSION: the validated set filters the response, which reports a
+/// token inactive unless its `aud` includes every requested value.
 /// `revoke` and the token-exchange subject-token lookup stay
 /// audience-agnostic.
 pub async fn handler(
@@ -703,16 +721,6 @@ pub async fn handler(
   let form = IntrospectForm::from_map(&map);
   let resources =
     crate::protocol::params::values_of(&pairs, crate::protocol::params::RESOURCE_PARAM);
-  let resources = match crate::protocol::params::validate_resources(
-    &state.pool,
-    state.config.resource_indicators_enabled,
-    &resources,
-  )
-  .await
-  {
-    Ok(resources) => resources,
-    Err(error) => return error.into_response(),
-  };
   let basic_header = headers
     .get(axum::http::header::AUTHORIZATION)
     .and_then(|value| value.to_str().ok());
@@ -739,6 +747,7 @@ pub async fn handler(
   let ctx = IntrospectContext {
     issuer: &state.config.issuer,
     now_unix: state.clock.now().unix_timestamp(),
+    resource_indicators_enabled: state.config.resource_indicators_enabled,
     cimd: state
       .config
       .cimd_enabled

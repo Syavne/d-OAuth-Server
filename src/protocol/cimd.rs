@@ -297,6 +297,53 @@ impl From<CimdError> for AppError {
   }
 }
 
+/// The class of a short-cached fresh-fetch validation failure. It is stored as
+/// a tiny marker in `cimd:invalid:<sha256>` so a retry replays the original
+/// client-visible error: a bad redirect set keeps `invalid_redirect_uri`;
+/// every other validation failure stays `invalid_client_metadata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidClass {
+  /// [`CimdError::InvalidRedirectUri`].
+  Redirect,
+  /// Every other validation failure, replayed as [`CimdError::InvalidJson`].
+  Metadata,
+}
+
+impl InvalidClass {
+  /// The stored marker value.
+  const fn marker(self) -> &'static str {
+    match self {
+      Self::Redirect => "redirect",
+      Self::Metadata => "metadata",
+    }
+  }
+
+  /// Classify a validation failure.
+  const fn of(error: &CimdError) -> Self {
+    match error {
+      CimdError::InvalidRedirectUri => Self::Redirect,
+      _ => Self::Metadata,
+    }
+  }
+
+  /// Replay a stored marker. An unknown marker (a legacy `"1"` or a corrupt
+  /// entry) fails closed as the generic metadata class.
+  const fn from_marker(raw: &str) -> Self {
+    match raw.as_bytes() {
+      b"redirect" => Self::Redirect,
+      _ => Self::Metadata,
+    }
+  }
+
+  /// The client-visible error replayed for this class.
+  const fn to_error(self) -> CimdError {
+    match self {
+      Self::Redirect => CimdError::InvalidRedirectUri,
+      Self::Metadata => CimdError::InvalidJson,
+    }
+  }
+}
+
 /// The cache key for a validated document: `{state}`-prefixed
 /// `cimd:<sha256(url)>`.
 ///
@@ -517,8 +564,10 @@ pub async fn fetch_and_validate(
 /// An origin-level fetch failure (`Fetch`/`InvalidJson`) is negatively cached
 /// for 30 seconds under `cimd:neg:<sha256(url)>`. A fresh-fetch validation
 /// failure is short-cached for [`INVALID_CACHE_TTL_SECS`] under
-/// `cimd:invalid:<sha256(url)>` as a single-flight completion marker, so a
-/// corrected document is seen within that short window; a validation failure
+/// `cimd:invalid:<sha256(url)>` as a single-flight completion marker tagged
+/// with the failure class (`redirect` or `metadata`), so a retry replays the
+/// original client-visible error and a corrected document is seen within that
+/// short window; a validation failure
 /// on a cached document writes no marker. A cached document is revalidated so
 /// catalog changes are honored during the 15-minute TTL. If the cache write
 /// after a successful validation fails, the validated document is still
@@ -555,8 +604,8 @@ pub async fn resolve(
   if let Some(document) = get_cached(conn, &key).await? {
     return validate_document(client_id_url, &document, validation);
   }
-  if is_invalid_cached(conn, &invalid_key).await? {
-    return Err(CimdError::Fetch);
+  if let Some(error) = is_invalid_cached(conn, &invalid_key).await? {
+    return Err(error);
   }
 
   let ttl_ms = lock_ttl_ms(limits);
@@ -587,8 +636,8 @@ pub async fn resolve(
     if let Some(document) = get_cached(conn, &key).await? {
       return validate_document(client_id_url, &document, validation);
     }
-    if is_invalid_cached(conn, &invalid_key).await? {
-      return Err(CimdError::Fetch);
+    if let Some(error) = is_invalid_cached(conn, &invalid_key).await? {
+      return Err(error);
     }
     // A holder that failed validation releases without a cache entry; stop
     // waiting as soon as the lock is gone and try to elect the next fetcher.
@@ -642,8 +691,8 @@ async fn resolve_under_lock(
   if let Some(document) = get_cached(conn, key).await? {
     return validate_document(client_id_url, &document, validation);
   }
-  if is_invalid_cached(conn, invalid_key).await? {
-    return Err(CimdError::Fetch);
+  if let Some(error) = is_invalid_cached(conn, invalid_key).await? {
+    return Err(error);
   }
   let document = match fetch_document(client_id_url, limits).await {
     Ok(document) => document,
@@ -656,7 +705,10 @@ async fn resolve_under_lock(
   let validated = match validate_document(client_id_url, &document, validation) {
     Ok(validated) => validated,
     Err(error) => {
-      if put_invalid(conn, invalid_key).await.is_err() {
+      if put_invalid(conn, invalid_key, InvalidClass::of(&error))
+        .await
+        .is_err()
+      {
         tracing::warn!("cimd invalid-document marker write failed");
       }
       return Err(error);
@@ -799,22 +851,35 @@ async fn put_negative(conn: &mut RedisConn, neg_key: &str) -> Result<(), CimdErr
     .map_err(cache_backend)
 }
 
-/// Whether a fresh-fetch validation failure is short-cached. A Redis failure
-/// is fail-closed [`CimdError::Backend`].
-async fn is_invalid_cached(conn: &mut RedisConn, invalid_key: &str) -> Result<bool, CimdError> {
-  let present: bool = redis::cmd("EXISTS")
+/// The class of a short-cached fresh-fetch validation failure; `None` when no
+/// marker is present. A Redis failure is fail-closed [`CimdError::Backend`].
+async fn is_invalid_cached(
+  conn: &mut RedisConn,
+  invalid_key: &str,
+) -> Result<Option<CimdError>, CimdError> {
+  let raw: Option<String> = redis::cmd("GET")
     .arg(invalid_key)
     .query_async(conn)
     .await
     .map_err(cache_backend)?;
-  Ok(present)
+  Ok(
+    raw
+      .as_deref()
+      .map(InvalidClass::from_marker)
+      .map(InvalidClass::to_error),
+  )
 }
 
-/// Record a fresh-fetch validation failure for [`INVALID_CACHE_TTL_SECS`].
-async fn put_invalid(conn: &mut RedisConn, invalid_key: &str) -> Result<(), CimdError> {
+/// Record a fresh-fetch validation failure for [`INVALID_CACHE_TTL_SECS`],
+/// tagged with its client-visible class so a retry replays it.
+async fn put_invalid(
+  conn: &mut RedisConn,
+  invalid_key: &str,
+  class: InvalidClass,
+) -> Result<(), CimdError> {
   redis::cmd("SET")
     .arg(invalid_key)
-    .arg("1")
+    .arg(class.marker())
     .arg("EX")
     .arg(INVALID_CACHE_TTL_SECS)
     .query_async::<()>(conn)

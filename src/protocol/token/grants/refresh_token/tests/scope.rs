@@ -235,6 +235,7 @@ async fn grant_refresh_narrow_drops_revoked_from_refresh_scope() -> TestResult {
       refresh_token: &minted.refresh_token,
       requested_scope: Some("read"),
       requested_resources: &[],
+      resource_indicators_enabled: false,
       proof: &proof,
       enabled: &enabled,
       client_registered: &registered,

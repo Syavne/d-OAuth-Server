@@ -247,6 +247,7 @@ async fn run_core_full(
   let ctx = IntrospectContext {
     issuer: &h.config.issuer,
     now_unix: now_unix(),
+    resource_indicators_enabled: true,
     cimd: None,
     service: &service,
     jwt_signer: signer.as_ref(),
@@ -398,6 +399,28 @@ async fn test_introspect_unauthenticated_is_401() -> TestResult {
   assert_eq!(
     body.get("error").and_then(Value::as_str),
     Some("invalid_client")
+  );
+  Ok(())
+}
+
+/// Authentication precedes catalog validation: an unauthenticated caller
+/// presenting an unknown `resource` observes `invalid_client` 401, never
+/// `invalid_target`.
+#[tokio::test]
+async fn test_introspect_unauthenticated_with_unknown_resource_is_401() -> TestResult {
+  let h = harness().await?;
+  let (status, body) = post_form(
+    router(&h),
+    None,
+    "token=whatever&resource=https://ghost.introspect.test/",
+  )
+  .await?;
+
+  assert_eq!(status, StatusCode::UNAUTHORIZED);
+  assert_eq!(
+    body.get("error").and_then(Value::as_str),
+    Some("invalid_client"),
+    "auth must run before the catalog check"
   );
   Ok(())
 }

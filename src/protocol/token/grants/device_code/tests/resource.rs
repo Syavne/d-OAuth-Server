@@ -9,7 +9,9 @@
 use uuid::Uuid;
 
 use super::super::{DevicePollError, DevicePollInputs};
-use super::flows::{authorize_with_resources, decide, now_unix, poll_once, public_inputs};
+use super::flows::{
+  authorize_with_resources, decide, now_unix, poll_once, poll_once_with_flag, public_inputs,
+};
 use super::setup;
 use super::{TestError, TestResult, harness, unique};
 use crate::{
@@ -288,12 +290,111 @@ async fn device_poll_rejects_different_resource() -> TestResult {
   Ok(())
 }
 
-/// Authorization-side negatives: the flag gate and the catalog/scheme checks
-/// fail closed with `invalid_target` before any device record is written.
+/// A resource server disabled after authorization rejects the inheriting
+/// poll with `invalid_target` before minting: the grant is already consumed,
+/// so a retry observes `expired_token` and no token is ever issued for the
+/// dead audience.
+#[tokio::test]
+async fn device_poll_rejects_disabled_audience_without_minting() -> TestResult {
+  let mut h = harness().await?;
+  seed_catalog(&mut h, &[RES_A]).await?;
+  let (client_id, user_id) = public_client(&h).await?;
+  let t0 = now_unix();
+  let requested = vec![RES_A.to_owned()];
+  let issued = issue_approved(&mut h, &client_id, &user_id, &requested, t0).await?;
+  if !resource_repo::disable(&h.pool, RES_A).await? {
+    return Err(TestError::Unexpected(
+      "disable must update the seeded row".to_owned(),
+    ));
+  }
+
+  let (access_before, refresh_before) = minted_counts(&mut h).await?;
+  let t1 = t0 + crate::protocol::device::DEVICE_INTERVAL_SECS as i64 + 1;
+  match poll_once(&mut h, &inputs(&client_id, &issued.device_code, &[]), t1).await {
+    Err(DevicePollError::Protocol(error)) if is_invalid_target(&error) => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "disabled audience must be invalid_target, got {}",
+        other.code()
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "a disabled audience must never mint".to_owned(),
+      ));
+    }
+  }
+  let (access_after, refresh_after) = minted_counts(&mut h).await?;
+  if (access_before, refresh_before) != (access_after, refresh_after) {
+    return Err(TestError::Unexpected(
+      "a stale poll must not mint any token".to_owned(),
+    ));
+  }
+  // The grant was consumed by the failed poll: a retry is expired.
+  let t2 = t1 + crate::protocol::device::DEVICE_INTERVAL_SECS as i64 + 1;
+  match poll_once(&mut h, &inputs(&client_id, &issued.device_code, &[]), t2).await {
+    Err(DevicePollError::ExpiredToken) => Ok(()),
+    Err(other) => Err(TestError::Unexpected(format!(
+      "a consumed grant must be expired_token, got {}",
+      other.code()
+    ))),
+    Ok(_) => Err(TestError::Unexpected(
+      "a consumed grant must never mint".to_owned(),
+    )),
+  }
+}
+
+/// The flag turned off since authorization rejects the inheriting poll the
+/// same way, even though the catalog row is still enabled.
+#[tokio::test]
+async fn device_poll_rejects_stale_audience_when_flag_off() -> TestResult {
+  let mut h = harness().await?;
+  seed_catalog(&mut h, &[RES_A]).await?;
+  let (client_id, user_id) = public_client(&h).await?;
+  let t0 = now_unix();
+  let requested = vec![RES_A.to_owned()];
+  let issued = issue_approved(&mut h, &client_id, &user_id, &requested, t0).await?;
+
+  let (access_before, refresh_before) = minted_counts(&mut h).await?;
+  let t1 = t0 + crate::protocol::device::DEVICE_INTERVAL_SECS as i64 + 1;
+  match poll_once_with_flag(
+    &mut h,
+    &inputs(&client_id, &issued.device_code, &[]),
+    t1,
+    false,
+  )
+  .await
+  {
+    Err(DevicePollError::Protocol(error)) if is_invalid_target(&error) => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "flag-off audience must be invalid_target, got {}",
+        other.code()
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "a flag-off audience must never mint".to_owned(),
+      ));
+    }
+  }
+  let (access_after, refresh_after) = minted_counts(&mut h).await?;
+  if (access_before, refresh_before) != (access_after, refresh_after) {
+    return Err(TestError::Unexpected(
+      "a stale poll must not mint any token".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// Authorization-side negatives: once the caller is authenticated, the flag
+/// gate and the catalog/scheme checks fail closed with `invalid_target`
+/// before any device record is written.
 #[tokio::test]
 async fn device_authorization_rejects_resource_without_catalog() -> TestResult {
   let mut h = harness().await?;
   seed_catalog(&mut h, &[RES_A]).await?;
+  let (client_id, _) = public_client(&h).await?;
 
   let valid = vec![RES_A.to_owned()];
   let unknown = vec![RES_C.to_owned()];
@@ -305,7 +406,7 @@ async fn device_authorization_rejects_resource_without_catalog() -> TestResult {
     ("non-https identifier", insecure.as_slice(), true),
   ] {
     let inputs = DeviceHttpInputs {
-      client_id: "resource-negatives",
+      client_id: client_id.as_str(),
       scope: None,
       basic_header: None,
       body_secret: None,
@@ -333,6 +434,46 @@ async fn device_authorization_rejects_resource_without_catalog() -> TestResult {
         "{label} must not write a device record"
       )));
     }
+  }
+  Ok(())
+}
+
+/// Authentication runs before catalog validation: an unknown client
+/// presenting an unknown `resource` observes `invalid_client`, never
+/// `invalid_target`, and no device record is written.
+#[tokio::test]
+async fn device_authorization_rejects_unknown_client_before_catalog() -> TestResult {
+  let mut h = harness().await?;
+  seed_catalog(&mut h, &[RES_A]).await?;
+  let unknown = vec![RES_C.to_owned()];
+  let inputs = DeviceHttpInputs {
+    client_id: "ghost-client",
+    scope: None,
+    basic_header: None,
+    body_secret: None,
+    assertion_type: None,
+    assertion: None,
+    dpop_proof: None,
+    resource: unknown.as_slice(),
+    peer_certs: None,
+  };
+  match authorize_with_resources(&mut h, &inputs, now_unix(), true).await {
+    Err(error) if error.code() == OAuthErrorCode::InvalidClient => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "unknown client must be invalid_client, got {other}"
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "an unknown client must never issue a device code".to_owned(),
+      ));
+    }
+  }
+  if device_keys(&mut h).await? != 0 {
+    return Err(TestError::Unexpected(
+      "a rejected authorization must not write a device record".to_owned(),
+    ));
   }
   Ok(())
 }

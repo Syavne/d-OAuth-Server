@@ -63,6 +63,17 @@ pub(super) async fn poll_once(
   inputs: &DevicePollInputs<'_>,
   now: i64,
 ) -> Result<DeviceTokenResponse, DevicePollError> {
+  poll_once_with_flag(h, inputs, now, true).await
+}
+
+/// Poll with an explicit `resource_indicators_enabled` flag, for the stale
+/// catalog and flag-off negatives.
+pub(super) async fn poll_once_with_flag(
+  h: &mut Harness,
+  inputs: &DevicePollInputs<'_>,
+  now: i64,
+  resource_indicators_enabled: bool,
+) -> Result<DeviceTokenResponse, DevicePollError> {
   let mut state = PollState {
     pool: &h.pool,
     conn: &mut h.conn,
@@ -75,6 +86,7 @@ pub(super) async fn poll_once(
     token_format: TokenFormat::Opaque,
     jwt_signer: None,
     cimd: None,
+    resource_indicators_enabled,
     now_unix: now,
   };
   poll_device(&mut state, inputs).await

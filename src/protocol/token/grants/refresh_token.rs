@@ -60,12 +60,12 @@ pub struct RefreshInput<'a> {
   pub refresh_token: &'a str,
   /// Raw `scope` parameter, or `None` when omitted (keeps the grant scope).
   pub requested_scope: Option<&'a str>,
-  /// Validated RFC 8707 §2 `resource` set for this request, in the handler's
+  /// Catalog-validated RFC 8707 §2 `resource` set for this request, in
   /// sorted deduped order; empty when the request carried no `resource`
   /// (RFC 8707 §2.2: the grant keeps its full original audience, NOT §3's
-  /// empty set). The token handler already rejected a disabled gate, a
-  /// non-`https` value, and any value outside the enabled catalog with
-  /// `invalid_target`, so this set is catalog-bounded on entry.
+  /// empty set). The dispatcher validates the presented set against the
+  /// catalog after client authentication, so this set is catalog-bounded on
+  /// entry.
   pub requested_resources: &'a [String],
   /// Freshly verified proofs for this request (never a stored binding).
   pub proof: &'a SenderProof,
@@ -82,6 +82,11 @@ pub struct RefreshInput<'a> {
   /// today's behavior; `Jwt` returns a signed RFC 9068 `at+jwt` whose `aud`
   /// claim is the narrowed access set. The refresh half stays opaque.
   pub token_format: TokenFormat,
+  /// Config `resource_indicators_enabled`: the grant's stored audience is
+  /// re-validated against the CURRENT catalog before rotation, so a
+  /// disabled/deleted member (or a flag turned off since issuance) fails
+  /// `invalid_target` while the presented refresh token stays live.
+  pub resource_indicators_enabled: bool,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
 }
@@ -128,7 +133,9 @@ pub struct RefreshUserStores<'a> {
 /// replacement refresh token (draft-ietf-oauth-v2-1-16 §4.3.3), so a revoked
 /// entitlement or a removed client scope drops out on refresh instead of
 /// surviving for the token's whole lifetime while an explicit narrower
-/// request narrows only the access token (§4.3.1). The disabled check preserves unknown-token,
+/// request narrows only the access token (§4.3.1). The grant's stored
+/// audience is likewise re-checked against the current catalog before
+/// rotation (`invalid_target`, token stays live). The disabled check preserves unknown-token,
 /// tombstone-cascade, and proof-check behavior. A datastore failure propagates
 /// as an error.
 ///
@@ -155,6 +162,18 @@ pub async fn refresh_with_subject_check(
   let Some(found) = found else {
     return refresh(conn, store, service, input).await;
   };
+  // The stored audience is re-validated against the CURRENT catalog before
+  // anything is minted or rotated: a resource server disabled or deleted
+  // after issuance (or a flag turned off since) fails `invalid_target` while
+  // the presented refresh token stays live for a retry.
+  if !found.record.aud.is_empty() {
+    crate::protocol::params::validate_resources(
+      users.pool,
+      input.resource_indicators_enabled,
+      &found.record.aud,
+    )
+    .await?;
+  }
   if !found.record.subject.trim().is_empty()
     && matches!(
       user_repo::subject_account_status(users.pool, users.keys, &found.record.subject).await?,
@@ -180,6 +199,7 @@ pub async fn refresh_with_subject_check(
     client_registered: input.client_registered,
     user_entitled: &entitled,
     token_format: input.token_format,
+    resource_indicators_enabled: input.resource_indicators_enabled,
     now_unix: input.now_unix,
   };
   refresh(conn, store, service, &fresh).await

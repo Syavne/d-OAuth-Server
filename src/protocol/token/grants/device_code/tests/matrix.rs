@@ -215,6 +215,7 @@ async fn test_grant_device_confidential_secret_redeems_bearer() -> TestResult {
     token_format: TokenFormat::Opaque,
     jwt_signer: None,
     cimd: None,
+    resource_indicators_enabled: false,
     now_unix: t0 + 6,
   };
   let tokens = poll_device(&mut state, &poll_inputs)
@@ -289,6 +290,7 @@ async fn test_grant_device_dpop_bound_confidential_requires_fresh_proof() -> Tes
     token_format: TokenFormat::Opaque,
     jwt_signer: None,
     cimd: None,
+    resource_indicators_enabled: false,
     now_unix: t0 + 6,
   };
   match poll_device(&mut state, &poll_inputs).await {

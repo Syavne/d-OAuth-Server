@@ -153,7 +153,12 @@ never stand for an entire origin or a non-fetchable identifier. `create`
 upserts: it creates the row, updates its description, or leaves an unchanged
 row alone; it never silently re-enables an operator-disabled row, and `list`
 shows both states. `delete` removes the row outright (nothing references the
-catalog directly).
+catalog directly). Disabling or deleting an identifier stops new authorizations
+and, at mint time, refresh/device grants already bound to it: refresh fails
+`invalid_target` with the refresh token still live, device poll fails
+`invalid_target` with the code consumed, and auth-code redemption fails before
+consuming the code. Re-enable the identifier and the client re-authorizes (or
+retries the live refresh token).
 
 `client set-access-token-format --client-id <id> --format opaque|jwt` is the
 OPERATOR-ONLY opt-in to JWT access tokens for one client; `opaque` (the OAuth

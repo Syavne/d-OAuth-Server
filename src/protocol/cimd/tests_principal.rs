@@ -367,6 +367,7 @@ async fn redeem(
     ttl: &h.ttl,
     token_format: TokenFormat::Opaque,
     jwt_signer: None,
+    resource_indicators_enabled: false,
     cimd: Some(CimdSettings {
       token_prefix: &h.token_prefix,
       max_bytes: 5_120,
@@ -573,6 +574,7 @@ async fn cimd_none_unbound_gets_bearer() -> TestResult {
       client_registered: &registered,
       user_entitled: &entitled,
       token_format: TokenFormat::Opaque,
+      resource_indicators_enabled: false,
       now_unix: now_unix(),
     },
   )
@@ -949,6 +951,7 @@ async fn cimd_none_cannot_introspect() -> TestResult {
   let ctx = IntrospectContext {
     issuer: ISSUER,
     now_unix: now_unix(),
+    resource_indicators_enabled: false,
     cimd: Some(CimdSettings {
       token_prefix: &token_prefix,
       max_bytes: 5_120,

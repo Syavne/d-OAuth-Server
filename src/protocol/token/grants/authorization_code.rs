@@ -68,6 +68,10 @@ pub struct CodeGrantState<'a> {
   /// CIMD resolution settings for a registration-free fallback; `None` when
   /// `config.cimd_enabled` is off.
   pub cimd: Option<cimd::CimdSettings<'a>>,
+  /// Config `resource_indicators_enabled`: the presented `resource` set is
+  /// validated against the catalog after authentication and before the code
+  /// is consumed, so a bad value fails `invalid_target` without burning it.
+  pub resource_indicators_enabled: bool,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
 }
@@ -94,9 +98,10 @@ pub struct CodeGrantInputs<'a> {
   pub dpop_proof: Option<&'a str>,
   /// Verified peer chain injected by the TLS accept loop, when present.
   pub peer_certs: Option<&'a PeerCertificates>,
-  /// Validated resource audiences (RFC 8707) presented with this token
-  /// request, sorted and deduped by the handler; empty when the request
-  /// carried no `resource`. Must equal the set pinned into the code.
+  /// Raw repeated `resource` values (RFC 8707) presented with this token
+  /// request, in wire order; empty when the request carried no `resource`.
+  /// Validated against the catalog after authentication (before the code is
+  /// consumed); the validated set must equal the set pinned into the code.
   pub aud: &'a [String],
 }
 
@@ -119,7 +124,9 @@ pub struct CodeTokenResponse {
 
 /// Redeem an authorization code at the token endpoint (RFC 9700 §4.5.3).
 ///
-/// The client is authenticated, then the code is consumed atomically bound to
+/// The client is authenticated and its sender proofs verified first, then the
+/// presented resource set is catalog-validated (`invalid_target` while the
+/// code stays live), and only then is the code consumed atomically bound to
 /// the expected client id, redirect URI, and PKCE challenge: a foreign or
 /// mismatched presentation observes `Mismatched` and the victim record
 /// survives for its legitimate presenter, so a wrong, expired, or
@@ -189,6 +196,23 @@ pub async fn redeem_code(
     .ok_or_else(|| AppError::invalid_grant("code_verifier does not match code_challenge"))?;
   let expected_challenge = pkce::challenge_from_verifier(verifier)
     .map_err(|_| AppError::invalid_grant("code_verifier does not match code_challenge"))?;
+
+  // Authentication and sender-constraint checks run BEFORE the code is
+  // consumed, so a wrong client, a bad DPoP proof, or a catalog failure
+  // never burns a live code.
+  let proofs = fresh_proofs(state, &client, inputs, used_basic).await?;
+  require_dpop_binding(&client, &proofs)?;
+
+  // RFC 8707 §2: the presented set is catalog-validated before the consume,
+  // so a disabled flag, a non-`https` value, or an unknown/disabled member
+  // fails `invalid_target` while the code stays live for a retry.
+  let validated = crate::protocol::params::validate_resources(
+    state.pool,
+    state.resource_indicators_enabled,
+    inputs.aud,
+  )
+  .await?;
+
   let record = consume_code(
     state,
     inputs.code.trim(),
@@ -202,7 +226,7 @@ pub async fn redeem_code(
   // the authorization request pinned into the code. The code was consumed
   // above (single use), so a mismatch is terminal for it: fail closed with
   // `invalid_grant`, never mint.
-  if !crate::protocol::params::audience_binds(&record.aud, inputs.aud) {
+  if !crate::protocol::params::audience_binds(&record.aud, &validated) {
     return Err(AppError::invalid_grant(
       "resource indicators do not match this authorization code",
     ));
@@ -217,8 +241,6 @@ pub async fn redeem_code(
     ));
   }
 
-  let proofs = fresh_proofs(state, &client, inputs, used_basic).await?;
-  require_dpop_binding(&client, &proofs)?;
   if let Some(want) = non_empty(&record.cnf) {
     if proofs.dpop_jkt.as_deref().unwrap_or("") != want {
       return Err(AppError::invalid_grant(
@@ -721,6 +743,7 @@ mod tests {
       token_format: TokenFormat::Opaque,
       jwt_signer: None,
       cimd: None,
+      resource_indicators_enabled: true,
       now_unix: now,
     };
     super::redeem_code(&mut state, inputs).await
@@ -1166,6 +1189,66 @@ mod tests {
     Ok(())
   }
 
+  /// Authentication precedes catalog validation: a wrong secret with an
+  /// unknown `resource` observes `invalid_client`, never `invalid_target`,
+  /// and the code stays live for the legitimate retry.
+  #[tokio::test]
+  async fn code_wrong_secret_with_unknown_resource_is_invalid_client() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("auth-first");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::ClientSecretPost,
+      Some("code-secret"),
+      &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+    )
+    .await?;
+    let issued = issue_code(&mut h, &client_id, CodeClientKind::Confidential, None, &[]).await?;
+    let now = now_unix();
+
+    let ghost = vec!["https://ghost.example.test/".to_owned()];
+    let denied = CodeGrantInputs {
+      code: issued.code.as_str(),
+      redirect_uri: REDIRECT,
+      code_verifier: Some(VERIFIER),
+      client_id: Some(client_id.as_str()),
+      basic_header: None,
+      body_secret: Some(secret("wrong-secret")),
+      assertion_type: None,
+      assertion: None,
+      dpop_proof: None,
+      peer_certs: None,
+      aud: &ghost,
+    };
+    match redeem_once(&mut h, &denied, now).await {
+      Err(error) if error.code() == crate::error::OAuthErrorCode::InvalidClient => {}
+      Err(other) => {
+        return Err(TestError::Unexpected(format!(
+          "bad credentials must be invalid_client, got {other}"
+        )));
+      }
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "bad credentials must never mint".to_owned(),
+        ));
+      }
+    }
+    // The failed attempt must not burn the code: the legitimate presenter
+    // redeems the same value.
+    let retry = CodeGrantInputs {
+      body_secret: Some(secret("code-secret")),
+      aud: &[],
+      ..inputs_clone(&denied)
+    };
+    redeem_once(&mut h, &retry, now + 1)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("legitimate retry burned by bad auth: {error}"))
+      })?;
+    Ok(())
+  }
+
   #[tokio::test]
   async fn test_grant_code_wrong_verifier_rejected() -> TestResult {
     let mut h = harness().await?;
@@ -1425,6 +1508,7 @@ mod tests {
         client_registered: &enabled,
         user_entitled: &enabled,
         token_format: TokenFormat::Opaque,
+        resource_indicators_enabled: false,
         now_unix: now + 1,
       },
     )
@@ -1575,6 +1659,9 @@ mod tests {
       &[super::GRANT_TYPE_AUTHORIZATION_CODE],
     )
     .await?;
+    for value in [AUD_ONE, AUD_TWO, AUD_OTHER] {
+      resource_repo::upsert(&h.pool, value, "audience pinning test").await?;
+    }
     let pinned = vec![AUD_ONE.to_owned(), AUD_TWO.to_owned()];
     let now = now_unix();
 
@@ -1657,6 +1744,70 @@ mod tests {
     )
     .await?;
     expect_audience_rejected(&mut h, &code_inputs(&issued, &client_id, &[]), now_unix()).await
+  }
+
+  /// A code pinned to a resource that is disabled after issuance fails
+  /// `invalid_target` WITHOUT consuming the code: re-enabling the row lets
+  /// the same code redeem.
+  #[tokio::test]
+  async fn code_with_disabled_resource_is_invalid_target_without_consuming() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("stale-audience");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::ClientSecretPost,
+      Some("code-secret"),
+      &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+    )
+    .await?;
+    resource_repo::upsert(&h.pool, AUD_ONE, "stale audience test").await?;
+    let pinned = vec![AUD_ONE.to_owned()];
+    let issued = issue_code(
+      &mut h,
+      &client_id,
+      CodeClientKind::Confidential,
+      None,
+      &pinned,
+    )
+    .await?;
+    if !resource_repo::disable(&h.pool, AUD_ONE).await? {
+      return Err(TestError::Unexpected(
+        "disable must update the seeded row".to_owned(),
+      ));
+    }
+    let now = now_unix();
+
+    let inputs = code_inputs(&issued, &client_id, &pinned);
+    match redeem_once(&mut h, &inputs, now).await {
+      Err(error) if error.code() == crate::error::OAuthErrorCode::InvalidTarget => {}
+      Err(other) => {
+        return Err(TestError::Unexpected(format!(
+          "disabled audience must be invalid_target, got {other}"
+        )));
+      }
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "a disabled audience must never mint".to_owned(),
+        ));
+      }
+    }
+
+    // The failed redemption must not have burned the code: re-enable the row
+    // and redeem the same value.
+    sqlx::query("UPDATE resource_servers SET enabled = true WHERE identifier = $1")
+      .bind(AUD_ONE)
+      .execute(&h.pool)
+      .await?;
+    let tokens = redeem_once(&mut h, &code_inputs(&issued, &client_id, &pinned), now + 1)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("re-enabled redemption rejected: {error}")))?;
+    if tokens.access_token.is_empty() {
+      return Err(TestError::Unexpected(
+        "re-enabled redemption must mint an access token".to_owned(),
+      ));
+    }
+    Ok(())
   }
 
   /// Assert an audience mismatch fails as `invalid_grant` and never mints.
@@ -1879,6 +2030,7 @@ mod tests {
     let approved = ScopeSet::parse("orders:read")?;
     let entitled = ScopeSet::parse("orders:read orders:admin")?;
     let pinned = vec![AUD_ONE.to_owned()];
+    resource_repo::upsert(&h.pool, AUD_ONE, "jwt audience").await?;
     let issued = issuer
       .issue(
         &mut h.conn,
@@ -1933,6 +2085,7 @@ mod tests {
       token_format: TokenFormat::Jwt,
       jwt_signer: Some(signer.clone()),
       cimd: None,
+      resource_indicators_enabled: true,
     };
     let tokens = super::redeem_code(&mut state, &inputs)
       .await
@@ -2041,6 +2194,7 @@ mod tests {
         token_format: TokenFormat::Jwt,
         jwt_signer: Some(signer.clone()),
         cimd: None,
+        resource_indicators_enabled: false,
       };
       match super::redeem_code(&mut state, &inputs).await {
         Err(error) if error.code() == crate::error::OAuthErrorCode::InvalidTarget => {}
@@ -2070,6 +2224,7 @@ mod tests {
       token_format: TokenFormat::Jwt,
       jwt_signer: Some(signer),
       cimd: None,
+      resource_indicators_enabled: false,
     };
     match super::redeem_code(&mut retry, &inputs).await {
       Err(error) if error.code() == crate::error::OAuthErrorCode::InvalidGrant => Ok(()),

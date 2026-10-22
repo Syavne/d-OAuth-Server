@@ -73,6 +73,10 @@ pub struct PollState<'a> {
   /// CIMD resolution settings for a registration-free fallback; `None` when
   /// `config.cimd_enabled` is off.
   pub cimd: Option<crate::protocol::cimd::CimdSettings<'a>>,
+  /// Config `resource_indicators_enabled`: the presented `resource` set is
+  /// catalog-validated after authentication and before any device state is
+  /// read, so a bad value fails `invalid_target` without touching the grant.
+  pub resource_indicators_enabled: bool,
   /// Current time as seconds since the Unix epoch.
   pub now_unix: i64,
 }
@@ -95,10 +99,11 @@ pub struct DevicePollInputs<'a> {
   pub dpop_proof: Option<&'a str>,
   /// Verified peer chain injected by the TLS accept loop, when present.
   pub peer_certs: Option<&'a PeerCertificates>,
-  /// Validated resource audiences (RFC 8707 §2) presented with this poll,
-  /// sorted and deduped by the token handler; empty when the poll carried no
-  /// `resource`. Must equal the set pinned at authorization time (or be
-  /// inherited when empty: RFC 8707 §2.2).
+  /// Raw repeated `resource` values (RFC 8707 §2) presented with this poll,
+  /// in wire order; empty when the poll carried no `resource`. Validated
+  /// against the catalog after authentication; the validated set must equal
+  /// the set pinned at authorization time (or be inherited when empty:
+  /// RFC 8707 §2.2).
   pub aud: &'a [String],
 }
 
@@ -167,6 +172,17 @@ pub async fn poll_device(
   let proofs = proofs::fresh_proofs(state, &client, inputs).await?;
   require_dpop_binding(&client, &proofs)?;
 
+  // RFC 8707 §2: the presented set is catalog-validated after authentication
+  // and before any device state is read, so a disabled flag, a non-`https`
+  // value, or an unknown/disabled member fails `invalid_target` without
+  // touching the grant.
+  let validated = crate::protocol::params::validate_resources(
+    state.pool,
+    state.resource_indicators_enabled,
+    inputs.aud,
+  )
+  .await?;
+
   let device_hash = hash_token(state.keys, inputs.device_code.trim())?;
   let record = device_store::poll(state.conn, state.store, &device_hash)
     .await
@@ -194,7 +210,7 @@ pub async fn poll_device(
           kind,
           dpop_required: client.dpop_bound_access_tokens,
           proofs,
-          aud: inputs.aud,
+          aud: &validated,
           token_format: state.token_format,
           jwt_signer: state.jwt_signer.clone(),
         },

@@ -293,6 +293,45 @@ async fn params_http_and_relative_resources_are_invalid_target() -> TestResult {
   Ok(())
 }
 
+/// Userinfo, a query, and a fragment are rejected syntactically before any
+/// catalog lookup: even an exact matching row cannot make them acceptable.
+#[tokio::test]
+async fn params_resources_reject_userinfo_query_fragment() -> TestResult {
+  let (_db, pool) = crate::db::test_support::migrated_pool().await?;
+  for value in [
+    "https://user@api.example.test/path",
+    "https://user:pass@api.example.test/path",
+    "https://api.example.test/path?audience=x",
+    "https://api.example.test/path#frag",
+  ] {
+    // Seed the exact invalid shape: the syntactic gate must reject it before
+    // `resource_repo::find_enabled` could ever match this row.
+    resource_repo::upsert(&pool, value, "invalid shape").await?;
+    match validate_resources(&pool, true, &[value.to_owned()]).await {
+      Err(error) if error.code() == OAuthErrorCode::InvalidTarget => {}
+      Err(error) => {
+        return Err(format!("wrong code for {value}: {}", error.code()).into());
+      }
+      Ok(_) => {
+        return Err(format!("resource with userinfo/query/fragment accepted: {value}").into());
+      }
+    }
+  }
+  Ok(())
+}
+
+/// A clean absolute `https` resource with a path passes and pins.
+#[tokio::test]
+async fn params_valid_resource_with_path_passes() -> TestResult {
+  let (_db, pool) = crate::db::test_support::migrated_pool().await?;
+  resource_repo::upsert(&pool, "https://api.example.test/path", "api").await?;
+  let aud = validate_resources(&pool, true, &["https://api.example.test/path".to_owned()]).await?;
+  if aud != vec!["https://api.example.test/path".to_owned()] {
+    return Err(format!("clean resource must pass unchanged: {aud:?}").into());
+  }
+  Ok(())
+}
+
 /// Unknown and disabled catalog entries are `invalid_target`.
 #[tokio::test]
 async fn params_unknown_and_disabled_resources_are_invalid_target() -> TestResult {

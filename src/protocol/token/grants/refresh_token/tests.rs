@@ -15,6 +15,7 @@ mod recovery;
 mod reuse;
 mod rotation;
 mod scope;
+mod stale_audience;
 
 use std::{
   sync::atomic::{AtomicU64, Ordering},
@@ -213,6 +214,7 @@ fn input<'a>(
     refresh_token: token,
     requested_scope: scope,
     requested_resources: &[],
+    resource_indicators_enabled: false,
     proof,
     enabled,
     client_registered: enabled,

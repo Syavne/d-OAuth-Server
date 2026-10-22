@@ -87,6 +87,7 @@ fn aud_input<'a>(
     client_registered: enabled,
     user_entitled: enabled,
     token_format: TokenFormat::Opaque,
+    resource_indicators_enabled: false,
     now_unix: now_unix(),
   }
 }

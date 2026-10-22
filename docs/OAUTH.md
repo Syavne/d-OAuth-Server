@@ -330,7 +330,8 @@ This server's validation is **stricter than RFC 8707 §2**, which only
 SHOULD-NOTs a query component and leaves the identifier semantics to the
 authorization server:
 
-- Every value must be an absolute `https` URI with a host.
+- Every value must be an absolute `https` URI with a host and no userinfo,
+  query, or fragment.
 - It must exactly match an enabled catalog row. There is no prefix, suffix,
   sub-path, case folding, or wildcard match; `*` cannot be registered.
 - The RFC 8252 §7.3 loopback exception applies only to redirect URIs. It does
@@ -358,14 +359,16 @@ single-valued map cannot represent repeats.
 | --- | --- | --- |
 | `GET /authorize` | `PendingAuth.aud`, then the authorization-code record | The token request's set must equal the code's set; any subset, superset, different member, or an unbound request against a pinned code is `invalid_grant` (RFC 8707 §2). |
 | `POST /par` | The PAR record's `aud`; the pushed request is re-validated at authorize | The code carries the same set; the token request must match it exactly. |
-| `POST /device_authorization` | The device record's `aud` | An omitted `resource` at poll time inherits the pinned set; a presented set must equal it, else `invalid_grant`. |
+| `POST /device_authorization` | The device record's `aud` | An omitted `resource` at poll time inherits the pinned set; a presented set must equal it, else `invalid_grant`. The inherited set is re-validated against the current catalog at poll time; a disabled/deleted member or the flag turned off is `invalid_target` (the device code is consumed, so the client re-authorizes). |
 | `POST /token` with `client_credentials` | The access-token record | No refresh token is issued. |
-| `POST /token` with `refresh_token` | The rotated access and refresh records | See [Refresh audience narrowing](#refresh-audience-narrowing). |
+| `POST /token` with `refresh_token` | The rotated access and refresh records | See [Refresh audience narrowing](#refresh-audience-narrowing). The stored full set is re-validated against the current catalog before rotation. |
 
 At `/authorize` the catalog check runs after the redirect URI is validated, so a
 bad audience is delivered as an error redirect (`302`) with `invalid_target`
 rather than an HTML error page. At the other endpoints it is the usual JSON error
-response (`400`).
+response (`400`). On `/token`, `/introspect`, and `/device_authorization` the
+client is authenticated before the catalog lookup, so an unauthenticated caller
+observes `invalid_client` rather than a catalog error.
 
 ### Refresh audience narrowing
 
@@ -383,6 +386,11 @@ issued with. On rotation:
 - A valid subset narrows only the access token. The replacement refresh token
   keeps the full original set, so a later rotation can use the full audience
   again. Scope still intersects and is never widened.
+- Before anything is minted or rotated, the stored full set is re-validated
+  against the current enabled catalog. A member disabled or deleted since
+  issuance, or `resource_indicators_enabled` turned off, is `invalid_target`;
+  the presented refresh token stays live for a retry once the identifier is
+  enabled again.
 
 ### Token exchange is excluded
 
@@ -408,7 +416,8 @@ parameter. When present, the token is reported active only if its `aud` includes
 every requested value; otherwise the response is the ordinary inactive body
 (`{"active": false}`) and the token's metadata is not leaked. Inclusion is the
 test, so a token pinned to a superset stays active. Without `resource`,
-introspection remains audience-agnostic.
+introspection remains audience-agnostic. The caller is authenticated before the
+`resource` values are validated against the catalog.
 
 `token_type` is `DPoP` for an access token bound with `cnf.jkt` (RFC 9449
 §6.2), `Bearer` for an unbound or mTLS-only access token, and omitted for a
@@ -423,6 +432,7 @@ refresh token.
 | Unknown or disabled catalog row | `invalid_target` |
 | Token request set differs from the pinned code or device set | `invalid_grant` |
 | Device poll presents a set that differs from the pinned set | `invalid_grant` |
+| Refresh or device mint where the stored audience contains a disabled/deleted member, or the indicator flag is off | `invalid_target` (refresh stays live; device code is consumed) |
 | Refresh presents a superset, a different member, or a member against an unbound grant | `invalid_target` |
 | Introspect presents `resource` the token is not bound to | Inactive body (`200`) |
 | `resource` on token exchange | `invalid_request` |

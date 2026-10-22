@@ -265,15 +265,6 @@ pub async fn authorize_device(
   if inputs.client_id.trim().is_empty() {
     return Err(AppError::invalid_request("client_id is required"));
   }
-  // Resource indicators (RFC 8707) validate fail-closed before any state is
-  // written: off + present is `invalid_target`, and every value must be an
-  // absolute `https` URI with an exact enabled-catalog match.
-  let aud = crate::protocol::params::validate_resources(
-    stores.pool,
-    ctx.resource_indicators_enabled,
-    inputs.resource,
-  )
-  .await?;
   let used_basic = inputs.basic_header.is_some();
   let unknown_client = || {
     if used_basic {
@@ -349,6 +340,17 @@ pub async fn authorize_device(
   {
     return Err(AppError::invalid_dpop_proof("DPoP proof is required"));
   }
+
+  // Resource indicators (RFC 8707) validate fail-closed after authentication
+  // and before any state is written: an unauthenticated caller observes
+  // `invalid_client` first, while off + present, a non-`https` value, or an
+  // unknown/disabled member is `invalid_target` here.
+  let aud = crate::protocol::params::validate_resources(
+    stores.pool,
+    ctx.resource_indicators_enabled,
+    inputs.resource,
+  )
+  .await?;
 
   if !client.grant_types.iter().any(|g| g == DEVICE_GRANT) {
     return Err(AppError::unauthorized_client(

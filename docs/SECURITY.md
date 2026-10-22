@@ -106,6 +106,15 @@ contract is in [RS-CONTRACT.md](RS-CONTRACT.md); a resource server that skips th
 audience check re-opens the cross-resource replay this server's audience binding
 is meant to close.
 
+Disabling or deleting a `resource_servers` row is a kill switch for that
+audience: refresh and device mints re-validate the stored audience against the
+current enabled catalog, so a disabled/deleted member (or
+`resource_indicators_enabled` turned off) fails `invalid_target` instead of
+minting. A refresh token stays live; a device code is already consumed by the
+poll; an authorization code is not consumed because catalog validation now runs
+before the redemption. The client must re-authorize (or retry the live refresh
+token) once the identifier is enabled again.
+
 Last reviewed: 2026-10-21. File-mounted DB/Redis passwords, a mutable `:latest`
 image reference, NetworkPolicy, `automountServiceAccountToken: false`, scheduled
 fuzzing, and the CIMD outbound fetch surface are implemented in the shipped

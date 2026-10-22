@@ -96,6 +96,7 @@ async fn authorization_code(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, T
     token_format: format,
     jwt_signer: jwt,
     cimd: d.cimd,
+    resource_indicators_enabled: d.state.config.resource_indicators_enabled,
     now_unix: d.now_unix,
   };
   let inputs = CodeGrantInputs {
@@ -123,6 +124,10 @@ async fn authorization_code(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, T
 }
 
 /// `grant_type=refresh_token`: authenticate, then rotate with fresh proofs.
+///
+/// The presented `resource` set is validated against the catalog only after
+/// the client is authenticated, so an unauthenticated caller observes
+/// `invalid_client` before any catalog error.
 async fn refresh(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
   let authenticated = d.authenticate().await?;
   let client = authenticated.client;
@@ -131,6 +136,12 @@ async fn refresh(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> 
   let kind = client_kind(&client)?;
   let proof = d.sender_proof(&client).await?;
   require_dpop_binding(&client, &proof)?;
+  let validated = crate::protocol::params::validate_resources(
+    &d.state.pool,
+    d.state.config.resource_indicators_enabled,
+    d.resources,
+  )
+  .await?;
   let enabled = enabled_scopes(&d.state.pool).await?;
   let mut service = token_service(d.state)?;
   if format == TokenFormat::Jwt {
@@ -156,12 +167,13 @@ async fn refresh(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> 
       dpop_required: client.dpop_bound_access_tokens,
       refresh_token: d.form.refresh_token.as_deref().unwrap_or(""),
       requested_scope: d.form.scope.as_deref(),
-      requested_resources: d.resources,
+      requested_resources: &validated,
       proof: &proof,
       enabled: &enabled,
       client_registered: &registered,
       user_entitled: &no_user_term,
       token_format: format,
+      resource_indicators_enabled: d.state.config.resource_indicators_enabled,
       now_unix: d.now_unix,
     },
   )
@@ -177,10 +189,20 @@ async fn refresh(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> 
 }
 
 /// `grant_type=client_credentials`: confidential clients only, access-only.
+///
+/// The presented `resource` set is validated against the catalog only after
+/// the client is authenticated, so an unauthenticated caller observes
+/// `invalid_client` before any catalog error.
 async fn client_credentials(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
   let authenticated = d.authenticate().await?;
   let client = authenticated.client;
   require_grant(&client, client_credentials::GRANT_TYPE_CLIENT_CREDENTIALS)?;
+  let validated = crate::protocol::params::validate_resources(
+    &d.state.pool,
+    d.state.config.resource_indicators_enabled,
+    d.resources,
+  )
+  .await?;
   let format = d.require_token_format(&client)?;
   let kind = client_kind(&client)?;
   let proof = d.sender_proof(&client).await?;
@@ -204,7 +226,7 @@ async fn client_credentials(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, T
       dpop_bound_jkt: None,
       mtls_bound_x5t_s256: client.tls_client_auth_cert_thumbprint.as_deref(),
       proof: &proof,
-      aud: d.resources,
+      aud: &validated,
       token_format: format,
       now_unix: d.now_unix,
     },
@@ -255,6 +277,7 @@ async fn device(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
     token_format: format,
     jwt_signer: jwt,
     cimd: d.cimd,
+    resource_indicators_enabled: d.state.config.resource_indicators_enabled,
     now_unix: d.now_unix,
   };
   let inputs = DevicePollInputs {

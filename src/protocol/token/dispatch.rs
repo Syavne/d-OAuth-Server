@@ -196,8 +196,10 @@ struct Dispatch<'a> {
   form: &'a TokenForm,
   /// Verified peer chain injected by the TLS accept loop, when present.
   peer_certs: Option<&'a PeerCertificates>,
-  /// Validated resource audiences (RFC 8707) from this token request, sorted
-  /// and deduped; empty when the request carried no `resource`.
+  /// Raw repeated `resource` values (RFC 8707) from this token request, in
+  /// wire order; empty when the request carried no `resource`. Each grant
+  /// validates this set against the catalog AFTER authenticating the client,
+  /// so an unauthenticated caller observes `invalid_client` first.
   resources: &'a [String],
   /// CIMD resolution settings for a registration-free fallback; `None` when
   /// `config.cimd_enabled` is off.
@@ -445,11 +447,11 @@ pub async fn handler(
   // the extractor consumed the raw body, hiding repeats. The explicit
   // exact-MIME gate below is the second content-type check (see above); any
   // other transport failure keeps the documented `invalid_request` mapping
-  // ("includes a parameter more than once"). The
-  // repeated `resource` indicator (RFC 8707) is captured in order by
-  // `params::values_of` and validated fail-closed here; the
-  // authorization-code branch binds the validated set to the redeemed code,
-  // and the remaining grants wire it in later todos.
+  // ("includes a parameter more than once"). The repeated `resource`
+  // indicator (RFC 8707) is captured in order by `params::values_of` and
+  // carried raw on the dispatcher: each grant validates it against the
+  // catalog AFTER authenticating the client, so an unauthenticated caller
+  // observes `invalid_client` before any catalog error.
   if let Err(reject) = crate::protocol::params::require_form_content_type(&headers) {
     return reject.into_response();
   }
@@ -485,16 +487,6 @@ pub async fn handler(
     ))
     .into_response();
   }
-  let aud = match crate::protocol::params::validate_resources(
-    &state.pool,
-    state.config.resource_indicators_enabled,
-    &resources,
-  )
-  .await
-  {
-    Ok(aud) => aud,
-    Err(error) => return TokenError::from(error).into_response(),
-  };
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let now_unix = state.clock.now().unix_timestamp();
@@ -505,7 +497,7 @@ pub async fn handler(
     headers: &headers,
     form: &form,
     peer_certs: peer_certs.as_deref(),
-    resources: &aud,
+    resources: &resources,
     cimd: state
       .config
       .cimd_enabled

@@ -88,7 +88,11 @@ non-urlencoded body and `400` on a malformed or non-UTF-8 body; a duplicated
 known field is JSON `invalid_request` on `/token`, `/introspect`,
 `/device_authorization`, and `/revoke` (PAR and authorize keep last-wins
 absorption). `/token` rejects a `resource` on token exchange before any catalog
-lookup.
+lookup. On `/token`, `/introspect`, and `/device_authorization` the client is
+authenticated before the catalog lookup, so an unauthenticated caller sees
+`invalid_client` rather than a catalog error; the authorization-code grant also
+validates the presented audience before consuming the code, so a bad resource
+does not burn it.
 
 ## The two listeners
 

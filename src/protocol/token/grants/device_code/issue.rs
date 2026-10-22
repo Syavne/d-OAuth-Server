@@ -84,16 +84,27 @@ pub(super) async fn issue_approved(
   // re-sends `resource`, so an empty presentation inherits `consumed.aud`;
   // an empty pinned set keeps the unchanged no-audience behavior. A mismatch
   // is a grant-binding failure (`invalid_grant`), never `invalid_target`: the
-  // request values were already catalog-validated by the token handler.
-  //
-  // Todo 11 binds the enforced set (`consumed.aud`) through `MintRequest.aud`;
-  // nothing is written onto the token record here.
+  // request values were already catalog-validated after authentication.
   if !redemption.aud.is_empty()
     && !crate::protocol::params::audience_binds(&consumed.aud, redemption.aud)
   {
     return Err(
       AppError::invalid_grant("resource indicators do not match this device authorization").into(),
     );
+  }
+  // The pinned audience is re-validated against the CURRENT catalog before
+  // minting: a resource server disabled or deleted after authorization (or a
+  // flag turned off since) fails `invalid_target` instead of minting a token
+  // for a dead audience. The device record above is already consumed (single
+  // redemption), so a retry observes `expired_token` and the client must
+  // re-authorize; no token is minted on this path.
+  if !consumed.aud.is_empty() {
+    crate::protocol::params::validate_resources(
+      state.pool,
+      state.resource_indicators_enabled,
+      &consumed.aud,
+    )
+    .await?;
   }
   // The device record above is already consumed (single redemption): a JWT
   // redemption with an unbound audience fails here, before the mint, and the

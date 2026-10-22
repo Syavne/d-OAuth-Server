@@ -120,6 +120,7 @@ fn entitled_input<'a>(
     refresh_token: token,
     requested_scope: scope,
     requested_resources: &[],
+    resource_indicators_enabled: false,
     proof,
     enabled,
     client_registered: registered,

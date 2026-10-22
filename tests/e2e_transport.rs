@@ -318,3 +318,62 @@ async fn e2e_transport_register_malformed_json_and_missing_auth() -> Result<(), 
     format!("missing auth must render invalid_client, got {body}"),
   )
 }
+
+/// Authentication precedes catalog validation on `/token`: bad credentials
+/// with an unknown `resource` observe `invalid_client` 401 (never
+/// `invalid_target`), while the same unknown `resource` with valid
+/// credentials still fails `invalid_target` 400 (the check moved, it did
+/// not disappear).
+#[tokio::test]
+async fn e2e_transport_token_auth_runs_before_catalog() -> Result<(), TestError> {
+  let world = World::start_with(
+    open_rate_limit(),
+    serde_json::json!({"resource_indicators_enabled": true}),
+  )
+  .await?;
+  seed_client(
+    &world.pool,
+    &world.state.keys,
+    CLIENT_ID,
+    Some(CLIENT_SECRET),
+    &["authorization_code", "refresh_token", "client_credentials"],
+    "read",
+    TokenEndpointAuthMethod::ClientSecretBasic,
+  )
+  .await?;
+  seed_scope(&world.pool, "read").await?;
+
+  let ghost = "https://ghost.example.test/";
+  let params = [
+    ("grant_type", "client_credentials"),
+    ("client_id", CLIENT_ID),
+    ("resource", ghost),
+  ];
+  let (status, _, body) = world
+    .post_form("/token", &params, Some((CLIENT_ID, "wrong-secret")), &[])
+    .await?;
+  ensure(
+    status == StatusCode::UNAUTHORIZED,
+    format!("bad credentials must 401, got {status}: {body}"),
+  )?;
+  ensure(
+    json_body(&body)?["error"] == "invalid_client",
+    format!("auth must run before the catalog check, got {body}"),
+  )?;
+  ensure(
+    !body.contains("access_token"),
+    "a rejected request must not carry an access token",
+  )?;
+
+  let (status, _, body) = world
+    .post_form("/token", &params, Some((CLIENT_ID, CLIENT_SECRET)), &[])
+    .await?;
+  ensure(
+    status == StatusCode::BAD_REQUEST,
+    format!("unknown resource must 400, got {status}: {body}"),
+  )?;
+  ensure(
+    json_body(&body)?["error"] == "invalid_target",
+    format!("the catalog check must still run after auth, got {body}"),
+  )
+}
