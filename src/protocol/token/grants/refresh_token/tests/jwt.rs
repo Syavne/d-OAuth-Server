@@ -267,10 +267,44 @@ async fn jwt_discard_orphan_deletes_marker_by_key() -> TestResult {
   Ok(())
 }
 
+/// Every live `jwt:` marker key bound to `grant_id`.
+///
+/// A marker is a hash carrying a `grant_id` field, so filtering on that field
+/// scopes the snapshot to this grant. Required because every lib test in one
+/// `cargo test` process shares the same testcontainers Redis and runs
+/// concurrently: a bare `KEYS` diff would attribute other tests' markers to
+/// this failed rotation.
+async fn grant_marker_keys(
+  conn: &mut crate::state::RedisConn,
+  store: &crate::store::Store,
+  grant_id: &str,
+) -> Result<Vec<String>, TestError> {
+  let pattern = format!("{}*", store.jwt_marker_key(""));
+  let keys: Vec<String> = redis::cmd("KEYS").arg(&pattern).query_async(conn).await?;
+  let mut owned = Vec::new();
+  for key in keys {
+    let fields: Vec<String> = redis::cmd("HGETALL").arg(&key).query_async(conn).await?;
+    let mut bound = false;
+    let mut rest = fields.as_slice();
+    while let [field, value, tail @ ..] = rest {
+      if field == "grant_id" && value == grant_id {
+        bound = true;
+        break;
+      }
+      rest = tail;
+    }
+    if bound {
+      owned.push(key);
+    }
+  }
+  owned.sort();
+  Ok(owned)
+}
+
 /// A REUSE rotation for a JWT client leaves no live `jwt:` marker for the
-/// discarded pre-mint: the `jwt:` key set after the failed rotation holds no
-/// key beyond the committed pair's own marker, and the attempt is
-/// `invalid_grant` with no tokens.
+/// discarded pre-mint: the grant-scoped `jwt:` key set after the failed
+/// rotation holds no key beyond the committed pair's own marker, and the
+/// attempt is `invalid_grant` with no tokens.
 #[tokio::test]
 async fn jwt_failed_rotation_leaves_no_marker() -> TestResult {
   let (_container, mut conn, store, _url) = test_redis().await?;
@@ -320,15 +354,12 @@ async fn jwt_failed_rotation_leaves_no_marker() -> TestResult {
       "a rotated jwt access token must stay a JWT".to_owned(),
     ));
   }
-  // Snapshot the `jwt:` key set: the initial mint's marker and the
+  // Snapshot this grant's `jwt:` marker set: the initial mint's marker and the
   // committed pair's marker both legitimately exist (the cascade does not
   // purge markers until Todo 27), so the invariant is that the failed
   // rotation ADDS nothing.
-  let mut before: Vec<String> = redis::cmd("KEYS")
-    .arg("oauth:{state}:jwt:*")
-    .query_async(&mut conn)
-    .await?;
-  before.sort();
+  let grant_id = old.record.grant_id.clone();
+  let before = grant_marker_keys(&mut conn, &store, &grant_id).await?;
   if !before.contains(&committed_marker) {
     return Err(TestError::Unexpected(format!(
       "committed marker must exist before reuse, saw {before:?}"
@@ -361,11 +392,7 @@ async fn jwt_failed_rotation_leaves_no_marker() -> TestResult {
       error.code()
     )));
   }
-  let mut after: Vec<String> = redis::cmd("KEYS")
-    .arg("oauth:{state}:jwt:*")
-    .query_async(&mut conn)
-    .await?;
-  after.sort();
+  let after = grant_marker_keys(&mut conn, &store, &grant_id).await?;
   let added: Vec<&String> = after.iter().filter(|key| !before.contains(key)).collect();
   if !added.is_empty() {
     return Err(TestError::Unexpected(format!(
