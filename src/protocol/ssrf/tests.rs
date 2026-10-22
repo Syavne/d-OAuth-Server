@@ -357,15 +357,24 @@ fn ssrf_rejects_special_use_ranges() -> TestResult {
     "203.0.113.1",
     "100.64.0.1",
     "240.0.0.1",
+    "192.31.196.1",
+    "192.52.193.1",
+    "192.175.48.1",
     "64:ff9b::7f00:1",
     "64:ff9b:1::1",
     "2002:7f00:1::",
     "2001::1",
+    "2001:1::1",
     "2001:2::1",
+    "2001:3::1",
+    "2001:4:112::1",
     "2001:10::1",
     "2001:20::1",
     "100::1",
     "2001:db8::1",
+    "::127.0.0.1",
+    "::169.254.169.254",
+    "::ffff:0:127.0.0.1",
     "::ffff:0.0.0.1",
     "::ffff:192.0.0.1",
     "::ffff:198.18.0.1",
@@ -378,11 +387,50 @@ fn ssrf_rejects_special_use_ranges() -> TestResult {
     "192.0.1.1",
     "198.17.0.1",
     "198.20.0.1",
+    "192.31.197.1",
     "2001:4860:4860::8888",
+    "::8.8.8.8",
   ] {
     if blocked(addr)? {
       return Err(TestError::Unexpected(format!("{addr} should pass")));
     }
   }
   Ok(())
+}
+
+/// An expired deadline leaves no budget; a future deadline leaves some. The
+/// helper drives the fail-closed total-timeout budget in
+/// `fetch_guarded_bytes_with`.
+#[test]
+fn ssrf_remaining_budget_expired_is_none() -> TestResult {
+  let past = tokio::time::Instant::now()
+    .checked_sub(Duration::from_secs(1))
+    .ok_or_else(|| TestError::Unexpected("clock must allow a past deadline".to_owned()))?;
+  if super::remaining_budget(past).is_some() {
+    return Err(TestError::Unexpected(
+      "an expired deadline must leave no budget".to_owned(),
+    ));
+  }
+  let future = tokio::time::Instant::now() + Duration::from_secs(5);
+  match super::remaining_budget(future) {
+    Some(left) if !left.is_zero() => Ok(()),
+    _ => Err(TestError::Unexpected(
+      "a future deadline must leave budget".to_owned(),
+    )),
+  }
+}
+
+/// A zero total budget fails closed before any policy or DNS work: even a
+/// blocked target reports `FetchFailed`, never reaching the guard.
+#[tokio::test]
+async fn ssrf_zero_timeout_fails_closed_before_policy() -> TestResult {
+  match fetch_guarded_bytes_with("https://127.0.0.1:8443/doc.json", 5_120, Duration::ZERO).await {
+    Err(super::SsrfError::FetchFailed) => Ok(()),
+    Err(other) => Err(TestError::Unexpected(format!(
+      "zero budget must be FetchFailed, got {other}"
+    ))),
+    Ok(_) => Err(TestError::Unexpected(
+      "zero budget must never fetch".to_owned(),
+    )),
+  }
 }

@@ -208,6 +208,8 @@ Threat model for the signer:
 - Key material never appears in `Debug`, an error, a metric label, or a log.
   `Config` and `JwtSigningKey` print only the key id and algorithm; `/jwks.json`
   carries public coordinates only (`kid`, `kty`, `crv`, `x`, and `y` for EC).
+  `JwtClaims`'s `Debug` redacts the PII `sub` and the raw `jti`; only public
+  claim members print.
 - Rotation is verify-only for the old key: the current key signs, every
   `jwt_signing_previous_keys` entry verifies. Kids must be distinct, and a
   previous key cannot be configured without a current key. Retain the old key at
@@ -234,6 +236,10 @@ The marker is torn down by every revocation path:
   `iss`, requires both the signed `client_id` and the marker's `client_id` to
   match the caller, then deletes marker, record, and grant membership with a
   durability barrier. A failed ownership check is a uniform no-op (`200`).
+- DCR `DELETE` (`/register/{client_id}`) sweeps the client's access records; a
+  `jwt:<hash>` access record also deletes its allowlist marker, covering a
+  client-credentials token that has no refresh record to trigger the grant
+  cascade.
 
 A resource server that verifies locally against `/jwks.json` cannot observe any
 of this: it sees the signature, `iss`, `exp`, and its own audience binding, so it

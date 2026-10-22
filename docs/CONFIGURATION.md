@@ -340,8 +340,8 @@ validating example document, is in
   enforce only a minimum). A `jwt_signing_key_file` mount works exactly like the
   other `*_file` keys and is trimmed of trailing newlines; the inline form wins
   when both are set. The key material is turned into a real JOSE signing key at
-  load, so an all-zero or out-of-range EC scalar fails at boot with
-  `InvalidJwtSigningKey`, not at the first mint. Enabling
+  load, so an all-zero EC scalar or EdDSA seed, or an out-of-range EC scalar,
+  fails at boot with `InvalidJwtSigningKey`, not at the first mint. Enabling
   `jwt_access_tokens_enabled` without a signing key fails closed with
   `MissingJwtSigningKey`.
 - `jwt_signing_previous_keys` retains rotated-out keys as a list of
@@ -357,6 +357,11 @@ validating example document, is in
   (`InvalidCimdFetchTimeout`) and `cimd_max_bytes` between 1 and 5120
   (`InvalidCimdMaxBytes`). A malformed value fails the load rather than
   silently meaning "no limit".
+- `protected_resources_enabled` is validated at load
+  (`InvalidProtectedResources`): it requires `resource_indicators_enabled=true`
+  and a non-empty, duplicate-free `protected_resource_ids` list of absolute
+  `https` URIs with a host and no wildcard, userinfo, fragment, or query. With
+  the flag off the identifiers are inert.
 
 ## The timeout ladder
 

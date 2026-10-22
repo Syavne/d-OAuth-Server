@@ -252,12 +252,6 @@ pub async fn validate(mut input: AuthorizeInput<'_>) -> Result<ValidatedRequest,
   let merged_claims = jar::resolve(input.conn, input.store, &jar_input)
     .await
     .map_err(AuthorizeFailure::Page)?;
-  // Query-presented indicators union with JAR/PAR-pinned ones (both are
-  // catalog-validated below, so the union cannot smuggle anything past the
-  // catalog). A `resource` in both transports is already rejected by the
-  // merge as `invalid_request_object`.
-  let mut resources = input.resources.clone();
-  resources.extend(merged_claims.resource);
   let merged = &merged_claims.params;
 
   let expected_client_id = resolution.client_id();
@@ -307,6 +301,26 @@ pub async fn validate(mut input: AuthorizeInput<'_>) -> Result<ValidatedRequest,
     error,
     state: merged.get("state").cloned(),
     iss: input.issuer.to_owned(),
+  };
+
+  // JAR/PAR pins the audience in exactly one transport: the PAR record's
+  // `aud` or the signed object's `resource` claim. A query `resource` beside
+  // either would union into, and widen, that pinned set; a PAR record strips
+  // `resource` at push, so the merge cannot see the duplicate. Reject it
+  // fail-closed (RFC 9101 §5.2, RFC 8707 §2.1).
+  let jar_present =
+    input.query.get("request").is_some() || input.query.get("request_uri").is_some();
+  if jar_present && !input.resources.is_empty() {
+    return Err(redirect_err(AppError::invalid_request_object(
+      "resource must be carried in the request object, not the query",
+    )));
+  }
+  let resources = if jar_present {
+    merged_claims.resource
+  } else {
+    let mut resources = input.resources.clone();
+    resources.extend(merged_claims.resource);
+    resources
   };
 
   // Resource indicators (RFC 8707) validate after the redirect target, so a

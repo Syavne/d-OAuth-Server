@@ -24,7 +24,7 @@ mod tests;
 
 use std::time::Duration;
 
-use axum::{Extension, extract::State, http::HeaderMap};
+use axum::{Extension, extract::RawForm, extract::State, http::HeaderMap};
 use rand::{TryRng as _, rngs::SysRng};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
@@ -507,20 +507,31 @@ async fn put_binding(
 
 /// Axum handler for `POST /device_authorization` (wired by task 40).
 ///
-/// Thin glue: `Bytes` + a manual parse replaces `Form<...>` (the extractor
+/// Thin glue: `RawForm` + a manual parse replaces `Form<...>` (the extractor
 /// consumed the raw body, hiding repeats), then delegates to
-/// [`authorize_device`]. The explicit content-type gate preserves the 415
-/// `Form` rendered (`Bytes` never fails on content-type), a malformed body
-/// or a repeated known field is the same 400, and the repeated `resource`
-/// indicator (RFC 8707) is captured in order by
-/// `params::repeated_values`.
+/// [`authorize_device`]. `RawForm` rejects a wrong content type with 415
+/// before buffering the body; the explicit exact-MIME gate below is the
+/// second check for the prefix-match case
+/// (`application/x-www-form-urlencodedevil`). A malformed (non-UTF-8) body
+/// is 400 plain text (deliberately stricter than the old `Form`, which
+/// lossily accepted raw non-UTF-8 bytes); a repeated known field is JSON
+/// `invalid_request` (the old `Form` returned 422 `Failed to deserialize
+/// form body`, so the new JSON 400 is the intended contract, not parity).
+/// The repeated `resource` indicator (RFC 8707) is captured in order by
+/// `params::values_of`.
 pub async fn handler(
   State(state): State<AppState>,
   peer_certs: Option<Extension<PeerCertificates>>,
   headers: HeaderMap,
-  body: axum::body::Bytes,
+  body: RawForm,
 ) -> axum::response::Response {
   use axum::response::IntoResponse as _;
+  // `RawForm` gates the content type BEFORE `Bytes` buffering, so a wrong
+  // content type is rejected 415 without reading the (up to 2 MiB) body.
+  // The explicit exact-MIME gate below is the second check: `RawForm` uses a
+  // case-sensitive prefix match, so it accepts e.g.
+  // `application/x-www-form-urlencodedevil`, which the exact gate rejects.
+  let body = body.0;
   if let Err(reject) = crate::protocol::params::require_form_content_type(&headers) {
     return reject.into_response();
   }
@@ -529,10 +540,7 @@ pub async fn handler(
     Err(reject) => return reject.into_response(),
   };
   if crate::protocol::params::has_duplicate_field(&pairs, &DeviceAuthorizationForm::KNOWN_FIELDS) {
-    return (
-      axum::http::StatusCode::BAD_REQUEST,
-      "Failed to deserialize form",
-    )
+    return AppError::invalid_request("the request body includes a parameter more than once")
       .into_response();
   }
   let map = crate::protocol::params::single_valued_map(&pairs);
@@ -543,12 +551,8 @@ pub async fn handler(
     )
       .into_response();
   };
-  let text = match crate::protocol::params::form_text(&body) {
-    Ok(text) => text,
-    Err(reject) => return reject.into_response(),
-  };
   let resources =
-    crate::protocol::params::repeated_values(text, crate::protocol::params::RESOURCE_PARAM);
+    crate::protocol::params::values_of(&pairs, crate::protocol::params::RESOURCE_PARAM);
   let dpop_proof = headers.get("dpop").and_then(|value| value.to_str().ok());
   let basic_header = headers
     .get(axum::http::header::AUTHORIZATION)

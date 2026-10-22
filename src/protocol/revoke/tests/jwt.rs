@@ -86,10 +86,11 @@ fn jwt_mint_request(client: &str, grant: &str, subject: &str) -> MintRequest {
     dpop_required: false,
     subject: subject.to_owned(),
     scope: "orders:read".to_owned(),
+    access_scope: "orders:read".to_owned(),
     grant_id: grant.to_owned(),
     proof: SenderProof::none(),
-    aud: Vec::new(),
-    refresh_aud: Vec::new(),
+    aud: vec!["https://api.example.test/".to_owned()],
+    refresh_aud: vec!["https://api.example.test/".to_owned()],
     format: TokenFormat::Jwt,
   }
 }

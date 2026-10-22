@@ -970,6 +970,25 @@ pub(crate) static SCRIPT_GRANT_REVOKE: LazyLock<Script> = LazyLock::new(|| {
   )
 });
 
+/// Atomic orphan cleanup for a discarded JWT rotation pre-mint.
+///
+/// KEYS: access record, grant token set (or a same-slot dummy when there is
+/// no grant id), allowlist marker. ARGV: member, grant id (empty means the
+/// `SREM` is skipped). One command so a discarded pre-mint can never leave a
+/// live marker next to a surviving record/member.
+pub(crate) static SCRIPT_DISCARD_ACCESS_JWT: LazyLock<Script> = LazyLock::new(|| {
+  Script::new(
+    r"
+    redis.call('DEL', KEYS[1])
+    if ARGV[2] ~= '' then
+      redis.call('SREM', KEYS[2], ARGV[1])
+    end
+    redis.call('DEL', KEYS[3])
+    return 1
+    ",
+  )
+});
+
 /// Fixed-window rate-limit counter: `INCR` plus `PEXPIRE`-on-first.
 pub(crate) static SCRIPT_RATELIMIT_INCR: LazyLock<Script> = LazyLock::new(|| {
   Script::new(

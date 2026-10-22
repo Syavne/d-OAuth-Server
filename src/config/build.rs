@@ -3,8 +3,9 @@
 //! Kept in a submodule so the root `config.rs` stays focused on the public
 //! types and loader surface.
 
-use std::{net::SocketAddr, path::Path, str::FromStr, time::Duration};
+use std::{collections::HashSet, net::SocketAddr, path::Path, str::FromStr, time::Duration};
 
+use reqwest::Url;
 use secrecy::{ExposeSecret, SecretString};
 
 use super::{
@@ -27,6 +28,7 @@ const DEFAULT_KEY_ID: &str = "v1";
 impl Config {
   pub(crate) fn build(raw: RawConfig) -> Result<Self, ConfigError> {
     let environment = raw.environment;
+    validate_protected_resources(&raw)?;
     let issuer = parse_issuer(raw.issuer.as_deref())?;
     let bind_addr = parse_socket_addr(raw.bind_addr.as_deref(), DEFAULT_BIND_ADDR, |value| {
       ConfigError::InvalidBindAddr { value }
@@ -305,6 +307,61 @@ fn build_jwt_signing(
     }
   }
   Ok((current, previous))
+}
+
+/// RFC 9728 `protected_resources` is advertised only from a validated,
+/// non-empty, duplicate-free identifier set, and only when the RFC 8707
+/// indicator gate is also on. With the flag off the identifiers are inert.
+fn validate_protected_resources(raw: &RawConfig) -> Result<(), ConfigError> {
+  if !raw.protected_resources_enabled {
+    return Ok(());
+  }
+  if !raw.resource_indicators_enabled {
+    return Err(ConfigError::InvalidProtectedResources {
+      reason: "resource_indicators_enabled must be true".to_owned(),
+    });
+  }
+  if raw.protected_resource_ids.is_empty() {
+    return Err(ConfigError::InvalidProtectedResources {
+      reason: "protected_resource_ids must not be empty".to_owned(),
+    });
+  }
+  let mut seen = HashSet::new();
+  for value in &raw.protected_resource_ids {
+    let url = validate_protected_resource_id(value)?;
+    if !seen.insert(url) {
+      return Err(ConfigError::InvalidProtectedResources {
+        reason: format!("duplicate protected resource id: {value}"),
+      });
+    }
+  }
+  Ok(())
+}
+
+/// One advertised identifier must be an absolute `https` URI with a host and
+/// no wildcard, userinfo, fragment, or query. The parsed record is returned so
+/// duplicates are detected after URL normalization.
+fn validate_protected_resource_id(value: &str) -> Result<Url, ConfigError> {
+  let invalid = |reason: &str| ConfigError::InvalidProtectedResources {
+    reason: format!("{reason}: {value}"),
+  };
+  if value.contains('*') {
+    return Err(invalid("wildcards are not allowed"));
+  }
+  let url = Url::parse(value).map_err(|_| invalid("must be an absolute URI"))?;
+  if url.scheme() != "https" || url.host_str().is_none_or(str::is_empty) {
+    return Err(invalid("must be an absolute https URI with a host"));
+  }
+  if !url.username().is_empty() || url.password().is_some() {
+    return Err(invalid("userinfo is not allowed"));
+  }
+  if url.fragment().is_some() {
+    return Err(invalid("a fragment is not allowed"));
+  }
+  if url.query().is_some() {
+    return Err(invalid("a query is not allowed"));
+  }
+  Ok(url)
 }
 
 /// CIMD fetch timeout must sit inside the 1-10 second window.

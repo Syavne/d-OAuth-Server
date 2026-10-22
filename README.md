@@ -9,8 +9,9 @@ includes the host `localhost` only when `allow_localhost_redirect` is set).
 It implements the authorization-code, refresh-token, client-credentials,
 device-code, and token-exchange grants, with DPoP, mTLS, PAR, JAR, dynamic
 client registration, introspection, and revocation. Tokens are opaque and
-hashed at rest by default; an opt-in per-client or global `jwt` access-token
-format mints RFC 9068 `at+jwt` tokens verified against the AS JWKS. All
+hashed at rest by default; a global enable switch plus a per-client `jwt`
+access-token format mints RFC 9068 `at+jwt` tokens verified against the AS
+JWKS. All
 durable domain state is in PostgreSQL and all ephemeral state is in Redis, so
 replicas are interchangeable.
 

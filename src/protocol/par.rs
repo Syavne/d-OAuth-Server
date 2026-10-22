@@ -10,7 +10,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use axum::{
-  extract::State,
+  extract::{RawForm, State},
   http::{HeaderMap, StatusCode},
 };
 use secrecy::SecretString;
@@ -256,15 +256,21 @@ async fn validate_request_rules(
 pub async fn par_handler(
   State(state): State<AppState>,
   headers: HeaderMap,
-  body: axum::body::Bytes,
+  body: RawForm,
 ) -> axum::response::Response {
   use axum::response::IntoResponse as _;
-  // `Bytes` + a manual parse replaces `Form<HashMap>`: the extractor
+  // `RawForm` gates the content type BEFORE `Bytes` buffering, so a wrong
+  // content type is rejected 415 without reading the (up to 2 MiB) body.
+  // The explicit exact-MIME gate below is the second check: `RawForm` uses a
+  // case-sensitive prefix match, so it accepts e.g.
+  // `application/x-www-form-urlencodedevil`, which the exact gate rejects.
+  let body = body.0;
+  // `RawForm` + a manual parse replaces `Form<HashMap>`: the extractor
   // consumed the raw body, hiding repeats — the repeated `resource`
-  // indicator (RFC 8707) is captured in order by `params::repeated_values`
-  // while the single-valued map keeps last-wins absorption. The explicit
-  // content-type gate preserves the 415 `Form` rendered (`Bytes` never
-  // fails on content-type), and a malformed body is the same 400.
+  // indicator (RFC 8707) is captured in order by `params::values_of`
+  // while the single-valued map keeps last-wins absorption. A malformed
+  // body is the same 400 (deliberately stricter than the old `Form`, which
+  // lossily accepted raw non-UTF-8 bytes).
   if let Err(reject) = super::params::require_form_content_type(&headers) {
     return reject.into_response();
   }
@@ -273,11 +279,7 @@ pub async fn par_handler(
     Err(reject) => return reject.into_response(),
   };
   let form = super::params::single_valued_map(&pairs);
-  let text = match super::params::form_text(&body) {
-    Ok(text) => text,
-    Err(reject) => return reject.into_response(),
-  };
-  let resources = super::params::repeated_values(text, super::params::RESOURCE_PARAM);
+  let resources = super::params::values_of(&pairs, super::params::RESOURCE_PARAM);
   let header_value = headers
     .get(axum::http::header::AUTHORIZATION)
     .and_then(|value| value.to_str().ok());

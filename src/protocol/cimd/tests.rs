@@ -6,8 +6,9 @@ use std::{collections::HashSet, time::Duration};
 use serde_json::{Value, json};
 
 use super::{
-  CimdAuthMethod, CimdDocument, CimdError, CimdLimits, CimdValidation, ValidatedCimd, cache_key,
-  fetch_document, get_cached, put_cached, resolve, validate_document,
+  CimdAuthMethod, CimdDocument, CimdError, CimdLimits, CimdValidation, ValidatedCimd, acquire_lock,
+  cache_key, fetch_document, get_cached, invalid_cache_key, lock_key, negative_cache_key,
+  put_cached, release_lock, resolve, validate_document,
 };
 use crate::state::RedisConn;
 
@@ -346,6 +347,427 @@ async fn cimd_cache_round_trip() -> TestResult {
   .map_err(|error| TestError::Unexpected(format!("resolve: {error}")))?;
   if resolved.client_id != url {
     return Err(TestError::Unexpected("resolved wrong client".to_owned()));
+  }
+  Ok(())
+}
+
+/// A seeded negative key fails fast with `Fetch` before any fetch: even a
+/// valid cached document is shadowed while the negative holds, and the raw
+/// URL never appears in the key.
+#[tokio::test]
+async fn cimd_negative_cache_blocks_fetch() -> TestResult {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let mut conn = RedisConn::Single(manager);
+  let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
+  // `.invalid` can never fetch, so any fetch attempt would be observable as
+  // DNS work; the seeded negative must short-circuit before that.
+  let url = "https://client.invalid/neg-blocked.json";
+  let document = parse(document_value(url, &["https://client.invalid/cb"]))?;
+  let key = cache_key(&prefix, url);
+  put_cached(&mut conn, &key, &document)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("cache write: {error}")))?;
+  let neg = negative_cache_key(&prefix, url);
+  if !neg.starts_with(&prefix) || !neg.contains("cimd:neg:") || neg.contains("client.invalid") {
+    return Err(TestError::Unexpected(format!("bad negative key {neg}")));
+  }
+  redis::cmd("SET")
+    .arg(&neg)
+    .arg("1")
+    .arg("EX")
+    .arg(30)
+    .query_async::<()>(&mut conn)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("negative seed: {error}")))?;
+  let enabled = scopes();
+  match resolve(
+    &mut conn,
+    &prefix,
+    url,
+    &CimdValidation {
+      enabled_scopes: &enabled,
+      allow_localhost: false,
+    },
+    CimdLimits {
+      max_bytes: 5_120,
+      timeout: Duration::from_secs(1),
+    },
+  )
+  .await
+  {
+    Err(CimdError::Fetch) => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "negative hit must be Fetch, got {other}"
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "negative cache must block even a cached document".to_owned(),
+      ));
+    }
+  }
+  // The valid positive entry survives the negative hit untouched.
+  match get_cached(&mut conn, &key)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("cache read: {error}")))?
+  {
+    Some(cached) if cached.client_id == url => Ok(()),
+    _ => Err(TestError::Unexpected(
+      "positive cache must survive a negative hit".to_owned(),
+    )),
+  }
+}
+
+/// An origin-level fetch failure writes the negative key (30 s TTL); a
+/// validation failure served from cache never does, so a fixed document is
+/// seen immediately.
+#[tokio::test]
+async fn cimd_fetch_failure_negatively_cached() -> TestResult {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let mut conn = RedisConn::Single(manager);
+  let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
+  let url = "https://client.invalid/neg-write.json";
+  let enabled = scopes();
+  match resolve(
+    &mut conn,
+    &prefix,
+    url,
+    &CimdValidation {
+      enabled_scopes: &enabled,
+      allow_localhost: false,
+    },
+    CimdLimits {
+      max_bytes: 5_120,
+      timeout: Duration::from_secs(2),
+    },
+  )
+  .await
+  {
+    Err(CimdError::Fetch | CimdError::InvalidJson) => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "unfetchable origin must fail fetch-side, got {other}"
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "unfetchable origin resolved".to_owned(),
+      ));
+    }
+  }
+  let neg = negative_cache_key(&prefix, url);
+  let ttl: i64 = redis::cmd("TTL")
+    .arg(&neg)
+    .query_async(&mut conn)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("negative ttl: {error}")))?;
+  if ttl <= 0 || ttl > 30 {
+    return Err(TestError::Unexpected(format!(
+      "negative key must carry a 30 s TTL, got {ttl}"
+    )));
+  }
+  Ok(())
+}
+
+/// A validation failure served from cache is not negatively cached (no fetch
+/// occurred); only a fresh-fetch validation failure writes the 2 s
+/// `cimd:invalid:` completion marker. The cached document echoes another URL,
+/// so `resolve` reports `ClientIdMismatch` and leaves no negative key behind.
+#[tokio::test]
+async fn cimd_validation_failure_not_negatively_cached() -> TestResult {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let mut conn = RedisConn::Single(manager);
+  let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
+  let url = "https://client.invalid/neg-nocache.json";
+  let wrong = parse(document_value(
+    "https://other.invalid/cimd.json",
+    &["https://other.invalid/cb"],
+  ))?;
+  let key = cache_key(&prefix, url);
+  put_cached(&mut conn, &key, &wrong)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("cache write: {error}")))?;
+  let enabled = scopes();
+  match resolve(
+    &mut conn,
+    &prefix,
+    url,
+    &CimdValidation {
+      enabled_scopes: &enabled,
+      allow_localhost: false,
+    },
+    CimdLimits {
+      max_bytes: 5_120,
+      timeout: Duration::from_secs(1),
+    },
+  )
+  .await
+  {
+    Err(CimdError::ClientIdMismatch) => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "mismatched cache hit must be ClientIdMismatch, got {other}"
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "mismatched cached document was accepted".to_owned(),
+      ));
+    }
+  }
+  let neg = negative_cache_key(&prefix, url);
+  let present: bool = redis::cmd("EXISTS")
+    .arg(&neg)
+    .query_async(&mut conn)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("negative read: {error}")))?;
+  if present {
+    return Err(TestError::Unexpected(
+      "validation failure must not be negatively cached".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// The single-flight lock is exclusive, ignores a release with the wrong
+/// token, and can be reacquired after the owner releases it.
+#[tokio::test]
+async fn cimd_single_flight_lock_is_exclusive() -> TestResult {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let mut conn = RedisConn::Single(manager);
+  let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
+  let key = lock_key(&prefix, "https://client.invalid/lock.json");
+  let ttl = 3_000;
+  let Some(token) = acquire_lock(&mut conn, &key, ttl)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("acquire: {error}")))?
+  else {
+    return Err(TestError::Unexpected("first acquire must win".to_owned()));
+  };
+  if acquire_lock(&mut conn, &key, ttl)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("second acquire: {error}")))?
+    .is_some()
+  {
+    return Err(TestError::Unexpected(
+      "a held lock must not be acquired twice".to_owned(),
+    ));
+  }
+  release_lock(&mut conn, &key, "wrong-token")
+    .await
+    .map_err(|error| TestError::Unexpected(format!("wrong release: {error}")))?;
+  if acquire_lock(&mut conn, &key, ttl)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("reacquire: {error}")))?
+    .is_some()
+  {
+    return Err(TestError::Unexpected(
+      "a wrong-token release must not drop the lock".to_owned(),
+    ));
+  }
+  release_lock(&mut conn, &key, &token)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("owner release: {error}")))?;
+  let Some(next) = acquire_lock(&mut conn, &key, ttl)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("final acquire: {error}")))?
+  else {
+    return Err(TestError::Unexpected(
+      "the owner release must free the lock".to_owned(),
+    ));
+  };
+  release_lock(&mut conn, &key, &next)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("final release: {error}")))?;
+  Ok(())
+}
+
+/// Two concurrent cache misses for the same uncached URL both return the
+/// document published by the elected fetcher. The `.invalid` host proves
+/// neither waiter started a fetch of its own.
+#[tokio::test]
+async fn cimd_single_flight_waiters_share_one_fetch() -> TestResult {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let mut holder = RedisConn::Single(manager.clone());
+  let mut waiter_a = RedisConn::Single(manager.clone());
+  let mut waiter_b = RedisConn::Single(manager);
+  let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
+  let url = "https://client.invalid/single-flight.json";
+  let lock = lock_key(&prefix, url);
+  let token = acquire_lock(&mut holder, &lock, 3_000)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("lock: {error}")))?
+    .ok_or_else(|| TestError::Unexpected("lock must be free".to_owned()))?;
+  let key = cache_key(&prefix, url);
+  let document = parse(document_value(url, &["https://client.invalid/cb"]))?;
+  let enabled = scopes();
+  let validation = CimdValidation {
+    enabled_scopes: &enabled,
+    allow_localhost: false,
+  };
+  let limits = CimdLimits {
+    max_bytes: 5_120,
+    timeout: Duration::from_secs(1),
+  };
+  let a = resolve(&mut waiter_a, &prefix, url, &validation, limits);
+  let b = resolve(&mut waiter_b, &prefix, url, &validation, limits);
+  let publish = async {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    put_cached(&mut holder, &key, &document)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("cache write: {error}")))?;
+    release_lock(&mut holder, &lock, &token)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("release: {error}")))?;
+    Ok::<(), TestError>(())
+  };
+  let (a_result, b_result, published) = tokio::join!(a, b, publish);
+  published?;
+  for (label, result) in [("a", a_result), ("b", b_result)] {
+    match result {
+      Ok(validated) if validated.client_id == url => {}
+      Ok(validated) => {
+        return Err(TestError::Unexpected(format!(
+          "waiter {label} saw the wrong client: {}",
+          validated.client_id
+        )));
+      }
+      Err(error) => {
+        return Err(TestError::Unexpected(format!(
+          "waiter {label} rejected the published document: {error}"
+        )));
+      }
+    }
+  }
+  Ok(())
+}
+
+/// A waiter observes the elected fetcher's negative cache and fails with the
+/// same fetch error instead of starting a second fetch.
+#[tokio::test]
+async fn cimd_single_flight_waiter_observes_negative() -> TestResult {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let mut holder = RedisConn::Single(manager.clone());
+  let mut waiter = RedisConn::Single(manager);
+  let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
+  let url = "https://client.invalid/single-flight-neg.json";
+  let lock = lock_key(&prefix, url);
+  let token = acquire_lock(&mut holder, &lock, 3_000)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("lock: {error}")))?
+    .ok_or_else(|| TestError::Unexpected("lock must be free".to_owned()))?;
+  let neg = negative_cache_key(&prefix, url);
+  let enabled = scopes();
+  let validation = CimdValidation {
+    enabled_scopes: &enabled,
+    allow_localhost: false,
+  };
+  let limits = CimdLimits {
+    max_bytes: 5_120,
+    timeout: Duration::from_secs(1),
+  };
+  let waiting = resolve(&mut waiter, &prefix, url, &validation, limits);
+  let publish = async {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    redis::cmd("SET")
+      .arg(&neg)
+      .arg("1")
+      .arg("EX")
+      .arg(30)
+      .query_async::<()>(&mut holder)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("negative seed: {error}")))?;
+    release_lock(&mut holder, &lock, &token)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("release: {error}")))?;
+    Ok::<(), TestError>(())
+  };
+  let (result, published) = tokio::join!(waiting, publish);
+  published?;
+  match result {
+    Err(CimdError::Fetch) => Ok(()),
+    Err(other) => Err(TestError::Unexpected(format!(
+      "waiter must observe the elected fetch failure, got {other}"
+    ))),
+    Ok(_) => Err(TestError::Unexpected(
+      "waiter accepted a token the elected fetcher rejected".to_owned(),
+    )),
+  }
+}
+
+/// A fresh-fetch validation failure is short-cached under `cimd:invalid:`: a
+/// later resolve for the same URL fails fast with `Fetch` without a network
+/// fetch, and the marker TTL is the 2-second completion window.
+#[tokio::test]
+async fn cimd_invalid_cache_blocks_fetch() -> TestResult {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let mut conn = RedisConn::Single(manager);
+  let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
+  let url = "https://client.invalid/invalid-cached.json";
+  let key = invalid_cache_key(&prefix, url);
+  if !key.starts_with(&prefix) || !key.contains("cimd:invalid:") || key.contains("client.invalid") {
+    return Err(TestError::Unexpected(format!("bad invalid key {key}")));
+  }
+  redis::cmd("SET")
+    .arg(&key)
+    .arg("1")
+    .arg("EX")
+    .arg(2)
+    .query_async::<()>(&mut conn)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("invalid seed: {error}")))?;
+  let enabled = scopes();
+  match resolve(
+    &mut conn,
+    &prefix,
+    url,
+    &CimdValidation {
+      enabled_scopes: &enabled,
+      allow_localhost: false,
+    },
+    CimdLimits {
+      max_bytes: 5_120,
+      timeout: Duration::from_secs(1),
+    },
+  )
+  .await
+  {
+    Err(CimdError::Fetch) => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "invalid-cache hit must be Fetch, got {other}"
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "invalid-cache hit fetched or accepted a document".to_owned(),
+      ));
+    }
+  }
+  let ttl: i64 = redis::cmd("TTL")
+    .arg(&key)
+    .query_async(&mut conn)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("invalid ttl: {error}")))?;
+  if ttl <= 0 || ttl > 2 {
+    return Err(TestError::Unexpected(format!(
+      "invalid key must carry a 2 s TTL, got {ttl}"
+    )));
   }
   Ok(())
 }

@@ -107,6 +107,7 @@ async fn write_marker(
   subject: &str,
 ) -> Result<(), TestError> {
   let key = store.jwt_marker_key(&jti_hash(jti));
+  let hash = jti_hash(jti);
   redis::cmd("HSET")
     .arg(&key)
     .arg("grant_id")
@@ -115,6 +116,11 @@ async fn write_marker(
     .arg("test-client")
     .arg("subject")
     .arg(subject)
+    .query_async::<()>(conn)
+    .await?;
+  redis::cmd("SADD")
+    .arg(store.grant_tokens_key("grant-1"))
+    .arg(format!("jwt:{hash}"))
     .query_async::<()>(conn)
     .await?;
   Ok(())
@@ -422,6 +428,44 @@ async fn jwt_verify_live_rejects_disabled_subject() -> TestResult {
   }
 }
 
+/// Strict liveness: a marker hash without grant membership is dead
+/// (`MarkerAbsent`), even though the marker-only check reads live.
+#[tokio::test]
+async fn jwt_verify_live_rejects_orphan_marker() -> TestResult {
+  let (signer, _) = test_signer()?;
+  let (mut conn, store) = test_redis().await?;
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  let claims = JwtClaims {
+    sub: String::new(),
+    ..valid_claims(now_unix())
+  };
+  let token = signer.sign(&claims)?;
+  let hash = jti_hash(&claims.jti);
+  let key = store.jwt_marker_key(&hash);
+  redis::cmd("HSET")
+    .arg(&key)
+    .arg("grant_id")
+    .arg("orphan-grant")
+    .arg("client_id")
+    .arg("test-client")
+    .arg("subject")
+    .arg("")
+    .query_async::<()>(&mut conn)
+    .await?;
+  if !marker_live(&mut conn, &store, &hash).await? {
+    return Err("orphan marker must read live on the marker-only check".into());
+  }
+  match signer
+    .verify_live(&mut conn, &store, &pool, &keys, &token, None)
+    .await
+  {
+    Err(JwtError::MarkerAbsent) => Ok(()),
+    Err(got) => Err(format!("expected MarkerAbsent, got {got:?}").into()),
+    Ok(_) => Err("orphan marker token was accepted".into()),
+  }
+}
+
 /// `Debug` on the signer and on every key shape carries no key material: the
 /// raw 32-byte scalars appear nowhere; only `kid`/`alg`/public coordinates.
 #[test]
@@ -456,4 +500,27 @@ fn jwt_debug_redacts_key_material() -> TestResult {
     return Err("signer Debug lost the public coordinates".into());
   }
   Ok(())
+}
+
+/// `JwtClaims` Debug never prints the PII `sub` or the raw `jti` (the
+/// allowlist marker key material); public claim members stay visible.
+#[test]
+fn jwt_claims_debug_redacts_sub_and_jti() {
+  let claims = JwtClaims {
+    iss: "https://auth.example.test".to_owned(),
+    sub: "user@example.test".to_owned(),
+    aud: vec!["https://api.example.test".to_owned()],
+    scope: "read".to_owned(),
+    exp: 1_700_000_000,
+    iat: 1_699_999_700,
+    jti: "raw-jti-marker".to_owned(),
+    client_id: "client-abc".to_owned(),
+    cnf: None,
+    act: None,
+  };
+  let rendered = format!("{claims:?}");
+  assert!(!rendered.contains("user@example.test"));
+  assert!(!rendered.contains("raw-jti-marker"));
+  assert!(rendered.contains("[REDACTED]"));
+  assert!(rendered.contains("client-abc"));
 }

@@ -428,6 +428,14 @@ pub enum ConfigError {
   /// The CIMD document byte cap was zero or above 5120 bytes.
   #[error("cimd_max_bytes must be between 1 and 5120 bytes")]
   InvalidCimdMaxBytes,
+  /// RFC 9728 `protected_resources` was enabled without a valid, non-empty,
+  /// duplicate-free list of absolute `https` identifiers (and RFC 8707
+  /// indicators enabled).
+  #[error("invalid protected resources configuration: {reason}")]
+  InvalidProtectedResources {
+    /// Why the configuration was rejected.
+    reason: String,
+  },
   /// Argon2 parameters were outside the safe range.
   #[error("invalid argon2 parameters")]
   InvalidArgon2Params,

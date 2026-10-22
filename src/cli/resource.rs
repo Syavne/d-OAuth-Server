@@ -104,11 +104,13 @@ async fn delete(context: &Context, identifier: &str) -> Result<(), CliError> {
 
 /// Validate an RFC 8707 resource identifier.
 ///
-/// The catalog is fail-closed: an empty identifier or a wildcard `*` is
-/// rejected so a single row can never stand for an entire origin.
+/// The catalog is fail-closed: the value must be an absolute `https` URI with
+/// a host, and an empty identifier, a wildcard `*`, userinfo, a fragment, or a
+/// query is rejected so a single row can never stand for an entire origin or a
+/// non-fetchable identifier.
 ///
 /// # Errors
-/// Returns [`CliError::Input`] when the identifier is empty or contains `*`.
+/// Returns [`CliError::Input`] for any of the rejected shapes.
 pub fn validate(identifier: &str) -> Result<(), CliError> {
   if identifier.trim().is_empty() {
     return Err(CliError::Input(
@@ -118,6 +120,28 @@ pub fn validate(identifier: &str) -> Result<(), CliError> {
   if identifier.contains('*') {
     return Err(CliError::Input(
       "resource identifier must not contain a wildcard '*'".to_owned(),
+    ));
+  }
+  let url = reqwest::Url::parse(identifier)
+    .map_err(|_| CliError::Input("resource identifier must be an absolute https URI".to_owned()))?;
+  if url.scheme() != "https" || url.host_str().is_none_or(str::is_empty) {
+    return Err(CliError::Input(
+      "resource identifier must be an absolute https URI with a host".to_owned(),
+    ));
+  }
+  if !url.username().is_empty() || url.password().is_some() {
+    return Err(CliError::Input(
+      "resource identifier must not contain userinfo".to_owned(),
+    ));
+  }
+  if url.fragment().is_some() {
+    return Err(CliError::Input(
+      "resource identifier must not contain a fragment".to_owned(),
+    ));
+  }
+  if url.query().is_some() {
+    return Err(CliError::Input(
+      "resource identifier must not contain a query".to_owned(),
     ));
   }
   Ok(())

@@ -11,6 +11,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, encode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use super::ConfigError;
 use crate::keys::KeyId;
@@ -100,13 +101,16 @@ impl JwtSigningKey {
     field: &'static str,
   ) -> Result<Self, ConfigError> {
     let raw = secret.expose_secret().as_bytes();
-    let der = match alg {
+    if alg == JwtSigningAlg::EdDsa && raw.iter().all(|byte| *byte == 0) {
+      return Err(ConfigError::InvalidJwtSigningKey { key: field });
+    }
+    let der = Zeroizing::new(match alg {
       JwtSigningAlg::Es256 => p256_pkcs8(raw),
       JwtSigningAlg::EdDsa => ed25519_pkcs8(raw),
-    };
+    });
     let key = match alg {
-      JwtSigningAlg::Es256 => EncodingKey::from_ec_der(&der),
-      JwtSigningAlg::EdDsa => EncodingKey::from_ed_der(&der),
+      JwtSigningAlg::Es256 => EncodingKey::from_ec_der(der.as_slice()),
+      JwtSigningAlg::EdDsa => EncodingKey::from_ed_der(der.as_slice()),
     };
     encode(&Header::new(alg.algorithm()), &serde_json::json!({}), &key)
       .map_err(|_| ConfigError::InvalidJwtSigningKey { key: field })?;

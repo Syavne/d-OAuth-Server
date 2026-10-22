@@ -51,7 +51,7 @@ const LEEWAY_SECS: u64 = 0;
 /// `scope` is the space-joined granted scope; `aud` is always an array (this
 /// AS never emits the string form). `sub` is empty for client-credentials
 /// tokens. `client_id` is REQUIRED (§2.2): a token without it is malformed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JwtClaims {
   /// Token issuer: the AS `issuer`.
   pub iss: String,
@@ -85,6 +85,25 @@ pub struct JwtClaims {
 pub struct ActClaim {
   /// The subject token's client: the impersonated/delegated party.
   pub sub: String,
+}
+
+impl fmt::Debug for JwtClaims {
+  /// Locked [`fmt::Debug`]: the raw `sub` (PII) and `jti` (allowlist key
+  /// material) are redacted; the remaining members are public identifiers.
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("JwtClaims")
+      .field("iss", &self.iss)
+      .field("sub", &"[REDACTED]")
+      .field("aud", &self.aud)
+      .field("scope", &self.scope)
+      .field("exp", &self.exp)
+      .field("iat", &self.iat)
+      .field("jti", &"[REDACTED]")
+      .field("client_id", &self.client_id)
+      .field("cnf", &self.cnf)
+      .field("act", &self.act)
+      .finish()
+  }
 }
 
 /// A verified access token: signature, claims, marker, and account checks all
@@ -300,8 +319,9 @@ impl JwtAccessSigner {
     Ok(VerifiedJwt { claims })
   }
 
-  /// Full liveness verification: [`Self::verify`] plus the allowlist marker
-  /// and the disabled-subject re-check (same `subject_account_status` call
+  /// Full liveness verification: [`Self::verify`] plus the strict allowlist
+  /// marker (marker + grant membership, [`marker_live_strict`]) and the
+  /// disabled-subject re-check (same `subject_account_status` call
   /// introspection uses).
   ///
   /// # Errors
@@ -320,7 +340,7 @@ impl JwtAccessSigner {
     expected_aud: Option<&[String]>,
   ) -> Result<VerifiedJwt, JwtError> {
     let verified = self.verify(token, expected_aud)?;
-    if !marker_live(conn, store, &jti_hash(&verified.claims.jti)).await? {
+    if !marker_live_strict(conn, store, &jti_hash(&verified.claims.jti)).await? {
       return Err(JwtError::MarkerAbsent);
     }
     if !subject_active(pool, keys, &verified.claims.sub).await? {

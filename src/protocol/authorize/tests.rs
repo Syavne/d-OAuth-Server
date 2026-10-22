@@ -3,7 +3,12 @@
 use std::{collections::HashMap, time::Duration};
 
 use axum::http::{StatusCode, header};
+use base64::Engine as _;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use ring::rand::SystemRandom;
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use secrecy::SecretString;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{AuthorizeFailure, AuthorizeInput, validate};
@@ -16,7 +21,11 @@ use crate::{
   },
   error::{AppError, OAuthErrorCode},
   keys::{KeyId, KeyRing},
-  protocol::cimd,
+  protocol::{
+    cimd,
+    client_auth::ClientAuthRequest,
+    par::{ParContext, ParStores, push_authorization_request},
+  },
   state::RedisConn,
   store::Store,
   test_support,
@@ -135,6 +144,84 @@ fn test_keys() -> TestResult<KeyRing> {
     vec![(KeyId::new("v1"), SecretString::from("authorize-test-totp"))],
     vec![(KeyId::new("v1"), SecretString::from("authorize-test-pii"))],
   )?)
+}
+
+/// An Ed25519 signer plus the matching inline JWKS for a JAR regression.
+struct TestSigner {
+  encoding: EncodingKey,
+  jwks: serde_json::Value,
+}
+
+impl TestSigner {
+  /// Generate a fresh Ed25519 keypair and its one-key inline JWKS.
+  fn generate(kid: &str) -> TestResult<Self> {
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| "ed25519 keygen failed")?;
+    let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|_| "ed25519 reload failed")?;
+    let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pair.public_key().as_ref());
+    Ok(Self {
+      encoding: EncodingKey::from_ed_der(pkcs8.as_ref()),
+      jwks: serde_json::json!({
+        "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": x, "kid": kid }]
+      }),
+    })
+  }
+
+  /// Sign a request object bound to `client_id` and the test issuer.
+  fn request_object(
+    &self,
+    kid: &str,
+    client_id: &str,
+    extra: serde_json::Value,
+  ) -> TestResult<String> {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let mut claims = serde_json::json!({
+      "iss": client_id,
+      "aud": ISSUER,
+      "exp": now + 300,
+      "iat": now,
+    });
+    let object = claims
+      .as_object_mut()
+      .ok_or("request object claims must be an object")?;
+    let extra = extra
+      .as_object()
+      .ok_or("request object extra claims must be an object")?;
+    for (name, value) in extra {
+      object.insert(name.clone(), value.clone());
+    }
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(kid.to_owned());
+    Ok(encode(&header, &claims, &self.encoding)?)
+  }
+}
+
+/// Register a client whose inline JWKS verifies signed request objects.
+async fn provision_signing(
+  pool: &sqlx::PgPool,
+  keys: &KeyRing,
+  client_id: &str,
+  jwks: serde_json::Value,
+) -> TestResult {
+  let mut new = fixture(client_id, true);
+  new.jwks = Some(jwks);
+  client_repo::insert(pool, keys, false, &new).await?;
+  let (row, _) = redirect_repo::upsert(
+    pool,
+    keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: Uuid::new_v4(),
+      uri: REDIRECT,
+      kind: redirect_repo::RedirectKind::Authorize,
+      description: "authorize test",
+      created_by: None,
+    },
+  )
+  .await?;
+  redirect_repo::attach(pool, client_id, row.id, None).await?;
+  scope_repo::upsert(pool, "api:read", "read api").await?;
+  Ok(())
 }
 
 /// A valid plain-query authorize map for the provisioned client.
@@ -1125,4 +1212,136 @@ async fn authorize_accepts_repeated_resource() -> TestResult {
     return Err(format!("aud not pinned sorted deduped: {:?}", validated.aud).into());
   }
   Ok(())
+}
+
+/// A query `resource` appended to a PAR `request_uri` must not union into the
+/// pinned audience: the request rejects as `invalid_request_object` through
+/// the validated redirect (RFC 9101 §5.2, RFC 8707 §2.1).
+#[tokio::test]
+async fn authorize_rejects_query_resource_beside_par() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  let client_id = "authz-par-resource";
+  provision(&pool, &keys, client_id, true).await?;
+  resource_repo::upsert(&pool, "https://a.example.test/", "a").await?;
+  resource_repo::upsert(&pool, "https://b.example.test/", "b").await?;
+  let (mut conn, prefix, ratelimit) = shared_redis().await?;
+  let store = Store::from_parts(prefix, ratelimit, DurabilityMode::WaitAof);
+
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let pushed_params = valid_query(client_id, &challenge);
+  let auth = ClientAuthRequest {
+    basic_header: None,
+    client_id: Some(client_id),
+    body_secret: None,
+    assertion_type: None,
+    assertion: None,
+    peer_certs: None,
+  };
+  let ctx = ParContext {
+    token_endpoint: "https://auth.example.test/token",
+    now: OffsetDateTime::now_utc(),
+    par_ttl: Duration::from_secs(90),
+    allow_localhost_redirect: false,
+    cimd: None,
+    resource_indicators_enabled: true,
+  };
+  let pinned = ["https://a.example.test/".to_owned()];
+  let pushed = {
+    let mut stores = ParStores {
+      pool: &pool,
+      keys: &keys,
+      conn: &mut conn,
+      store: &store,
+    };
+    push_authorization_request(&mut stores, &ctx, &auth, &pushed_params, &pinned)
+      .await
+      .map_err(|error| format!("PAR push rejected: {}", error.code()))?
+  };
+
+  let appended = "https://b.example.test/".to_owned();
+  let params = query(&[
+    ("client_id", client_id),
+    ("request_uri", pushed.request_uri.as_str()),
+    ("resource", appended.as_str()),
+  ]);
+
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
+    query: &params,
+    resources: vec![appended],
+    resource_indicators_enabled: true,
+  })
+  .await
+  {
+    Ok(validated) => Err(format!("PAR audience was widened to {:?}", validated.aud).into()),
+    Err(AuthorizeFailure::Redirect { target, error, .. }) => {
+      assert_eq!(target, REDIRECT);
+      assert_eq!(error.code(), OAuthErrorCode::InvalidRequestObject);
+      Ok(())
+    }
+    Err(other) => Err(format!("expected invalid_request_object, got {}", other.code()).into()),
+  }
+}
+
+/// A query `resource` beside an inline signed request object is rejected:
+/// the audience travels in the object, never the query (RFC 9101 §5.2).
+#[tokio::test]
+async fn authorize_rejects_query_resource_beside_inline_request() -> TestResult {
+  let (_db, pool) = migrated_pool().await?;
+  let keys = test_keys()?;
+  let client_id = "authz-jar-resource";
+  let signer = TestSigner::generate("jar-resource-key")?;
+  provision_signing(&pool, &keys, client_id, signer.jwks.clone()).await?;
+  resource_repo::upsert(&pool, "https://b.example.test/", "b").await?;
+  let challenge = challenge_from_verifier(VERIFIER).map_err(|_| "bad fixture verifier")?;
+  let request = signer.request_object(
+    "jar-resource-key",
+    client_id,
+    serde_json::json!({
+      "response_type": "code",
+      "redirect_uri": REDIRECT,
+      "scope": "api:read",
+      "code_challenge": challenge,
+      "code_challenge_method": "S256",
+      "state": "jar-state",
+    }),
+  )?;
+  let appended = "https://b.example.test/".to_owned();
+  let params = query(&[
+    ("client_id", client_id),
+    ("request", request.as_str()),
+    ("resource", appended.as_str()),
+  ]);
+  let mut conn = offline_redis()?;
+  let store = test_store();
+
+  match validate(AuthorizeInput {
+    pool: &pool,
+    keys: &keys,
+    conn: &mut conn,
+    store: &store,
+    issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: None,
+    query: &params,
+    resources: vec![appended],
+    resource_indicators_enabled: true,
+  })
+  .await
+  {
+    Ok(validated) => Err(format!("JAR pinned the query audience {:?}", validated.aud).into()),
+    Err(AuthorizeFailure::Redirect { target, error, .. }) => {
+      assert_eq!(target, REDIRECT);
+      assert_eq!(error.code(), OAuthErrorCode::InvalidRequestObject);
+      Ok(())
+    }
+    Err(other) => Err(format!("expected invalid_request_object, got {}", other.code()).into()),
+  }
 }

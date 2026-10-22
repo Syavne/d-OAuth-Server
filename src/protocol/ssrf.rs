@@ -73,27 +73,30 @@ pub enum SsrfError {
 ///   (IETF protocol assignments), `192.0.2.0/24`, `192.88.99.0/24` (6to4
 ///   relay anycast), `192.168.0.0/16`, `198.18.0.0/15` (benchmarking),
 ///   `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4` (multicast),
-///   `240.0.0.0/4` (reserved, incl. broadcast), and the Azure/Alibaba
-///   metadata addresses.
+///   `240.0.0.0/4` (reserved, incl. broadcast), AS112 `192.31.196.0/24`,
+///   AMT `192.52.193.0/24`, direct-delegation `192.175.48.0/24`, and the
+///   Azure/Alibaba metadata addresses.
 /// - IPv6: `::1`, `::`, `fc00::/7`, `fe80::/10`, `ff00::/8`, `2001:db8::/32`,
-///   `100::/64` (discard-only), `2001:2::/48` (benchmarking), `2001:10::/28`
+///   `100::/64` (discard-only), `2001:2::/48` (benchmarking), PCP
+///   `2001:1::/32`, AMT `2001:3::/32`, AS112 `2001:4:112::/48`, `2001:10::/28`
 ///   and `2001:20::/28` (ORCHID/ORCHIDv2 identifiers), `2001::/32` (Teredo),
 ///   `2002::/16` (6to4), and `64:ff9b::/96` / `64:ff9b:1::/48` (NAT64
 ///   translation — can reach an embedded private IPv4 target).
 ///
-/// IPv4-mapped addresses (`::ffff:a.b.c.d`) are judged by the embedded IPv4
-/// address.
+/// IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) addresses
+/// are judged by the embedded IPv4 address; the IPv4-translated SIIT prefix
+/// `::ffff:0:0/96` is blocked outright.
 #[must_use]
 pub fn is_blocked_ip(ip: &IpAddr) -> bool {
   match ip {
     IpAddr::V4(v4) => is_blocked_v4(v4),
     IpAddr::V6(v6) => {
-      // An IPv4-mapped address (`::ffff:a.b.c.d`) reaches the same host as
-      // its embedded IPv4 address, so it must be judged by that address —
-      // otherwise `::ffff:127.0.0.1` / `::ffff:169.254.169.254` would slip
-      // past the guard. `to_ipv4_mapped` returns `None` for every other
-      // IPv6 form, including IPv4-compatible (`::a.b.c.d`) and NAT64.
-      if let Some(v4) = v6.to_ipv4_mapped() {
+      // An IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible (`::a.b.c.d`)
+      // address reaches the same host as its embedded IPv4 address, so it is
+      // judged by that address — otherwise `::ffff:127.0.0.1` /
+      // `::169.254.169.254` could slip past the guard. NAT64 and the other
+      // transition prefixes are blocked explicitly below.
+      if let Some(v4) = v6.to_ipv4() {
         return is_blocked_v4(&v4);
       }
       v6.is_loopback()
@@ -110,10 +113,24 @@ pub fn is_blocked_ip(ip: &IpAddr) -> bool {
           && v6.segments()[2] == 0
           && v6.segments()[3] == 0)
         || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0002 && v6.segments()[2] == 0)
+        // IPv4-translated SIIT (`::ffff:0:a.b.c.d`, `::ffff:0:0/96`).
+        || (v6.segments()[0] == 0
+          && v6.segments()[1] == 0
+          && v6.segments()[2] == 0
+          && v6.segments()[3] == 0
+          && v6.segments()[4] == 0xffff
+          && v6.segments()[5] == 0)
         // Non-routable identifier prefixes: ORCHID (2001:10::/28) and
         // ORCHIDv2 (2001:20::/28).
         || (v6.segments()[0] == 0x2001 && (v6.segments()[1] & 0xfff0) == 0x0010)
         || (v6.segments()[0] == 0x2001 && (v6.segments()[1] & 0xfff0) == 0x0020)
+        // Anycast/special-purpose: PCP (2001:1::/32), AMT (2001:3::/32),
+        // AS112 (2001:4:112::/48).
+        || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0001)
+        || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0003)
+        || (v6.segments()[0] == 0x2001
+          && v6.segments()[1] == 0x0004
+          && v6.segments()[2] == 0x0112)
         // IPv4 transition/translation: Teredo (2001::/32), 6to4 (2002::/16),
         // NAT64 well-known (64:ff9b::/96) and local-use (64:ff9b:1::/48).
         || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0)
@@ -144,6 +161,11 @@ fn is_blocked_v4(v4: &std::net::Ipv4Addr) -> bool {
     || (o[0] == 192 && o[1] == 88 && o[2] == 99)
     // Benchmarking (RFC 2544): 198.18.0.0/15.
     || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+    // AS112 (192.31.196.0/24), AMT (192.52.193.0/24), and direct delegation
+    // (192.175.48.0/24) — never public fetch targets.
+    || (o[0] == 192 && o[1] == 31 && o[2] == 196)
+    || (o[0] == 192 && o[1] == 52 && o[2] == 193)
+    || (o[0] == 192 && o[1] == 175 && o[2] == 48)
     // Reserved (240.0.0.0/4, includes 255.255.255.255 broadcast).
     || o[0] >= 240
     || o == AZURE_METADATA_V4
@@ -208,6 +230,14 @@ pub async fn fetch_guarded_bytes(raw: &str) -> Result<Vec<u8>, SsrfError> {
   fetch_guarded_bytes_with(raw, SSRF_MAX_BYTES, SSRF_TIMEOUT).await
 }
 
+/// Remaining budget under a total `deadline`: `None` when the deadline has
+/// passed or exactly zero remains, so the caller fails closed.
+fn remaining_budget(deadline: tokio::time::Instant) -> Option<Duration> {
+  deadline
+    .checked_duration_since(tokio::time::Instant::now())
+    .filter(|left| !left.is_zero())
+}
+
 /// Fetch `raw` through the full SSRF guard with per-call limits.
 ///
 /// Same policy as [`fetch_guarded_bytes`] — `https`-only, no redirects, a
@@ -215,6 +245,10 @@ pub async fn fetch_guarded_bytes(raw: &str) -> Result<Vec<u8>, SsrfError> {
 /// statuses only — but the response body cap and total timeout are the
 /// caller's, so a tighter caller (for example CIMD's 5120-byte cap and
 /// configured timeout) reuses the one fetcher instead of adding a second.
+///
+/// `timeout` is the total budget for the DNS check plus the HTTPS fetch: the
+/// DNS check runs under the deadline, and only the remainder reaches the
+/// fetch. A zero or already-expired budget fails closed.
 ///
 /// # Errors
 ///
@@ -225,11 +259,18 @@ pub async fn fetch_guarded_bytes_with(
   max_bytes: usize,
   timeout: Duration,
 ) -> Result<Vec<u8>, SsrfError> {
+  if timeout.is_zero() {
+    return Err(SsrfError::FetchFailed);
+  }
   let url = validate_fetch_url(raw)?;
   let host = url.host_str().unwrap_or_default().to_owned();
   let port = url.port_or_known_default().unwrap_or(443);
-  let addrs = check_fetch_host(&host, port).await?;
-  fetch_pinned(&url, &host, &addrs, max_bytes, timeout).await
+  let deadline = tokio::time::Instant::now() + timeout;
+  let addrs = tokio::time::timeout_at(deadline, check_fetch_host(&host, port))
+    .await
+    .map_err(|_| SsrfError::FetchFailed)??;
+  let left = remaining_budget(deadline).ok_or(SsrfError::FetchFailed)?;
+  fetch_pinned(&url, &host, &addrs, max_bytes, left).await
 }
 
 /// The post-guard network step shared by every guarded fetch: an `https` GET

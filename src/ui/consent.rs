@@ -35,6 +35,7 @@ use crate::{
   keys::KeyRing,
   middleware::{audit::AuditEvent, request_id::RequestId},
   protocol::{
+    cimd::{self, CimdSettings},
     code,
     scope::{self, ScopeSet},
   },
@@ -137,6 +138,9 @@ pub struct ConsentDeps<'a> {
   pub store: &'a Store,
   /// Versioned PII keys for the encrypted user-email lookup.
   pub keys: &'a KeyRing,
+  /// CIMD resolution settings; `None` keeps CIMD disabled, while a registered
+  /// active row still wins when enabled (CIMD draft §3).
+  pub cimd: Option<CimdSettings<'a>>,
 }
 
 /// Whether `live` is a full authenticated session (never a pre-session or a
@@ -270,15 +274,26 @@ fn client_kind_of(client: &client_repo::Client) -> code::CodeClientKind {
   }
 }
 
-/// Load the active client and the non-disabled user for a pending request.
+/// Load the resolved client and the non-disabled user for a pending request.
+///
+/// Resolution is the single CIMD seam: a registered active row wins, and when
+/// CIMD is enabled an `https://` client id with no row materializes the
+/// synthetic client from its validated document.
 async fn client_and_user(
-  deps: &ConsentDeps<'_>,
+  deps: &mut ConsentDeps<'_>,
   pending: &PendingAuth,
   subject: &str,
 ) -> Result<(client_repo::Client, user_repo::UserRecord), AppError> {
-  let client = client_repo::find_active_by_client_id(deps.pool, deps.keys, &pending.client_id)
-    .await?
-    .ok_or_else(|| AppError::invalid_request("the client is no longer active"))?;
+  let client = cimd::resolve_client(
+    deps.pool,
+    deps.keys,
+    deps.conn,
+    deps.cimd,
+    &pending.client_id,
+  )
+  .await
+  .map_err(AppError::from)?
+  .ok_or_else(|| AppError::invalid_request("the client is no longer active"))?;
   let user = user_repo::find_by_email(deps.pool, deps.keys, subject)
     .await?
     .filter(|user| !user.disabled)
@@ -435,11 +450,18 @@ pub async fn get_consent(
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let session_id = login::session_id_from_jar(&state.config, &jar);
+  let cimd = state.config.cimd_enabled.then(|| CimdSettings {
+    token_prefix: &state.config.redis.token_key_prefix,
+    max_bytes: state.config.cimd_max_bytes,
+    timeout: state.config.cimd_fetch_timeout,
+    allow_localhost: state.config.allow_localhost_redirect,
+  });
   let mut deps = ConsentDeps {
     pool: &state.pool,
     conn: &mut conn,
     store: &store,
     keys: &state.keys,
+    cimd,
   };
   match load_consent_view(&mut deps, &session_id).await {
     Ok(Some(view)) => render(ConsentTemplate {
@@ -478,11 +500,18 @@ pub async fn post_consent(
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let session_id = login::session_id_from_jar(&state.config, &jar);
+  let cimd = state.config.cimd_enabled.then(|| CimdSettings {
+    token_prefix: &state.config.redis.token_key_prefix,
+    max_bytes: state.config.cimd_max_bytes,
+    timeout: state.config.cimd_fetch_timeout,
+    allow_localhost: state.config.allow_localhost_redirect,
+  });
   let mut deps = ConsentDeps {
     pool: &state.pool,
     conn: &mut conn,
     store: &store,
     keys: &state.keys,
+    cimd,
   };
   let submission = ConsentSubmission {
     session_id: &session_id,

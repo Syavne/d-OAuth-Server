@@ -1371,11 +1371,19 @@ async fn setup_with_jwt_flag(enabled: bool) -> Result<World, TestError> {
     serde_json::json!({
       "jwt_access_tokens_enabled": true,
       "jwt_signing_key": JWT_TEST_KEY,
+      "resource_indicators_enabled": true,
     })
   } else {
     serde_json::json!({})
   };
   let world = World::start_with(open_rate_limit(), overrides).await?;
+  if enabled {
+    for resource in [RESOURCE_A, RESOURCE_B] {
+      resource_repo::upsert(&world.pool, resource, "e2e resource server")
+        .await
+        .map_err(|error| fail(format!("resource upsert failed: {error}")))?;
+    }
+  }
   seed_client(
     &world.pool,
     &world.state.keys,
@@ -1498,10 +1506,9 @@ async fn jwt_client_flag_off_is_503() -> Result<(), TestError> {
 }
 
 /// The positive branch: `jwt` + the global switch on + a valid signing key
-/// passes the format gate instead of 503.
-///
-/// Todo 26 turns the mint into a real JWT; until then the gate is the only
-/// behavior this test pins, so a 200 opaque token is expected here.
+/// passes the format gate instead of 503 and mints a real JWT bound to the
+/// requested `resource` (a JWT without a resource audience is
+/// `invalid_target`).
 #[tokio::test]
 async fn jwt_client_with_flag_on_resolves_jwt() -> Result<(), TestError> {
   let world = setup_with_jwt_flag(true).await?;
@@ -1512,7 +1519,10 @@ async fn jwt_client_with_flag_on_resolves_jwt() -> Result<(), TestError> {
   let (status, _, body) = world
     .post_form(
       "/token",
-      &[("grant_type", "client_credentials")],
+      &[
+        ("grant_type", "client_credentials"),
+        ("resource", RESOURCE_A),
+      ],
       Some((CLIENT_ID, CLIENT_SECRET)),
       &[],
     )
@@ -1525,11 +1535,13 @@ async fn jwt_client_with_flag_on_resolves_jwt() -> Result<(), TestError> {
     status == reqwest::StatusCode::OK,
     format!("the gate's positive branch must reach minting: {status} {body}"),
   )?;
+  let token = json_body(&body)?["access_token"]
+    .as_str()
+    .map(str::to_owned)
+    .ok_or_else(|| fail("the positive branch mints a token"))?;
   ensure(
-    json_body(&body)?["access_token"]
-      .as_str()
-      .is_some_and(|token| !token.is_empty()),
-    "the positive branch mints a token",
+    token.split('.').count() == 3,
+    "the positive branch mints a JWT",
   )?;
   Ok(())
 }

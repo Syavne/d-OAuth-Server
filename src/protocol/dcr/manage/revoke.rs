@@ -68,16 +68,18 @@ pub async fn revoke_client_tokens(
   for key in access_keys {
     let fields = read_fields(conn, &key).await?;
     if is_owned(&fields, client_id) {
-      if let (Some(hash), Some(grant)) = (
-        key.strip_prefix(&store.access_key_prefix()),
-        fields.get("grant_id"),
-      ) {
-        let _: () = redis::cmd("SREM")
-          .arg(store.grant_tokens_key(grant))
-          .arg(hash)
-          .query_async(conn)
-          .await
-          .map_err(store_mapped)?;
+      if let Some(hash) = key.strip_prefix(&store.access_key_prefix()) {
+        if let Some(jti_hash) = hash.strip_prefix("jwt:") {
+          del_key(conn, &store.jwt_marker_key(jti_hash)).await?;
+        }
+        if let Some(grant) = fields.get("grant_id") {
+          let _: () = redis::cmd("SREM")
+            .arg(store.grant_tokens_key(grant))
+            .arg(hash)
+            .query_async(conn)
+            .await
+            .map_err(store_mapped)?;
+        }
       }
       del_key(conn, &key).await?;
       summary.access += 1;

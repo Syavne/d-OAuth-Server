@@ -38,7 +38,7 @@ use crate::{
   protocol::scope::{ScopeSet, refresh_scopes},
   state::RedisConn,
   store::{
-    Store, StoreError, durability_barrier,
+    Store, durability_barrier,
     grants::revoke_by_token_hash,
     tokens::{AccessRecord, RefreshRecord, RotateOutcome, RotationInput},
   },
@@ -264,6 +264,11 @@ pub async fn refresh(
   // refresh token stays bound to the full original set (NOT §3).
   let original_aud = found.record.aud.clone();
   let (access_aud, refresh_aud) = resolve_audience(&original_aud, input.requested_resources)?;
+  if input.token_format == TokenFormat::Jwt && access_aud.is_empty() {
+    return Err(AppError::invalid_target(
+      "jwt access tokens require a resource audience",
+    ));
+  }
   let minted = service
     .mint_for_rotation(
       conn,
@@ -274,6 +279,7 @@ pub async fn refresh(
         dpop_required: input.dpop_required,
         subject: found.record.subject.clone(),
         scope: retained.render(),
+        access_scope: access.render(),
         grant_id: found.record.grant_id.clone(),
         proof: input.proof.clone(),
         aud: access_aud.clone(),
@@ -462,29 +468,14 @@ async fn discard_orphan(
     .map_err(AppError::from)?;
   if let Some(jti_hash) = minted.jwt_jti_hash() {
     let member = minted.access_hash.clone();
-    let record_key = store.access_key(&member);
     let grant_id = crate::store::tokens::get_access(conn, store, &member)
       .await
       .map_err(AppError::from)?
-      .map(|record| record.grant_id);
-    let _: () = redis::cmd("DEL")
-      .arg(&record_key)
-      .query_async(conn)
+      .map(|record| record.grant_id)
+      .unwrap_or_default();
+    crate::store::tokens::discard_access_jwt(conn, store, &member, jti_hash, &grant_id)
       .await
-      .map_err(StoreError::Redis)?;
-    if let Some(grant_id) = grant_id {
-      let _: () = redis::cmd("SREM")
-        .arg(store.grant_tokens_key(&grant_id))
-        .arg(&member)
-        .query_async(conn)
-        .await
-        .map_err(StoreError::Redis)?;
-    }
-    let _: () = redis::cmd("DEL")
-      .arg(store.jwt_marker_key(jti_hash))
-      .query_async(conn)
-      .await
-      .map_err(StoreError::Redis)?;
+      .map_err(AppError::from)?;
     durability_barrier(conn, store)
       .await
       .map_err(AppError::from)?;

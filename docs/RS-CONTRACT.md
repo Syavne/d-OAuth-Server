@@ -218,8 +218,10 @@ This AS additionally accepts a repeated `resource` parameter on the
 introspection request as a LOCAL EXTENSION to RFC 7662, which defines no
 `resource` parameter. When present, the token's `aud` must include every
 requested member (set inclusion, so a token pinned to a superset stays active);
-a token that does not include every requested member returns the inactive shape,
-never an error. An RS uses this to ask whether a token is bound to its own
+a token that does not include every requested member returns the inactive shape.
+A requested value that is not an enabled catalog row (or a request while
+resource indicators are disabled) is `invalid_target` before the lookup, matching
+the other endpoints. An RS uses this to ask whether a token is bound to its own
 resource identifier.
 
 ## Validating the metadata document
@@ -260,13 +262,19 @@ The AS side of this contract is narrow and fixed:
 - RFC 9728 §4 defines one AS-side member, `protected_resources`, which lists the
   protected resources usable with this AS. It is emitted only when
   `protected_resources_enabled` is set, using the identifiers in
-  `protected_resource_ids`; both default off and empty. Until enabled, the AS
-  advertises no `protected_resources` and clients rely on the RS metadata alone.
+  `protected_resource_ids`; both default off and empty. The identifiers are
+  validated at load (absolute `https`, host, no wildcard/userinfo/fragment/
+  query, no duplicates) and the flag requires `resource_indicators_enabled`.
+  Until enabled, the AS advertises no `protected_resources` and clients rely on
+  the RS metadata alone.
 - Tokens are opaque by default and hashed at rest, so the RS validates them by
   introspection (RFC 7662) rather than by local verification. A client can be
   opted into JWT access tokens, in which case the AS advertises `jwks_uri` and
   the RS may verify locally; local verification cannot observe revocation or
-  `user disable` before `exp`, so a sensitive RS still introspects. See
+  `user disable` before `exp`, so a sensitive RS still introspects. A JWT access
+  token always carries a non-empty `aud`; a JWT-format client must request at
+  least one `resource` and the AS rejects an empty audience with
+  `invalid_target`. See
   [OAUTH.md](OAUTH.md#the-resource-server-trade-off).
 - RFC 8707 resource indicators are honored only when `resource_indicators_enabled`
   is set (default off). The RS should confirm with the operator whether tokens

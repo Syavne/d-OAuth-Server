@@ -230,7 +230,7 @@ impl TokenService {
     let access = low::AccessRecord {
       client_id: request.client_id.clone(),
       grant_id: request.grant_id.clone(),
-      scope: request.scope.clone(),
+      scope: request.access_scope.clone(),
       subject: request.subject.clone(),
       cnf: cnf_json.clone(),
       aud: request.aud.clone(),
@@ -305,6 +305,9 @@ impl TokenService {
     now_unix: i64,
     apply_barrier: bool,
   ) -> Result<MintedTokens, TokenServiceError> {
+    if request.aud.is_empty() {
+      return Err(TokenServiceError::EmptyAudience);
+    }
     let signer = self
       .jwt
       .as_ref()
@@ -319,7 +322,7 @@ impl TokenService {
       iss: signer.issuer().to_owned(),
       sub: request.subject.clone(),
       aud: request.aud.clone(),
-      scope: request.scope.clone(),
+      scope: request.access_scope.clone(),
       exp: access_expires_at,
       iat: issued_at,
       jti: jti_raw,
@@ -338,7 +341,7 @@ impl TokenService {
     let access = low::AccessRecord {
       client_id: request.client_id.clone(),
       grant_id: request.grant_id.clone(),
-      scope: request.scope.clone(),
+      scope: request.access_scope.clone(),
       subject: request.subject.clone(),
       cnf: cnf_json.clone(),
       aud: request.aud.clone(),

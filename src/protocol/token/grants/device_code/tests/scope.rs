@@ -5,7 +5,9 @@ use super::flows::{authorize, decide, now_unix, poll_once, public_inputs};
 use super::{TestError, TestResult, harness, unique};
 use super::{keys, setup};
 use crate::{
-  db::TokenEndpointAuthMethod, error::OAuthErrorCode, protocol::device::DeviceHttpInputs,
+  db::TokenEndpointAuthMethod,
+  error::OAuthErrorCode,
+  protocol::{device::DeviceHttpInputs, token::TokenService},
 };
 
 #[tokio::test]
@@ -117,6 +119,77 @@ async fn test_grant_device_scope_reduced_to_user_entitlement() -> TestResult {
     return Err(TestError::Unexpected(format!(
       "scope must reduce to the user entitlement, got {}",
       tokens.scope
+    )));
+  }
+  Ok(())
+}
+
+/// The device UI approves with the session subject, which is the user's email.
+/// Redemption must resolve that email to the entitlement owner while keeping
+/// the email as the minted token subject.
+#[tokio::test]
+async fn test_grant_device_email_subject_resolves_entitlement() -> TestResult {
+  let mut h = harness().await?;
+  let client_id = unique("public");
+  setup::insert_client(
+    &h.pool,
+    &h.config,
+    &client_id,
+    TokenEndpointAuthMethod::None,
+    None,
+    "orders:read orders:admin",
+  )
+  .await?;
+  setup::enable_scopes(&h.pool, &["orders:admin", "orders:read"]).await?;
+  let user = setup::entitled_user_record(&h.pool, &h.config, &["orders:read"]).await?;
+  let t0 = now_unix();
+  let key = keys::fresh_key()?;
+  let authorize_htu = keys::device_htu(&h.config);
+  let poll_htu = keys::token_htu(&h.config);
+
+  let authorize_proof = keys::mint_proof(&key, &authorize_htu, &unique("jti"), t0)?;
+  let authorize_inputs = DeviceHttpInputs {
+    client_id: client_id.as_str(),
+    scope: None,
+    basic_header: None,
+    body_secret: None,
+    assertion_type: None,
+    assertion: None,
+    dpop_proof: Some(authorize_proof.as_str()),
+    resource: &[],
+    peer_certs: None,
+  };
+  let issued = authorize(&mut h, &authorize_inputs, t0)
+    .await
+    .map_err(|error| TestError::Unexpected(format!("authorize rejected: {error}")))?;
+
+  if !decide(&mut h, &issued.device_code, true, &user.email).await? {
+    return Err(TestError::Unexpected("decide must apply".to_owned()));
+  }
+  let redeem_proof = keys::mint_proof(&key, &poll_htu, &unique("jti"), t0 + 6)?;
+  let tokens = poll_once(
+    &mut h,
+    &public_inputs(&client_id, &issued.device_code, Some(&redeem_proof)),
+    t0 + 6,
+  )
+  .await
+  .map_err(|error| TestError::Unexpected(format!("approved poll rejected: {}", error.code())))?;
+  if tokens.scope != "orders:read" {
+    return Err(TestError::Unexpected(format!(
+      "email subject must resolve to the user entitlement, got {}",
+      tokens.scope
+    )));
+  }
+
+  let service = TokenService::new(&h.config.ttl, &h.config.keys)?;
+  let found = service
+    .find_access(&mut h.conn, &h.store, &tokens.access_token)
+    .await?
+    .ok_or_else(|| TestError::Unexpected("access token must resolve".to_owned()))?;
+  if found.record.subject != user.email {
+    return Err(TestError::Unexpected(format!(
+      "minted subject must stay the approving email, got {}",
+      found.record.subject
     )));
   }
   Ok(())

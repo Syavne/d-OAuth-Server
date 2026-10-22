@@ -5,7 +5,8 @@
 use super::{TestError, TestResult, dpop_proof, input, is_invalid_grant, test_redis, unique};
 use crate::{
   config::{JwtSigningAlg, JwtSigningKey, TtlConfig},
-  jose::jwt_access::JwtAccessSigner,
+  error::OAuthErrorCode,
+  jose::jwt_access::{JwtAccessSigner, jti_hash},
   keys::KeyId,
   protocol::{
     scope::ScopeSet,
@@ -13,6 +14,12 @@ use crate::{
   },
   store::tokens as low,
 };
+
+/// Resource audience every JWT mint in this module binds (RFC 8707 §2:
+/// a JWT access token without a requested resource is rejected).
+fn jwt_aud() -> Vec<String> {
+  vec!["https://api.example.test/".to_owned()]
+}
 
 /// A fixed 32-byte ASCII signing key (the e2e JWT fixture material).
 const JWT_TEST_KEY: &str = "bcdefghijklmnopqrstuvwxyzabcdefg";
@@ -62,10 +69,11 @@ async fn mint_jwt_grant(
         dpop_required: true,
         subject: unique("subject"),
         scope: "read".to_owned(),
+        access_scope: "read".to_owned(),
         grant_id: unique("grant"),
         proof,
-        aud: Vec::new(),
-        refresh_aud: Vec::new(),
+        aud: jwt_aud(),
+        refresh_aud: jwt_aud(),
         format: TokenFormat::Jwt,
       },
       super::now_unix(),
@@ -77,6 +85,97 @@ async fn mint_jwt_grant(
     ));
   }
   Ok(minted)
+}
+
+/// A narrowed JWT refresh binds the ACCESS token to the narrowed scope: the
+/// response, the JWT `scope` claim (which is what introspection reports),
+/// and the stored access record all carry `read`, while the rotated refresh
+/// record retains the full `read write` grant scope.
+#[tokio::test]
+async fn jwt_narrowed_refresh_binds_access_scope() -> TestResult {
+  let (_container, mut conn, store, _url) = test_redis().await?;
+  let service = jwt_service(test_signer()?)?;
+  let verifier = test_signer()?;
+  let client = unique("jwt-narrow-client");
+  let proof = dpop_proof(&unique("jwt-narrow-jkt"));
+  let minted = service
+    .mint(
+      &mut conn,
+      &store,
+      &MintRequest {
+        client_id: client.clone(),
+        client_kind: ClientKind::Public,
+        dpop_required: true,
+        subject: unique("subject"),
+        scope: "read write".to_owned(),
+        access_scope: "read write".to_owned(),
+        grant_id: unique("grant"),
+        proof: proof.clone(),
+        aud: jwt_aud(),
+        refresh_aud: jwt_aud(),
+        format: TokenFormat::Jwt,
+      },
+      super::now_unix(),
+    )
+    .await?;
+  let enabled = ScopeSet::parse("read write")?;
+
+  let mut narrowed_input = input(
+    &client,
+    ClientKind::Public,
+    &minted.refresh_token,
+    Some("read"),
+    &proof,
+    &enabled,
+  );
+  narrowed_input.token_format = TokenFormat::Jwt;
+  let narrowed = super::super::refresh(&mut conn, &store, &service, &narrowed_input).await?;
+  if narrowed.scope != "read" {
+    return Err(TestError::Unexpected(format!(
+      "response scope not narrowed: {}",
+      narrowed.scope
+    )));
+  }
+  let verified = verifier
+    .verify(&narrowed.access_token, None)
+    .map_err(|error| TestError::Unexpected(format!("rotated jwt rejected: {error}")))?;
+  if verified.claims.scope != "read" {
+    return Err(TestError::Unexpected(format!(
+      "jwt scope claim not narrowed: {}",
+      verified.claims.scope
+    )));
+  }
+  let member = format!("jwt:{}", jti_hash(&verified.claims.jti));
+  let access_scope = match low::get_access(&mut conn, &store, &member).await? {
+    Some(record) => record.scope,
+    None => {
+      return Err(TestError::Unexpected(
+        "rotated jwt access record not found".to_owned(),
+      ));
+    }
+  };
+  if access_scope != "read" {
+    return Err(TestError::Unexpected(format!(
+      "access record scope not narrowed: {access_scope}"
+    )));
+  }
+  let refresh_scope = match service
+    .find_refresh(&mut conn, &store, &narrowed.refresh_token)
+    .await?
+  {
+    Some(found) => found.record.scope,
+    None => {
+      return Err(TestError::Unexpected(
+        "rotated refresh token not found".to_owned(),
+      ));
+    }
+  };
+  if refresh_scope != "read write" {
+    return Err(TestError::Unexpected(format!(
+      "refresh scope not retained: {refresh_scope}"
+    )));
+  }
+  Ok(())
 }
 
 /// `discard_orphan` deletes the JWT marker by key: a leaked marker written
@@ -98,10 +197,11 @@ async fn jwt_discard_orphan_deletes_marker_by_key() -> TestResult {
         dpop_required: true,
         subject: unique("subject"),
         scope: "read".to_owned(),
+        access_scope: "read".to_owned(),
         grant_id: unique("grant"),
         proof,
-        aud: Vec::new(),
-        refresh_aud: Vec::new(),
+        aud: jwt_aud(),
+        refresh_aud: jwt_aud(),
         format: TokenFormat::Jwt,
       },
       super::now_unix(),
@@ -269,8 +369,63 @@ async fn jwt_failed_rotation_leaves_no_marker() -> TestResult {
   let added: Vec<&String> = after.iter().filter(|key| !before.contains(key)).collect();
   if !added.is_empty() {
     return Err(TestError::Unexpected(format!(
-      "failed rotation left live jwt markers: {added:?}"
+      "failed rotation leaves live jwt markers: {added:?}"
     )));
+  }
+  Ok(())
+}
+
+/// Refreshing an unbound grant (no `resource` was ever requested) after the
+/// client switches to `Jwt` fails `invalid_target` before minting or
+/// rotating, so the refresh record stays live for a retry.
+#[tokio::test]
+async fn jwt_refresh_of_unbound_grant_is_invalid_target_and_preserves_refresh() -> TestResult {
+  let (_container, mut conn, store, _url) = test_redis().await?;
+  let service = jwt_service(test_signer()?)?;
+  let client = unique("jwt-unbound-refresh-client");
+  let proof = dpop_proof(&unique("jwt-unbound-refresh-jkt"));
+  let minted = super::mint_grant(
+    &service,
+    &mut conn,
+    &store,
+    &client,
+    ClientKind::Public,
+    "read",
+    proof.clone(),
+  )
+  .await?;
+  let enabled = ScopeSet::parse("read")?;
+  let mut refresh_input = input(
+    &client,
+    ClientKind::Public,
+    &minted.refresh_token,
+    None,
+    &proof,
+    &enabled,
+  );
+  refresh_input.token_format = TokenFormat::Jwt;
+  match super::super::refresh(&mut conn, &store, &service, &refresh_input).await {
+    Err(error) if error.code() == OAuthErrorCode::InvalidTarget => {}
+    Err(error) => {
+      return Err(TestError::Unexpected(format!(
+        "a resourceless jwt refresh must be invalid_target, got {}",
+        error.code()
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "a resourceless jwt refresh must never rotate".to_owned(),
+      ));
+    }
+  }
+  if service
+    .find_refresh(&mut conn, &store, &minted.refresh_token)
+    .await?
+    .is_none()
+  {
+    return Err(TestError::Unexpected(
+      "the refresh token must stay live after an invalid_target rejection".to_owned(),
+    ));
   }
   Ok(())
 }

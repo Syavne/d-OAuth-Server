@@ -60,6 +60,7 @@ fn test_config_protected(ids: &[&str]) -> Result<Config, ConfigError> {
     "totp_encryption_key": "metadata-test-totp-key-0123456789abcdef",
     "pii_encryption_key": "metadata-test-pii-key-0123456789abcdef",
     "protected_resources_enabled": true,
+    "resource_indicators_enabled": true,
     "protected_resource_ids": ids,
   });
   let source = ::config::Config::try_from(&fixture)?;

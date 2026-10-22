@@ -208,6 +208,15 @@ pub async fn redeem_code(
     ));
   }
 
+  // The code above is already consumed (single-use): a JWT redemption with an
+  // unbound audience fails here, before the mint, and the client must
+  // re-authorize with a `resource`.
+  if state.token_format == TokenFormat::Jwt && record.aud.is_empty() {
+    return Err(AppError::invalid_target(
+      "jwt access tokens require a resource audience",
+    ));
+  }
+
   let proofs = fresh_proofs(state, &client, inputs, used_basic).await?;
   require_dpop_binding(&client, &proofs)?;
   if let Some(want) = non_empty(&record.cnf) {
@@ -241,6 +250,7 @@ pub async fn redeem_code(
         dpop_required: client.dpop_bound_access_tokens,
         subject: record.subject.clone(),
         scope: record.scope.clone(),
+        access_scope: record.scope.clone(),
         grant_id: record.grant_id.clone(),
         proof: proofs,
         aud: record.aud.clone(),
@@ -1868,6 +1878,114 @@ mod tests {
     let issuer = CodeIssuer::new(&h.ttl, &h.ring)?;
     let approved = ScopeSet::parse("orders:read")?;
     let entitled = ScopeSet::parse("orders:read orders:admin")?;
+    let pinned = vec![AUD_ONE.to_owned()];
+    let issued = issuer
+      .issue(
+        &mut h.conn,
+        &h.store,
+        &CodeIssueRequest {
+          client_id: &client_id,
+          client_kind: CodeClientKind::Public,
+          dpop_required: false,
+          user_id: "user-1",
+          redirect_uri: REDIRECT,
+          approved_scope: &approved,
+          user_entitled: &entitled,
+          code_challenge: CHALLENGE,
+          dpop_jkt: None,
+          state: None,
+          aud: &pinned,
+          issuer: ISSUER,
+        },
+      )
+      .await?;
+    let now = now_unix();
+    let raw = secret("bcdefghijklmnopqrstuvwxyzabcdefg");
+    let key = JwtSigningKey::from_raw(
+      KeyId::new("test-kid"),
+      JwtSigningAlg::Es256,
+      &raw,
+      "jwt_signing_key",
+    )
+    .map_err(|error| TestError::Unexpected(format!("signing key rejected: {error:?}")))?;
+    let signer = JwtAccessSigner::new(ISSUER.to_owned(), key, Vec::new());
+    let inputs = CodeGrantInputs {
+      code: issued.code.as_str(),
+      redirect_uri: REDIRECT,
+      code_verifier: Some(VERIFIER),
+      client_id: Some(client_id.as_str()),
+      basic_header: None,
+      body_secret: None,
+      assertion_type: None,
+      assertion: None,
+      dpop_proof: None,
+      peer_certs: None,
+      aud: &pinned,
+    };
+    let mut state = CodeGrantState {
+      pool: &h.pool,
+      conn: &mut h.conn,
+      store: &h.store,
+      keys: &h.ring,
+      issuer: ISSUER,
+      ttl: &h.ttl,
+      now_unix: now,
+      token_format: TokenFormat::Jwt,
+      jwt_signer: Some(signer.clone()),
+      cimd: None,
+    };
+    let tokens = super::redeem_code(&mut state, &inputs)
+      .await
+      .map_err(|error| {
+        TestError::Unexpected(format!("unbound jwt redemption rejected: {error}"))
+      })?;
+    if tokens.token_type != "Bearer" {
+      return Err(TestError::Unexpected(format!(
+        "unbound jwt redemption must be Bearer, got {}",
+        tokens.token_type
+      )));
+    }
+    if tokens.refresh_token.is_some() {
+      return Err(TestError::Unexpected(
+        "a client without the refresh grant must receive no refresh token".to_owned(),
+      ));
+    }
+    let verified = signer
+      .verify(&tokens.access_token, Some(&pinned))
+      .map_err(|error| TestError::Unexpected(format!("fresh jwt rejected: {error:?}")))?;
+    if verified.claims.aud != pinned {
+      return Err(TestError::Unexpected(format!(
+        "aud must be {pinned:?}, got {:?}",
+        verified.claims.aud
+      )));
+    }
+    if verified.claims.cnf.is_some() {
+      return Err(TestError::Unexpected(
+        "an unbound public jwt must carry no cnf".to_owned(),
+      ));
+    }
+    Ok(())
+  }
+
+  /// An authorization code bound to no audience cannot redeem a JWT: the
+  /// redemption fails `invalid_target` (the code is already consumed, so a
+  /// retry observes `invalid_grant`) and no token is returned. The client
+  /// must re-authorize with a `resource`.
+  #[tokio::test]
+  async fn jwt_redeem_unbound_code_is_invalid_target_and_consumes_code() -> TestResult {
+    let mut h = harness().await?;
+    let client_id = unique("public-unbound-jwt-code");
+    insert_client(
+      &h,
+      &client_id,
+      TokenEndpointAuthMethod::None,
+      None,
+      &[super::GRANT_TYPE_AUTHORIZATION_CODE],
+    )
+    .await?;
+    let issuer = CodeIssuer::new(&h.ttl, &h.ring)?;
+    let approved = ScopeSet::parse("orders:read")?;
+    let entitled = ScopeSet::parse("orders:read orders:admin")?;
     let issued = issuer
       .issue(
         &mut h.conn,
@@ -1911,7 +2029,37 @@ mod tests {
       peer_certs: None,
       aud: &[],
     };
-    let mut state = CodeGrantState {
+    {
+      let mut state = CodeGrantState {
+        pool: &h.pool,
+        conn: &mut h.conn,
+        store: &h.store,
+        keys: &h.ring,
+        issuer: ISSUER,
+        ttl: &h.ttl,
+        now_unix: now,
+        token_format: TokenFormat::Jwt,
+        jwt_signer: Some(signer.clone()),
+        cimd: None,
+      };
+      match super::redeem_code(&mut state, &inputs).await {
+        Err(error) if error.code() == crate::error::OAuthErrorCode::InvalidTarget => {}
+        Err(error) => {
+          return Err(TestError::Unexpected(format!(
+            "an unbound jwt redemption must be invalid_target, got {}",
+            error.code()
+          )));
+        }
+        Ok(_) => {
+          return Err(TestError::Unexpected(
+            "an unbound jwt redemption must never mint".to_owned(),
+          ));
+        }
+      }
+    }
+    // The code was consumed by the failed redemption: a retry observes
+    // `invalid_grant`, proving single-use was not bypassed.
+    let mut retry = CodeGrantState {
       pool: &h.pool,
       conn: &mut h.conn,
       store: &h.store,
@@ -1920,33 +2068,18 @@ mod tests {
       ttl: &h.ttl,
       now_unix: now,
       token_format: TokenFormat::Jwt,
-      jwt_signer: Some(signer.clone()),
+      jwt_signer: Some(signer),
       cimd: None,
     };
-    let tokens = super::redeem_code(&mut state, &inputs)
-      .await
-      .map_err(|error| {
-        TestError::Unexpected(format!("unbound jwt redemption rejected: {error}"))
-      })?;
-    if tokens.token_type != "Bearer" {
-      return Err(TestError::Unexpected(format!(
-        "unbound jwt redemption must be Bearer, got {}",
-        tokens.token_type
-      )));
+    match super::redeem_code(&mut retry, &inputs).await {
+      Err(error) if error.code() == crate::error::OAuthErrorCode::InvalidGrant => Ok(()),
+      Err(error) => Err(TestError::Unexpected(format!(
+        "a consumed code must be invalid_grant, got {}",
+        error.code()
+      ))),
+      Ok(_) => Err(TestError::Unexpected(
+        "a consumed code must never mint".to_owned(),
+      )),
     }
-    if tokens.refresh_token.is_some() {
-      return Err(TestError::Unexpected(
-        "a client without the refresh grant must receive no refresh token".to_owned(),
-      ));
-    }
-    let verified = signer
-      .verify(&tokens.access_token, None)
-      .map_err(|error| TestError::Unexpected(format!("fresh jwt rejected: {error:?}")))?;
-    if verified.claims.cnf.is_some() {
-      return Err(TestError::Unexpected(
-        "an unbound public jwt must carry no cnf".to_owned(),
-      ));
-    }
-    Ok(())
   }
 }

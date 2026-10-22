@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 
 use axum::{
-  Extension, Form, Json,
-  extract::State,
+  Extension, Json,
+  extract::{RawForm, State},
   http::{HeaderMap, StatusCode, header},
   response::{IntoResponse, Response},
 };
@@ -332,6 +332,19 @@ struct ErrorBody {
   error_description: &'static str,
 }
 
+/// Fields the extractor recognizes: a repeat of any of these is the
+/// duplicate-field rejection (mapped to JSON `invalid_request`, per
+/// RFC 6749 §5.2 "includes a parameter more than once"). Unknown fields are
+/// silently absorbed, as `serde_urlencoded` absorbed them.
+const KNOWN_FIELDS: [&str; 6] = [
+  "token",
+  "token_type_hint",
+  "client_id",
+  "client_secret",
+  "client_assertion_type",
+  "client_assertion",
+];
+
 /// `POST /revoke` (RFC 7009 §2.1).
 ///
 /// Credentials come from the `Authorization` header and the form body only; a
@@ -359,8 +372,27 @@ pub async fn revoke_handler(
   State(state): State<AppState>,
   peer_certs: Option<Extension<PeerCertificates>>,
   headers: HeaderMap,
-  Form(form): Form<HashMap<String, String>>,
+  body: RawForm,
 ) -> Result<Response, AppError> {
+  // `RawForm` gates the content type BEFORE `Bytes` buffering, so a wrong
+  // content type is rejected 415 without reading the (up to 2 MiB) body.
+  // The explicit exact-MIME gate below is the second check: `RawForm` uses a
+  // case-sensitive prefix match, so it accepts e.g.
+  // `application/x-www-form-urlencodedevil`, which the exact gate rejects.
+  let body = body.0;
+  if let Err(reject) = crate::protocol::params::require_form_content_type(&headers) {
+    return Ok(reject.into_response());
+  }
+  let pairs = match crate::protocol::params::form_pairs(&body) {
+    Ok(pairs) => pairs,
+    Err(reject) => return Ok(reject.into_response()),
+  };
+  if crate::protocol::params::has_duplicate_field(&pairs, &KNOWN_FIELDS) {
+    return Err(AppError::invalid_request(
+      "the request body includes a parameter more than once",
+    ));
+  }
+  let form = crate::protocol::params::single_valued_map(&pairs);
   let service = TokenService::new(&state.config.ttl, &state.keys)?;
   let auth = ClientAuthRequest {
     basic_header: headers

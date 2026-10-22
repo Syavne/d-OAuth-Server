@@ -127,6 +127,10 @@ impl Rule {
         per_ip: limits.login_per_ip,
         per_client: None,
       }),
+      "/jwks.json" => Some(Self {
+        per_ip: limits.per_ip,
+        per_client: None,
+      }),
       "/register" => Some(Self {
         per_ip: limits.per_ip,
         per_client: None,

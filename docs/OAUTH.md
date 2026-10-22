@@ -149,7 +149,9 @@ A document is accepted only when all of these hold:
   Every shared-secret and mTLS method is rejected.
 - Any `jwks_uri` member is rejected. For `private_key_jwt`, an inline `jwks`
   with a non-empty `keys` array is required. This is inline-only by decision,
-  so client authentication never starts a second network fetch.
+  so client authentication never starts a second network fetch. An inline
+  `jwks` on a `none` document is ignored: that client does not authenticate
+  with a key.
 - `redirect_uris` must be a non-empty array. Each entry is an absolute
   `http`/`https` URI with a non-empty host and no userinfo, query, or fragment,
   and no entry may contain `*`. Plaintext `http` is accepted only for an RFC
@@ -173,8 +175,10 @@ outage is a fail-closed `503`.
 Resolution and the synthetic principal:
 
 - A registered row always wins. A row whose `client_id` happens to be an
-  `https://` URL is resolved from Postgres with no document fetch. Only a
-  missing row can fall back to CIMD.
+  `https://` URL is resolved from Postgres with no document fetch. An existing
+  inactive row also blocks the document fetch (it resolved to "client is no
+  longer active"), so deactivation cannot be bypassed; only a truly missing row
+  can fall back to CIMD.
 - The validated document is materialized as an in-memory `client_repo::Client`
   for the request. No `/register` row is written and no initial-access token
   is consumed.
@@ -196,13 +200,27 @@ Resolution and the synthetic principal:
   are exactly the same as before.
 
 The validated document is cached for 15 minutes under the `{state}` keyspace as
-`cimd:<sha256(url)>` (the hash of the URL, never the raw URL). Only the raw
-document is cached, and it is revalidated on every read, so a scope disabled or
-a catalog row removed during the TTL takes effect on the next request. A
+`cimd:<sha256(url)>` (the hash of the URL, never the raw URL). The parsed
+document (unknown members dropped) is cached, and it is revalidated on every
+read, so a scope disabled or a catalog row removed during the TTL takes effect
+on the next request. A
 malformed cache entry is deleted and treated as a miss. A cache hit does not
 fetch; a document changed at its origin may therefore be served from cache for
-up to the 15-minute TTL. Redis is not a second source of truth, and a Redis
-failure on this path is a fail-closed `503`.
+up to the 15-minute TTL. An origin-level fetch failure (network/TLS/non-2xx,
+timeout, or non-JSON body) is negatively cached for 30 seconds under
+`cimd:neg:<sha256(url)>`. A fresh-fetch validation failure is short-cached for
+2 seconds under `cimd:invalid:<sha256(url)>` (a single-flight completion
+marker), so a corrected document is seen within 2 seconds and waiters do not
+re-fetch a deterministically invalid one; a validation failure on an
+already-cached document writes no marker. If the cache write after a successful
+validation fails, the validated document is still served, uncached. Concurrent
+misses for the same URL elect one fetcher through a `cimd:lock:<sha256(url)>`
+Redis lock (TTL = the fetch timeout plus 1 s); the other requests wait for the
+positive or negative result for the fetch budget plus 1.5 s, then try once more
+to acquire the lock and otherwise fail closed. The lock is released with a
+compare-and-delete, so a holder whose TTL expired cannot release a successor's
+lock. Redis is not a second source of truth; a Redis read or lock failure on
+this path is a fail-closed `503`.
 
 ## The five grants
 
@@ -320,7 +338,12 @@ authorization server:
   literally registered in the catalog.
 - Values are never delimiter-joined. A URI containing a comma is stored as its
   own array element, so it cannot collide with a joined string.
-- The validated set is sorted and deduplicated before it is pinned.
+- At most 32 raw `resource` values are accepted per request; more is
+  `invalid_target`. Values containing an ASCII control character (at minimum
+  NUL) are `invalid_target` before any catalog lookup.
+- Duplicates are deduplicated before catalog validation so each distinct
+  value costs one lookup. The validated set is sorted and deduplicated
+  before it is pinned.
 
 `resource` is a repeated parameter. On `GET /authorize` it is read from the
 query string; on `POST /par`, `POST /token`, `POST /device_authorization`, and
@@ -386,6 +409,10 @@ every requested value; otherwise the response is the ordinary inactive body
 (`{"active": false}`) and the token's metadata is not leaked. Inclusion is the
 test, so a token pinned to a superset stays active. Without `resource`,
 introspection remains audience-agnostic.
+
+`token_type` is `DPoP` for an access token bound with `cnf.jkt` (RFC 9449
+§6.2), `Bearer` for an unbound or mTLS-only access token, and omitted for a
+refresh token.
 
 ### `invalid_target` and `invalid_grant`
 
@@ -466,7 +493,7 @@ Errors use the RFC 6749 §5.2 body `{error, error_description}`.
 | --- | --- | --- |
 | `invalid_request` | 400, or 302 on the `/authorize` error redirect once `client_id` and `redirect_uri` are validated | Missing or duplicated parameter; PAR misuse; JAR misuse. |
 | `invalid_client` | 401 with `WWW-Authenticate` for Basic or Bearer, else 400 | Bad client authentication; ambiguous mTLS certificate. |
-| `invalid_grant` | 400 | Unknown, consumed, or foreign code; rotation reuse; PKCE mismatch; proof against the wrong grant. |
+| `invalid_grant` | 400 | Unknown, consumed, or foreign code; rotation reuse; PKCE mismatch; proof against the wrong grant; the token request's resource set differing from the code/device set. |
 | `invalid_scope` | 400 | Unknown, disabled, over-registered, or non-entitled scope; refresh widening. |
 | `invalid_target` | 400, or 302 on the `/authorize` error redirect once `redirect_uri` is validated | Resource indicator rejected: flag off, non-`https` or relative value, unknown or disabled catalog row, or a refresh audience that exceeds the grant. |
 | `unsupported_grant_type` | 400 | A `grant_type` outside the five. |
@@ -526,6 +553,15 @@ every other grant artifact stay opaque and hashed at rest, so refresh rotation,
 tombstones, and reuse detection are identical for both formats. Token exchange
 is opaque-only: a `jwt`-format caller of the exchange grant is refused with
 `503`.
+
+A JWT access token always carries a **non-empty** audience. A `jwt` client must
+request at least one `resource` at `/authorize`, `/device_authorization`, or
+`client_credentials`; an unbound grant (or a token request whose bound set is
+empty) fails closed with `invalid_target`, never `aud: []`. The authorization-
+code and device records are consumed before that mint-time check, so a `jwt`
+client that authorized without a resource must re-run the flow with one. A
+refresh of an unbound grant fails `invalid_target` before rotation, leaving the
+refresh token live.
 
 The JOSE header carries `typ: at+jwt`, the configured `kid`, and the configured
 algorithm (`ES256` or `EdDSA`; there is no RSA branch because the key material

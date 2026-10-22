@@ -222,7 +222,7 @@ async fn authorize_entry(
 ) -> Response {
   // `RawQuery` + a manual parse replaces `Query<HashMap>`: the extractor
   // consumed the raw query, hiding repeats — the repeated `resource`
-  // indicator (RFC 8707) is captured in order by `params::repeated_values`
+  // indicator (RFC 8707) is captured in order by `params::values_of`
   // while the single-valued map keeps last-wins absorption. A malformed
   // query is the same 400 `Query` rendered.
   let raw = raw.as_deref().unwrap_or("");
@@ -232,7 +232,7 @@ async fn authorize_entry(
   };
   let query = crate::protocol::params::single_valued_map(&pairs);
   let resources =
-    crate::protocol::params::repeated_values(raw, crate::protocol::params::RESOURCE_PARAM);
+    crate::protocol::params::values_of(&pairs, crate::protocol::params::RESOURCE_PARAM);
   let mut conn = state.redis.clone();
   let store = Store::from_config(&state.config.redis);
   let input = authorize::AuthorizeInput {
@@ -1226,9 +1226,10 @@ mod router_tests {
     Ok(())
   }
 
-  /// `POST /par` preserves the `Form` transport contract after the `Bytes`
-  /// switch: a structurally unreadable body (raw non-UTF-8 bytes) is the
-  /// same 400 `Form` rendered, a lossy-encoded body (`%FF` decodes to
+  /// `POST /par` preserves the transport contract after the `RawForm`
+  /// switch: a structurally unreadable body (raw non-UTF-8 bytes) is 400
+  /// (deliberately stricter than the old `Form`, which lossily accepted raw
+  /// non-UTF-8 bytes), a lossy-encoded body (`%FF` decodes to
   /// U+FFFD) reaches downstream validation (`invalid_client`: no
   /// credentials name a client), and a non-urlencoded body is 415.
   #[tokio::test]
@@ -1275,7 +1276,7 @@ mod router_tests {
   }
 
   /// `POST /token` preserves the documented duplicate-parameter mapping
-  /// after the `Bytes` switch: a repeated known field is `invalid_request`
+  /// after the `RawForm` switch: a repeated known field is `invalid_request`
   /// (RFC 6749 §5.2), and a non-urlencoded body is 415.
   #[tokio::test]
   async fn router_token_duplicate_param_preserved() -> TestResult {
@@ -1309,10 +1310,14 @@ mod router_tests {
   }
 
   /// `POST /introspect` and `POST /device_authorization` preserve the
-  /// `Form` transport contract after the `Bytes` switch: a structurally
-  /// unreadable body (raw non-UTF-8 bytes) is the same 400 `Form`
-  /// rendered, a lossy-encoded body (`%FF` decodes to U+FFFD) reaches
-  /// downstream validation, and non-urlencoded bodies are 415. The
+  /// transport contract after the `RawForm` switch: a structurally
+  /// unreadable body (raw non-UTF-8 bytes) is 400 plain text (deliberately
+  /// stricter than the old `Form`, which lossily accepted raw non-UTF-8
+  /// bytes), a lossy-encoded body (`%FF` decodes to U+FFFD) reaches
+  /// downstream validation, and non-urlencoded bodies are 415. A repeated
+  /// known field is JSON `invalid_request` (the old `Form` returned 422
+  /// `Failed to deserialize form body`, so the new JSON 400 is the intended
+  /// contract, not parity). The
   /// downstream expectation differs per path: introspect has no
   /// credentials, so `invalid_client` (401); device has an empty
   /// `client_id`, so `invalid_request` (400).
@@ -1369,6 +1374,111 @@ mod router_tests {
       if ctype_status != StatusCode::UNSUPPORTED_MEDIA_TYPE {
         return Err(format!("non-form {path} body must be 415, got {ctype_status}").into());
       }
+    }
+    Ok(())
+  }
+
+  /// A repeated known field on `POST /introspect` is JSON `invalid_request`
+  /// (RFC 6749 §5.2), never the old `Form` 422 `Failed to deserialize form
+  /// body` and never plain text.
+  #[tokio::test]
+  async fn router_introspect_duplicate_param_is_json_invalid_request() -> TestResult {
+    let urlencoded = [("content-type", "application/x-www-form-urlencoded")];
+    let (status, _, body) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/introspect",
+      &urlencoded,
+      "token=abc&token=def",
+    )
+    .await?;
+    if status != StatusCode::BAD_REQUEST || !body.contains("invalid_request") {
+      return Err(
+        format!("duplicate introspect param must be invalid_request 400, got {status}: {body}")
+          .into(),
+      );
+    }
+    if body.contains("Failed to deserialize form") {
+      return Err("duplicate introspect param must be JSON, not the plain-text form error".into());
+    }
+    Ok(())
+  }
+
+  /// A repeated known field on `POST /device_authorization` is JSON
+  /// `invalid_request` (RFC 6749 §5.2), never the old `Form` 422 `Failed to
+  /// deserialize form body` and never plain text.
+  #[tokio::test]
+  async fn router_device_duplicate_param_is_json_invalid_request() -> TestResult {
+    let urlencoded = [("content-type", "application/x-www-form-urlencoded")];
+    let (status, _, body) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/device_authorization",
+      &urlencoded,
+      "client_id=nobody&client_id=somebody",
+    )
+    .await?;
+    if status != StatusCode::BAD_REQUEST || !body.contains("invalid_request") {
+      return Err(
+        format!("duplicate device param must be invalid_request 400, got {status}: {body}").into(),
+      );
+    }
+    if body.contains("Failed to deserialize form") {
+      return Err("duplicate device param must be JSON, not the plain-text form error".into());
+    }
+    Ok(())
+  }
+
+  /// `POST /revoke` preserves the transport contract after the `RawForm`
+  /// switch: a repeated known field is JSON `invalid_request`, a
+  /// non-urlencoded body is 415, and a well-formed unauthenticated body
+  /// still parses and reaches authentication (`invalid_client` 401),
+  /// proving the field mapping survived the `Form<HashMap>` migration.
+  #[tokio::test]
+  async fn router_revoke_transport_contract_preserved() -> TestResult {
+    let urlencoded = [("content-type", "application/x-www-form-urlencoded")];
+    let (dup_status, _, dup_body) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/revoke",
+      &urlencoded,
+      "token=abc&token=def",
+    )
+    .await?;
+    if dup_status != StatusCode::BAD_REQUEST || !dup_body.contains("invalid_request") {
+      return Err(
+        format!("duplicate revoke param must be invalid_request 400, got {dup_status}: {dup_body}")
+          .into(),
+      );
+    }
+    if dup_body.contains("Failed to deserialize form") {
+      return Err("duplicate revoke param must be JSON, not the plain-text form error".into());
+    }
+    let json = [("content-type", "application/json")];
+    let (ctype_status, _, _) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/revoke",
+      &json,
+      "token=abc",
+    )
+    .await?;
+    if ctype_status != StatusCode::UNSUPPORTED_MEDIA_TYPE {
+      return Err(format!("non-form revoke body must be 415, got {ctype_status}").into());
+    }
+    let (auth_status, _, auth_body) = drive(
+      build_router(passthrough_state()?),
+      "POST",
+      "/revoke",
+      &urlencoded,
+      "token=abc",
+    )
+    .await?;
+    if auth_status != StatusCode::UNAUTHORIZED || !auth_body.contains("invalid_client") {
+      return Err(
+        format!("well-formed unauthenticated revoke must be invalid_client 401, got {auth_status}: {auth_body}")
+          .into(),
+      );
     }
     Ok(())
   }

@@ -700,6 +700,121 @@ fn config_localhost_redirect_defaults_off() -> Result<(), Box<dyn Error>> {
   Ok(())
 }
 
+/// RFC 9728 `protected_resources` cannot be enabled without identifiers.
+#[test]
+fn config_rejects_protected_resources_without_ids() {
+  let mut map = base();
+  map.insert("protected_resources_enabled".to_owned(), Value::Bool(true));
+  map.insert("resource_indicators_enabled".to_owned(), Value::Bool(true));
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::InvalidProtectedResources { .. })
+  ));
+}
+
+/// Advertised protected resources require the RFC 8707 indicator gate.
+#[test]
+fn config_rejects_protected_resources_without_resource_indicators() {
+  let mut map = base();
+  map.insert("protected_resources_enabled".to_owned(), Value::Bool(true));
+  map.insert(
+    "protected_resource_ids".to_owned(),
+    json!(["https://api.example.test"]),
+  );
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::InvalidProtectedResources { .. })
+  ));
+}
+
+/// Every advertised identifier must be an absolute `https` URI with a host
+/// and no wildcard, userinfo, fragment, or query.
+#[test]
+fn config_rejects_invalid_protected_resource_ids() {
+  for id in [
+    "*",
+    "https://api.example.test/*",
+    "http://api.example.test",
+    "api.example.test",
+    "/relative",
+    "https://user@api.example.test",
+    "https://user:pass@api.example.test",
+    "https://api.example.test#fragment",
+    "https://api.example.test?query=1",
+    "https://",
+  ] {
+    let mut map = base();
+    map.insert("protected_resources_enabled".to_owned(), Value::Bool(true));
+    map.insert("resource_indicators_enabled".to_owned(), Value::Bool(true));
+    map.insert("protected_resource_ids".to_owned(), json!([id]));
+    assert!(
+      matches!(
+        try_load(&map),
+        Err(ConfigError::InvalidProtectedResources { .. })
+      ),
+      "protected resource id {id:?} must be rejected"
+    );
+  }
+}
+
+/// Duplicate identifiers would be advertised twice, so they fail at load.
+#[test]
+fn config_rejects_duplicate_protected_resource_ids() {
+  let mut map = base();
+  map.insert("protected_resources_enabled".to_owned(), Value::Bool(true));
+  map.insert("resource_indicators_enabled".to_owned(), Value::Bool(true));
+  map.insert(
+    "protected_resource_ids".to_owned(),
+    json!(["https://api.example.test", "https://api.example.test"]),
+  );
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::InvalidProtectedResources { .. })
+  ));
+}
+
+/// Valid identifiers load unchanged when both gates are on.
+#[test]
+fn config_accepts_valid_protected_resources() -> Result<(), Box<dyn Error>> {
+  let mut map = base();
+  map.insert("protected_resources_enabled".to_owned(), Value::Bool(true));
+  map.insert("resource_indicators_enabled".to_owned(), Value::Bool(true));
+  map.insert(
+    "protected_resource_ids".to_owned(),
+    json!([
+      "https://api.example.test",
+      "https://rs.example.test:8443/a/b"
+    ]),
+  );
+  let cfg = try_load(&map)?;
+  assert!(cfg.protected_resources_enabled);
+  assert_eq!(
+    cfg.protected_resource_ids,
+    vec![
+      "https://api.example.test".to_owned(),
+      "https://rs.example.test:8443/a/b".to_owned()
+    ]
+  );
+  Ok(())
+}
+
+/// With the feature flag off the identifiers stay inert (existing behavior).
+#[test]
+fn config_ignores_protected_resource_ids_when_disabled() -> Result<(), Box<dyn Error>> {
+  let mut map = base();
+  map.insert(
+    "protected_resource_ids".to_owned(),
+    json!(["not a uri", "*"]),
+  );
+  let cfg = try_load(&map)?;
+  assert!(!cfg.protected_resources_enabled);
+  assert_eq!(
+    cfg.protected_resource_ids,
+    vec!["not a uri".to_owned(), "*".to_owned()]
+  );
+  Ok(())
+}
+
 /// A JWT signing key that is not exactly 32 bytes is rejected at load with the
 /// offending key named — both short and over-long material.
 #[test]
@@ -768,6 +883,27 @@ fn config_rejects_zero_scalar_jwt_key() {
   map.insert(
     "jwt_signing_key".to_owned(),
     Value::String("\u{0}".repeat(32)),
+  );
+  assert!(matches!(
+    try_load(&map),
+    Err(ConfigError::InvalidJwtSigningKey {
+      key: "jwt_signing_key"
+    })
+  ));
+}
+
+/// An all-zero Ed25519 seed is a valid but publicly forgeable key, so it is
+/// rejected at load just like an out-of-range EC scalar.
+#[test]
+fn config_rejects_zero_seed_eddsa_jwt_key() {
+  let mut map = base();
+  map.insert(
+    "jwt_signing_key".to_owned(),
+    Value::String("\u{0}".repeat(32)),
+  );
+  map.insert(
+    "jwt_access_token_signing_alg".to_owned(),
+    Value::String("EdDSA".to_owned()),
   );
   assert!(matches!(
     try_load(&map),

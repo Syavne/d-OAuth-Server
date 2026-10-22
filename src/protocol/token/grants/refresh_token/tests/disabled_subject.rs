@@ -80,6 +80,7 @@ async fn mint_subject(
           dpop_required: true,
           subject: subject.to_owned(),
           scope: "read".to_owned(),
+          access_scope: "read".to_owned(),
           grant_id: unique("grant"),
           proof,
           aud: Vec::new(),

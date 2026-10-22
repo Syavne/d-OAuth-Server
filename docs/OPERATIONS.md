@@ -147,8 +147,9 @@ d-oauth-server resource-server delete <identifier>
 
 A resource server is an RFC 8707 resource indicator (the `resource` parameter
 and the `aud` target of an access token). `identifier` matches exactly — no
-normalization, sub-path, or wildcard. A `*` anywhere in the identifier is
-rejected, so one catalog row can never stand for an entire origin. `create`
+normalization, sub-path, or wildcard. It must be an absolute `https` URI with a
+host; a `*`, userinfo, fragment, or query is rejected, so one catalog row can
+never stand for an entire origin or a non-fetchable identifier. `create`
 upserts: it creates the row, updates its description, or leaves an unchanged
 row alone; it never silently re-enables an operator-disabled row, and `list`
 shows both states. `delete` removes the row outright (nothing references the
@@ -286,8 +287,9 @@ d-oauth-server resource-server list
 ```
 
 `identifier` matches exactly, with no normalization, sub-path, or wildcard; a
-`*` anywhere is rejected at creation, so one catalog row can never stand for an
-entire origin. `create` upserts (it creates the row, updates its description, or
+`*` anywhere is rejected at creation, as are a non-`https` scheme, a missing
+host, userinfo, a fragment, or a query, so one catalog row can never stand for an
+entire origin or a non-fetchable identifier. `create` upserts (it creates the row, updates its description, or
 leaves an unchanged row alone) and never silently re-enables an
 operator-disabled row. `list` shows both the `enabled` and `disabled` states.
 Use `resource-server enable|disable <identifier>` to flip a row and
@@ -326,7 +328,10 @@ The full member set and an example document are in
 Optionally, advertise the RS identifier on the AS side through the RFC 9728 §4
 `protected_resources` member: set `protected_resources_enabled=true` and list the
 identifier in `protected_resource_ids`. Both default off and empty, so the AS
-advertises no `protected_resources` until enabled. `resource_metadata` is never
+advertises no `protected_resources` until enabled. The load is fail-closed:
+the flag requires `resource_indicators_enabled=true` and a non-empty,
+duplicate-free list of absolute `https` identifiers with no wildcard,
+userinfo, fragment, or query. `resource_metadata` is never
 an AS metadata member (RFC 9728 §4, §5.1); it belongs only on the RS challenge in
 step 3.
 

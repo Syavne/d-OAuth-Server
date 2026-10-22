@@ -29,7 +29,7 @@ the library.
 | `src/db/resource_repo.rs` | Exact-match CRUD for the `resource_servers` catalog: `upsert` preserves `id`/`enabled`, `find_enabled`, `list_enabled`, and `disable`. |
 | `src/store/` | Redis ephemeral state and the durability barrier. See [REDIS.md](REDIS.md). |
 | `src/protocol/` | OAuth endpoints and grants, plus the subject-scoped Redis purges (`src/protocol/purge.rs`: `purge_subject` for `user disable`, `purge_sibling_sessions` on credential change). |
-| `src/protocol/params.rs` | Shared raw-parameter parsing (`parse_pairs`, `repeated_values`, the form-content-type gate) and fail-closed RFC 8707 audience validation (`validate_resources`, `audience_binds`). |
+| `src/protocol/params.rs` | Shared raw-parameter parsing (`parse_pairs`, `values_of`, the form-content-type gate) and fail-closed RFC 8707 audience validation (`validate_resources`, `audience_binds`). |
 | `src/ui/` | Server-rendered login, consent, and device pages (Askama templates) plus the embedded same-origin stylesheet served at `/assets/app.css`. |
 | `src/middleware/` | Request id, tracing and redaction, rate limiting, security headers, and audit. |
 | `src/resilience.rs` | Load-shed, timeout, and concurrency-limit guard between CORS and rate limiting. |
@@ -79,11 +79,15 @@ Five parameter-carrying endpoints parse the raw query or body instead of using
 `Query<HashMap>` or `Form<...>`, because those extractors consume the raw input
 and cannot see a repeated `resource`: `GET /authorize`, `POST /par`,
 `POST /token`, `POST /device_authorization`, and `POST /introspect`.
-`src/protocol/params.rs` captures repeats in wire order while keeping the
-single-valued map last-wins. For the body endpoints it preserves the prior
-transport contract (`415` on a non-urlencoded body, `400` on a malformed or
-non-UTF-8 body, and the documented `invalid_request` mapping for a duplicated
-known field). `/token` rejects a `resource` on token exchange before any catalog
+`POST /revoke` uses the same raw body parser for duplicate-field rejection but
+is audience-agnostic. `/authorize` uses `RawQuery`; the POST handlers use
+`RawForm`, which checks the content type before buffering the body, then the
+shared raw parser. `src/protocol/params.rs` captures repeats in wire order while
+keeping the single-valued map last-wins. The body endpoints return `415` on a
+non-urlencoded body and `400` on a malformed or non-UTF-8 body; a duplicated
+known field is JSON `invalid_request` on `/token`, `/introspect`,
+`/device_authorization`, and `/revoke` (PAR and authorize keep last-wins
+absorption). `/token` rejects a `resource` on token exchange before any catalog
 lookup.
 
 ## The two listeners

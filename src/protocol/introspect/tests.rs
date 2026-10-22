@@ -168,6 +168,7 @@ async fn mint_bound(
           dpop_required: false,
           subject: "user-1".to_owned(),
           scope: "orders:read".to_owned(),
+          access_scope: "orders:read".to_owned(),
           grant_id: unique("grant"),
           proof,
           aud: Vec::new(),
@@ -346,7 +347,7 @@ async fn test_introspect_active_access_token_reports_shape() -> TestResult {
   assert!(response.active, "minted token must be active");
   assert_eq!(response.scope.as_deref(), Some("orders:read"));
   assert_eq!(response.client_id.as_deref(), Some(client_id.as_str()));
-  assert_eq!(response.token_type.as_deref(), Some("Bearer"));
+  assert_eq!(response.token_type.as_deref(), Some("DPoP"));
   assert_eq!(response.sub.as_deref(), Some("user-1"));
   let cnf = response.cnf.as_ref().ok_or("cnf missing")?;
   assert_eq!(cnf.jkt.as_deref(), Some("jkt-thumbnail"));
@@ -619,6 +620,8 @@ async fn test_introspect_dpop_bound_token_reports_jkt_only() -> TestResult {
   let cnf = response.cnf.as_ref().ok_or("cnf missing")?;
   assert_eq!(cnf.jkt.as_deref(), Some("jkt-dpop-only"));
   assert_eq!(cnf.x5t_s256, None, "no mTLS binding was proven");
+  // RFC 9449 §6.2: a DPoP-bound access token introspects as `DPoP`.
+  assert_eq!(response.token_type.as_deref(), Some("DPoP"));
   let json = serde_json::to_value(&response)?;
   let cnf_json = json
     .get("cnf")
@@ -898,6 +901,7 @@ async fn mint_audience_subject(
           dpop_required: false,
           subject: subject.to_owned(),
           scope: "orders:read".to_owned(),
+          access_scope: "orders:read".to_owned(),
           grant_id: unique("grant"),
           proof: SenderProof::none(),
           aud: aud.clone(),
@@ -928,6 +932,7 @@ async fn mint_subject(
           dpop_required: false,
           subject: subject.to_owned(),
           scope: "orders:read".to_owned(),
+          access_scope: "orders:read".to_owned(),
           grant_id: unique("grant"),
           proof: SenderProof::none(),
           aud: Vec::new(),
@@ -1355,6 +1360,7 @@ async fn mint_jwt(
         dpop_required: false,
         subject: subject.to_owned(),
         scope: "orders:read".to_owned(),
+        access_scope: "orders:read".to_owned(),
         grant_id: unique("grant"),
         proof,
         aud: aud.clone(),
@@ -1460,7 +1466,7 @@ async fn test_introspect_dual_path() -> TestResult {
   assert_eq!(response.client_id.as_deref(), Some(client_id.as_str()));
   assert_eq!(response.scope.as_deref(), Some("orders:read"));
   assert_eq!(response.sub.as_deref(), Some("jwt-subject-1"));
-  assert_eq!(response.token_type.as_deref(), Some("Bearer"));
+  assert_eq!(response.token_type.as_deref(), Some("DPoP"));
   assert_eq!(
     response.aud,
     Some(vec![audience_a.to_owned(), audience_b.to_owned()])

@@ -56,18 +56,30 @@ pub enum TokenServiceError {
   /// so this is unreachable in practice; fail closed).
   #[error("JWT minting failed")]
   Jwt(#[from] crate::jose::jwt_access::JwtError),
+  /// A `Jwt` mint ran with an empty audience: RFC 9068 `aud` is mandatory,
+  /// so a JWT access token without a requested RFC 8707 resource is
+  /// rejected before signing or writing anything.
+  #[error("jwt access tokens require a resource audience")]
+  EmptyAudience,
 }
 
 impl From<TokenServiceError> for AppError {
   /// Map a service failure onto the RFC error model: a missing public-client
   /// binding is the caller's `invalid_grant`; store failures reuse the store
-  /// mapping (fail closed); everything else is masked as `server_error`.
+  /// mapping (fail closed); a JWT signing/deployment failure is the fail-closed
+  /// `503`; everything else is masked as `server_error`.
   fn from(error: TokenServiceError) -> Self {
     match error {
       TokenServiceError::MissingDpopBinding => {
         Self::invalid_grant("public clients require a DPoP-bound token")
       }
+      TokenServiceError::EmptyAudience => {
+        Self::invalid_target("jwt access tokens require a resource audience")
+      }
       TokenServiceError::Store(inner) => Self::from(inner),
+      TokenServiceError::JwtSignerMissing | TokenServiceError::Jwt(_) => {
+        Self::temporarily_unavailable()
+      }
       other => Self::internal(other),
     }
   }
@@ -192,6 +204,14 @@ pub(super) fn resolve_cnf(
 /// so the rotation script — which commits the [`RotationInput`] records
 /// verbatim and never rewrites the grant record — preserves the full binding
 /// while the access token narrows.
+///
+/// Scope travels as the same kind of pair: [`MintRequest::scope`] is the
+/// REFRESH/grant scope (the retained set, re-checked against the current
+/// catalog, client registration, and entitlements), while
+/// [`MintRequest::access_scope`] is the ACCESS scope (the narrowed subset on
+/// an explicit `scope` request, else equal to `scope`). The JWT `scope`
+/// claim and the stored access record bind `access_scope`; the refresh and
+/// grant records bind `scope`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintRequest {
   /// Client the tokens are issued to.
@@ -204,8 +224,12 @@ pub struct MintRequest {
   pub dpop_required: bool,
   /// Resource-owner subject, empty for client-credentials tokens.
   pub subject: String,
-  /// Space-joined scope.
+  /// Space-joined scope: the REFRESH/grant scope (retained set).
   pub scope: String,
+  /// Space-joined ACCESS scope: the narrowed subset on an explicit `scope`
+  /// request, else equal to [`MintRequest::scope`]. Binds the JWT `scope`
+  /// claim and the stored access record.
+  pub access_scope: String,
   /// Grant chain the tokens join.
   pub grant_id: String,
   /// Freshly verified proofs for this request.
@@ -326,5 +350,23 @@ impl fmt::Debug for FoundRefresh {
       .field("hash", &self.hash)
       .field("key_label", &self.key_label)
       .finish()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use axum::http::StatusCode;
+
+  use super::TokenServiceError;
+  use crate::{error::AppError, jose::jwt_access::JwtError};
+
+  /// A missing signer or a signing failure is a deployment/dependency failure:
+  /// it must fail closed with `503`, never a masked `500`.
+  #[test]
+  fn jwt_service_failures_map_to_503() {
+    let missing = AppError::from(TokenServiceError::JwtSignerMissing);
+    assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let signing = AppError::from(TokenServiceError::Jwt(JwtError::NoSigningKey));
+    assert_eq!(signing.status(), StatusCode::SERVICE_UNAVAILABLE);
   }
 }

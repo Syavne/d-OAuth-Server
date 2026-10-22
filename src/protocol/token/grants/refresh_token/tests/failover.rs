@@ -56,6 +56,7 @@ async fn grant_refresh_failover_no_double_rotation() -> TestResult {
         dpop_required: true,
         subject: unique("failover-subject"),
         scope: "read".to_owned(),
+        access_scope: "read".to_owned(),
         grant_id: unique("failover-grant"),
         proof: proof.clone(),
         aud: Vec::new(),

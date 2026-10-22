@@ -1,6 +1,7 @@
 //! `test(dcr_manage)` delete suite: cross-client denial, DELETE, revocation,
 //! and Redis-loss survival.
 
+use secrecy::SecretString;
 use testcontainers::{
   GenericImage, ImageExt as _,
   core::{IntoContainerPort, WaitFor},
@@ -14,8 +15,15 @@ use super::support::{
   Harness, TestError, TestResult, expect_app_error, expect_forbidden, expect_unauthorized, harness,
   harness_with_redis, manage_parts, mtls_request, register, register_mtls, try_register,
 };
+use crate::config::{JwtSigningAlg, JwtSigningKey};
 use crate::db::client_repo::{self, NewClient};
 use crate::error::OAuthErrorCode;
+use crate::jose::jwt_access::JwtAccessSigner;
+use crate::keys::KeyId;
+use crate::protocol::scope::ScopeSet;
+use crate::protocol::token::grants::client_credentials::{
+  ClientCredentialsInput, issue_client_credentials,
+};
 use crate::protocol::token::{ClientKind, MintRequest, SenderProof, TokenFormat, TokenService};
 
 #[tokio::test]
@@ -166,6 +174,7 @@ async fn dcr_manage_delete_revokes_tokens() -> TestResult {
           dpop_required: false,
           subject: String::new(),
           scope: String::new(),
+          access_scope: String::new(),
           grant_id: Uuid::new_v4().to_string(),
           proof: SenderProof::none(),
           aud: Vec::new(),
@@ -189,6 +198,7 @@ async fn dcr_manage_delete_revokes_tokens() -> TestResult {
         dpop_required: false,
         subject: String::new(),
         scope: String::new(),
+        access_scope: String::new(),
         grant_id: Uuid::new_v4().to_string(),
         proof: SenderProof::none(),
         aud: Vec::new(),
@@ -232,6 +242,108 @@ async fn dcr_manage_delete_revokes_tokens() -> TestResult {
   if live.is_none() {
     return Err(TestError::Unexpected(
       "unrelated client's token was revoked".to_owned(),
+    ));
+  }
+  Ok(())
+}
+
+/// RFC 7592 DELETE must also remove the JWT allowlist marker. A
+/// client-credentials token has no refresh half (the grant revokes it before
+/// returning), so the access scan is the only path that can delete its
+/// `jwt:<jti-hash>` marker.
+#[tokio::test]
+async fn dcr_manage_delete_removes_jwt_marker() -> TestResult {
+  let mut harness = harness("catalog").await?;
+  let registered = register(&mut harness, "https://app.example.test/cb", None).await?;
+  let raw_key = SecretString::from("bcdefghijklmnopqrstuvwxyzabcdefg");
+  let key = JwtSigningKey::from_raw(
+    KeyId::new("test-kid"),
+    JwtSigningAlg::Es256,
+    &raw_key,
+    "jwt_signing_key",
+  )
+  .map_err(|error| TestError::Unexpected(format!("signing key rejected: {error}")))?;
+  let signer = JwtAccessSigner::new(harness.config.issuer.clone(), key, Vec::new());
+  let service = TokenService::new(&harness.config.ttl, &harness.config.keys)
+    .map_err(|error| TestError::Unexpected(format!("token service: {error}")))?
+    .with_jwt_signer(signer);
+  let empty = ScopeSet::empty();
+  let proof = SenderProof::none();
+  let aud = vec!["https://api.example.test/".to_owned()];
+  let issued = issue_client_credentials(
+    &mut harness.conn,
+    &harness.store,
+    &service,
+    &ClientCredentialsInput {
+      client_id: &registered.client_id,
+      client_kind: ClientKind::Confidential,
+      client_registered: &empty,
+      enabled: &empty,
+      requested_scope: None,
+      dpop_bound_jkt: None,
+      mtls_bound_x5t_s256: None,
+      proof: &proof,
+      aud: &aud,
+      token_format: TokenFormat::Jwt,
+      now_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+    },
+  )
+  .await
+  .map_err(|error| TestError::Unexpected(format!("client-credentials mint failed: {error}")))?;
+  let jti_hash = issued
+    .access_hash
+    .strip_prefix("jwt:")
+    .ok_or_else(|| TestError::Unexpected("jwt mint did not use a jwt: member".to_owned()))?
+    .to_owned();
+  let marker_key = harness.store.jwt_marker_key(&jti_hash);
+  let marker_before: bool = redis::cmd("EXISTS")
+    .arg(&marker_key)
+    .query_async(&mut harness.conn)
+    .await?;
+  if !marker_before {
+    return Err(TestError::Unexpected(
+      "jwt marker missing before delete".to_owned(),
+    ));
+  }
+
+  {
+    let (mut stores, ctx) = manage_parts(&mut harness);
+    delete_client(
+      &mut stores,
+      &ctx,
+      &registered.client_id,
+      Some(&registered.reg_token),
+    )
+    .await
+    .map_err(|error| TestError::Unexpected(format!("delete failed: {error:?}")))?;
+  }
+
+  let marker_after: bool = redis::cmd("EXISTS")
+    .arg(&marker_key)
+    .query_async(&mut harness.conn)
+    .await?;
+  if marker_after {
+    return Err(TestError::Unexpected(
+      "deleted client's jwt marker survived".to_owned(),
+    ));
+  }
+  let access =
+    crate::store::tokens::get_access(&mut harness.conn, &harness.store, &issued.access_hash)
+      .await
+      .map_err(|error| TestError::Unexpected(format!("lookup failed: {error}")))?;
+  if access.is_some() {
+    return Err(TestError::Unexpected(
+      "deleted client's jwt access record survived".to_owned(),
+    ));
+  }
+  let member: bool = redis::cmd("SISMEMBER")
+    .arg(harness.store.grant_tokens_key(&issued.grant_id))
+    .arg(&issued.access_hash)
+    .query_async(&mut harness.conn)
+    .await?;
+  if member {
+    return Err(TestError::Unexpected(
+      "deleted client's jwt grant membership survived".to_owned(),
     ));
   }
   Ok(())

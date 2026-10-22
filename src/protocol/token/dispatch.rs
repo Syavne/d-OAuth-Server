@@ -13,7 +13,7 @@
 mod grants;
 
 use axum::Json;
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, RawForm, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use secrecy::SecretString;
@@ -433,15 +433,21 @@ pub async fn handler(
   State(state): State<AppState>,
   peer_certs: Option<Extension<PeerCertificates>>,
   headers: HeaderMap,
-  body: axum::body::Bytes,
+  body: RawForm,
 ) -> Response {
-  // `Bytes` + a manual parse replaces `Result<Form<TokenForm>, FormRejection>`:
+  // `RawForm` gates the content type BEFORE `Bytes` buffering, so a wrong
+  // content type is rejected 415 without reading the (up to 2 MiB) body.
+  // The explicit exact-MIME gate below is the second check: `RawForm` uses a
+  // case-sensitive prefix match, so it accepts e.g.
+  // `application/x-www-form-urlencodedevil`, which the exact gate rejects.
+  let body = body.0;
+  // `RawForm` + a manual parse replaces `Result<Form<TokenForm>, FormRejection>`:
   // the extractor consumed the raw body, hiding repeats. The explicit
-  // content-type gate preserves the 415 `Form` rendered (`Bytes` never fails
-  // on content-type); any other transport failure keeps the documented
-  // `invalid_request` mapping ("includes a parameter more than once"). The
+  // exact-MIME gate below is the second content-type check (see above); any
+  // other transport failure keeps the documented `invalid_request` mapping
+  // ("includes a parameter more than once"). The
   // repeated `resource` indicator (RFC 8707) is captured in order by
-  // `params::repeated_values` and validated fail-closed here; the
+  // `params::values_of` and validated fail-closed here; the
   // authorization-code branch binds the validated set to the redeemed code,
   // and the remaining grants wire it in later todos.
   if let Err(reject) = crate::protocol::params::require_form_content_type(&headers) {
@@ -466,7 +472,7 @@ pub async fn handler(
   let map = crate::protocol::params::single_valued_map(&pairs);
   let form = TokenForm::from_map(&map);
   let resources =
-    crate::protocol::params::repeated_values(text, crate::protocol::params::RESOURCE_PARAM);
+    crate::protocol::params::values_of(&pairs, crate::protocol::params::RESOURCE_PARAM);
   // RFC 8707 resource indicators do not apply to RFC 8693 token exchange;
   // reject the parameter BEFORE the catalog lookup so a bogus value cannot
   // surface `invalid_target` from a grant that must answer `invalid_request`.

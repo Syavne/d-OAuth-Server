@@ -24,7 +24,7 @@ base64 = "0.23.1"
 base64ct = "1.8.3"
 clap = { version = "4.6.7", features = ["derive"] }
 config = "0.15.27"
-ed25519-dalek = { version = "2.2.0", default-features = false }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"] }
 hmac = "0.13.0"
 hyper = "1.11.1"
 hyper-util = { version = "0.1.21", features = ["server-auto", "tokio", "service"] }

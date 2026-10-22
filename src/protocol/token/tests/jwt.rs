@@ -9,9 +9,10 @@ use secrecy::SecretString;
 use super::{TestError, TestResult, mint_request, ring, test_redis, unique};
 use crate::{
   config::{JwtSigningAlg, JwtSigningKey, TtlConfig},
+  error::{AppError, OAuthErrorCode},
   jose::jwt_access::{JwtAccessSigner, jti_hash, marker_live, marker_live_strict},
   keys::KeyId,
-  protocol::token::{ClientKind, SenderProof, TokenFormat, TokenService},
+  protocol::token::{ClientKind, SenderProof, TokenFormat, TokenService, TokenServiceError},
 };
 
 /// A fixed 32-byte ASCII signing key (the e2e JWT fixture material).
@@ -62,6 +63,8 @@ async fn jwt_mint_revoke_race_no_bypass() -> TestResult {
     SenderProof::none(),
   );
   request.format = TokenFormat::Jwt;
+  request.aud = vec!["https://api.example.test/".to_owned()];
+  request.refresh_aud = request.aud.clone();
   let minted = service
     .mint(&mut conn, &store, &request, super::now_unix())
     .await?;
@@ -71,8 +74,14 @@ async fn jwt_mint_revoke_race_no_bypass() -> TestResult {
     ));
   }
   let verified = signer
-    .verify(&minted.access_token, None)
+    .verify(&minted.access_token, Some(&request.aud))
     .map_err(|error| TestError::Unexpected(format!("fresh jwt rejected: {error:?}")))?;
+  if verified.claims.aud != request.aud {
+    return Err(TestError::Unexpected(format!(
+      "aud must be {:?}, got {:?}",
+      request.aud, verified.claims.aud
+    )));
+  }
   let hash = jti_hash(&verified.claims.jti);
   let member = format!("jwt:{hash}");
   if !marker_live(&mut conn, &store, &hash)
@@ -169,6 +178,8 @@ async fn jwt_cascade_revoke_deletes_marker() -> TestResult {
     SenderProof::none(),
   );
   request.format = TokenFormat::Jwt;
+  request.aud = vec!["https://api.example.test/".to_owned()];
+  request.refresh_aud = request.aud.clone();
   // Empty subject keeps the liveness verdict on the marker alone (no account
   // lookup), so the assertion pins exactly the allowlist behavior.
   request.subject = String::new();
@@ -176,7 +187,7 @@ async fn jwt_cascade_revoke_deletes_marker() -> TestResult {
     .mint(&mut conn, &store, &request, super::now_unix())
     .await?;
   let verified = signer
-    .verify(&minted.access_token, None)
+    .verify(&minted.access_token, Some(&request.aud))
     .map_err(|error| TestError::Unexpected(format!("fresh jwt rejected: {error:?}")))?;
   let hash = jti_hash(&verified.claims.jti);
   let marker_key = store.jwt_marker_key(&hash);
@@ -231,7 +242,64 @@ async fn jwt_cascade_revoke_deletes_marker() -> TestResult {
   // The cascade revokes liveness, not the signature: the token must still
   // parse and verify while both liveness checks report dead.
   signer
-    .verify(&minted.access_token, None)
+    .verify(&minted.access_token, Some(&request.aud))
     .map_err(|error| TestError::Unexpected(format!("signature check failed: {error:?}")))?;
+  Ok(())
+}
+
+/// `test(jwt_mint_rejects_empty_audience)`: `mint_jwt` with an empty `aud`
+/// fails with `EmptyAudience` before signing or writing anything, and the
+/// error maps to `invalid_target` (HTTP 400), never `server_error`.
+#[tokio::test]
+async fn jwt_mint_rejects_empty_audience() -> TestResult {
+  let (mut conn, store) = test_redis().await?;
+  let signer = test_signer()?;
+  let service = jwt_service(signer)?;
+  let client = unique("jwt-empty-aud-client");
+  let grant = unique("jwt-empty-aud-grant");
+  let mut request = mint_request(
+    &client,
+    ClientKind::Confidential,
+    &grant,
+    SenderProof::none(),
+  );
+  request.format = TokenFormat::Jwt;
+  request.aud = Vec::new();
+  request.refresh_aud = Vec::new();
+  match service
+    .mint(&mut conn, &store, &request, super::now_unix())
+    .await
+  {
+    Err(TokenServiceError::EmptyAudience) => {}
+    Err(other) => {
+      return Err(TestError::Unexpected(format!(
+        "empty-audience jwt mint must be EmptyAudience, got {other}"
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "an empty-audience jwt mint must never succeed".to_owned(),
+      ));
+    }
+  }
+  let mapped = AppError::from(TokenServiceError::EmptyAudience);
+  if mapped.code() != OAuthErrorCode::InvalidTarget {
+    return Err(TestError::Unexpected(format!(
+      "EmptyAudience must map to invalid_target, got {}",
+      mapped.code()
+    )));
+  }
+  if mapped.status() != axum::http::StatusCode::BAD_REQUEST {
+    return Err(TestError::Unexpected(format!(
+      "EmptyAudience must render 400, got {}",
+      mapped.status()
+    )));
+  }
+  if mapped.description() != "jwt access tokens require a resource audience" {
+    return Err(TestError::Unexpected(format!(
+      "EmptyAudience description mismatch: {}",
+      mapped.description()
+    )));
+  }
   Ok(())
 }

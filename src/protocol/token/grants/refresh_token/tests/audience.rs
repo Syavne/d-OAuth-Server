@@ -54,6 +54,7 @@ async fn mint_aud_grant(
         dpop_required: true,
         subject: unique("audience-subject"),
         scope: scope.to_owned(),
+        access_scope: scope.to_owned(),
         grant_id: unique("audience-grant"),
         proof,
         aud: aud.to_vec(),

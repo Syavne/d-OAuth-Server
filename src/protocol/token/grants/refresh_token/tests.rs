@@ -179,6 +179,7 @@ async fn mint_grant(
         dpop_required: kind == ClientKind::Public,
         subject: unique("subject"),
         scope: scope.to_owned(),
+        access_scope: scope.to_owned(),
         grant_id: unique("grant"),
         proof,
         aud: Vec::new(),

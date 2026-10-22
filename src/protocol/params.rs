@@ -12,8 +12,8 @@
 //!
 //! - [`parse_pairs`] / [`single_valued_map`] — the strict urlencoded parse
 //!   (last-wins, mirroring `serde_urlencoded`'s `HashMap` absorption).
-//! - [`repeated_values`] — the ONE helper capturing repeated `resource`
-//!   values in order from a raw query/body string.
+//! - [`values_of`] — the ONE helper capturing repeated `resource` values
+//!   in wire order from already-parsed pairs.
 //! - [`require_form_content_type`] / [`form_pairs`] / [`query_pairs`] — the
 //!   transport contract the `Form`/`Query` extractors used to enforce
 //!   (415 on a non-urlencoded body, 400 on malformed input), so the
@@ -53,6 +53,15 @@ use crate::{db::resource_repo, error::AppError};
 
 /// RFC 8707 indicator parameter name.
 pub const RESOURCE_PARAM: &str = "resource";
+
+/// Hard cap on urlencoded pairs per body/query, bounding the allocation
+/// amplification of a many-pair body (a 2 MiB body of repeated pairs
+/// otherwise allocates ~170 MB of `String` pairs).
+pub const MAX_FORM_PAIRS: usize = 1024;
+
+/// Hard cap on raw `resource` values per request, enforced fail-closed with
+/// `invalid_target` before any catalog lookup.
+pub const MAX_RESOURCE_VALUES: usize = 32;
 
 /// Urlencoded parse failure.
 ///
@@ -146,6 +155,9 @@ pub fn parse_pairs(raw: &str) -> Result<Vec<(String, String)>, ParamsError> {
       None => (segment, ""),
     };
     pairs.push((decode_component(name), decode_component(value)));
+    if pairs.len() > MAX_FORM_PAIRS {
+      return Err(ParamsError);
+    }
   }
   Ok(pairs)
 }
@@ -164,22 +176,18 @@ pub fn single_valued_map(pairs: &[(String, String)]) -> HashMap<String, String> 
   map
 }
 
-/// Capture every `name` value in order from a raw query/body string.
+/// Capture every `name` value in wire order from already-parsed pairs.
 ///
 /// This is the ONE helper for the query/body endpoints (JAR arrays are
 /// handled out-of-band by the merge carrier, never by this function).
-/// Infallible by design: handlers run the strict [`parse_pairs`] first for
-/// error mapping and only call this on input that already parsed, so an
-/// undecodable segment is skipped as unreachable rather than erroring.
+/// Handlers pass the [`parse_pairs`] output they already hold, so the raw
+/// input is never parsed twice.
 #[must_use]
-pub fn repeated_values(raw: &str, name: &str) -> Vec<String> {
-  match parse_pairs(raw) {
-    Ok(pairs) => pairs
-      .into_iter()
-      .filter_map(|(key, value)| (key == name).then_some(value))
-      .collect(),
-    Err(ParamsError) => Vec::new(),
-  }
+pub fn values_of(pairs: &[(String, String)], name: &str) -> Vec<String> {
+  pairs
+    .iter()
+    .filter_map(|(key, value)| (key == name).then_some(value.clone()))
+    .collect()
 }
 
 /// Whether any KNOWN field repeats — mirrors serde's duplicate-field
@@ -191,7 +199,7 @@ pub fn repeated_values(raw: &str, name: &str) -> Vec<String> {
 /// absorbed here, exactly as `serde_urlencoded` absorbed it.
 #[must_use]
 pub fn has_duplicate_field(pairs: &[(String, String)], known: &[&str]) -> bool {
-  let mut seen: HashSet<&str> = HashSet::with_capacity(pairs.len());
+  let mut seen: HashSet<&str> = HashSet::with_capacity(known.len());
   for (name, _) in pairs {
     if known.contains(&name.as_str()) && !seen.insert(name.as_str()) {
       return true;
@@ -236,8 +244,8 @@ pub fn require_form_content_type(headers: &HeaderMap) -> Result<(), TransportRej
 /// Borrow a request body as text, mirroring `Form`'s 400
 /// (`FailedToDeserializeForm`) on non-UTF-8 input.
 ///
-/// Handlers use this before [`parse_pairs`] + [`repeated_values`] so the
-/// raw text stays available for the repeated-value capture.
+/// Handlers use this before [`parse_pairs`] + [`values_of`] so the raw
+/// text stays available for the repeated-value capture.
 ///
 /// # Errors
 ///
@@ -295,13 +303,28 @@ pub async fn validate_resources(
   if values.is_empty() {
     return Ok(Vec::new());
   }
+  if values.len() > MAX_RESOURCE_VALUES {
+    return Err(AppError::invalid_target("too many resource values"));
+  }
+  if values
+    .iter()
+    .any(|value| value.chars().any(|c| c.is_ascii_control()))
+  {
+    return Err(AppError::invalid_target(
+      "resource must not contain control characters",
+    ));
+  }
   if !enabled {
     return Err(AppError::invalid_target(
       "resource indicators are not enabled",
     ));
   }
-  let mut aud = Vec::with_capacity(values.len());
+  let mut distinct: HashSet<&str> = HashSet::with_capacity(values.len());
   for value in values {
+    distinct.insert(value.as_str());
+  }
+  let mut aud = Vec::with_capacity(distinct.len());
+  for value in distinct {
     let absolute_https = reqwest::Url::parse(value)
       .ok()
       .filter(|url| url.scheme() == "https" && url.has_host())
@@ -317,7 +340,7 @@ pub async fn validate_resources(
         "unknown or disabled resource server",
       ));
     }
-    aud.push(value.clone());
+    aud.push(value.to_owned());
   }
   aud.sort();
   aud.dedup();

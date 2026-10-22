@@ -1843,6 +1843,36 @@ fn cli_password_file_trims_trailing_newline() -> Result<(), TestError> {
   Ok(())
 }
 
+/// The resource-identifier grammar is shared by the CLI and `config sync`:
+/// only absolute `https` URIs with a host and no wildcard/userinfo/fragment/
+/// query may enter the catalog.
+#[test]
+fn cli_resource_identifier_validation_rejects_non_https_and_userinfo() {
+  for bad in [
+    "not-a-url",
+    "http://api.example.test",
+    "/relative",
+    "https://",
+    "https://user@api.example.test",
+    "https://user:pass@api.example.test",
+    "https://api.example.test#fragment",
+    "https://api.example.test?query=1",
+    "https://*.example.test",
+  ] {
+    assert!(resource::validate(bad).is_err(), "{bad:?} must be rejected");
+  }
+  for good in [
+    "https://api.example.test",
+    "https://api.example.test/a/b",
+    "https://api.example.test:8443/a",
+  ] {
+    assert!(
+      resource::validate(good).is_ok(),
+      "{good:?} must be accepted"
+    );
+  }
+}
+
 /// `resource-server` create/list/enable/disable/delete round-trips, rejects a
 /// wildcard identifier, and re-applies a `config sync` `resource_servers`
 /// array idempotently.

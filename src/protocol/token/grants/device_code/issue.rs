@@ -12,7 +12,7 @@ use super::{DevicePollError, DeviceTokenResponse, PollState};
 use crate::jose::jwt_access::JwtAccessSigner;
 use crate::{
   config::GrantKind,
-  db::{scope_repo, user_scope_repo},
+  db::{scope_repo, user_repo, user_scope_repo},
   error::AppError,
   protocol::{
     device::{binding_key, read_binding},
@@ -95,6 +95,12 @@ pub(super) async fn issue_approved(
       AppError::invalid_grant("resource indicators do not match this device authorization").into(),
     );
   }
+  // The device record above is already consumed (single redemption): a JWT
+  // redemption with an unbound audience fails here, before the mint, and the
+  // client must re-authorize with a `resource`.
+  if redemption.token_format == TokenFormat::Jwt && consumed.aud.is_empty() {
+    return Err(AppError::invalid_target("jwt access tokens require a resource audience").into());
+  }
   if consumed.grant_id.is_empty() || consumed.subject.is_empty() {
     return Err(AppError::server_error().into());
   }
@@ -118,6 +124,7 @@ pub(super) async fn issue_approved(
         dpop_required: redemption.dpop_required,
         subject: consumed.subject.clone(),
         scope: effective.clone(),
+        access_scope: effective.clone(),
         grant_id: consumed.grant_id.clone(),
         proof: redemption.proofs.clone(),
         aud: consumed.aud.clone(),
@@ -163,7 +170,16 @@ async fn approved_scope(
   client: &crate::db::Client,
   consumed: &device_store::DeviceRecord,
 ) -> Result<String, DevicePollError> {
-  let user_id = Uuid::parse_str(&consumed.subject).map_err(|_| AppError::server_error())?;
+  // The UI records the authenticated session subject, which is the user's
+  // email; older records and fixtures carry the user UUID. Resolve either to
+  // the entitlement owner and fail closed when the account is not live.
+  let user_id = match user_repo::find_by_email(state.pool, state.keys, &consumed.subject).await? {
+    Some(user) if user.disabled => {
+      return Err(AppError::invalid_grant("the approving user is disabled").into());
+    }
+    Some(user) => user.id,
+    None => Uuid::parse_str(&consumed.subject).map_err(|_| AppError::server_error())?,
+  };
   let client_registered =
     ScopeSet::parse(client.scope.trim()).map_err(|_| AppError::server_error())?;
   let enabled_names = scope_repo::list_enabled(state.pool)

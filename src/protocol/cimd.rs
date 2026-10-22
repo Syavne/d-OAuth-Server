@@ -42,7 +42,7 @@ mod tests;
 #[cfg(test)]
 mod tests_principal;
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::LazyLock, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -61,6 +61,26 @@ use crate::{
 
 /// How long a validated CIMD document stays cached (seconds).
 const CACHE_TTL_SECS: u64 = 15 * 60;
+
+/// How long a fetch failure stays negatively cached (seconds).
+const NEG_CACHE_TTL_SECS: u64 = 30;
+
+/// How long a fresh-fetch validation failure stays short-cached (seconds).
+/// This is a single-flight completion marker: it stops every waiter from
+/// re-fetching a deterministically invalid document, while a corrected
+/// document is seen within this short window.
+const INVALID_CACHE_TTL_SECS: u64 = 2;
+
+/// Extra lifetime on the single-flight lock beyond the fetch budget: the
+/// elected fetcher finishes its bounded fetch and cache write inside this.
+const LOCK_TTL_MARGIN: Duration = Duration::from_secs(1);
+
+/// Extra wait beyond the fetch budget before a waiter tries to acquire the
+/// lock itself: longer than [`LOCK_TTL_MARGIN`] so an abandoned lock expires.
+const LOCK_WAIT_MARGIN: Duration = Duration::from_millis(1_500);
+
+/// Waiter poll interval for the positive and negative cache.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Grant types a CIMD client may declare (CIMD §4.1; no device or
 /// client-credentials grants in a registration-free document).
@@ -290,6 +310,27 @@ pub fn cache_key(token_prefix: &str, client_id_url: &str) -> String {
   )
 }
 
+/// The negative cache key for origin-level fetch failures: `{state}`-prefixed
+/// `cimd:neg:<sha256(url)>`, same prefix/hash conventions as [`cache_key`].
+/// The raw URL is never stored.
+#[must_use]
+pub fn negative_cache_key(token_prefix: &str, client_id_url: &str) -> String {
+  format!(
+    "{token_prefix}cimd:neg:{}",
+    sha256_hex(client_id_url.as_bytes())
+  )
+}
+
+/// The short cache key for a fresh-fetch validation failure:
+/// `{state}`-prefixed `cimd:invalid:<sha256(url)>`.
+#[must_use]
+pub fn invalid_cache_key(token_prefix: &str, client_id_url: &str) -> String {
+  format!(
+    "{token_prefix}cimd:invalid:{}",
+    sha256_hex(client_id_url.as_bytes())
+  )
+}
+
 /// Per-request CIMD resolution settings for a client-auth consumer.
 ///
 /// `None` at a call site means CIMD is disabled there (`config.cimd_enabled`
@@ -314,9 +355,10 @@ pub struct CimdSettings<'a> {
 /// (token dispatch, `client_auth`, `/revoke`, `/introspect`, authorize/JAR,
 /// PAR, device poll).
 ///
-/// A registered row always wins: when `find_active_by_client_id` names a row
-/// — including a row whose `client_id` happens to be an `https://` URL — that
-/// row is returned and no document is fetched. Otherwise, when `settings` is
+/// A registered row always wins: when `find_by_client_id_any_state` names a
+/// row — including a row whose `client_id` happens to be an `https://` URL —
+/// an active row is returned and an inactive row resolves to `None` (no fetch,
+/// so deactivation cannot be bypassed). Otherwise, when `settings` is
 /// `Some` and the id parses as `https://`, the document is resolved through
 /// [`resolve_with_catalog`] (cache, else guarded fetch + strict validation)
 /// and materialized via [`ValidatedCimd::to_client`]. Any other id, or a
@@ -342,11 +384,16 @@ pub async fn resolve_client(
   settings: Option<CimdSettings<'_>>,
   client_id: &str,
 ) -> Result<Option<client_repo::Client>, CimdError> {
-  let row = client_repo::find_active_by_client_id(pool, keys, client_id)
+  let row = client_repo::find_by_client_id_any_state(pool, keys, client_id)
     .await
     .map_err(CimdError::Lookup)?;
   if let Some(client) = row {
-    return Ok(Some(client));
+    if client.active {
+      return Ok(Some(client));
+    }
+    // A disabled row is dead: the caller keeps its unknown-client error
+    // and no document is fetched, so deactivation cannot be bypassed.
+    return Ok(None);
   }
   let Some(settings) = settings else {
     return Ok(None);
@@ -464,10 +511,28 @@ pub async fn fetch_and_validate(
   validate_document(client_id_url, &document, validation)
 }
 
-/// Resolve a CIMD client: cache hit, else fetch + validate + cache.
+/// Resolve a CIMD client: negative-cache hit fails fast, else cache hit,
+/// else one elected fetcher plus waiters.
 ///
-/// A cached document is revalidated so catalog changes are honored during the
-/// 15-minute TTL. `token_prefix` must carry the `{state}` hash tag.
+/// An origin-level fetch failure (`Fetch`/`InvalidJson`) is negatively cached
+/// for 30 seconds under `cimd:neg:<sha256(url)>`. A fresh-fetch validation
+/// failure is short-cached for [`INVALID_CACHE_TTL_SECS`] under
+/// `cimd:invalid:<sha256(url)>` as a single-flight completion marker, so a
+/// corrected document is seen within that short window; a validation failure
+/// on a cached document writes no marker. A cached document is revalidated so
+/// catalog changes are honored during the 15-minute TTL. If the cache write
+/// after a successful validation fails, the validated document is still
+/// served (uncached).
+///
+/// Concurrent misses for the same URL elect exactly one fetcher through a
+/// `{state}` Redis lock (`cimd:lock:<sha256(url)>`, TTL = the fetch budget plus
+/// [`LOCK_TTL_MARGIN`]). The other requests poll the positive and negative
+/// caches for up to the fetch budget plus [`LOCK_WAIT_MARGIN`], then try once
+/// more to acquire the lock; if it is still held they fail closed with
+/// [`CimdError::Fetch`]. A holder's `release_lock` is a compare-and-delete, and
+/// the lock TTL bounds a crashed holder.
+///
+/// `token_prefix` must carry the `{state}` hash tag.
 ///
 /// # Errors
 ///
@@ -481,14 +546,178 @@ pub async fn resolve(
   limits: CimdLimits,
 ) -> Result<ValidatedCimd, CimdError> {
   let key = cache_key(token_prefix, client_id_url);
+  let neg_key = negative_cache_key(token_prefix, client_id_url);
+  let invalid_key = invalid_cache_key(token_prefix, client_id_url);
+  let lock = lock_key(token_prefix, client_id_url);
+  if is_negatively_cached(conn, &neg_key).await? {
+    return Err(CimdError::Fetch);
+  }
   if let Some(document) = get_cached(conn, &key).await? {
     return validate_document(client_id_url, &document, validation);
   }
+  if is_invalid_cached(conn, &invalid_key).await? {
+    return Err(CimdError::Fetch);
+  }
 
-  let document = fetch_document(client_id_url, limits).await?;
-  let validated = validate_document(client_id_url, &document, validation)?;
-  put_cached(conn, &key, &document).await?;
+  let ttl_ms = lock_ttl_ms(limits);
+  if let Some(token) = acquire_lock(conn, &lock, ttl_ms).await? {
+    let result = resolve_under_lock(
+      conn,
+      &key,
+      &neg_key,
+      &invalid_key,
+      client_id_url,
+      validation,
+      limits,
+    )
+    .await;
+    // Best effort: a missed release is bounded by the lock TTL.
+    let _ = release_lock(conn, &lock, &token).await;
+    return result;
+  }
+
+  let deadline = tokio::time::Instant::now()
+    .checked_add(limits.timeout)
+    .and_then(|instant| instant.checked_add(LOCK_WAIT_MARGIN))
+    .unwrap_or_else(tokio::time::Instant::now);
+  loop {
+    if is_negatively_cached(conn, &neg_key).await? {
+      return Err(CimdError::Fetch);
+    }
+    if let Some(document) = get_cached(conn, &key).await? {
+      return validate_document(client_id_url, &document, validation);
+    }
+    if is_invalid_cached(conn, &invalid_key).await? {
+      return Err(CimdError::Fetch);
+    }
+    // A holder that failed validation releases without a cache entry; stop
+    // waiting as soon as the lock is gone and try to elect the next fetcher.
+    let lock_present: bool = redis::cmd("EXISTS")
+      .arg(&lock)
+      .query_async(conn)
+      .await
+      .map_err(cache_backend)?;
+    if !lock_present {
+      break;
+    }
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+      break;
+    }
+    let left = deadline.saturating_duration_since(now);
+    tokio::time::sleep(left.min(LOCK_POLL_INTERVAL)).await;
+  }
+
+  if let Some(token) = acquire_lock(conn, &lock, ttl_ms).await? {
+    let result = resolve_under_lock(
+      conn,
+      &key,
+      &neg_key,
+      &invalid_key,
+      client_id_url,
+      validation,
+      limits,
+    )
+    .await;
+    let _ = release_lock(conn, &lock, &token).await;
+    return result;
+  }
+  Err(CimdError::Fetch)
+}
+
+/// The lock-held path: re-check the caches (another holder may have just
+/// published), then fetch, validate, and cache.
+async fn resolve_under_lock(
+  conn: &mut RedisConn,
+  key: &str,
+  neg_key: &str,
+  invalid_key: &str,
+  client_id_url: &str,
+  validation: &CimdValidation<'_>,
+  limits: CimdLimits,
+) -> Result<ValidatedCimd, CimdError> {
+  if is_negatively_cached(conn, neg_key).await? {
+    return Err(CimdError::Fetch);
+  }
+  if let Some(document) = get_cached(conn, key).await? {
+    return validate_document(client_id_url, &document, validation);
+  }
+  if is_invalid_cached(conn, invalid_key).await? {
+    return Err(CimdError::Fetch);
+  }
+  let document = match fetch_document(client_id_url, limits).await {
+    Ok(document) => document,
+    Err(error @ (CimdError::Fetch | CimdError::InvalidJson)) => {
+      put_negative(conn, neg_key).await?;
+      return Err(error);
+    }
+    Err(error) => return Err(error),
+  };
+  let validated = match validate_document(client_id_url, &document, validation) {
+    Ok(validated) => validated,
+    Err(error) => {
+      if put_invalid(conn, invalid_key).await.is_err() {
+        tracing::warn!("cimd invalid-document marker write failed");
+      }
+      return Err(error);
+    }
+  };
+  if put_cached(conn, key, &document).await.is_err() {
+    tracing::warn!("cimd cache population failed after validation");
+  }
   Ok(validated)
+}
+
+/// The single-flight lock key: `{state}`-prefixed, hash of the URL, never the
+/// raw URL.
+fn lock_key(token_prefix: &str, client_id_url: &str) -> String {
+  format!(
+    "{token_prefix}cimd:lock:{}",
+    sha256_hex(client_id_url.as_bytes())
+  )
+}
+
+/// Lock lifetime in milliseconds: the fetch budget plus a scheduling margin.
+fn lock_ttl_ms(limits: CimdLimits) -> u64 {
+  u64::try_from(limits.timeout.saturating_add(LOCK_TTL_MARGIN).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Acquire the single-flight lock with `SET NX PX`. The random token is the
+/// compare-and-delete value; `None` means another request holds it.
+async fn acquire_lock(
+  conn: &mut RedisConn,
+  key: &str,
+  ttl_ms: u64,
+) -> Result<Option<String>, CimdError> {
+  let token = crate::crypto::tokens::mint_token()
+    .map_err(|_| CimdError::Backend(AppError::temporarily_unavailable()))?;
+  let acquired: Option<String> = redis::cmd("SET")
+    .arg(key)
+    .arg(&token)
+    .arg("NX")
+    .arg("PX")
+    .arg(ttl_ms)
+    .query_async(conn)
+    .await
+    .map_err(cache_backend)?;
+  Ok(acquired.map(|_| token))
+}
+
+/// Compare-and-delete the single-flight lock, so a holder whose TTL expired
+/// cannot release a successor's lock.
+static RELEASE_LOCK: LazyLock<redis::Script> = LazyLock::new(|| {
+  redis::Script::new(
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+  )
+});
+
+/// Release the lock only when it still holds `token`.
+async fn release_lock(conn: &mut RedisConn, key: &str, token: &str) -> Result<(), CimdError> {
+  let mut invocation = RELEASE_LOCK.prepare_invoke();
+  invocation.key(key);
+  invocation.arg(token);
+  let _: i64 = invocation.invoke_async(conn).await.map_err(cache_backend)?;
+  Ok(())
 }
 
 /// Resolve a CIMD client while loading the enabled scope catalog from
@@ -544,6 +773,53 @@ async fn get_cached(conn: &mut RedisConn, key: &str) -> Result<Option<CimdDocume
       Ok(None)
     }
   }
+}
+
+/// Whether an origin-level fetch failure is negatively cached. A Redis
+/// failure is fail-closed [`CimdError::Backend`].
+async fn is_negatively_cached(conn: &mut RedisConn, neg_key: &str) -> Result<bool, CimdError> {
+  let present: bool = redis::cmd("EXISTS")
+    .arg(neg_key)
+    .query_async(conn)
+    .await
+    .map_err(cache_backend)?;
+  Ok(present)
+}
+
+/// Record an origin-level fetch failure for [`NEG_CACHE_TTL_SECS`]. A Redis
+/// failure is fail-closed [`CimdError::Backend`].
+async fn put_negative(conn: &mut RedisConn, neg_key: &str) -> Result<(), CimdError> {
+  redis::cmd("SET")
+    .arg(neg_key)
+    .arg("1")
+    .arg("EX")
+    .arg(NEG_CACHE_TTL_SECS)
+    .query_async::<()>(conn)
+    .await
+    .map_err(cache_backend)
+}
+
+/// Whether a fresh-fetch validation failure is short-cached. A Redis failure
+/// is fail-closed [`CimdError::Backend`].
+async fn is_invalid_cached(conn: &mut RedisConn, invalid_key: &str) -> Result<bool, CimdError> {
+  let present: bool = redis::cmd("EXISTS")
+    .arg(invalid_key)
+    .query_async(conn)
+    .await
+    .map_err(cache_backend)?;
+  Ok(present)
+}
+
+/// Record a fresh-fetch validation failure for [`INVALID_CACHE_TTL_SECS`].
+async fn put_invalid(conn: &mut RedisConn, invalid_key: &str) -> Result<(), CimdError> {
+  redis::cmd("SET")
+    .arg(invalid_key)
+    .arg("1")
+    .arg("EX")
+    .arg(INVALID_CACHE_TTL_SECS)
+    .query_async::<()>(conn)
+    .await
+    .map_err(cache_backend)
 }
 
 /// Cache a validated document for [`CACHE_TTL_SECS`].

@@ -50,7 +50,7 @@ One row per registered client (RFC 7591 / RFC 7592).
 | `active` | `bool` | Soft disable, default true. |
 | `registration_access_token_hash` | `text` | Keyed hash of the RFC 7592 management token. |
 | `dpop_bound_access_tokens` | `bool` | Whether this client's tokens require DPoP proof (`migrations/1791244800_client_dpop_bound.sql`). |
-| `access_token_format` | `text` | `opaque` (default) or `jwt`, checked by `ck_oauth_clients_access_token_format`; `jwt` is honored only while JWT access tokens are enabled (`migrations/1791504000_resource_servers.sql`). Dynamic registration always inserts `opaque`; only `client set-access-token-format` changes it. |
+| `access_token_format` | `text` | `opaque` (default) or `jwt`, checked by `ck_oauth_clients_access_token_format`; `jwt` is honored only while JWT access tokens are enabled (`migrations/1791504000_resource_servers.sql`). Dynamic registration always inserts `opaque`; `client set-access-token-format` and `config sync` can change it. |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
 
 Four partial unique indexes enforce client-identity uniqueness. Two are on the

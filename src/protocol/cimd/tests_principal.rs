@@ -1161,3 +1161,66 @@ async fn cimd_fetch_failure_maps_fail_closed() -> TestResult {
     ))),
   }
 }
+
+/// A disabled URL-shaped row is dead: `resolve_client` returns `Ok(None)` —
+/// the caller keeps its unknown-client error — and never falls through to a
+/// CIMD fetch (CIMD enabled, no cache seed; `.invalid` could never fetch).
+#[tokio::test]
+async fn cimd_inactive_url_row_never_fetches() -> TestResult {
+  let mut h = harness().await?;
+  let url = unique("inactiverow");
+  let params =
+    Argon2Params::new(8, 1, 1, 32).map_err(|error| TestError::Unexpected(format!("{error:?}")))?;
+  let secret_hash = hash_secret("row-secret", &params)
+    .map_err(|error| TestError::Unexpected(format!("{error:?}")))?;
+  client_repo::insert(
+    &h.pool,
+    &h.ring,
+    false,
+    &NewClient {
+      id: uuid::Uuid::new_v4(),
+      client_id: url.clone(),
+      client_secret_hash: Some(secret_hash),
+      client_secret_expires_at: None,
+      client_name: "inactive row".to_owned(),
+      grant_types: vec!["authorization_code".to_owned()],
+      response_types: vec!["code".to_owned()],
+      scope: "api:read".to_owned(),
+      token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost
+        .as_str()
+        .to_owned(),
+      jwks: None,
+      jwks_uri: None,
+      tls_client_auth_subject_dn: None,
+      tls_client_auth_cert_thumbprint: None,
+      request_uris: None,
+      contacts: None,
+      software_id: None,
+      dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
+      registration_access_token_hash: None,
+    },
+  )
+  .await?;
+  if !client_repo::deactivate(&h.pool, &url).await? {
+    return Err(TestError::Unexpected(
+      "deactivate reported no change".to_owned(),
+    ));
+  }
+  let token_prefix = h.token_prefix.clone();
+  let settings = CimdSettings {
+    token_prefix: &token_prefix,
+    max_bytes: 5_120,
+    timeout: Duration::from_secs(2),
+    allow_localhost: false,
+  };
+  match resolve_client(&h.pool, &h.ring, &mut h.conn, Some(settings), &url).await {
+    Ok(None) => Ok(()),
+    Ok(Some(_)) => Err(TestError::Unexpected(
+      "inactive row must not resolve".to_owned(),
+    )),
+    Err(error) => Err(TestError::Unexpected(format!(
+      "inactive row must be Ok(None) without fetching, got {error}"
+    ))),
+  }
+}

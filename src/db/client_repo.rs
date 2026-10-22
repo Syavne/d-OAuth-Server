@@ -259,6 +259,71 @@ pub async fn find_active_by_client_id(
     .transpose()
 }
 
+/// Find a client by its public `client_id`, active or not.
+///
+/// An inactive row is returned as-is (with `active == false`) so callers
+/// that must not fall through to a registration-free fallback — CIMD
+/// `resolve_client` — can distinguish "disabled" from "missing" without a
+/// second query.
+///
+/// # Errors
+///
+/// Returns [`AppError::PiiDecrypt`] when a stored ciphertext fails to open,
+/// or a masked error on any database failure.
+pub async fn find_by_client_id_any_state(
+  pool: &PgPool,
+  keys: &KeyRing,
+  client_id: &str,
+) -> Result<Option<Client>, AppError> {
+  let row = sqlx::query!(
+    "SELECT id, client_id, client_secret_expires_at, client_id_issued_at, client_name, \
+       client_name_enc, grant_types, response_types, scope, token_endpoint_auth_method, jwks, \
+       jwks_uri, jwks_uri_enc, tls_client_auth_subject_dn, tls_client_auth_subject_dn_enc, \
+       tls_client_auth_cert_thumbprint, tls_client_auth_cert_thumbprint_enc, request_uris, \
+       request_uris_enc, contacts, contacts_enc, software_id, software_id_enc, \
+       dpop_bound_access_tokens, access_token_format, active, created_at, updated_at \
+     FROM oauth_clients WHERE client_id = $1",
+    client_id,
+  )
+  .fetch_optional(pool)
+  .await?;
+  row
+    .map(|row| {
+      Ok(Client {
+        id: row.id,
+        client_id: row.client_id,
+        client_secret_expires_at: row.client_secret_expires_at,
+        client_id_issued_at: row.client_id_issued_at,
+        client_name: decrypt_required_text(keys, row.client_name_enc, row.client_name)?,
+        grant_types: row.grant_types,
+        response_types: row.response_types,
+        scope: row.scope,
+        token_endpoint_auth_method: row.token_endpoint_auth_method,
+        jwks: row.jwks,
+        jwks_uri: decrypt_optional_text(keys, row.jwks_uri_enc, row.jwks_uri)?,
+        tls_client_auth_subject_dn: decrypt_optional_text(
+          keys,
+          row.tls_client_auth_subject_dn_enc,
+          row.tls_client_auth_subject_dn,
+        )?,
+        tls_client_auth_cert_thumbprint: decrypt_optional_text(
+          keys,
+          row.tls_client_auth_cert_thumbprint_enc,
+          row.tls_client_auth_cert_thumbprint,
+        )?,
+        request_uris: decrypt_optional_json(keys, row.request_uris_enc, row.request_uris)?,
+        contacts: decrypt_optional_json(keys, row.contacts_enc, row.contacts)?,
+        software_id: decrypt_optional_text(keys, row.software_id_enc, row.software_id)?,
+        dpop_bound_access_tokens: row.dpop_bound_access_tokens,
+        access_token_format: row.access_token_format,
+        active: row.active,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })
+    })
+    .transpose()
+}
+
 /// Find a client by its surrogate id, active or not.
 ///
 /// # Errors

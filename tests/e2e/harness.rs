@@ -299,6 +299,7 @@ impl World {
           dpop_required: kind == ClientKind::Public,
           subject: "e2e-subject".to_owned(),
           scope: scope.to_owned(),
+          access_scope: scope.to_owned(),
           grant_id: uuid::Uuid::new_v4().to_string(),
           proof: SenderProof {
             dpop_jkt: jkt.map(str::to_owned),

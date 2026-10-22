@@ -21,7 +21,7 @@ mod tests;
 
 use std::time::Duration;
 
-use axum::{Extension, extract::State, http::HeaderMap};
+use axum::{Extension, extract::RawForm, extract::State, http::HeaderMap};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -46,6 +46,8 @@ use crate::{
 pub const REFRESH_TOKEN_HINT: &str = "refresh_token";
 /// `token_type` reported for an active access token (RFC 6749 §5.1).
 pub const BEARER: &str = "Bearer";
+/// `token_type` reported for a DPoP-bound access token (RFC 9449 §6.2).
+pub const DPOP: &str = "DPoP";
 
 /// Form fields accepted at `POST /introspect` (RFC 7662 §2.1).
 #[derive(Debug, Deserialize)]
@@ -409,11 +411,16 @@ async fn introspect_jwt(
   if !inputs.resource.is_empty() && !audience_includes(&claims.aud, inputs.resource) {
     return Ok(IntrospectionResponse::inactive());
   }
+  let token_type = if claims.cnf.as_ref().is_some_and(|cnf| cnf.jkt.is_some()) {
+    DPOP
+  } else {
+    BEARER
+  };
   Ok(IntrospectionResponse {
     active: true,
     scope: Some(claims.scope),
     client_id: Some(claims.client_id),
-    token_type: Some(BEARER.to_owned()),
+    token_type: Some(token_type.to_owned()),
     exp: Some(claims.exp),
     iat: Some(claims.iat),
     sub: (!claims.sub.is_empty()).then_some(claims.sub),
@@ -527,16 +534,14 @@ async fn active_response(
   ctx: &IntrospectContext<'_>,
   located: Located,
 ) -> Result<IntrospectionResponse, AppError> {
-  let (key, ttl, token_type) = match located.kind {
+  let (key, ttl) = match located.kind {
     TokenKind::Access => (
       stores.store.access_key(&located.hash),
       ctx.service.access_ttl(),
-      Some(BEARER.to_owned()),
     ),
     TokenKind::Refresh => (
       stores.store.refresh_key(&located.hash),
       ctx.service.refresh_ttl(),
-      None,
     ),
   };
   let (iat, exp) = token_window(stores.conn, &key, ttl, ctx.now_unix).await?;
@@ -546,6 +551,11 @@ async fn active_response(
     None
   };
   let cnf = Cnf::parse_storage(&located.cnf).map_err(AppError::from)?;
+  let token_type = match located.kind {
+    TokenKind::Access if cnf.jkt.is_some() => Some(DPOP.to_owned()),
+    TokenKind::Access => Some(BEARER.to_owned()),
+    TokenKind::Refresh => None,
+  };
   Ok(IntrospectionResponse {
     active: true,
     scope: Some(located.scope),
@@ -647,12 +657,17 @@ pub async fn read_act(
 
 /// Axum handler for `POST /introspect` (wired by task 40).
 ///
-/// Thin glue: `Bytes` + a manual parse replaces `Form<IntrospectForm>` (the
-/// extractor consumed the raw body, hiding repeats), then builds the token
-/// service and delegates to [`introspect`]. The explicit content-type gate
-/// preserves the 415 `Form` rendered (`Bytes` never fails on
-/// content-type), a malformed body or a repeated known field is the same
-/// 400, and a present `resource` indicator (RFC 8707) validates fail-closed
+/// Thin glue: `RawForm` + a manual parse replaces `Form<IntrospectForm>`
+/// (the extractor consumed the raw body, hiding repeats), then builds the
+/// token service and delegates to [`introspect`]. `RawForm` rejects a wrong
+/// content type with 415 before buffering the body; the explicit exact-MIME
+/// gate below is the second check for the prefix-match case
+/// (`application/x-www-form-urlencodedevil`). A malformed (non-UTF-8) body
+/// is 400 plain text (deliberately stricter than the old `Form`, which
+/// lossily accepted raw non-UTF-8 bytes); a repeated known field is JSON
+/// `invalid_request` (the old `Form` returned 422 `Failed to deserialize
+/// form body`, so the new JSON 400 is the intended contract, not parity).
+/// A present `resource` indicator (RFC 8707) validates fail-closed
 /// (`invalid_target`) before any lookup runs.
 ///
 /// RFC 7662 defines no `resource` parameter. This endpoint accepts it as a
@@ -664,9 +679,15 @@ pub async fn handler(
   State(state): State<AppState>,
   peer_certs: Option<Extension<PeerCertificates>>,
   headers: HeaderMap,
-  body: axum::body::Bytes,
+  body: RawForm,
 ) -> axum::response::Response {
   use axum::response::IntoResponse as _;
+  // `RawForm` gates the content type BEFORE `Bytes` buffering, so a wrong
+  // content type is rejected 415 without reading the (up to 2 MiB) body.
+  // The explicit exact-MIME gate below is the second check: `RawForm` uses a
+  // case-sensitive prefix match, so it accepts e.g.
+  // `application/x-www-form-urlencodedevil`, which the exact gate rejects.
+  let body = body.0;
   if let Err(reject) = crate::protocol::params::require_form_content_type(&headers) {
     return reject.into_response();
   }
@@ -675,20 +696,13 @@ pub async fn handler(
     Err(reject) => return reject.into_response(),
   };
   if crate::protocol::params::has_duplicate_field(&pairs, &IntrospectForm::KNOWN_FIELDS) {
-    return (
-      axum::http::StatusCode::BAD_REQUEST,
-      "Failed to deserialize form",
-    )
+    return AppError::invalid_request("the request body includes a parameter more than once")
       .into_response();
   }
   let map = crate::protocol::params::single_valued_map(&pairs);
   let form = IntrospectForm::from_map(&map);
-  let text = match crate::protocol::params::form_text(&body) {
-    Ok(text) => text,
-    Err(reject) => return reject.into_response(),
-  };
   let resources =
-    crate::protocol::params::repeated_values(text, crate::protocol::params::RESOURCE_PARAM);
+    crate::protocol::params::values_of(&pairs, crate::protocol::params::RESOURCE_PARAM);
   let resources = match crate::protocol::params::validate_resources(
     &state.pool,
     state.config.resource_indicators_enabled,

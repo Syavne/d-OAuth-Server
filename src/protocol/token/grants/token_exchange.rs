@@ -282,6 +282,7 @@ pub async fn exchange(
         // never be wrapped in an `at+jwt`.
         subject: subject.record.subject.clone(),
         scope: issued.render(),
+        access_scope: issued.render(),
         grant_id,
         proof: input.proof.clone(),
         aud: Vec::new(),

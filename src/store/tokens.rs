@@ -21,8 +21,8 @@ use std::{collections::HashMap, time::Duration};
 use serde::{Deserialize, Serialize};
 
 use super::{
-  OpClass, SCRIPT_PUT_MEMBER, SCRIPT_ROTATE_REFRESH, Store, StoreError, durability_barrier,
-  hmac_sha256, may_retry_op, retry_op,
+  OpClass, SCRIPT_DISCARD_ACCESS_JWT, SCRIPT_PUT_MEMBER, SCRIPT_ROTATE_REFRESH, Store, StoreError,
+  durability_barrier, hmac_sha256, may_retry_op, retry_op,
 };
 use crate::state::RedisConn;
 
@@ -239,6 +239,38 @@ pub async fn put_access_jwt(
     subject: &record.subject,
   };
   put_access_inner(conn, store, member, record, ttl, true, Some(&marker)).await
+}
+
+/// Atomically discard a JWT rotation pre-mint: delete its access record,
+/// remove its grant-set member, and delete its allowlist marker in one Lua
+/// command. An empty `grant_id` skips the `SREM` and uses the record key as
+/// the same-slot dummy.
+pub async fn discard_access_jwt(
+  conn: &mut RedisConn,
+  store: &Store,
+  member: &str,
+  jti_hash: &str,
+  grant_id: &str,
+) -> Result<(), StoreError> {
+  let record_key = store.access_key(member);
+  let marker_key = store.jwt_marker_key(jti_hash);
+  let set_key = if grant_id.is_empty() {
+    record_key.clone()
+  } else {
+    store.grant_tokens_key(grant_id)
+  };
+  let mut invocation = SCRIPT_DISCARD_ACCESS_JWT.prepare_invoke();
+  invocation
+    .key(&record_key)
+    .key(&set_key)
+    .key(&marker_key)
+    .arg(member)
+    .arg(grant_id);
+  let _: i64 = invocation
+    .invoke_async(conn)
+    .await
+    .map_err(StoreError::Redis)?;
+  Ok(())
 }
 
 /// Store an access-token record and index it in its grant set WITHOUT the

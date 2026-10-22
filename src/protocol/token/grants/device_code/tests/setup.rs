@@ -71,12 +71,12 @@ pub(super) async fn enable_scopes(pool: &PgPool, names: &[&str]) -> TestResult {
   Ok(())
 }
 
-/// Provision a user and entitle it to the given scopes.
-pub(super) async fn entitled_user(
+/// Provision a user and entitle it to the given scopes, returning the record.
+pub(super) async fn entitled_user_record(
   pool: &PgPool,
   config: &Config,
   scopes: &[&str],
-) -> Result<Uuid, TestError> {
+) -> Result<user_repo::UserRecord, TestError> {
   let email = format!("{}@example.test", unique("user"));
   let record = user_repo::create_user(
     pool,
@@ -93,5 +93,14 @@ pub(super) async fn entitled_user(
   for scope in scopes {
     crate::db::user_scope_repo::entitle(pool, record.id, scope, None).await?;
   }
-  Ok(record.id)
+  Ok(record)
+}
+
+/// Provision a user and entitle it to the given scopes.
+pub(super) async fn entitled_user(
+  pool: &PgPool,
+  config: &Config,
+  scopes: &[&str],
+) -> Result<Uuid, TestError> {
+  Ok(entitled_user_record(pool, config, scopes).await?.id)
 }

@@ -3,8 +3,9 @@
 Redis holds every short-lived value: authorization codes, access and refresh
 tokens, grant chains, sessions, PAR request URIs, device codes, DCR
 initial-access tokens, replay markers, and rate-limit counters. No raw token is
-ever a Redis key or value; keys are keyed hashes and values hold only derived
-state.
+ever a Redis key or value; token keys are keyed hashes and values hold only
+derived state. The JWT marker and CIMD cache use an unkeyed SHA-256 over a
+random `jti` or a public document URL respectively, neither of which is secret.
 
 ## Purpose
 
@@ -21,7 +22,7 @@ differ.
 | Key | Contents | TTL |
 | --- | --- | --- |
 | `oauth:{state}:code:<hash>` | Single-use authorization code, PKCE-bound. | `ttl.code` (60s), clamped to 60 s (`CODE_TTL_CAP`) |
-| `oauth:{state}:access:<hash>` | Access-token record. | `ttl.access` (300s) |
+| `oauth:{state}:access:<hash>` | Access-token record. | `ttl.access_secs` (default 300s) |
 | `oauth:{state}:access:<hash>:act` | Token-exchange `act` claim sidecar. | Lives with the access record |
 | `oauth:{state}:refresh:<hash>` | Refresh-token record or tombstone. | `ttl.refresh` (30d) |
 | `oauth:{state}:grant:<id>` | Grant-chain record. | Refresh lifetime |
@@ -42,13 +43,17 @@ differ.
 | `oauth:{state}:loginfail:ip:<sha256>:<sha256>` | Composite failed-login counter for one source IP and one account (both halves hashed; locks that IP only). | `ui::login::LOCKOUT_WINDOW` (15 min) |
 | `oauth:{state}:loginfail:unknown:<sha256>` | Unknown-label bucket for one source IP (hashed IP only; no per-label keys, so label enumeration cannot spray the keyspace). | `ui::login::LOCKOUT_WINDOW` (15 min) |
 | `oauth:{state}:totp_replay:<fingerprint>` | TOTP used-code replay marker. The fingerprint is an HMAC under the token pepper (never the code itself), so a dump does not reveal the code. | 180 s (`USED_CODE_TTL`; fixed, 6× the 30 s step) |
-| `oauth:{state}:jwt:<jti-hash>` | JWT access-token kill marker (allowlist: a signed token is valid only while this hash is live). Carries `grant_id`, `client_id`, and the raw `subject` (email/user-id; empty for client-credentials), matching the `purge_subject` `subject` decoder. | `ttl.access` (300s) |
-| `oauth:{state}:cimd:<sha256>` | Cached client-id-metadata document (keyed by a hash of the URL, never the raw URL). | Bounded cache lifetime |
+| `oauth:{state}:jwt:<jti-hash>` | JWT access-token kill marker (allowlist: a signed token is valid only while this hash is live). Carries `grant_id`, `client_id`, and the raw `subject` (email/user-id; empty for client-credentials), matching the `purge_subject` `subject` decoder. | `ttl.access_secs` (default 300s) |
+| `oauth:{state}:cimd:<sha256>` | Cached client-id-metadata document (keyed by a hash of the URL, never the raw URL). | 15 minutes |
+| `oauth:{state}:cimd:neg:<sha256>` | Negative cache for an origin-level CIMD fetch failure (network/TLS/non-2xx, timeout, non-JSON). | 30 seconds |
+| `oauth:{state}:cimd:invalid:<sha256>` | Short completion marker for a fresh-fetch CIMD validation failure, so waiters do not re-fetch a deterministically invalid document. | 2 seconds |
+| `oauth:{state}:cimd:lock:<sha256>` | Single-flight fetcher election for one uncached CIMD URL; a random token is released with a compare-and-delete Lua script. | `cimd_fetch_timeout_secs` + 1 s (2–11 s) |
 | `oauth:{rl}:ratelimit:<bucket-hash>` | Fixed-window rate-limit counter. | `rate_limit.window` (60s) |
 
-`<hash>` is always a keyed hash. Tokens are opaque, so the server can look a
-record up by re-hashing the presented value but cannot recover the raw value
-from storage.
+`<hash>` is a keyed hash for token lookups: tokens are opaque, so the server can
+look a record up by re-hashing the presented value but cannot recover the raw
+value from storage. The `<jti-hash>` of a JWT marker and the CIMD `<sha256>` are
+unkeyed because their inputs are already a random token id and a public URL.
 
 Resource audiences (`aud`, RFC 8707) ride on seven record families as a field
 named `aud`: `code:`, `access:`, `refresh:`, `grant:`, `par:`, `device:`, and
@@ -66,7 +71,7 @@ Postgres, not Redis.
 
 JWT access tokens use an allowlist, not a denylist. Each mint writes a
 `jwt:<jti-hash>` marker (`grant_id`, `client_id`, `subject`, TTL
-`ttl.access`) in the same atomic script as the grant membership, and a token is
+`ttl.access_secs`) in the same atomic script as the grant membership, and a token is
 live only while that hash exists. Because the marker rides the `{state}` tag, it
 is single-slot with the access record and the grant set. Three paths delete it:
 
@@ -200,7 +205,9 @@ rotation mapping or the record instead of replaying the write.
 
 ## Security properties
 
-- Only keyed hashes are stored. A Redis dump does not reveal a usable token.
+- Token keys are keyed hashes; the JWT marker and CIMD cache use an unkeyed
+  SHA-256 over a random `jti` or a public URL. A Redis dump does not reveal a
+  usable token.
 - `noeviction` and AOF are required by default and asserted at startup unless
   the matching opt-out flag (`redis.noeviction_required` or `redis.aof_required`)
   is set false.
@@ -242,7 +249,7 @@ field is the canonical email or the user-id string:
   cascade already removes markers for grant-bound tokens; this sweep covers a
   marker whose grant set is already gone. Client-credentials markers carry an
   empty subject, so the subject decoder never matches them; they expire with
-  `ttl.access`.
+  `ttl.access_secs`.
 
 Records without a `subject` field are never touched: `par:`, `pending:`,
 `dpop_jti:`, `client_assertion_jti:`, `rotation:`, `totp_replay:`, and the

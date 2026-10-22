@@ -33,7 +33,10 @@ use crate::{
   },
   error::{AppError, OAuthErrorCode},
   keys::{KeyId, KeyRing},
-  protocol::code,
+  protocol::{
+    cimd::{self, CimdDocument, CimdSettings},
+    code,
+  },
   state::RedisConn,
   store::{
     self, Store, codes,
@@ -59,6 +62,8 @@ struct Harness {
   conn: RedisConn,
   /// Store handle over the test keyspaces.
   store: Store,
+  /// Token keyspace prefix (CIMD cache key layout).
+  token_prefix: String,
   /// PII key ring for the encrypted user-email lookup (strict encrypt-only).
   keys: KeyRing,
 }
@@ -68,12 +73,17 @@ async fn harness() -> Result<Harness, TestError> {
   let (db, pool) = crate::db::test_support::migrated_pool().await?;
   let manager = crate::test_support::redis_manager().await?;
   let (state_prefix, ratelimit_prefix) = crate::test_support::unique_prefixes();
-  let store = Store::from_parts(state_prefix, ratelimit_prefix, DurabilityMode::WaitAof);
+  let store = Store::from_parts(
+    state_prefix.clone(),
+    ratelimit_prefix,
+    DurabilityMode::WaitAof,
+  );
   Ok(Harness {
     _db: db,
     pool,
     conn: RedisConn::Single(manager),
     store,
+    token_prefix: state_prefix,
     keys: test_ring()?,
   })
 }
@@ -85,6 +95,23 @@ fn deps_of(h: &mut Harness) -> ConsentDeps<'_> {
     conn: &mut h.conn,
     store: &h.store,
     keys: &h.keys,
+    cimd: None,
+  }
+}
+
+/// Borrow the harness with CIMD resolution enabled.
+fn cimd_deps_of(h: &mut Harness) -> ConsentDeps<'_> {
+  ConsentDeps {
+    pool: &h.pool,
+    conn: &mut h.conn,
+    store: &h.store,
+    keys: &h.keys,
+    cimd: Some(CimdSettings {
+      token_prefix: &h.token_prefix,
+      max_bytes: 5_120,
+      timeout: Duration::from_secs(2),
+      allow_localhost: false,
+    }),
   }
 }
 
@@ -225,6 +252,114 @@ async fn code_key_count(h: &mut Harness) -> Result<usize, TestError> {
     .query_async(&mut h.conn)
     .await?;
   Ok(keys.len())
+}
+
+/// Seed a CIMD document into the Redis cache so resolution never fetches.
+async fn seed_cimd(
+  h: &mut Harness,
+  client_id_url: &str,
+  document: &CimdDocument,
+) -> Result<(), TestError> {
+  let payload = serde_json::to_string(document)?;
+  redis::cmd("SET")
+    .arg(cimd::cache_key(&h.token_prefix, client_id_url))
+    .arg(payload)
+    .arg("EX")
+    .arg(900)
+    .query_async::<()>(&mut h.conn)
+    .await?;
+  Ok(())
+}
+
+/// A registration-free CIMD client (no Postgres row) loads consent and
+/// approves, using the document's name, scope, DPoP flag, and auth method.
+#[tokio::test]
+async fn consent_cimd_client_without_row_loads_and_approves() -> TestResult {
+  let mut h = harness().await?;
+  let fx = provision(&mut h).await?;
+  let client_id_url = "https://cimd.example.test/client.json";
+  let document = CimdDocument {
+    client_id: client_id_url.to_owned(),
+    redirect_uris: vec!["https://client.example.test/cb".to_owned()],
+    token_endpoint_auth_method: Some("none".to_owned()),
+    grant_types: Some(vec!["authorization_code".to_owned()]),
+    scope: Some("orders:read".to_owned()),
+    jwks: None,
+    jwks_uri: None,
+    client_name: Some("CIMD Test App".to_owned()),
+    dpop_bound_access_tokens: Some(true),
+  };
+  seed_cimd(&mut h, client_id_url, &document).await?;
+  let record = PendingAuth {
+    client_id: client_id_url.to_owned(),
+    redirect_uri: "https://client.example.test/cb".to_owned(),
+    scope: "orders:read orders:write".to_owned(),
+    code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+    state: Some("state-xyz".to_owned()),
+    dpop_jkt: Some("cimd-jkt".to_owned()),
+    iss: "https://auth.example.test".to_owned(),
+    post_logout_uri: None,
+    aud: Vec::new(),
+  };
+  pending::put(
+    &mut h.conn,
+    &h.store,
+    &fx.request_id,
+    &record,
+    Duration::from_secs(300),
+  )
+  .await?;
+  let view = {
+    let mut deps = cimd_deps_of(&mut h);
+    load_consent_view(&mut deps, &fx.session_id).await?
+  };
+  let Some(view) = view else {
+    return Err("a CIMD client must render consent without a registered row".into());
+  };
+  if view.client_name != "CIMD Test App" {
+    return Err(format!("document client_name must render: {}", view.client_name).into());
+  }
+  if view.scopes != vec!["orders:read".to_owned()] {
+    return Err(format!("document scope must bound the view: {:?}", view.scopes).into());
+  }
+  let issuer = test_issuer()?;
+  let outcome = {
+    let mut deps = cimd_deps_of(&mut h);
+    submit_consent(
+      &mut deps,
+      ConsentSubmission {
+        session_id: &fx.session_id,
+        request_id: &view.request_id,
+        csrf: &view.csrf,
+        decision: ConsentDecision::Approve,
+      },
+      &issuer,
+    )
+    .await?
+  };
+  let issued = match outcome {
+    ConsentOutcome::Approved { issued } => issued,
+    _ => return Err("a CIMD approval must issue a code".into()),
+  };
+  let stored = codes::consume(&mut h.conn, &h.store, &issued.code_hash)
+    .await?
+    .ok_or_else(|| -> TestError { "the issued code must be stored".into() })?;
+  if stored.client_id != client_id_url {
+    return Err(
+      format!(
+        "code must carry the CIMD client id, got: {}",
+        stored.client_id
+      )
+      .into(),
+    );
+  }
+  if stored.scope != "orders:read" {
+    return Err(format!("code must store the effective scope, got: {}", stored.scope).into());
+  }
+  if stored.cnf != "cimd-jkt" {
+    return Err("the document DPoP flag must bind the code".into());
+  }
+  Ok(())
 }
 
 /// Approve issues a code whose stored record carries the effective scope

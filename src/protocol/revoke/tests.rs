@@ -183,6 +183,7 @@ fn mint_request(client: &str, grant: &str) -> MintRequest {
     dpop_required: false,
     subject: "user-1".to_owned(),
     scope: "orders:read".to_owned(),
+    access_scope: "orders:read".to_owned(),
     grant_id: grant.to_owned(),
     proof: SenderProof::none(),
     aud: Vec::new(),

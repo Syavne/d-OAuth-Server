@@ -17,6 +17,7 @@ use super::test_support::{
   Extras, Passthrough, TestResult, live_state, peer, retry_after, scan_keys, send, send_with,
   test_config, unavailable_state,
 };
+use crate::config::RateLimitConfig;
 
 /// N in-window requests pass; the N+1th is `429` + `Retry-After`.
 #[tokio::test]
@@ -218,6 +219,23 @@ async fn ratelimit_token_fails_closed_on_store_outage() -> TestResult {
     "fail-closed response must carry Retry-After"
   );
   Ok(())
+}
+
+/// `/jwks.json` is anonymous, so it is classified under the per-IP budget
+/// only and never gets a per-client bucket.
+#[test]
+fn ratelimit_classifies_jwks_json_under_per_ip_budget() {
+  let limits = RateLimitConfig {
+    per_ip: 7,
+    per_client: 11,
+    ..RateLimitConfig::default()
+  };
+  let rule = super::Rule::for_path(&limits, "/jwks.json");
+  assert!(rule.is_some(), "/jwks.json must be rate-limit classified");
+  if let Some(rule) = rule {
+    assert_eq!(rule.per_ip, limits.per_ip);
+    assert_eq!(rule.per_client, None);
+  }
 }
 
 /// Protected-path classification is exact: an unlisted path is untouched even

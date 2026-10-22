@@ -10,6 +10,7 @@ use super::super::issue_client_credentials;
 use super::{Ctx, TestError, TestResult, dpop_proof, ring, test_redis, unique};
 use crate::{
   config::{JwtSigningAlg, JwtSigningKey, TtlConfig},
+  error::OAuthErrorCode,
   jose::jwt_access::{JwtAccessSigner, jti_hash, marker_live},
   keys::KeyId,
   protocol::{
@@ -147,6 +148,48 @@ async fn jwt_mint_carries_aud_and_cnf() -> TestResult {
     return Err(TestError::Unexpected(
       "the fresh mint must leave a live allowlist marker".to_owned(),
     ));
+  }
+  Ok(())
+}
+
+/// `test(jwt_client_credentials_without_resource_is_invalid_target)`: a JWT
+/// client-credentials request with no `resource` fails `invalid_target`
+/// before minting, so no JWT is issued.
+#[tokio::test]
+async fn jwt_client_credentials_without_resource_is_invalid_target() -> TestResult {
+  let (mut conn, store) = test_redis().await?;
+  let signer = test_signer()?;
+  let service = TokenService::new(&TtlConfig::default(), &ring()?)
+    .map_err(TestError::from)?
+    .with_jwt_signer(signer);
+  let client = unique("jwt-cc-no-resource");
+  let registered = ScopeSet::parse("read")?;
+  let enabled = ScopeSet::parse("read")?;
+  let proof = dpop_proof("jwt-no-resource-jkt");
+  let ctx = Ctx {
+    kind: ClientKind::Confidential,
+    registered: &registered,
+    enabled: &enabled,
+    dpop_bound: None,
+    mtls_bound: None,
+    proof: &proof,
+  };
+  let mut inputs = super::input(&client, None, &ctx);
+  inputs.aud = &[];
+  inputs.token_format = TokenFormat::Jwt;
+  match issue_client_credentials(&mut conn, &store, &service, &inputs).await {
+    Err(error) if error.code() == OAuthErrorCode::InvalidTarget => {}
+    Err(error) => {
+      return Err(TestError::Unexpected(format!(
+        "a resourceless jwt mint must be invalid_target, got {}",
+        error.code()
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected(
+        "a resourceless jwt mint must never issue a token".to_owned(),
+      ));
+    }
   }
   Ok(())
 }

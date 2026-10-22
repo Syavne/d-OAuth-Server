@@ -2,8 +2,9 @@
 //! transport-contract preservation, and fail-closed resource validation.
 
 use super::{
-  RESOURCE_PARAM, form_pairs, has_duplicate_field, parse_pairs, query_pairs, repeated_values,
-  require_form_content_type, single_valued_map, validate_resources,
+  MAX_FORM_PAIRS, MAX_RESOURCE_VALUES, RESOURCE_PARAM, form_pairs, has_duplicate_field,
+  parse_pairs, query_pairs, require_form_content_type, single_valued_map, validate_resources,
+  values_of,
 };
 use crate::{db::resource_repo, error::OAuthErrorCode};
 
@@ -14,7 +15,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[test]
 fn params_repeated_resource_is_captured_in_order() -> TestResult {
   let raw = "client_id=web&resource=https%3A%2F%2Fapi.example.test%2Fa&scope=read&resource=https%3A%2F%2Fapi.example.test%2Fb";
-  let values = repeated_values(raw, RESOURCE_PARAM);
+  let pairs = parse_pairs(raw)?;
+  let values = values_of(&pairs, RESOURCE_PARAM);
   if values
     != vec![
       "https://api.example.test/a".to_owned(),
@@ -22,6 +24,110 @@ fn params_repeated_resource_is_captured_in_order() -> TestResult {
     ]
   {
     return Err(format!("repeated resource order lost: {values:?}").into());
+  }
+  Ok(())
+}
+
+/// A body with more than `MAX_FORM_PAIRS` pairs is rejected, bounding the
+/// ~170 MB amplification of a 2 MiB repeated-pair body.
+#[test]
+fn params_form_pair_cap_rejects_oversized_body() -> TestResult {
+  let mut raw = String::new();
+  for index in 0..=MAX_FORM_PAIRS {
+    if index > 0 {
+      raw.push('&');
+    }
+    raw.push_str("a=1");
+  }
+  match parse_pairs(&raw) {
+    Err(_) => Ok(()),
+    Ok(_) => Err("oversized pair body was silently accepted".into()),
+  }
+}
+
+/// More than `MAX_RESOURCE_VALUES` raw values are `invalid_target`.
+#[tokio::test]
+async fn params_resource_value_cap_rejects_oversized_set() -> TestResult {
+  let (_db, pool) = crate::db::test_support::migrated_pool().await?;
+  let values: Vec<String> = (0..=MAX_RESOURCE_VALUES)
+    .map(|index| format!("https://api.example.test/{index}"))
+    .collect();
+  match validate_resources(&pool, true, &values).await {
+    Err(error) if error.code() == OAuthErrorCode::InvalidTarget => Ok(()),
+    Err(error) => Err(format!("wrong code for oversized resource set: {}", error.code()).into()),
+    Ok(_) => Err("oversized resource set was accepted".into()),
+  }
+}
+
+/// Duplicate resource values collapse to one sorted output with a single
+/// catalog lookup per distinct value.
+#[tokio::test]
+async fn params_duplicate_resources_deduped_before_catalog() -> TestResult {
+  let (_db, pool) = crate::db::test_support::migrated_pool().await?;
+  resource_repo::upsert(&pool, "https://b.example.test/", "b").await?;
+  resource_repo::upsert(&pool, "https://a.example.test/", "a").await?;
+  let aud = validate_resources(
+    &pool,
+    true,
+    &[
+      "https://b.example.test/".to_owned(),
+      "https://a.example.test/".to_owned(),
+      "https://b.example.test/".to_owned(),
+      "https://a.example.test/".to_owned(),
+    ],
+  )
+  .await?;
+  if aud
+    != vec![
+      "https://a.example.test/".to_owned(),
+      "https://b.example.test/".to_owned(),
+    ]
+  {
+    return Err(format!("duplicates must collapse to one sorted output: {aud:?}").into());
+  }
+  Ok(())
+}
+
+/// A `%00`/NUL resource is `invalid_target`, never a database error or 500.
+#[tokio::test]
+async fn params_nul_resource_is_invalid_target() -> TestResult {
+  let (_db, pool) = crate::db::test_support::migrated_pool().await?;
+  for value in [
+    "https://api.example.test/\0",
+    "https://api.example.test/\x01x",
+  ] {
+    match validate_resources(&pool, true, &[value.to_owned()]).await {
+      Err(error) if error.code() == OAuthErrorCode::InvalidTarget => {}
+      Err(error) => {
+        return Err(format!("wrong code for control-char resource: {}", error.code()).into());
+      }
+      Ok(_) => return Err(format!("control-char resource accepted: {value:?}").into()),
+    }
+  }
+  Ok(())
+}
+
+/// Repeated-resource capture from pre-parsed pairs matches the old behavior:
+/// wire order, `+` as space, invalid `%` literal, bare name empty, empty
+/// segments skipped, `;` not a separator.
+#[test]
+fn params_values_of_matches_wire_order() -> TestResult {
+  let pairs = parse_pairs(
+    "resource=a+b&resource=%ZZ&empty&resource=x%3By&;resource=semi&other=1&resource=last",
+  )?;
+  let values = values_of(&pairs, RESOURCE_PARAM);
+  if values
+    != vec![
+      "a b".to_owned(),
+      "%ZZ".to_owned(),
+      "x;y".to_owned(),
+      "last".to_owned(),
+    ]
+  {
+    return Err(format!("values_of wire order broken: {values:?}").into());
+  }
+  if !values_of(&pairs, "missing").is_empty() {
+    return Err("unknown name must yield empty".into());
   }
   Ok(())
 }

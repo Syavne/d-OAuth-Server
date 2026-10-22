@@ -139,6 +139,12 @@ pub async fn issue_client_credentials(
     exchange_allowlist: &ScopeSet::empty(),
   })?;
 
+  if input.token_format == TokenFormat::Jwt && input.aud.is_empty() {
+    return Err(AppError::invalid_target(
+      "jwt access tokens require a resource audience",
+    ));
+  }
+
   let grant_id = crypto_tokens::mint_token().map_err(AppError::internal)?;
   let minted = service
     .mint(
@@ -150,6 +156,7 @@ pub async fn issue_client_credentials(
         dpop_required: false,
         subject: String::new(),
         scope: issued.render(),
+        access_scope: issued.render(),
         grant_id: grant_id.clone(),
         proof: input.proof.clone(),
         aud: input.aud.to_vec(),
