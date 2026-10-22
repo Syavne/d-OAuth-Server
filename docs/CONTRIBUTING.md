@@ -49,7 +49,9 @@ cargo sqlx prepare --workspace           # regenerate the cache
 Run all of these before opening a change. CI runs this set plus additional
 gates: `cargo sqlx prepare --check --workspace`, the fuzz targets
 (`cargo fuzz build`), coverage, `cargo mutants`, `miri`, and the separate
-`.github/workflows/docs.yml` link check.
+`.github/workflows/docs.yml` link check. Nothing in the set below compiles
+`fuzz/`, so build the targets yourself when a change reshapes a type or
+function one of them uses (see [Fuzzing](#fuzzing)).
 
 ```bash
 cargo fmt --check

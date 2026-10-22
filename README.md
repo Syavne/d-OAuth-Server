@@ -218,6 +218,13 @@ cargo deny check
 python3 scripts/check_doc_links.py
 ```
 
+CI also builds the fuzz targets, which none of the gates above compile. Run it
+when a change adds or reshapes a type or function a target constructs:
+
+```bash
+cd fuzz && cargo fuzz build --target x86_64-unknown-linux-gnu
+```
+
 ## Container
 
 Build both architectures with the bake definition, then run the image. The

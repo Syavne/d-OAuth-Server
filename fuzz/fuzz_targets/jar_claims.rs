@@ -62,6 +62,7 @@ fn client_with_method(method: &str) -> Client {
     contacts: None,
     software_id: None,
     dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
     active: true,
     created_at: time::OffsetDateTime::UNIX_EPOCH,
     updated_at: time::OffsetDateTime::UNIX_EPOCH,

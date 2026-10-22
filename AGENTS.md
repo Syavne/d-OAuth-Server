@@ -115,6 +115,15 @@ cargo deny check
 python3 scripts/check_doc_links.py
 ```
 
+`fuzz/` is a standalone workspace, so no gate above compiles it, and a fuzz
+target that builds a library type by hand goes stale the moment that struct
+gains a field. When a change adds or reshapes a type or function a target
+constructs or calls, build the targets too:
+
+```bash
+cd fuzz && cargo fuzz build --target x86_64-unknown-linux-gnu
+```
+
 When a query or migration is added or changed, regenerate and commit the
 offline cache. CI runs `cargo sqlx prepare --check --workspace` and fails if
 the committed cache is stale; regenerate it with the plain form:
