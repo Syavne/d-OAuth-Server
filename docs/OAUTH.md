@@ -209,9 +209,12 @@ fetch; a document changed at its origin may therefore be served from cache for
 up to the 15-minute TTL. An origin-level fetch failure (network/TLS/non-2xx,
 timeout, or non-JSON body) is negatively cached for 30 seconds under
 `cimd:neg:<sha256(url)>`. A fresh-fetch validation failure is short-cached for
-2 seconds under `cimd:invalid:<sha256(url)>` (a single-flight completion
-marker), so a corrected document is seen within 2 seconds and waiters do not
-re-fetch a deterministically invalid one; a validation failure on an
+2 seconds under `cimd:invalid:<sha256(url)>` as a single-flight completion
+marker tagged with the failure class (`redirect` or `metadata`), so a retry
+replays the original client-visible error (`invalid_redirect_uri` or
+`invalid_client_metadata`) and a corrected document is seen within 2 seconds;
+waiters do not re-fetch a deterministically invalid one, and a legacy or
+corrupt marker fails closed as the metadata class. A validation failure on an
 already-cached document writes no marker. If the cache write after a successful
 validation fails, the validated document is still served, uncached. Concurrent
 misses for the same URL elect one fetcher through a `cimd:lock:<sha256(url)>`

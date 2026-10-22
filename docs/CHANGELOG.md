@@ -10,6 +10,45 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Added
 
+- Client ID metadata documents (CIMD): with `cimd_enabled` on, an `https://`
+  `client_id` resolves to a fetched, strictly validated metadata document with
+  no registration row and no initial-access token. The fetch is `https` only,
+  follows no redirects, pins DNS, disables the proxy, rejects
+  special-use/private/loopback targets, and caps the body (`cimd_max_bytes`)
+  and duration (`cimd_fetch_timeout_secs`); only `none` and `private_key_jwt`
+  are accepted, with inline `jwks` only and no wildcard redirect URIs.
+  Documents are cached under `{state}` for 15 minutes, with a 30-second
+  origin-failure negative cache and a 2-second invalid-document marker.
+- RFC 8707 resource indicators: a repeated `resource` parameter on `/authorize`,
+  `/par`, `/token`, `/device_authorization`, and `/introspect` (the last as a
+  local RFC 7662 extension) binds the token audience to the enabled
+  `resource_servers` catalog. The catalog is exact-match only (no wildcard,
+  prefix, or normalization) and is managed with
+  `resource-server create|list|enable|disable|delete` or `config sync`; the
+  feature is gated by `resource_indicators_enabled`. The AS advertises
+  `resource_indicators_supported` (a local RFC 8414 extension) only while the
+  flag is on. The audience is pinned into the pending/PAR/code/device records
+  and must be re-presented exactly at redemption; duplicates are deduplicated
+  and at most 32 raw values are accepted per request.
+- JWT access tokens (the RFC 9068 `at+jwt` profile), opt-in twice: the
+  deployment switch `jwt_access_tokens_enabled` and a per-client
+  `access_token_format = jwt` set only by the operator with
+  `client set-access-token-format --client-id <id> --format opaque|jwt`.
+  Refresh tokens and the grant chain stay opaque and hashed. While the switch
+  is on the AS advertises `jwks_uri` at `/jwks.json` and
+  `access_token_signing_alg_values_supported`, serves an RFC 7517 key set with
+  retained verify-only keys, and keeps a Redis `jwt:<jti-hash>` allowlist
+  marker so AS-side revocation, introspection, and refresh observe a kill; a
+  resource server that verifies locally cannot see that marker before `exp`
+  (see [SECURITY.md](SECURITY.md)). Signing is `ES256` or `EdDSA` over raw
+  32-byte keys with `kid` rotation.
+- RFC 9728 `protected_resources` AS metadata, gated by
+  `protected_resources_enabled` and `protected_resource_ids`, plus the
+  resource-server contract in [RS-CONTRACT.md](RS-CONTRACT.md) and the
+  onboarding runbook in
+  [OPERATIONS.md](OPERATIONS.md#resource-server-onboarding-rfc-9728).
+- `allow_localhost_redirect` opts the RFC 8252 loopback exception in for the
+  host `localhost`; `127.0.0.1` and `[::1]` stay loopback regardless.
 - Container release publishing on GHCR. A `v*` git tag builds and pushes the
   signed multi-arch image under semver tags (`X.Y.Z`, `X.Y`, `X`, `latest`; a
   pre-release gets only `X.Y.Z`) and creates a GitHub Release. The image path is
@@ -90,6 +129,21 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Changed
 
+- Public clients are Bearer by default. DPoP is mandatory only when the client
+  carries `dpop_bound_access_tokens: true`; a DPoP-bound public client still
+  presents a fresh proof at every gate. Operators that require DPoP for public
+  clients must register them with the flag, because unbound public clients
+  become bearer-capable on upgrade.
+- Access tokens remain opaque unless an operator opts a client into
+  `access_token_format = jwt`; dynamic registration always stores `opaque`, and
+  a `jwt` client fails closed with `503` while `jwt_access_tokens_enabled` is
+  off instead of falling back to opaque.
+- Unit and integration tests now use the shared Postgres and Redis from
+  `compose.test.yaml` instead of starting a container per test. Only the
+  lifecycle, topology, durability, and dedicated-node suites keep
+  `testcontainers`. The `fuzz/` workspace stays outside the root gates and is
+  built by CI; build it locally when a change reshapes a type or function a
+  fuzz target constructs.
 - The key ring now holds three independent chains (token pepper, TOTP
   encryption key, and PII field-encryption key), each with an optional retained
   previous key. `pii_dual_write` (default `false`, encrypt-only) turns on
@@ -123,6 +177,21 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Security
 
+- Disabling or deleting a `resource_servers` row is a kill switch for that
+  audience. Refresh and device mints re-validate the stored audience against the
+  current enabled catalog, so a disabled/deleted member (or the indicator flag
+  turned off) fails `invalid_target` instead of minting: a refresh token stays
+  live for a retry, a device code is already consumed by the poll, and an
+  authorization code is validated before redemption so it survives a bad
+  `resource`. Re-enabling the identifier lets the client re-authorize or retry
+  the live refresh token.
+- `/token`, `/introspect`, and `/device_authorization` authenticate the client
+  before validating `resource` values, so an unauthenticated caller observes
+  `invalid_client` rather than a catalog error.
+- Resource identifiers are stricter than RFC 8707 §2: an absolute `https` URI
+  with a host and no userinfo, query, or fragment, exact-match against the
+  enabled catalog; values containing an ASCII control character are
+  `invalid_target` before any catalog lookup.
 - A PII or TOTP ciphertext that fails to open (tamper, truncation, or a missing
   key id) is fail-closed: the request returns `503 temporarily_unavailable` and
   emits a `pii.decrypt_failure` audit event carrying only the request id, never
@@ -162,6 +231,27 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Fixed
 
+- A fresh-fetch CIMD validation failure is cached with its error class
+  (`redirect` or `metadata`), so a retry within the 2-second window replays the
+  original `invalid_redirect_uri` or `invalid_client_metadata` instead of a
+  generic failure; an unknown or legacy marker fails closed as the metadata
+  class.
+- Authorization-code redemption validates the presented audience before
+  consuming the code, so a bad or disabled `resource` fails `invalid_target`
+  without burning a live code; refresh and device mints also re-check the stored
+  audience against the current catalog before minting.
+- CIMD resolution blocks the document fetch for an existing inactive
+  `https://` client row, so deactivation cannot be bypassed, and an inline
+  `jwks` on a `none` document is ignored.
+- CIMD caches the parsed document instead of the raw body, caches origin-level
+  fetch failures negatively for 30 seconds, short-caches fresh-fetch validation
+  failures, and elects one fetcher per URL; a Redis read or lock failure stays a
+  fail-closed `503`.
+- Introspection reports `token_type` (`DPoP` for a `cnf.jkt` token, `Bearer` for
+  unbound or mTLS-only tokens, omitted for refresh) and filters with the
+  validated audience set.
+- A JWT access token always carries a non-empty audience; an unbound `jwt`
+  client fails `invalid_target` rather than minting `aud: []`.
 - `GET /.well-known/oauth-authorization-server` reads the enabled scope catalog
   from Postgres on every request. A scope added, enabled, or disabled via the
   CLI now appears in `scopes_supported` immediately on every replica, instead of

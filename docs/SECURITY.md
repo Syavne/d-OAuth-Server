@@ -115,7 +115,7 @@ poll; an authorization code is not consumed because catalog validation now runs
 before the redemption. The client must re-authorize (or retry the live refresh
 token) once the identifier is enabled again.
 
-Last reviewed: 2026-10-21. File-mounted DB/Redis passwords, a mutable `:latest`
+Last reviewed: 2026-10-22. File-mounted DB/Redis passwords, a mutable `:latest`
 image reference, NetworkPolicy, `automountServiceAccountToken: false`, scheduled
 fuzzing, and the CIMD outbound fetch surface are implemented in the shipped
 manifests and workflows.

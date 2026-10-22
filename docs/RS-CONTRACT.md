@@ -219,9 +219,11 @@ introspection request as a LOCAL EXTENSION to RFC 7662, which defines no
 `resource` parameter. When present, the token's `aud` must include every
 requested member (set inclusion, so a token pinned to a superset stays active);
 a token that does not include every requested member returns the inactive shape.
-A requested value that is not an enabled catalog row (or a request while
-resource indicators are disabled) is `invalid_target` before the lookup, matching
-the other endpoints. An RS uses this to ask whether a token is bound to its own
+The caller is authenticated before the `resource` values are validated, so an
+unauthenticated request fails `invalid_client` first. A requested value that is
+not an enabled catalog row (or a request while resource indicators are
+disabled) is then `invalid_target` before the token lookup, matching the other
+endpoints. An RS uses this to ask whether a token is bound to its own
 resource identifier.
 
 ## Validating the metadata document

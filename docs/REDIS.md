@@ -46,7 +46,7 @@ differ.
 | `oauth:{state}:jwt:<jti-hash>` | JWT access-token kill marker (allowlist: a signed token is valid only while this hash is live). Carries `grant_id`, `client_id`, and the raw `subject` (email/user-id; empty for client-credentials), matching the `purge_subject` `subject` decoder. | `ttl.access_secs` (default 300s) |
 | `oauth:{state}:cimd:<sha256>` | Cached client-id-metadata document (keyed by a hash of the URL, never the raw URL). | 15 minutes |
 | `oauth:{state}:cimd:neg:<sha256>` | Negative cache for an origin-level CIMD fetch failure (network/TLS/non-2xx, timeout, non-JSON). | 30 seconds |
-| `oauth:{state}:cimd:invalid:<sha256>` | Short completion marker for a fresh-fetch CIMD validation failure, so waiters do not re-fetch a deterministically invalid document. | 2 seconds |
+| `oauth:{state}:cimd:invalid:<sha256>` | Short completion marker for a fresh-fetch CIMD validation failure, tagged `redirect` or `metadata` so a retry replays the original error class; waiters do not re-fetch a deterministically invalid document. | 2 seconds |
 | `oauth:{state}:cimd:lock:<sha256>` | Single-flight fetcher election for one uncached CIMD URL; a random token is released with a compare-and-delete Lua script. | `cimd_fetch_timeout_secs` + 1 s (2–11 s) |
 | `oauth:{rl}:ratelimit:<bucket-hash>` | Fixed-window rate-limit counter. | `rate_limit.window` (60s) |
 

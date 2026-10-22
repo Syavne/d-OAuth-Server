@@ -72,6 +72,7 @@ Before finishing any change, confirm:
 - [ ] `private_key_jwt` is treated as authentication only, never as a binding.
 - [ ] Master keys (pepper, TOTP/PII keys, and retained previous keys) carry at least 32 bytes; shorter material is rejected at load (`WeakKeyMaterial`).
 - [ ] A disabled subject is dead everywhere: introspection reports inactive, refresh rejects with `invalid_grant` before minting, and refresh re-checks current entitlements; `user disable` purges the subject's Redis state (sessions and their meta, codes, devices with their sidecars and `user_code` mappings, grants and their token sidecars, standalone tokens and their sidecars, lockout) before flipping `users.disabled`, failing closed on a Redis error.
+- [ ] A disabled or deleted resource identifier is dead at mint time: refresh and device grants re-validate the stored audience against the current enabled catalog (`invalid_target`; refresh stays live, device code is already consumed), authorization-code redemption validates a presented audience before consuming the code, and `/token`, `/introspect`, and `/device_authorization` authenticate before the catalog lookup.
 - [ ] The change does not introduce a wildcard scope, redirect URI, or CORS
       origin.
 
