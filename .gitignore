@@ -3,6 +3,7 @@
 !.env.example
 .omo/
 .opencode/
+.codegraph/
 /target
 .sccache/
 __pycache__/
