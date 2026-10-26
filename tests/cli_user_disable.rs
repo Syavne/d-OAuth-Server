@@ -84,14 +84,26 @@ impl Drop for TempConfig {
 /// resolves `D_OAUTH_CONFIG` through `File::with_name`, which probes supported
 /// formats (`tests/bootstrap.rs` uses the same pattern).
 fn write_config(world: &World) -> Result<(TempConfig, String), TestError> {
+  write_config_with_redis(world, None)
+}
+
+/// Like [`write_config`], but an explicit Redis URL overrides the world's, so
+/// the fail-closed test can point the CLI at an unavailable server.
+fn write_config_with_redis(
+  world: &World,
+  redis_override: Option<&str>,
+) -> Result<(TempConfig, String), TestError> {
   let config = &world.state.config;
-  let redis_url = match &config.redis.topology {
-    RedisTopology::Single { url } => url.expose_secret().to_owned(),
-    _ => {
-      return Err(fail(
-        "CLI config fixture requires the single-node Redis topology",
-      ));
-    }
+  let redis_url = match redis_override {
+    Some(url) => url.to_owned(),
+    None => match &config.redis.topology {
+      RedisTopology::Single { url } => url.expose_secret().to_owned(),
+      _ => {
+        return Err(fail(
+          "CLI config fixture requires the single-node Redis topology",
+        ));
+      }
+    },
   };
   let (pepper_id, pepper) = config
     .keys
@@ -136,6 +148,12 @@ fn write_config(world: &World) -> Result<(TempConfig, String), TestError> {
     &file,
     serde_json::to_vec(&fixture).map_err(|error| fail(format!("config JSON failed: {error}")))?,
   )?;
+  // The fixture carries live key material; keep it owner-only on disk.
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+  }
   let stem = file.with_extension("");
   let path = stem
     .to_str()
@@ -159,18 +177,17 @@ async fn user_disabled(world: &World, user_id: uuid::Uuid) -> Result<bool, TestE
   Ok(disabled)
 }
 
-/// The real CLI purges the user's Redis tokens, then flips `users.disabled`.
-#[tokio::test]
-async fn cli_user_disable_purges_redis_and_flips_the_flag() -> Result<(), TestError> {
-  let world = World::start(open_rate_limit()).await?;
-  seed_scope(&world.pool, SCOPE).await?;
-  let (user_id, _totp_secret) = seed_entitled_user(&world, EMAIL, PASSWORD, SCOPE).await?;
-
-  let mut conn = world.state.redis.clone();
+/// Mint one opaque pair whose subject is the seeded user's id, so the CLI's
+/// `purge_subject(email, user_id)` sweep matches it.
+async fn mint_subject_pair(
+  world: &World,
+  conn: &mut RedisConn,
+  user_id: uuid::Uuid,
+) -> Result<(String, String), TestError> {
   let minted = world
     .service
     .mint(
-      &mut conn,
+      conn,
       &world.store,
       &MintRequest {
         client_id: CLIENT_ID.to_owned(),
@@ -192,9 +209,21 @@ async fn cli_user_disable_purges_redis_and_flips_the_flag() -> Result<(), TestEr
     )
     .await
     .map_err(|error| fail(format!("fixture mint failed: {error}")))?;
+  Ok((minted.access_hash, minted.refresh_hash))
+}
 
-  let access_key = world.store.access_key(&minted.access_hash);
-  let refresh_key = world.store.refresh_key(&minted.refresh_hash);
+/// The real CLI purges the user's Redis tokens, then flips `users.disabled`.
+#[tokio::test]
+async fn cli_user_disable_purges_redis_and_flips_the_flag() -> Result<(), TestError> {
+  let world = World::start(open_rate_limit()).await?;
+  seed_scope(&world.pool, SCOPE).await?;
+  let (user_id, _totp_secret) = seed_entitled_user(&world, EMAIL, PASSWORD, SCOPE).await?;
+
+  let mut conn = world.state.redis.clone();
+  let (access_hash, refresh_hash) = mint_subject_pair(&world, &mut conn, user_id).await?;
+
+  let access_key = world.store.access_key(&access_hash);
+  let refresh_key = world.store.refresh_key(&refresh_hash);
   ensure(
     key_exists(&mut conn, &access_key).await?,
     "seeded access token must be live before disable",
@@ -234,6 +263,49 @@ async fn cli_user_disable_purges_redis_and_flips_the_flag() -> Result<(), TestEr
   ensure(
     user_disabled(&world, user_id).await?,
     "users.disabled must be true after the purge (exit-0 path)",
+  )?;
+  Ok(())
+}
+
+/// A Redis outage during the purge must leave the account enabled and the
+/// tokens live: the flag flips only after a successful purge.
+#[tokio::test]
+async fn cli_user_disable_fails_closed_when_redis_is_down() -> Result<(), TestError> {
+  let world = World::start(open_rate_limit()).await?;
+  seed_scope(&world.pool, SCOPE).await?;
+  let (user_id, _totp_secret) = seed_entitled_user(&world, EMAIL, PASSWORD, SCOPE).await?;
+
+  let mut conn = world.state.redis.clone();
+  let (access_hash, refresh_hash) = mint_subject_pair(&world, &mut conn, user_id).await?;
+  let access_key = world.store.access_key(&access_hash);
+  let refresh_key = world.store.refresh_key(&refresh_hash);
+
+  let (_config_guard, config_path) = write_config_with_redis(&world, Some("redis://127.0.0.1:1"))?;
+  let output = tokio::process::Command::new(server_binary()?)
+    .args(["user", "disable", "--email", EMAIL])
+    .env("D_OAUTH_CONFIG", &config_path)
+    .output()
+    .await?;
+  ensure(
+    !output.status.success(),
+    format!(
+      "a Redis outage must fail the CLI: {} {}",
+      output.status,
+      String::from_utf8_lossy(&output.stderr)
+    ),
+  )?;
+
+  ensure(
+    !user_disabled(&world, user_id).await?,
+    "a failed purge must leave users.disabled false",
+  )?;
+  ensure(
+    key_exists(&mut conn, &access_key).await?,
+    "a failed purge must leave the access token live",
+  )?;
+  ensure(
+    key_exists(&mut conn, &refresh_key).await?,
+    "a failed purge must leave the refresh token live",
   )?;
   Ok(())
 }

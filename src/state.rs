@@ -126,8 +126,9 @@ pub struct AppState {
   /// Injectable clock.
   pub clock: Clock,
   /// CIMD document fetcher: [`ssrf_fetcher`] in production, an injected stub
-  /// in tests. Cloned into every per-request CIMD settings value.
-  pub cimd_fetcher: CimdFetcher,
+  /// in tests. Cloned into every per-request CIMD settings value. Crate
+  /// private: tests swap it through [`AppState::with_cimd_fetcher`].
+  pub(crate) cimd_fetcher: CimdFetcher,
 }
 
 impl AppState {
@@ -150,6 +151,17 @@ impl AppState {
       clock: Clock::system(),
       cimd_fetcher: ssrf_fetcher(),
     })
+  }
+
+  /// Replace the CIMD document fetcher with a test stub.
+  ///
+  /// Test-only seam: production always uses [`ssrf_fetcher`], and the field
+  /// is crate private so a downstream consumer cannot swap it by accident.
+  #[doc(hidden)]
+  #[must_use]
+  pub fn with_cimd_fetcher(mut self, fetcher: CimdFetcher) -> Self {
+    self.cimd_fetcher = fetcher;
+    self
   }
 }
 

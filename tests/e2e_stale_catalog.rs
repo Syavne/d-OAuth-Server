@@ -5,9 +5,10 @@
 //! A resource or scope disabled AFTER issuance must be dead at the next
 //! mint-time check: refresh re-validates the grant's stored audience before
 //! rotation (`invalid_target`, presented token left live), the device poll
-//! validates before consuming, authorization-code redemption validates a
-//! presented audience before consuming the code, and refresh narrows a
-//! disabled scope into the replacement token without ever widening it back.
+//! consumes the code and rejects `invalid_target`, authorization-code
+//! redemption validates a presented audience before consuming the code, and
+//! refresh narrows a disabled scope into the replacement token without ever
+//! widening it back.
 //!
 //! Re-enabling each catalog row proves the disable was the cause: the same
 //! live token/code then succeeds.

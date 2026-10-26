@@ -42,9 +42,13 @@ mod tests;
 #[cfg(test)]
 mod tests_principal;
 
-use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc, time::Duration};
-
-use std::sync::LazyLock;
+use std::{
+  collections::HashSet,
+  future::Future,
+  pin::Pin,
+  sync::{Arc, LazyLock},
+  time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -425,8 +429,9 @@ pub struct CimdSettings<'a> {
   /// the RFC 8252 §7.3 loopback exception.
   pub allow_localhost: bool,
   /// Document fetcher: [`ssrf_fetcher`] in production, an injected stub in
-  /// tests. Cloned (never re-fetched) at every construction site.
-  pub fetcher: CimdFetcher,
+  /// tests. Cloned (never re-fetched) at every construction site. Crate
+  /// private so the SSRF guard cannot be swapped by a downstream consumer.
+  pub(crate) fetcher: CimdFetcher,
 }
 
 impl std::fmt::Debug for CimdSettings<'_> {

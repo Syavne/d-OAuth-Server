@@ -178,27 +178,26 @@ python3 scripts/check_doc_links.py
 ## Final gate run
 
 The closing run on the final tree passed every authoritative gate with exit
-code 0. The full nextest suite passed 1050/1050 tests in 59.1 s; the coverage
-run passed the same 1050/1050 tests in 761.2 s, and the full coverage command
-took 784 s. These are the final numbers; the baseline above stays as the
-historical first measurement.
+code 0. The full nextest suite passed 1052/1052 tests in 59.0 s; the coverage
+run passed the same 1052/1052 tests. These are the final numbers; the baseline
+above stays as the historical first measurement.
 
 Final coverage (`scripts/check_coverage.py` exit 0):
 
-- Global: 90.5% (22022/24335), floor 89.0.
-- Security aggregate: 92.1% (17226/18695), floor 91.0.
+- Global: 90.5% (22033/24337), floor 89.0.
+- Security aggregate: 92.2% (17228/18690), floor 91.0.
 
 | Module     | Final    | Hit / Found | Floor |
 |------------|----------|-------------|-------|
 | crypto     | 95.6%    | 1066/1115   | 94.0  |
 | jose       | 92.6%    | 1106/1194   | 91.0  |
-| protocol   | 93.3%    | 8313/8911   | 92.0  |
+| protocol   | 93.3%    | 8309/8906   | 92.0  |
 | db         | 91.7%    | 1602/1747   | 90.0  |
-| store      | 88.6%    | 2090/2360   | 87.0  |
+| store      | 88.8%    | 2096/2360   | 87.0  |
 | state      | 76.0%    | 355/467     | 75.0  |
 | middleware | 95.7%    | 986/1030    | 94.0  |
 | ui         | 88.7%    | 1362/1535   | 87.0  |
-| config     | 93.5%    | 907/970     | 92.0  |
+| config     | 93.4%    | 909/973     | 92.0  |
 | keys       | 88.5%    | 184/208     | 87.0  |
 | error      | 89.0%    | 422/474     | 88.0  |
 | routes     | 92.7%    | 1102/1189   | 91.0  |

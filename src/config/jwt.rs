@@ -92,8 +92,9 @@ impl JwtSigningKey {
   /// out-of-range EC scalar or malformed material fails at load.
   ///
   /// # Errors
-  /// Returns [`ConfigError::InvalidJwtSigningKey`] when the material cannot
-  /// sign under `alg`.
+  /// Returns [`ConfigError::WeakKeyMaterial`] when the material is not exactly
+  /// [`JWT_KEY_BYTES`] bytes, or [`ConfigError::InvalidJwtSigningKey`] when it
+  /// cannot sign under `alg`.
   #[doc(hidden)]
   pub fn from_raw(
     kid: KeyId,
@@ -102,6 +103,9 @@ impl JwtSigningKey {
     field: &'static str,
   ) -> Result<Self, ConfigError> {
     let raw = secret.expose_secret().as_bytes();
+    if raw.len() != JWT_KEY_BYTES {
+      return Err(ConfigError::WeakKeyMaterial { key: field });
+    }
     if alg == JwtSigningAlg::EdDsa && raw.iter().all(|byte| *byte == 0) {
       return Err(ConfigError::InvalidJwtSigningKey { key: field });
     }

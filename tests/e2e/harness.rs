@@ -223,14 +223,14 @@ impl World {
     }
     let config =
       Config::from_source(::config::Config::try_from(&fixture).map_err(ConfigError::from)?)?;
-    let mut state = AppState::connect(std::sync::Arc::new(config))
+    let state = AppState::connect(std::sync::Arc::new(config))
       .await
       .map_err(|error| {
         fail(format!(
           "cannot connect shared test services ({COMPOSE_HINT}): {error}"
         ))
-      })?;
-    state.cimd_fetcher = fetcher;
+      })?
+      .with_cimd_fetcher(fetcher);
     let store = Store::from_config(&state.config.redis);
     let service = TokenService::new(&state.config.ttl, &state.keys)
       .map_err(|error| fail(format!("token service failed: {error}")))?;

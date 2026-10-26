@@ -172,11 +172,19 @@ async fn e2e_token_exchange_allowlisted_mints_act_bound_token() -> Result<(), Te
     value.get("refresh_token").is_none(),
     "exchange must never issue a refresh token",
   )?;
+  let exchanged_ttl = exchange_ttl(&world.service);
   ensure(
-    value["expires_in"] == exchange_ttl(&world.service).as_secs(),
+    value["expires_in"] == exchanged_ttl.as_secs(),
     format!(
       "exchange must use the shortened TTL {}: {value}",
-      exchange_ttl(&world.service).as_secs()
+      exchanged_ttl.as_secs()
+    ),
+  )?;
+  ensure(
+    exchanged_ttl < world.state.config.ttl.access,
+    format!(
+      "the exchange TTL ({exchanged_ttl:?}) must be shorter than the access TTL ({:?})",
+      world.state.config.ttl.access
     ),
   )?;
   let access = value["access_token"]

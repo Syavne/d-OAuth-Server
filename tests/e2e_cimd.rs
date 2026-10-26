@@ -76,14 +76,20 @@ fn boxed<'a>(
   Box::pin(future)
 }
 
-/// A document fetcher that counts every call and returns `document`.
-fn document_fetcher(document: CimdDocument) -> (CimdFetcher, Arc<AtomicUsize>) {
+/// A document fetcher bound to `expected_url`: a request for any other URL
+/// fails, so URL drift cannot pass the fetch-count assertions.
+fn document_fetcher(expected_url: &str, document: CimdDocument) -> (CimdFetcher, Arc<AtomicUsize>) {
+  let expected_url = expected_url.to_owned();
   let calls = Arc::new(AtomicUsize::new(0));
   let counter = Arc::clone(&calls);
-  let fetcher: CimdFetcher = Arc::new(move |_url: &str, _limits: CimdLimits| {
+  let fetcher: CimdFetcher = Arc::new(move |url: &str, _limits: CimdLimits| {
     let document = document.clone();
     let counter = Arc::clone(&counter);
+    let matches = url == expected_url;
     boxed(async move {
+      if !matches {
+        return Err(CimdError::Fetch);
+      }
       counter.fetch_add(1, Ordering::SeqCst);
       Ok(document)
     })
@@ -297,7 +303,7 @@ async fn approve(browser: &Browser, expected_state: &str) -> Result<String, Test
 /// performs no second fetch.
 #[tokio::test]
 async fn e2e_cimd_authorize_login_consent_token() -> Result<(), TestError> {
-  let (fetcher, calls) = document_fetcher(none_document(CLIENT_URL, true));
+  let (fetcher, calls) = document_fetcher(CLIENT_URL, none_document(CLIENT_URL, true));
   let world = cimd_world(fetcher, true).await?;
   let browser = browser::begin_browser_for(
     world,
@@ -399,7 +405,10 @@ async fn e2e_cimd_authorize_login_consent_token() -> Result<(), TestError> {
 #[tokio::test]
 async fn e2e_cimd_private_key_jwt_requires_par_or_jar() -> Result<(), TestError> {
   let key = DocKey::generate("cimd-doc-key-plain")?;
-  let (fetcher, calls) = document_fetcher(private_key_document(CLIENT_URL, key.jwks.clone()));
+  let (fetcher, calls) = document_fetcher(
+    CLIENT_URL,
+    private_key_document(CLIENT_URL, key.jwks.clone()),
+  );
   let world = cimd_world(fetcher, true).await?;
   seed_scope(&world.pool, SCOPE).await?;
 
@@ -424,7 +433,7 @@ async fn e2e_cimd_private_key_jwt_par_jar_positive() -> Result<(), TestError> {
   const KID: &str = "cimd-doc-key-jar";
   const URL: &str = "https://cimd.example.test/private-key-jar.json";
   let key = DocKey::generate(KID)?;
-  let (fetcher, calls) = document_fetcher(private_key_document(URL, key.jwks.clone()));
+  let (fetcher, calls) = document_fetcher(URL, private_key_document(URL, key.jwks.clone()));
   let world = cimd_world(fetcher, true).await?;
   seed_scope(&world.pool, SCOPE).await?;
   let email = "cimd-jar@example.test";
@@ -562,7 +571,7 @@ async fn e2e_cimd_invalid_documents_fail_closed() -> Result<(), TestError> {
   ];
 
   for (url, document, expected) in rows {
-    let (fetcher, calls) = document_fetcher(document);
+    let (fetcher, calls) = document_fetcher(url, document);
     let world = cimd_world(fetcher, true).await?;
     let (challenge, _) = oauth2_pkce();
     let (status, _, body) = world.get(&authorize_path(url, &challenge), &[]).await?;
@@ -583,7 +592,7 @@ async fn e2e_cimd_invalid_documents_fail_closed() -> Result<(), TestError> {
 async fn e2e_cimd_registered_row_wins_and_inactive_is_dead() -> Result<(), TestError> {
   // Active registered row with an `https://` id: zero fetches.
   const ACTIVE_URL: &str = "https://cimd.example.test/registered.json";
-  let (fetcher, active_calls) = document_fetcher(none_document(ACTIVE_URL, true));
+  let (fetcher, active_calls) = document_fetcher(ACTIVE_URL, none_document(ACTIVE_URL, true));
   let world = cimd_world(fetcher, true).await?;
   seed_client(
     &world.pool,

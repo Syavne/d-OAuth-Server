@@ -51,8 +51,9 @@ pub struct CimdRequest<'a> {
   /// Total fetch budget (`config.cimd_fetch_timeout`).
   pub timeout: Duration,
   /// Document fetcher: the SSRF-guarded production fetch in handlers, an
-  /// injected stub in tests. Cloned (never re-fetched) at each use.
-  pub fetcher: cimd::CimdFetcher,
+  /// injected stub in tests. Cloned (never re-fetched) at each use. Crate
+  /// private so the SSRF guard cannot be swapped by a downstream consumer.
+  pub(crate) fetcher: cimd::CimdFetcher,
 }
 
 impl std::fmt::Debug for CimdRequest<'_> {
@@ -229,27 +230,20 @@ pub async fn validate(mut input: AuthorizeInput<'_>) -> Result<ValidatedRequest,
   // A registered row always wins over CIMD; an `https://` `client_id` with no
   // active row is a CIMD client only while the feature is enabled (CIMD
   // draft §3). With `cimd` absent the unknown-client page is unchanged.
-  let resolution = match client_repo::find_active_by_client_id(input.pool, input.keys, client_id)
+  let resolution = match client_repo::find_by_client_id_any_state(input.pool, input.keys, client_id)
     .await
     .map_err(AuthorizeFailure::Page)?
   {
-    Some(client) => ResolvedClient::Registered(Box::new(client)),
-    None => {
-      // Fail-closed: a registered row that is not active is dead. An
-      // inactive `https://` row must never fall through to the CIMD
-      // fallback below (zero fetches); the caller keeps unknown-client.
-      if client_repo::find_by_client_id_any_state(input.pool, input.keys, client_id)
-        .await
-        .map_err(AuthorizeFailure::Page)?
-        .is_some()
-      {
-        return Err(page(AppError::invalid_client_non_basic()));
-      }
-      match resolve_cimd(&mut input, client_id).await? {
-        Some(validated) => ResolvedClient::Cimd(validated),
-        None => return Err(page(AppError::invalid_client_non_basic())),
-      }
-    }
+    Some(client) if client.active => ResolvedClient::Registered(Box::new(client)),
+    // Fail-closed: a registered row that is not active is dead. An inactive
+    // `https://` row must never fall through to the CIMD fallback below
+    // (zero fetches); the caller keeps unknown-client. One any-state lookup
+    // keeps activation and the disabled check on a single snapshot.
+    Some(_) => return Err(page(AppError::invalid_client_non_basic())),
+    None => match resolve_cimd(&mut input, client_id).await? {
+      Some(validated) => ResolvedClient::Cimd(validated),
+      None => return Err(page(AppError::invalid_client_non_basic())),
+    },
   };
 
   // A registration-free CIMD client resolves through the same JAR entry

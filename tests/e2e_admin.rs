@@ -157,6 +157,10 @@ async fn consent_for_new_code(
     format!("second consent must render: {status} {body}"),
   )?;
   let bound = hidden_input(&body, "request_id")?;
+  ensure(
+    bound == request_id,
+    format!("consent must serve the new request {request_id}, got {bound}"),
+  )?;
   let csrf = hidden_input(&body, "csrf")?;
   let (status, headers, body) = post_consent(browser, session, &bound, &csrf, "approve").await?;
   ensure(
@@ -305,8 +309,14 @@ async fn e2e_user_disable_kills_tokens_refresh_and_code() -> Result<(), TestErro
     summary.devices == 1,
     format!("the purge must delete the approved device record, got {summary:?}"),
   )?;
+  ensure(
+    summary.grants >= 2,
+    format!("the purge must revoke both token pairs' grant families, got {summary:?}"),
+  )?;
 
-  // 1. Introspection: both the fixture token and the browser token are dead.
+  // 1. Introspection: the fixture token is owned by the introspecting client,
+  // so its inactive answer proves the purge. The browser token is foreign-owned,
+  // where the ownership check alone would also answer inactive.
   ensure(
     introspect(&browser.world, &fixture.access_token).await?["active"] == false,
     "the fixture access token must introspect inactive after disable",

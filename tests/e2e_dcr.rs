@@ -287,6 +287,19 @@ async fn e2e_dcr_register_read_update_delete_lifecycle() -> Result<(), TestError
     format!("management after delete must be invalid_client, got {body}"),
   )?;
 
+  // `DELETE` revokes the records themselves. A foreign client's introspection
+  // would answer inactive for any owner mismatch, so assert the store directly
+  // and keep the cross-client check as a separate observable contract.
+  let mut conn = world.state.redis.clone();
+  let access = d_oauth::store::tokens::get_access(&mut conn, &world.store, &minted.access_hash)
+    .await
+    .map_err(|error| fail(format!("access lookup failed: {error}")))?;
+  ensure(access.is_none(), "DELETE must revoke the access token")?;
+  let refresh = d_oauth::store::tokens::get_refresh(&mut conn, &world.store, &minted.refresh_hash)
+    .await
+    .map_err(|error| fail(format!("refresh lookup failed: {error}")))?;
+  ensure(refresh.is_none(), "DELETE must revoke the refresh token")?;
+
   let other_id = "e2e-dcr-introspector";
   let other_secret = "e2e-dcr-introspector-secret-aaaabbbbccccdddd";
   seed_client(

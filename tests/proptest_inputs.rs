@@ -178,7 +178,7 @@ proptest! {
 
   #[test]
   fn totp_verify_window_accepts_only_generated_codes(
-    secret_bytes in proptest::collection::vec(any::<u8>(), 10..=32),
+    secret_bytes in proptest::collection::vec(any::<u8>(), 16..=32),
     counter in 0u64..=(u64::MAX / TOTP_STEP_SECS),
     arbitrary_code in proptest::collection::vec(any::<char>(), 0..=16)
       .prop_map(|chars| chars.into_iter().collect::<String>()),
@@ -186,7 +186,10 @@ proptest! {
     let secret = to_base32(&secret_bytes);
     let totp = match build_totp(&secret) {
       Ok(totp) => totp,
-      Err(_) => return Ok(()),
+      Err(_) => {
+        prop_assert!(false, "a 16..=32-byte base32 secret must build");
+        return Ok(());
+      }
     };
     let now = counter.saturating_mul(TOTP_STEP_SECS);
     let generated = totp.generate(now).to_string();
@@ -216,6 +219,7 @@ proptest! {
     replacement in 0u8..8,
   ) {
     let Some(fixture) = jwt_fixture() else {
+      prop_assert!(false, "the fixed JWT fixture must build");
       return Ok(());
     };
 

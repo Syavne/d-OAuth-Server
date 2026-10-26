@@ -98,6 +98,58 @@ async fn e2e_logout_post_destroys_session_and_redirects() -> Result<(), TestErro
   Ok(())
 }
 
+/// A caller-supplied return target is ignored: only the URI frozen at
+/// authorization time is honored, even when the request presents another.
+#[tokio::test]
+async fn e2e_logout_ignores_caller_supplied_return_target() -> Result<(), TestError> {
+  let world = World::start(open_rate_limit()).await?;
+  let browser = begin_browser_with_post_logout(
+    world,
+    CLIENT_ID,
+    REDIRECT_URI,
+    SCOPE,
+    "logout-evil@example.test",
+    "correct-horse-28-logout-evil",
+    POST_LOGOUT_URI,
+  )
+  .await?;
+  let (_session, cookie) = login(&browser).await?;
+
+  let (status, _, body) = browser
+    .world
+    .get("/logout", &[("cookie", cookie.as_str())])
+    .await?;
+  ensure(
+    status == reqwest::StatusCode::OK,
+    format!("GET /logout must render the confirmation: {status} {body}"),
+  )?;
+  let logout_csrf = hidden_input(&body, "csrf")?;
+
+  let (status, headers, body) = browser
+    .world
+    .post_form(
+      "/logout",
+      &[
+        ("csrf", logout_csrf.as_str()),
+        ("post_logout_redirect_uri", "https://evil.example/steal"),
+        ("redirect_uri", "https://evil.example/steal"),
+      ],
+      None,
+      &[("cookie", cookie.as_str())],
+    )
+    .await?;
+  ensure(
+    status == reqwest::StatusCode::SEE_OTHER,
+    format!("POST /logout must 303 to the bound target: {status} {body}"),
+  )?;
+  let location = location_of(&headers)?;
+  ensure(
+    location == POST_LOGOUT_URI,
+    format!("logout must ignore a caller-supplied return target, got {location}"),
+  )?;
+  Ok(())
+}
+
 /// `GET /logout` only renders the confirmation form; the session survives and
 /// still serves the bound consent page.
 #[tokio::test]

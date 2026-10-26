@@ -132,9 +132,10 @@ async fn e2e_mtls_client_credentials_mints_cnf_bound_token() -> Result<(), TestE
   Ok(())
 }
 
-/// A verified chain whose subject DN is not the registered one is rejected.
+/// A verified chain whose leaf matches neither the registered subject DN nor
+/// thumbprint is rejected.
 #[tokio::test]
-async fn e2e_mtls_unknown_dn_rejected() -> Result<(), TestError> {
+async fn e2e_mtls_unknown_leaf_rejected() -> Result<(), TestError> {
   let world = World::start(open_rate_limit()).await?;
   seed_mtls_client(&world, CLIENT_ID, PKI_DN, PKI_THUMBPRINT).await?;
   seed_scope(&world.pool, "api:read").await?;
