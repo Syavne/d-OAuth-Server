@@ -162,6 +162,7 @@ fn test_state_with_config(pool: &sqlx::PgPool, config: Arc<Config>) -> TestResul
     keys,
     transition_unsafe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     clock: Clock::system(),
+    cimd_fetcher: crate::protocol::cimd::ssrf_fetcher(),
   })
 }
 

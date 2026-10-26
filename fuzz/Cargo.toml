@@ -16,6 +16,7 @@ cargo-fuzz = true
 base64 = "0.23"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 libfuzzer-sys = "0.4"
+secrecy = "0.10.3"
 serde_json = "1"
 time = "0.3"
 uuid = "1"
@@ -52,3 +53,31 @@ path = "fuzz_targets/redirect_uri.rs"
 [[bin]]
 name = "scope_parse"
 path = "fuzz_targets/scope_parse.rs"
+
+[[bin]]
+name = "jwt_access_verify"
+path = "fuzz_targets/jwt_access_verify.rs"
+
+[[bin]]
+name = "cimd_document"
+path = "fuzz_targets/cimd_document.rs"
+
+[[bin]]
+name = "mtls_cert"
+path = "fuzz_targets/mtls_cert.rs"
+
+[[bin]]
+name = "params_form"
+path = "fuzz_targets/params_form.rs"
+
+[[bin]]
+name = "ssrf_url"
+path = "fuzz_targets/ssrf_url.rs"
+
+[[bin]]
+name = "totp_input"
+path = "fuzz_targets/totp_input.rs"
+
+[[bin]]
+name = "pkce"
+path = "fuzz_targets/pkce.rs"

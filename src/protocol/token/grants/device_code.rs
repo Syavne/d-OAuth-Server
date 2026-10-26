@@ -158,7 +158,7 @@ pub async fn poll_device(
     state.pool,
     state.keys,
     state.conn,
-    state.cimd,
+    state.cimd.clone(),
     inputs.client_id.trim(),
   )
   .await

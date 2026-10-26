@@ -139,6 +139,7 @@ fn handler_state() -> Result<AppState, TestError> {
     keys: Arc::new(test_keys()?),
     transition_unsafe: Arc::new(AtomicBool::new(false)),
     clock: Clock::system(),
+    cimd_fetcher: crate::protocol::cimd::ssrf_fetcher(),
   })
 }
 

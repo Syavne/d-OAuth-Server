@@ -153,7 +153,7 @@ pub async fn revoke_tokens(
     let auth_ctx = AuthContext {
       token_endpoint: ctx.token_endpoint,
       now: ctx.now,
-      cimd: ctx.cimd,
+      cimd: ctx.cimd.clone(),
     };
     authenticate_client(&mut auth_stores, &auth_ctx, request.auth).await?
   };
@@ -431,6 +431,7 @@ pub async fn revoke_handler(
         max_bytes: state.config.cimd_max_bytes,
         timeout: state.config.cimd_fetch_timeout,
         allow_localhost: state.config.allow_localhost_redirect,
+        fetcher: state.cimd_fetcher.clone(),
       }),
     request_id: request_id.as_ref().map(RequestId::as_str),
   };

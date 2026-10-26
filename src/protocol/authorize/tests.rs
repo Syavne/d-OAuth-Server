@@ -981,6 +981,7 @@ fn cimd_settings(prefix: &str) -> super::CimdRequest<'_> {
     token_prefix: prefix,
     max_bytes: 5_120,
     timeout: Duration::from_secs(2),
+    fetcher: cimd::ssrf_fetcher(),
   }
 }
 

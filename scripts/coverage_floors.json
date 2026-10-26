@@ -1,0 +1,19 @@
+{
+  "global": 89.0,
+  "security": 91.0,
+  "modules": {
+    "crypto": 94.0,
+    "jose": 91.0,
+    "protocol": 92.0,
+    "db": 90.0,
+    "store": 87.0,
+    "state": 75.0,
+    "middleware": 94.0,
+    "ui": 87.0,
+    "config": 92.0,
+    "keys": 87.0,
+    "error": 88.0,
+    "routes": 91.0,
+    "tls": 95.0
+  }
+}

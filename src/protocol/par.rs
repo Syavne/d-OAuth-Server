@@ -116,6 +116,7 @@ pub async fn push_authorization_request(
       max_bytes: settings.max_bytes,
       timeout: settings.timeout,
       allow_localhost: ctx.allow_localhost_redirect,
+      fetcher: settings.fetcher.clone(),
     }),
   };
   let authenticated = authenticate_client(&mut auth_stores, &auth_ctx, auth).await?;
@@ -207,7 +208,7 @@ async fn validate_request_rules(
         .collect(),
       // No registered row: a CIMD `client_id` uses its document redirect set
       // (CIMD draft §5); the catalog is never consulted.
-      None => match ctx.cimd {
+      None => match ctx.cimd.as_ref() {
         Some(settings) if client_id.starts_with("https://") => {
           let limits = cimd::CimdLimits {
             max_bytes: settings.max_bytes,
@@ -220,6 +221,7 @@ async fn validate_request_rules(
             client_id,
             ctx.allow_localhost_redirect,
             limits,
+            &settings.fetcher,
           )
           .await
           .map_err(AppError::from)?
@@ -310,6 +312,7 @@ pub async fn par_handler(
       token_prefix: &state.config.redis.token_key_prefix,
       max_bytes: state.config.cimd_max_bytes,
       timeout: state.config.cimd_fetch_timeout,
+      fetcher: state.cimd_fetcher.clone(),
     }),
     resource_indicators_enabled: state.config.resource_indicators_enabled,
   };

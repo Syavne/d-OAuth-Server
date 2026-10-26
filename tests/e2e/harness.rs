@@ -28,7 +28,11 @@ use std::net::SocketAddr;
 use d_oauth::{
   config::{Config, ConfigError},
   crypto::secret::{Argon2Params, hash_secret},
-  db::{NewClient, TokenEndpointAuthMethod, client_repo, redirect_repo, scope_repo},
+  db::{
+    NewClient, TokenEndpointAuthMethod, client_repo, redirect_repo, scope_repo,
+    user_repo::{self, NewUser},
+    user_scope_repo,
+  },
   protocol::token::{
     ClientKind, MintRequest, MintedTokens, SenderProof, TokenFormat, TokenService,
   },
@@ -152,6 +156,24 @@ impl World {
     rate_limit: serde_json::Value,
     overrides: serde_json::Value,
   ) -> Result<Self, TestError> {
+    Self::start_with_cimd_fetcher(
+      rate_limit,
+      overrides,
+      d_oauth::protocol::cimd::ssrf_fetcher(),
+    )
+    .await
+  }
+
+  /// Start one world with an injected CIMD document fetcher.
+  ///
+  /// The production router always carries `state.cimd_fetcher`; this entry
+  /// point swaps it for a test stub (for example a counting fetcher) while
+  /// leaving every other fixture member identical to [`World::start_with`].
+  pub async fn start_with_cimd_fetcher(
+    rate_limit: serde_json::Value,
+    overrides: serde_json::Value,
+    fetcher: d_oauth::protocol::cimd::CimdFetcher,
+  ) -> Result<Self, TestError> {
     let pg_url = fresh_db_url().await?;
     let redis_url = redis_url();
     let (token_prefix, ratelimit_prefix) = unique_prefixes();
@@ -201,13 +223,14 @@ impl World {
     }
     let config =
       Config::from_source(::config::Config::try_from(&fixture).map_err(ConfigError::from)?)?;
-    let state = AppState::connect(std::sync::Arc::new(config))
+    let mut state = AppState::connect(std::sync::Arc::new(config))
       .await
       .map_err(|error| {
         fail(format!(
           "cannot connect shared test services ({COMPOSE_HINT}): {error}"
         ))
       })?;
+    state.cimd_fetcher = fetcher;
     let store = Store::from_config(&state.config.redis);
     let service = TokenService::new(&state.config.ttl, &state.keys)
       .map_err(|error| fail(format!("token service failed: {error}")))?;
@@ -287,6 +310,77 @@ impl World {
     kind: ClientKind,
     jkt: Option<&str>,
   ) -> Result<MintedTokens, TestError> {
+    self
+      .mint_for_subject(client_id, "e2e-subject", scope, kind, jkt)
+      .await
+  }
+
+  /// Mint a fixture token pair for a caller-supplied `subject`.
+  ///
+  /// [`World::mint`] pins `subject: "e2e-subject"`; token-exchange setup needs
+  /// a real account's EMAIL here, because entitlement resolution re-reads the
+  /// user with `user_repo::find_by_email` and an id-shaped subject resolves no
+  /// entitlements (fails closed).
+  pub async fn mint_for_subject(
+    &self,
+    client_id: &str,
+    subject: &str,
+    scope: &str,
+    kind: ClientKind,
+    jkt: Option<&str>,
+  ) -> Result<MintedTokens, TestError> {
+    self
+      .mint_pair(client_id, subject, scope, kind, jkt, &[])
+      .await
+  }
+
+  /// Mint a fixture token pair pinned to one RFC 8707 audit resource.
+  ///
+  /// [`World::mint`] hardcodes empty audiences; stale-catalog suites need a
+  /// grant whose access AND refresh records carry the audience under test, so
+  /// a later disable is observable at refresh.
+  // Only the stale-catalog suite mints an audience-pinned fixture pair.
+  #[allow(dead_code)]
+  pub async fn mint_with_aud(
+    &self,
+    client_id: &str,
+    scope: &str,
+    kind: ClientKind,
+    jkt: Option<&str>,
+    resource: &str,
+  ) -> Result<MintedTokens, TestError> {
+    self
+      .mint_for_subject_with_aud(client_id, "e2e-subject", scope, kind, jkt, resource)
+      .await
+  }
+
+  /// [`World::mint_for_subject`] with an audience pinned on both records.
+  // Only the stale-catalog suite mints an audience-pinned fixture pair.
+  #[allow(dead_code)]
+  pub async fn mint_for_subject_with_aud(
+    &self,
+    client_id: &str,
+    subject: &str,
+    scope: &str,
+    kind: ClientKind,
+    jkt: Option<&str>,
+    resource: &str,
+  ) -> Result<MintedTokens, TestError> {
+    self
+      .mint_pair(client_id, subject, scope, kind, jkt, &[resource.to_owned()])
+      .await
+  }
+
+  /// Shared fixture mint: the audience set feeds `aud` and `refresh_aud`.
+  async fn mint_pair(
+    &self,
+    client_id: &str,
+    subject: &str,
+    scope: &str,
+    kind: ClientKind,
+    jkt: Option<&str>,
+    aud: &[String],
+  ) -> Result<MintedTokens, TestError> {
     let mut conn: RedisConn = self.state.redis.clone();
     let minted = self
       .service
@@ -297,7 +391,7 @@ impl World {
           client_id: client_id.to_owned(),
           client_kind: kind,
           dpop_required: kind == ClientKind::Public,
-          subject: "e2e-subject".to_owned(),
+          subject: subject.to_owned(),
           scope: scope.to_owned(),
           access_scope: scope.to_owned(),
           grant_id: uuid::Uuid::new_v4().to_string(),
@@ -305,8 +399,8 @@ impl World {
             dpop_jkt: jkt.map(str::to_owned),
             mtls_x5t_s256: None,
           },
-          aud: Vec::new(),
-          refresh_aud: Vec::new(),
+          aud: aud.to_vec(),
+          refresh_aud: aud.to_vec(),
           format: TokenFormat::Opaque,
         },
         time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -428,12 +522,105 @@ pub async fn seed_client_bound(
   Ok(())
 }
 
+/// Seed one `tls_client_auth` client row with its registered subject DN and
+/// certificate thumbprint.
+///
+/// [`seed_client`] always writes `None` into both mTLS columns, so a
+/// `tls_client_auth` client needs this seam to enroll the CA-signed identity
+/// the token endpoint matches under RFC 8705 §2. The row registers the
+/// `client_credentials` grant and the `api:read` scope (the mTLS grant suite
+/// enables that scope in the catalog).
+// Only the mTLS grant suite seeds an mTLS-enrolled client.
+#[allow(dead_code)]
+pub async fn seed_mtls_client(
+  world: &World,
+  client_id: &str,
+  dn: &str,
+  thumbprint: &str,
+) -> Result<(), TestError> {
+  let new = NewClient {
+    id: uuid::Uuid::new_v4(),
+    client_id: client_id.to_owned(),
+    client_secret_hash: None,
+    client_secret_expires_at: None,
+    client_name: format!("{client_id} e2e"),
+    grant_types: vec!["client_credentials".to_owned()],
+    response_types: vec!["code".to_owned()],
+    scope: "api:read".to_owned(),
+    token_endpoint_auth_method: TokenEndpointAuthMethod::TlsClientAuth.as_str().to_owned(),
+    jwks: None,
+    jwks_uri: None,
+    tls_client_auth_subject_dn: Some(dn.to_owned()),
+    tls_client_auth_cert_thumbprint: Some(thumbprint.to_owned()),
+    request_uris: None,
+    contacts: None,
+    software_id: None,
+    dpop_bound_access_tokens: false,
+    access_token_format: "opaque".to_owned(),
+    registration_access_token_hash: None,
+  };
+  client_repo::insert(&world.pool, &world.state.keys, false, &new).await?;
+  Ok(())
+}
+
 /// Seed one catalog scope (enabled).
 pub async fn seed_scope(pool: &sqlx::PgPool, name: &str) -> Result<(), TestError> {
   scope_repo::upsert(pool, name, &format!("e2e scope {name}"))
     .await
     .map_err(|error| fail(format!("scope upsert failed: {error}")))?;
   Ok(())
+}
+
+/// Provision one enabled user (known password + TOTP secret, entitled to
+/// `scope`) through the REAL repository path, using the server's own Argon2
+/// parameters so verification matches production exactly.
+///
+/// Returns the user id and the plaintext TOTP secret. A token minted on the
+/// user's behalf must carry the EMAIL as its `subject`: the id is only for
+/// seeding entitlements and asserting the account, never a token subject.
+///
+/// # Errors
+///
+/// Returns a hashing, repository, or TOTP-sealing failure.
+// Only the token-exchange suite drives a user-bound subject token.
+#[allow(dead_code)]
+pub async fn seed_entitled_user(
+  world: &World,
+  email: &str,
+  password: &str,
+  scope: &str,
+) -> Result<(uuid::Uuid, String), TestError> {
+  let raw = &world.state.config.argon2;
+  let params = Argon2Params::new(raw.memory_kib, raw.iterations, raw.parallelism, 32)
+    .map_err(|error| fail(format!("argon2 params: {error}")))?;
+  let hash =
+    hash_secret(password, &params).map_err(|error| fail(format!("hash password: {error}")))?;
+  let created = user_repo::create_user(
+    &world.pool,
+    &world.state.keys,
+    world.state.config.pii_dual_write,
+    &NewUser {
+      email: email.to_owned(),
+      password_hash: hash,
+      is_admin: false,
+      must_change_password: false,
+    },
+  )
+  .await?;
+  let secret = d_oauth::crypto::totp::generate_secret()
+    .map_err(|error| fail(format!("totp secret: {error}")))?;
+  let blob = d_oauth::crypto::totp::encrypt_secret(
+    &world.state.keys,
+    &secret,
+    !world.state.config.pii_dual_write,
+  )
+  .map_err(|error| fail(format!("totp seal: {error}")))?;
+  ensure(
+    user_repo::set_totp_secret(&world.pool, created.id, &blob).await?,
+    "totp enroll must update the user row",
+  )?;
+  user_scope_repo::entitle(&world.pool, created.id, scope, None).await?;
+  Ok((created.id, secret))
 }
 
 /// Register a redirect URI in the catalog and attach it to a client.
@@ -451,6 +638,31 @@ pub async fn attach_redirect(
       id: uuid::Uuid::new_v4(),
       uri,
       kind: redirect_repo::RedirectKind::Authorize,
+      description: "e2e",
+      created_by: None,
+    },
+  )
+  .await?;
+  redirect_repo::attach(pool, client_id, row.id, None).await?;
+  Ok(())
+}
+
+/// Register a post-logout URI in the catalog and attach it to a client.
+#[allow(dead_code)]
+pub async fn attach_post_logout(
+  pool: &sqlx::PgPool,
+  keys: &d_oauth::keys::KeyRing,
+  client_id: &str,
+  uri: &str,
+) -> Result<(), TestError> {
+  let (row, _) = redirect_repo::upsert(
+    pool,
+    keys,
+    false,
+    &redirect_repo::NewRedirectUri {
+      id: uuid::Uuid::new_v4(),
+      uri,
+      kind: redirect_repo::RedirectKind::PostLogout,
       description: "e2e",
       created_by: None,
     },

@@ -63,6 +63,33 @@ cargo deny check
 python3 scripts/check_doc_links.py
 ```
 
+The measured coverage baseline, the per-module floors, the flow-by-level
+matrix, and the exact reproduction commands are in
+[TEST-COVERAGE.md](TEST-COVERAGE.md).
+
+### Coverage gate
+
+The coverage job runs every target (lib, integration, and end-to-end) under
+`cargo llvm-cov nextest` and checks the recorded floors. There are two
+aggregate floors: global 89.0 and the security aggregate at 91.0 (the ten core
+modules: crypto, jose, protocol, db, store, state, middleware, keys, error,
+routes). Each module also carries its own floor in
+`scripts/coverage_floors.json`: crypto 94.0, jose 91.0, protocol 92.0, db 90.0,
+store 87.0, state 75.0, middleware 94.0, ui 87.0, config 92.0, keys 87.0,
+error 88.0, routes 91.0, and tls 95.0. `ui`, `config`, and `tls` are outside
+the security aggregate.
+
+```bash
+docker compose -f compose.test.yaml up -d
+cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
+python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
+docker compose -f compose.test.yaml down -v
+```
+
+`scripts/check_coverage.py` reads the lcov report, normalizes the source paths,
+and exits non-zero when the global, security, or any per-module floor is
+missed. It fails closed when a listed module is missing from the report.
+
 Start the shared test services before `cargo nextest run --all-targets`:
 `docker compose -f compose.test.yaml up -d`, then tear them down with
 `docker compose -f compose.test.yaml down -v`. `cargo nextest run` is the
@@ -136,11 +163,19 @@ Fuzz targets live in `fuzz/fuzz_targets/` (a standalone workspace under
 | `jar_verify` | `protocol::client_auth::assertion::{unverified_iss, validate_assertion}` |
 | `redirect_uri` | `protocol::redirect_repo::match_redirect_uri` |
 | `scope_parse` | `protocol::scope::ScopeSet::{parse, render}` |
+| `cimd_document` | `protocol::cimd::{CimdDocument, validate_document}` |
+| `jwt_access_verify` | `jose::jwt_access::JwtAccessSigner::verify` |
+| `mtls_cert` | `protocol::mtls::{subject_dn, ensure_within_validity, thumbprint_b64url}` |
+| `params_form` | `protocol::params::{parse_pairs, single_valued_map, values_of, has_duplicate_field}` |
+| `pkce` | `crypto::pkce::{challenge_from_verifier, verify_s256}` |
+| `ssrf_url` | `protocol::ssrf::{validate_fetch_url, is_blocked_ip}` |
+| `totp_input` | `crypto::totp::{build_totp, verify_window, normalize_recovery_code}` |
 
-Every target is small and hermetic (no network, Postgres, or Redis):
-signature verification that needs keys and replay claims that need the store
-stay under unit/proptest cover. Targets contain no `unwrap`/`expect`/`panic`/
-`unsafe`, so arbitrary input can only surface a genuine parser panic.
+Every target is small and hermetic (no network, Postgres, or Redis): keyed
+signature verification with crafted tokens is fuzzed by `jwt_access_verify`,
+while replay and claims-state checks still need the store and stay under
+unit/proptest cover. Targets contain no `unwrap`/`expect`/`panic`/`unsafe`, so
+arbitrary input can only surface a genuine parser panic.
 
 ```bash
 cd fuzz

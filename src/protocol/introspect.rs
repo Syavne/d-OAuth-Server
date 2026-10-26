@@ -474,7 +474,7 @@ async fn authenticate(
   let auth_ctx = AuthContext {
     token_endpoint: &endpoint,
     now,
-    cimd: ctx.cimd,
+    cimd: ctx.cimd.clone(),
   };
   let authenticated = client_auth::authenticate_client(&mut auth_stores, &auth_ctx, &request)
     .await
@@ -756,6 +756,7 @@ pub async fn handler(
         max_bytes: state.config.cimd_max_bytes,
         timeout: state.config.cimd_fetch_timeout,
         allow_localhost: state.config.allow_localhost_redirect,
+        fetcher: state.cimd_fetcher.clone(),
       }),
     service: &service,
     jwt_signer: jwt_signer.as_ref(),

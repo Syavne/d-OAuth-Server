@@ -41,7 +41,7 @@ use crate::{
 /// Present only when `config.cimd_enabled`; a `None` value makes a CIMD URL
 /// `client_id` take the existing unknown-client path, so enabling the feature
 /// is the sole switch (CIMD draft §3/§4.1).
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct CimdRequest<'a> {
   /// Token keyspace prefix carrying the `{state}` hash tag, for the
   /// `cimd:<sha256(url)>` document cache.
@@ -50,6 +50,19 @@ pub struct CimdRequest<'a> {
   pub max_bytes: usize,
   /// Total fetch budget (`config.cimd_fetch_timeout`).
   pub timeout: Duration,
+  /// Document fetcher: the SSRF-guarded production fetch in handlers, an
+  /// injected stub in tests. Cloned (never re-fetched) at each use.
+  pub fetcher: cimd::CimdFetcher,
+}
+
+impl std::fmt::Debug for CimdRequest<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("CimdRequest")
+      .field("token_prefix", &self.token_prefix)
+      .field("max_bytes", &self.max_bytes)
+      .field("timeout", &self.timeout)
+      .finish_non_exhaustive()
+  }
 }
 
 /// Inputs to [`validate`]: live stores plus the raw authorize query.
@@ -221,10 +234,22 @@ pub async fn validate(mut input: AuthorizeInput<'_>) -> Result<ValidatedRequest,
     .map_err(AuthorizeFailure::Page)?
   {
     Some(client) => ResolvedClient::Registered(Box::new(client)),
-    None => match resolve_cimd(&mut input, client_id).await? {
-      Some(validated) => ResolvedClient::Cimd(validated),
-      None => return Err(page(AppError::invalid_client_non_basic())),
-    },
+    None => {
+      // Fail-closed: a registered row that is not active is dead. An
+      // inactive `https://` row must never fall through to the CIMD
+      // fallback below (zero fetches); the caller keeps unknown-client.
+      if client_repo::find_by_client_id_any_state(input.pool, input.keys, client_id)
+        .await
+        .map_err(AuthorizeFailure::Page)?
+        .is_some()
+      {
+        return Err(page(AppError::invalid_client_non_basic()));
+      }
+      match resolve_cimd(&mut input, client_id).await? {
+        Some(validated) => ResolvedClient::Cimd(validated),
+        None => return Err(page(AppError::invalid_client_non_basic())),
+      }
+    }
   };
 
   // A registration-free CIMD client resolves through the same JAR entry
@@ -420,7 +445,7 @@ async fn resolve_cimd(
   input: &mut AuthorizeInput<'_>,
   client_id: &str,
 ) -> Result<Option<cimd::ValidatedCimd>, AuthorizeFailure> {
-  let Some(settings) = input.cimd else {
+  let Some(settings) = input.cimd.as_ref() else {
     return Ok(None);
   };
   // CIMD draft §3: only an `https://` URL names a metadata document.
@@ -438,6 +463,7 @@ async fn resolve_cimd(
     client_id,
     input.allow_localhost_redirect,
     limits,
+    &settings.fetcher,
   )
   .await
   .map_err(|error| page(AppError::from(error)))?;

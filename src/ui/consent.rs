@@ -288,7 +288,7 @@ async fn client_and_user(
     deps.pool,
     deps.keys,
     deps.conn,
-    deps.cimd,
+    deps.cimd.clone(),
     &pending.client_id,
   )
   .await
@@ -455,6 +455,7 @@ pub async fn get_consent(
     max_bytes: state.config.cimd_max_bytes,
     timeout: state.config.cimd_fetch_timeout,
     allow_localhost: state.config.allow_localhost_redirect,
+    fetcher: state.cimd_fetcher.clone(),
   });
   let mut deps = ConsentDeps {
     pool: &state.pool,
@@ -505,6 +506,7 @@ pub async fn post_consent(
     max_bytes: state.config.cimd_max_bytes,
     timeout: state.config.cimd_fetch_timeout,
     allow_localhost: state.config.allow_localhost_redirect,
+    fetcher: state.cimd_fetcher.clone(),
   });
   let mut deps = ConsentDeps {
     pool: &state.pool,

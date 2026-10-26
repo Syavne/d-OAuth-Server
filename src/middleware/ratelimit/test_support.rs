@@ -84,6 +84,7 @@ fn build_state(
     keys,
     transition_unsafe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     clock: Clock::system(),
+    cimd_fetcher: crate::protocol::cimd::ssrf_fetcher(),
   }
 }
 

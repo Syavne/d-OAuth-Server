@@ -9,7 +9,10 @@
 //! keeps the exact pre-CIMD unknown-client behavior.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+  Arc,
+  atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -20,7 +23,10 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::{CimdDocument, CimdSettings, cache_key, resolve_client};
+use super::{
+  CimdDocument, CimdError, CimdFetcher, CimdLimits, CimdSettings, boxed, cache_key, resolve_client,
+  ssrf_fetcher,
+};
 use crate::config::{DurabilityMode, TtlConfig};
 use crate::crypto::secret::{Argon2Params, hash_secret};
 use crate::db::{NewClient, TokenEndpointAuthMethod, client_repo, scope_repo};
@@ -165,6 +171,7 @@ fn auth_ctx_for<'a>(endpoint: &'a str, token_prefix: &'a str) -> AuthContext<'a>
       max_bytes: 5_120,
       timeout: Duration::from_secs(2),
       allow_localhost: false,
+      fetcher: ssrf_fetcher(),
     }),
   }
 }
@@ -373,6 +380,7 @@ async fn redeem(
       max_bytes: 5_120,
       timeout: Duration::from_secs(2),
       allow_localhost: false,
+      fetcher: ssrf_fetcher(),
     }),
     now_unix: now,
   };
@@ -662,6 +670,7 @@ async fn cimd_client_jar_or_par() -> TestResult {
     token_prefix: &token_prefix,
     max_bytes: 5_120,
     timeout: Duration::from_secs(2),
+    fetcher: ssrf_fetcher(),
   };
   let pushed = {
     let mut stores = ParStores {
@@ -706,6 +715,7 @@ async fn cimd_client_jar_or_par() -> TestResult {
       token_prefix: &h.token_prefix,
       max_bytes: 5_120,
       timeout: Duration::from_secs(2),
+      fetcher: ssrf_fetcher(),
     }),
     query: &par_query,
     resources: Vec::new(),
@@ -752,6 +762,7 @@ async fn cimd_client_jar_or_par() -> TestResult {
       token_prefix: &h.token_prefix,
       max_bytes: 5_120,
       timeout: Duration::from_secs(2),
+      fetcher: ssrf_fetcher(),
     }),
     query: &jar_query,
     resources: Vec::new(),
@@ -833,6 +844,7 @@ async fn cimd_client_can_revoke() -> TestResult {
       max_bytes: 5_120,
       timeout: Duration::from_secs(2),
       allow_localhost: false,
+      fetcher: ssrf_fetcher(),
     }),
     request_id: None,
   };
@@ -957,6 +969,7 @@ async fn cimd_none_cannot_introspect() -> TestResult {
       max_bytes: 5_120,
       timeout: Duration::from_secs(2),
       allow_localhost: false,
+      fetcher: ssrf_fetcher(),
     }),
     service: &service,
     jwt_signer: None,
@@ -1134,6 +1147,7 @@ async fn cimd_fetch_failure_maps_fail_closed() -> TestResult {
     max_bytes: 5_120,
     timeout: Duration::from_secs(2),
     allow_localhost: false,
+    fetcher: ssrf_fetcher(),
   };
   // No cache seed: `.invalid` can never fetch, so this is a pure Fetch
   // failure (CIMD draft §5, fail-closed per Todo 19's mapping).
@@ -1216,6 +1230,7 @@ async fn cimd_inactive_url_row_never_fetches() -> TestResult {
     max_bytes: 5_120,
     timeout: Duration::from_secs(2),
     allow_localhost: false,
+    fetcher: ssrf_fetcher(),
   };
   match resolve_client(&h.pool, &h.ring, &mut h.conn, Some(settings), &url).await {
     Ok(None) => Ok(()),
@@ -1226,4 +1241,94 @@ async fn cimd_inactive_url_row_never_fetches() -> TestResult {
       "inactive row must be Ok(None) without fetching, got {error}"
     ))),
   }
+}
+
+/// An inactive registered `https://` row is dead at `/authorize` too: the
+/// unknown-client page renders with zero fetches, so deactivation cannot be
+/// bypassed through the CIMD document fallback.
+#[tokio::test]
+async fn cimd_inactive_registered_row_is_dead() -> TestResult {
+  let mut h = harness().await?;
+  let url = unique("inactivedead");
+  let params =
+    Argon2Params::new(8, 1, 1, 32).map_err(|error| TestError::Unexpected(format!("{error:?}")))?;
+  let secret_hash = hash_secret("row-secret", &params)
+    .map_err(|error| TestError::Unexpected(format!("{error:?}")))?;
+  client_repo::insert(
+    &h.pool,
+    &h.ring,
+    false,
+    &NewClient {
+      id: uuid::Uuid::new_v4(),
+      client_id: url.clone(),
+      client_secret_hash: Some(secret_hash),
+      client_secret_expires_at: None,
+      client_name: "inactive row".to_owned(),
+      grant_types: vec!["authorization_code".to_owned()],
+      response_types: vec!["code".to_owned()],
+      scope: "api:read".to_owned(),
+      token_endpoint_auth_method: TokenEndpointAuthMethod::ClientSecretPost
+        .as_str()
+        .to_owned(),
+      jwks: None,
+      jwks_uri: None,
+      tls_client_auth_subject_dn: None,
+      tls_client_auth_cert_thumbprint: None,
+      request_uris: None,
+      contacts: None,
+      software_id: None,
+      dpop_bound_access_tokens: false,
+      access_token_format: "opaque".to_owned(),
+      registration_access_token_hash: None,
+    },
+  )
+  .await?;
+  if !client_repo::deactivate(&h.pool, &url).await? {
+    return Err(TestError::Unexpected(
+      "deactivate reported no change".to_owned(),
+    ));
+  }
+  let calls = Arc::new(AtomicU64::new(0));
+  let counting = Arc::clone(&calls);
+  let fetcher: CimdFetcher = Arc::new(move |_url: &str, _limits: CimdLimits| {
+    counting.fetch_add(1, Ordering::Relaxed);
+    boxed(async { Err::<CimdDocument, _>(CimdError::Fetch) })
+  });
+  let query = HashMap::from([("client_id".to_owned(), url.clone())]);
+  match validate(AuthorizeInput {
+    pool: &h.pool,
+    keys: &h.ring,
+    conn: &mut h.conn,
+    store: &h.store,
+    issuer: ISSUER,
+    allow_localhost_redirect: false,
+    cimd: Some(CimdRequest {
+      token_prefix: &h.token_prefix,
+      max_bytes: 5_120,
+      timeout: Duration::from_secs(2),
+      fetcher,
+    }),
+    query: &query,
+    resources: Vec::new(),
+    resource_indicators_enabled: false,
+  })
+  .await
+  {
+    Err(failure) if failure.code() == OAuthErrorCode::InvalidClient => {}
+    Err(failure) => {
+      return Err(TestError::Unexpected(format!(
+        "inactive row must be unknown-client, got {}",
+        failure.code()
+      )));
+    }
+    Ok(_) => {
+      return Err(TestError::Unexpected("inactive row authorized".to_owned()));
+    }
+  }
+  if calls.load(Ordering::Relaxed) != 0 {
+    return Err(TestError::Unexpected(
+      "inactive row must never fetch".to_owned(),
+    ));
+  }
+  Ok(())
 }

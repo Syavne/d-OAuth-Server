@@ -111,6 +111,7 @@ fn cimd_deps_of(h: &mut Harness) -> ConsentDeps<'_> {
       max_bytes: 5_120,
       timeout: Duration::from_secs(2),
       allow_localhost: false,
+      fetcher: cimd::ssrf_fetcher(),
     }),
   }
 }

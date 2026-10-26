@@ -274,7 +274,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [token_form, dcr_json, jar_claims, dpop_proof, jar_verify, redirect_uri, scope_parse]
+        target: [token_form, dcr_json, jar_claims, dpop_proof, jar_verify, redirect_uri, scope_parse, cimd_document, jwt_access_verify, mtls_cert, params_form, pkce, ssrf_url, totp_input]
     defaults:
       run:
         working-directory: fuzz
@@ -362,16 +362,16 @@ jobs:
 
   coverage:
     name: coverage
-    # Report-only coverage signal (T4-4). Non-blocking by design: the upload
-    # is the deliverable; there is no `--fail-under-*` threshold yet.
+    # All-targets coverage signal (lib + integration + e2e). Blocking on the
+    # recorded floors in `scripts/coverage_floors.json` (see docs/TEST-COVERAGE.md
+    # baseline): the `Check coverage floors` step fails the job when global,
+    # security, or any per-module floor is missed.
     # Services mirror `nextest` (shared Postgres/Redis plus redis-server),
     # because several lib unit tests are testcontainers-backed.
-    # Follow-up: add a threshold and extend beyond `--lib` once
-    # the first reports land.
     runs-on: ubuntu-24.04
     env:
       RUSTC_WRAPPER: sccache
-    continue-on-error: true
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -392,12 +392,18 @@ jobs:
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-llvm-cov
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: nextest
       - name: Install redis-server (in-process Sentinel/Cluster fixtures)
         run: sudo apt-get update && sudo apt-get install -y redis-server
       - name: Start shared test services (Postgres + Redis)
         run: docker compose -f compose.test.yaml up -d
-      - name: Coverage report (lib unit tests only; integration tests stay in `nextest`)
-        run: cargo llvm-cov --lib --lcov --output-path lcov.info
+      - name: Coverage report (all targets; test files excluded by filename regex)
+        run: cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
+      - name: Check coverage floors
+        run: python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
       - name: Stop shared test services
         if: always()
         run: docker compose -f compose.test.yaml down -v

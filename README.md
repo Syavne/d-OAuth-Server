@@ -218,8 +218,19 @@ cargo deny check
 python3 scripts/check_doc_links.py
 ```
 
-CI also builds the fuzz targets, which none of the gates above compile. Run it
-when a change adds or reshapes a type or function a target constructs:
+Coverage is a separate blocking gate. It runs every target under
+`cargo llvm-cov` against the shared services and checks the global (89.0),
+security (91.0), and per-module floors in `scripts/coverage_floors.json`:
+
+```bash
+cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
+python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
+```
+
+CI also builds the 14 fuzz targets, which none of the gates above compile: the
+original seven plus `jwt_access_verify`, `cimd_document`, `mtls_cert`,
+`params_form`, `ssrf_url`, `totp_input`, and `pkce`. Run it when a change adds
+or reshapes a type or function a target constructs:
 
 ```bash
 cd fuzz && cargo fuzz build --target x86_64-unknown-linux-gnu

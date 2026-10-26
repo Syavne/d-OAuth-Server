@@ -116,10 +116,19 @@ cargo deny check
 python3 scripts/check_doc_links.py
 ```
 
-`fuzz/` is a standalone workspace, so no gate above compiles it, and a fuzz
-target that builds a library type by hand goes stale the moment that struct
-gains a field. When a change adds or reshapes a type or function a target
-constructs or calls, build the targets too:
+Coverage is a separate blocking gate. It runs every target under
+`cargo llvm-cov` against the shared services and checks the global (89.0),
+security (91.0), and per-module floors in `scripts/coverage_floors.json`:
+
+```bash
+cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
+python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
+```
+
+The `fuzz/` standalone workspace has 14 targets, and no gate above compiles
+it, so a fuzz target that builds a library type by hand goes stale the moment
+that struct gains a field. When a change adds or reshapes a type or function a
+target constructs or calls, build the targets too:
 
 ```bash
 cd fuzz && cargo fuzz build --target x86_64-unknown-linux-gnu

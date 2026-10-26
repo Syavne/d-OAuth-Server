@@ -1,14 +1,21 @@
 //! `test(cimd_)` suite: strict CIMD fetch/validation rules (offline except
 //! the cache round-trip, which uses the shared compose Redis).
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+  collections::HashSet,
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  time::Duration,
+};
 
 use serde_json::{Value, json};
 
 use super::{
-  CimdAuthMethod, CimdDocument, CimdError, CimdLimits, CimdValidation, ValidatedCimd, acquire_lock,
-  cache_key, fetch_document, get_cached, invalid_cache_key, lock_key, negative_cache_key,
-  put_cached, release_lock, resolve, validate_document,
+  CimdAuthMethod, CimdDocument, CimdError, CimdFetcher, CimdLimits, CimdValidation, ValidatedCimd,
+  acquire_lock, boxed, cache_key, fetch_document, get_cached, invalid_cache_key, lock_key,
+  negative_cache_key, put_cached, release_lock, resolve, ssrf_fetcher, validate_document,
 };
 use crate::state::RedisConn;
 
@@ -330,6 +337,7 @@ async fn cimd_cache_round_trip() -> TestResult {
   }
 
   let enabled = scopes();
+  let fetcher = ssrf_fetcher();
   let resolved = resolve(
     &mut conn,
     &prefix,
@@ -342,6 +350,7 @@ async fn cimd_cache_round_trip() -> TestResult {
       max_bytes: 5_120,
       timeout: Duration::from_secs(1),
     },
+    &fetcher,
   )
   .await
   .map_err(|error| TestError::Unexpected(format!("resolve: {error}")))?;
@@ -382,6 +391,7 @@ async fn cimd_negative_cache_blocks_fetch() -> TestResult {
     .await
     .map_err(|error| TestError::Unexpected(format!("negative seed: {error}")))?;
   let enabled = scopes();
+  let fetcher = ssrf_fetcher();
   match resolve(
     &mut conn,
     &prefix,
@@ -394,6 +404,7 @@ async fn cimd_negative_cache_blocks_fetch() -> TestResult {
       max_bytes: 5_120,
       timeout: Duration::from_secs(1),
     },
+    &fetcher,
   )
   .await
   {
@@ -433,6 +444,7 @@ async fn cimd_fetch_failure_negatively_cached() -> TestResult {
   let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
   let url = "https://client.invalid/neg-write.json";
   let enabled = scopes();
+  let fetcher = ssrf_fetcher();
   match resolve(
     &mut conn,
     &prefix,
@@ -445,6 +457,7 @@ async fn cimd_fetch_failure_negatively_cached() -> TestResult {
       max_bytes: 5_120,
       timeout: Duration::from_secs(2),
     },
+    &fetcher,
   )
   .await
   {
@@ -495,6 +508,7 @@ async fn cimd_validation_failure_not_negatively_cached() -> TestResult {
     .await
     .map_err(|error| TestError::Unexpected(format!("cache write: {error}")))?;
   let enabled = scopes();
+  let fetcher = ssrf_fetcher();
   match resolve(
     &mut conn,
     &prefix,
@@ -507,6 +521,7 @@ async fn cimd_validation_failure_not_negatively_cached() -> TestResult {
       max_bytes: 5_120,
       timeout: Duration::from_secs(1),
     },
+    &fetcher,
   )
   .await
   {
@@ -532,6 +547,55 @@ async fn cimd_validation_failure_not_negatively_cached() -> TestResult {
     return Err(TestError::Unexpected(
       "validation failure must not be negatively cached".to_owned(),
     ));
+  }
+  Ok(())
+}
+
+/// The injected fetcher serves the single fetch: its failure is the resolve
+/// failure, and the negative cache blocks a second call (the count stays 1).
+#[tokio::test]
+async fn cimd_injected_fetcher_failure_is_negatively_cached() -> TestResult {
+  let manager = crate::test_support::redis_manager()
+    .await
+    .map_err(|error| TestError::Unexpected(format!("shared redis: {error}")))?;
+  let mut conn = RedisConn::Single(manager);
+  let (prefix, _ratelimit) = crate::test_support::unique_prefixes();
+  let url = "https://client.invalid/injected-fetch.json";
+  let calls = Arc::new(AtomicUsize::new(0));
+  let counting = Arc::clone(&calls);
+  let fetcher: CimdFetcher = Arc::new(move |_url: &str, _limits: CimdLimits| {
+    counting.fetch_add(1, Ordering::SeqCst);
+    boxed(async { Err::<CimdDocument, _>(CimdError::Fetch) })
+  });
+  let enabled = scopes();
+  let validation = CimdValidation {
+    enabled_scopes: &enabled,
+    allow_localhost: false,
+  };
+  let limits = CimdLimits {
+    max_bytes: 5_120,
+    timeout: Duration::from_secs(1),
+  };
+  for _ in 0..2 {
+    match resolve(&mut conn, &prefix, url, &validation, limits, &fetcher).await {
+      Err(CimdError::Fetch) => {}
+      Err(other) => {
+        return Err(TestError::Unexpected(format!(
+          "injected failure must be Fetch, got {other}"
+        )));
+      }
+      Ok(_) => {
+        return Err(TestError::Unexpected(
+          "injected failure resolved".to_owned(),
+        ));
+      }
+    }
+  }
+  if calls.load(Ordering::SeqCst) != 1 {
+    return Err(TestError::Unexpected(format!(
+      "negative cache must block the second fetch, saw {} calls",
+      calls.load(Ordering::SeqCst)
+    )));
   }
   Ok(())
 }
@@ -620,8 +684,9 @@ async fn cimd_single_flight_waiters_share_one_fetch() -> TestResult {
     max_bytes: 5_120,
     timeout: Duration::from_secs(1),
   };
-  let a = resolve(&mut waiter_a, &prefix, url, &validation, limits);
-  let b = resolve(&mut waiter_b, &prefix, url, &validation, limits);
+  let fetcher = ssrf_fetcher();
+  let a = resolve(&mut waiter_a, &prefix, url, &validation, limits, &fetcher);
+  let b = resolve(&mut waiter_b, &prefix, url, &validation, limits, &fetcher);
   let publish = async {
     tokio::time::sleep(Duration::from_millis(100)).await;
     put_cached(&mut holder, &key, &document)
@@ -679,7 +744,8 @@ async fn cimd_single_flight_waiter_observes_negative() -> TestResult {
     max_bytes: 5_120,
     timeout: Duration::from_secs(1),
   };
-  let waiting = resolve(&mut waiter, &prefix, url, &validation, limits);
+  let fetcher = ssrf_fetcher();
+  let waiting = resolve(&mut waiter, &prefix, url, &validation, limits, &fetcher);
   let publish = async {
     tokio::time::sleep(Duration::from_millis(100)).await;
     redis::cmd("SET")
@@ -747,6 +813,7 @@ async fn cimd_invalid_cache_blocks_fetch() -> TestResult {
         max_bytes: 5_120,
         timeout: Duration::from_secs(1),
       },
+      &ssrf_fetcher(),
     )
     .await
     {

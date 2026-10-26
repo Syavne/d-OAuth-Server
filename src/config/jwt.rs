@@ -94,7 +94,8 @@ impl JwtSigningKey {
   /// # Errors
   /// Returns [`ConfigError::InvalidJwtSigningKey`] when the material cannot
   /// sign under `alg`.
-  pub(crate) fn from_raw(
+  #[doc(hidden)]
+  pub fn from_raw(
     kid: KeyId,
     alg: JwtSigningAlg,
     secret: &SecretString,

@@ -190,7 +190,7 @@ pub async fn authenticate_client(
     {
       return Err(invalid_client_for(true));
     }
-    let client = lookup_client(stores, ctx.cimd, &creds.client_id, true).await?;
+    let client = lookup_client(stores, ctx.cimd.clone(), &creds.client_id, true).await?;
     require_method(&client, TokenEndpointAuthMethod::ClientSecretBasic, true)?;
     authenticate_secret(
       stores.pool,
@@ -204,7 +204,7 @@ pub async fn authenticate_client(
     let Some(client_id) = req.client_id else {
       return Err(invalid_client_for(false));
     };
-    let client = lookup_client(stores, ctx.cimd, client_id, false).await?;
+    let client = lookup_client(stores, ctx.cimd.clone(), client_id, false).await?;
     require_method(&client, TokenEndpointAuthMethod::ClientSecretPost, false)?;
     authenticate_secret(stores.pool, &client, secret.expose_secret(), ctx.now, false).await
   } else if let Some(assertion_str) = req.assertion {
@@ -217,11 +217,11 @@ pub async fn authenticate_client(
       (None, Some(iss)) => iss,
       (None, None) => return Err(invalid_client_for(false)),
     };
-    let client = lookup_client(stores, ctx.cimd, &client_id, false).await?;
+    let client = lookup_client(stores, ctx.cimd.clone(), &client_id, false).await?;
     require_method(&client, TokenEndpointAuthMethod::PrivateKeyJwt, false)?;
     assertion::authenticate(stores, &client, assertion_str, ctx).await
   } else if let Some(client_id) = req.client_id {
-    let client = lookup_client(stores, ctx.cimd, client_id, false).await?;
+    let client = lookup_client(stores, ctx.cimd.clone(), client_id, false).await?;
     match client.auth_method() {
       Ok(TokenEndpointAuthMethod::None) => Ok(AuthenticatedClient {
         client,

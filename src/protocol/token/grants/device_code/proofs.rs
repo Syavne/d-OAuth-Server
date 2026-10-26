@@ -121,7 +121,7 @@ async fn authenticate_confidential(
   let auth_ctx = AuthContext {
     token_endpoint: endpoint.as_str(),
     now: OffsetDateTime::from_unix_timestamp(state.now_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH),
-    cimd: state.cimd,
+    cimd: state.cimd.clone(),
   };
   client_auth::authenticate_client(&mut auth, &auth_ctx, &request).await?;
   Ok(())

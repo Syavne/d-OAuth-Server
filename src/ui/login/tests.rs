@@ -150,6 +150,7 @@ pub(super) fn app_state(harness: &Harness) -> crate::state::AppState {
     keys: std::sync::Arc::new(harness.config.keys.clone()),
     transition_unsafe: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     clock: crate::state::Clock::fixed(harness.now),
+    cimd_fetcher: crate::protocol::cimd::ssrf_fetcher(),
   }
 }
 

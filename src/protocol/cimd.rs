@@ -42,7 +42,9 @@ mod tests;
 #[cfg(test)]
 mod tests_principal;
 
-use std::{collections::HashSet, sync::LazyLock, time::Duration};
+use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc, time::Duration};
+
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -215,6 +217,32 @@ pub struct CimdLimits {
   pub timeout: Duration,
 }
 
+/// An injectable CIMD document fetch: `fetch_document` in production, a
+/// counting or failing stub in tests. The higher-ranked bound lets one value
+/// serve any borrow of the URL.
+pub type CimdFetchFuture<'a> =
+  Pin<Box<dyn Future<Output = Result<CimdDocument, CimdError>> + Send + 'a>>;
+/// Shared fetcher handle threaded through [`AppState`](crate::state::AppState)
+/// and the CIMD carrier structs down to [`resolve`].
+pub type CimdFetcher =
+  Arc<dyn for<'a> Fn(&'a str, CimdLimits) -> CimdFetchFuture<'a> + Send + Sync>;
+
+/// Box one fetch so the higher-ranked [`CimdFetcher`] closure compiles: the
+/// named helper pins the elided borrow lifetime instead of asking inference
+/// to thread it through the closure.
+fn boxed<'a>(
+  f: impl Future<Output = Result<CimdDocument, CimdError>> + Send + 'a,
+) -> CimdFetchFuture<'a> {
+  Box::pin(f)
+}
+
+/// The production fetcher: exactly one guarded [`fetch_document`] per fetch,
+/// with the same limits and error mapping (CIMD draft §4.1/§5, §8.6/§8.7).
+#[must_use]
+pub fn ssrf_fetcher() -> CimdFetcher {
+  Arc::new(|url, limits| boxed(fetch_document(url, limits)))
+}
+
 /// Validation inputs resolved by the caller (keeps this module pure).
 pub struct CimdValidation<'a> {
   /// Every enabled scope name (`scope_repo::list_enabled`).
@@ -384,7 +412,7 @@ pub fn invalid_cache_key(token_prefix: &str, client_id_url: &str) -> String {
 /// is off): an `https://` `client_id` with no registered row keeps the
 /// existing unknown-client behavior. `Some` enables the registered-row-wins
 /// fallback for that consumer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct CimdSettings<'a> {
   /// Token keyspace prefix carrying the `{state}` hash tag, for the
   /// `cimd:<sha256(url)>` document cache.
@@ -396,6 +424,20 @@ pub struct CimdSettings<'a> {
   /// Config `allow_localhost_redirect`: whether the host `localhost` joins
   /// the RFC 8252 §7.3 loopback exception.
   pub allow_localhost: bool,
+  /// Document fetcher: [`ssrf_fetcher`] in production, an injected stub in
+  /// tests. Cloned (never re-fetched) at every construction site.
+  pub fetcher: CimdFetcher,
+}
+
+impl std::fmt::Debug for CimdSettings<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("CimdSettings")
+      .field("token_prefix", &self.token_prefix)
+      .field("max_bytes", &self.max_bytes)
+      .field("timeout", &self.timeout)
+      .field("allow_localhost", &self.allow_localhost)
+      .finish_non_exhaustive()
+  }
 }
 
 /// The single client-principal resolution for every client-auth consumer
@@ -460,6 +502,7 @@ pub async fn resolve_client(
     client_id,
     settings.allow_localhost,
     limits,
+    &settings.fetcher,
   )
   .await?;
   Ok(Some(validated.to_client()))
@@ -593,33 +636,23 @@ pub async fn resolve(
   client_id_url: &str,
   validation: &CimdValidation<'_>,
   limits: CimdLimits,
+  fetcher: &CimdFetcher,
 ) -> Result<ValidatedCimd, CimdError> {
-  let key = cache_key(token_prefix, client_id_url);
-  let neg_key = negative_cache_key(token_prefix, client_id_url);
-  let invalid_key = invalid_cache_key(token_prefix, client_id_url);
+  let keys = CacheKeys::of(token_prefix, client_id_url);
   let lock = lock_key(token_prefix, client_id_url);
-  if is_negatively_cached(conn, &neg_key).await? {
+  if is_negatively_cached(conn, &keys.neg_key).await? {
     return Err(CimdError::Fetch);
   }
-  if let Some(document) = get_cached(conn, &key).await? {
+  if let Some(document) = get_cached(conn, &keys.key).await? {
     return validate_document(client_id_url, &document, validation);
   }
-  if let Some(error) = is_invalid_cached(conn, &invalid_key).await? {
+  if let Some(error) = is_invalid_cached(conn, &keys.invalid_key).await? {
     return Err(error);
   }
 
   let ttl_ms = lock_ttl_ms(limits);
   if let Some(token) = acquire_lock(conn, &lock, ttl_ms).await? {
-    let result = resolve_under_lock(
-      conn,
-      &key,
-      &neg_key,
-      &invalid_key,
-      client_id_url,
-      validation,
-      limits,
-    )
-    .await;
+    let result = resolve_under_lock(conn, &keys, client_id_url, validation, limits, fetcher).await;
     // Best effort: a missed release is bounded by the lock TTL.
     let _ = release_lock(conn, &lock, &token).await;
     return result;
@@ -630,13 +663,13 @@ pub async fn resolve(
     .and_then(|instant| instant.checked_add(LOCK_WAIT_MARGIN))
     .unwrap_or_else(tokio::time::Instant::now);
   loop {
-    if is_negatively_cached(conn, &neg_key).await? {
+    if is_negatively_cached(conn, &keys.neg_key).await? {
       return Err(CimdError::Fetch);
     }
-    if let Some(document) = get_cached(conn, &key).await? {
+    if let Some(document) = get_cached(conn, &keys.key).await? {
       return validate_document(client_id_url, &document, validation);
     }
-    if let Some(error) = is_invalid_cached(conn, &invalid_key).await? {
+    if let Some(error) = is_invalid_cached(conn, &keys.invalid_key).await? {
       return Err(error);
     }
     // A holder that failed validation releases without a cache entry; stop
@@ -658,16 +691,7 @@ pub async fn resolve(
   }
 
   if let Some(token) = acquire_lock(conn, &lock, ttl_ms).await? {
-    let result = resolve_under_lock(
-      conn,
-      &key,
-      &neg_key,
-      &invalid_key,
-      client_id_url,
-      validation,
-      limits,
-    )
-    .await;
+    let result = resolve_under_lock(conn, &keys, client_id_url, validation, limits, fetcher).await;
     let _ = release_lock(conn, &lock, &token).await;
     return result;
   }
@@ -678,26 +702,25 @@ pub async fn resolve(
 /// published), then fetch, validate, and cache.
 async fn resolve_under_lock(
   conn: &mut RedisConn,
-  key: &str,
-  neg_key: &str,
-  invalid_key: &str,
+  keys: &CacheKeys,
   client_id_url: &str,
   validation: &CimdValidation<'_>,
   limits: CimdLimits,
+  fetcher: &CimdFetcher,
 ) -> Result<ValidatedCimd, CimdError> {
-  if is_negatively_cached(conn, neg_key).await? {
+  if is_negatively_cached(conn, &keys.neg_key).await? {
     return Err(CimdError::Fetch);
   }
-  if let Some(document) = get_cached(conn, key).await? {
+  if let Some(document) = get_cached(conn, &keys.key).await? {
     return validate_document(client_id_url, &document, validation);
   }
-  if let Some(error) = is_invalid_cached(conn, invalid_key).await? {
+  if let Some(error) = is_invalid_cached(conn, &keys.invalid_key).await? {
     return Err(error);
   }
-  let document = match fetch_document(client_id_url, limits).await {
+  let document = match fetcher(client_id_url, limits).await {
     Ok(document) => document,
     Err(error @ (CimdError::Fetch | CimdError::InvalidJson)) => {
-      put_negative(conn, neg_key).await?;
+      put_negative(conn, &keys.neg_key).await?;
       return Err(error);
     }
     Err(error) => return Err(error),
@@ -705,7 +728,7 @@ async fn resolve_under_lock(
   let validated = match validate_document(client_id_url, &document, validation) {
     Ok(validated) => validated,
     Err(error) => {
-      if put_invalid(conn, invalid_key, InvalidClass::of(&error))
+      if put_invalid(conn, &keys.invalid_key, InvalidClass::of(&error))
         .await
         .is_err()
       {
@@ -714,10 +737,32 @@ async fn resolve_under_lock(
       return Err(error);
     }
   };
-  if put_cached(conn, key, &document).await.is_err() {
+  if put_cached(conn, &keys.key, &document).await.is_err() {
     tracing::warn!("cimd cache population failed after validation");
   }
   Ok(validated)
+}
+
+/// The three `{state}`-prefixed cache keys for one CIMD URL, derived once
+/// per resolution and shared by the lock-holder and waiter paths.
+struct CacheKeys {
+  /// Positive document cache (`cimd:<sha256(url)>`).
+  key: String,
+  /// Origin-failure negative cache (`cimd:neg:<sha256(url)>`).
+  neg_key: String,
+  /// Fresh-fetch validation-failure marker (`cimd:invalid:<sha256(url)>`).
+  invalid_key: String,
+}
+
+impl CacheKeys {
+  /// Derive all three keys from the token prefix and the document URL.
+  fn of(token_prefix: &str, client_id_url: &str) -> Self {
+    Self {
+      key: cache_key(token_prefix, client_id_url),
+      neg_key: negative_cache_key(token_prefix, client_id_url),
+      invalid_key: invalid_cache_key(token_prefix, client_id_url),
+    }
+  }
 }
 
 /// The single-flight lock key: `{state}`-prefixed, hash of the URL, never the
@@ -786,6 +831,7 @@ pub async fn resolve_with_catalog(
   client_id_url: &str,
   allow_localhost: bool,
   limits: CimdLimits,
+  fetcher: &CimdFetcher,
 ) -> Result<ValidatedCimd, CimdError> {
   let enabled_scopes: HashSet<String> = scope_repo::list_enabled(pool)
     .await
@@ -802,6 +848,7 @@ pub async fn resolve_with_catalog(
       allow_localhost,
     },
     limits,
+    fetcher,
   )
   .await
 }

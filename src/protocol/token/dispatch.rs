@@ -229,7 +229,7 @@ impl Dispatch<'_> {
     let ctx = AuthContext {
       token_endpoint: &endpoint,
       now: self.state.clock.now(),
-      cimd: self.cimd,
+      cimd: self.cimd.clone(),
     };
     client_auth::authenticate_client(&mut stores, &ctx, &request).await
   }
@@ -506,6 +506,7 @@ pub async fn handler(
         max_bytes: state.config.cimd_max_bytes,
         timeout: state.config.cimd_fetch_timeout,
         allow_localhost: state.config.allow_localhost_redirect,
+        fetcher: state.cimd_fetcher.clone(),
       }),
     now_unix,
   };

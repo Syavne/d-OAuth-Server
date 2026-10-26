@@ -95,7 +95,7 @@ async fn authorization_code(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, T
     ttl: &d.state.config.ttl,
     token_format: format,
     jwt_signer: jwt,
-    cimd: d.cimd,
+    cimd: d.cimd.clone(),
     resource_indicators_enabled: d.state.config.resource_indicators_enabled,
     now_unix: d.now_unix,
   };
@@ -276,7 +276,7 @@ async fn device(d: &mut Dispatch<'_>) -> Result<TokenResponseBody, TokenError> {
     ttl: &d.state.config.ttl,
     token_format: format,
     jwt_signer: jwt,
-    cimd: d.cimd,
+    cimd: d.cimd.clone(),
     resource_indicators_enabled: d.state.config.resource_indicators_enabled,
     now_unix: d.now_unix,
   };

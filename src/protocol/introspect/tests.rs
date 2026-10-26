@@ -274,6 +274,7 @@ fn app_state(h: &Harness) -> AppState {
     keys: Arc::new(h.config.keys.clone()),
     transition_unsafe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     clock: Clock::system(),
+    cimd_fetcher: crate::protocol::cimd::ssrf_fetcher(),
   }
 }
 

@@ -246,6 +246,7 @@ async fn authorize_entry(
       token_prefix: &state.config.redis.token_key_prefix,
       max_bytes: state.config.cimd_max_bytes,
       timeout: state.config.cimd_fetch_timeout,
+      fetcher: state.cimd_fetcher.clone(),
     }),
     query: &query,
     resources,
@@ -498,6 +499,7 @@ mod router_tests {
       keys,
       transition_unsafe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
       clock: Clock::system(),
+      cimd_fetcher: crate::protocol::cimd::ssrf_fetcher(),
     })
   }
 

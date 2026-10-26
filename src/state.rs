@@ -40,6 +40,7 @@ use time::OffsetDateTime;
 use crate::{
   config::{Config, ConfigError},
   keys::KeyRing,
+  protocol::cimd::{CimdFetcher, ssrf_fetcher},
 };
 
 /// Embedded migrations compiled from `./migrations` (currently empty; todos
@@ -124,6 +125,9 @@ pub struct AppState {
   pub transition_unsafe: Arc<AtomicBool>,
   /// Injectable clock.
   pub clock: Clock,
+  /// CIMD document fetcher: [`ssrf_fetcher`] in production, an injected stub
+  /// in tests. Cloned into every per-request CIMD settings value.
+  pub cimd_fetcher: CimdFetcher,
 }
 
 impl AppState {
@@ -144,6 +148,7 @@ impl AppState {
       keys,
       transition_unsafe: Arc::new(AtomicBool::new(transition_unsafe)),
       clock: Clock::system(),
+      cimd_fetcher: ssrf_fetcher(),
     })
   }
 }
