@@ -1,5 +1,12 @@
-# `cargo audit` policy (task 42). Mirrors the `deny.toml` triage: the only
-# known advisory has no patched release and does not apply here (RSA
-# verify-only, never decryption). Re-evaluate when rsa ships a fix.
+# `cargo audit` policy (task 42). Mirrors the `deny.toml` triage.
+# RUSTSEC-2023-0071 (rsa Marvin timing): no patched release exists upstream
+# ("No safe upgrade is available"); this crate uses RSA for signature
+# verification only (JWK-selected `DecodingKey`), never RSA decryption, so
+# the padding-timing oracle does not apply. Re-evaluate when rsa ships a fix.
+# RUSTSEC-2026-0387 (crypto-bigint timing): patched only in crypto-bigint
+# >=0.7.6, which needs p256 0.14 via the still-unmerged jsonwebtoken bump
+# (Keats/jsonwebtoken#536); this is a real exposure on the ES256 signing path
+# (`src/jose/jwt_access.rs`), so drop the ignore as soon as jsonwebtoken
+# releases a p256 0.14 build rather than leaving it in place indefinitely.
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

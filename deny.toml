@@ -10,8 +10,14 @@ yanked = "deny"
 # ("No safe upgrade is available"); this crate uses RSA for signature
 # verification only (JWK-selected `DecodingKey`), never RSA decryption, so
 # the padding-timing oracle does not apply. Re-evaluate when rsa ships a fix.
+# RUSTSEC-2026-0387 (crypto-bigint timing): patched only in crypto-bigint
+# >=0.7.6, which needs p256 0.14 via the still-unmerged jsonwebtoken bump
+# (Keats/jsonwebtoken#536); this is a real exposure on the ES256 signing path
+# (`src/jose/jwt_access.rs`), so drop the ignore as soon as jsonwebtoken
+# releases a p256 0.14 build rather than leaving it in place indefinitely.
 ignore = [
   { id = "RUSTSEC-2023-0071", reason = "unpatched upstream; RSA verify-only, never decryption" },
+  { id = "RUSTSEC-2026-0387", reason = "unpatched in the p256 0.13 generation; fixed only in crypto-bigint >=0.7.6 via the unmerged jsonwebtoken p256 0.14 bump (Keats/jsonwebtoken#536); ES256 signing does run through it, so re-evaluate on that release" },
   { id = "RUSTSEC-2026-0374", reason = "unmaintained (no safe upgrade); basic-toml is a compile-time-only dep of the askama_derive proc macro, never in the runtime graph" },
 ]
 
