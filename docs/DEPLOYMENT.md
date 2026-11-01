@@ -609,7 +609,7 @@ two nodes can briefly run different builds mid-rollout, and a later re-apply
 can pull a newer image than the one you verified. That is the deliberate
 tradeoff for a simple, low-ceremony admin flow; treat the tag as a convenience
 reference, not an immutable pin. Record the rollout in
-[RUNBOOK.md](../RUNBOOK.md) (deploy provenance entry: the digest the tag
+[RUNBOOK.md](RUNBOOK.md) (deploy provenance entry: the digest the tag
 resolved to, the `sbom.spdx.json` / `trivy.sarif` run, and the `cosign verify`
 result). A rollout with no matching record is an unverified deploy: stop and
 re-verify.
@@ -711,7 +711,7 @@ d-oauth-server healthcheck --url http://127.0.0.1:8081/health/ready
 - `docker-bake.hcl` for the multi-arch targets.
 - `.dockerignore` for the build context.
 - `deny.toml` for the supply-chain policy.
-- `RUNBOOK.md` for the admin bootstrap Job.
+- [RUNBOOK.md](RUNBOOK.md) for the admin bootstrap Job.
 - `.github/workflows/ci.yml` for the quality and documentation gates.
 - `.github/workflows/supply-chain.yml` for the image pipeline: per-arch native
   build (linux/amd64 on `ubuntu-24.04`, linux/arm64 on `ubuntu-24.04-arm`) with

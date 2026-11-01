@@ -8,7 +8,8 @@ are enforced by CI, so a change that skips them will not merge.
 This guide is for anyone editing the Rust source. It covers prerequisites, the
 quality gates, module conventions, the test-driven workflow, commit style, and
 the documentation contract. Operators looking to run the server should start
-with the [README](../README.md) and [OPERATIONS.md](OPERATIONS.md).
+with [QUICKSTART.md](QUICKSTART.md) and [OPERATIONS.md](OPERATIONS.md), and
+find any other guide through [the documentation index](README.md).
 
 ## Prerequisites
 
@@ -309,6 +310,10 @@ the relevant guide in the same commit:
 - Redis keys, TTLs, or topology: `docs/REDIS.md`.
 - Image, manifests, or probes: `docs/DEPLOYMENT.md`.
 - A CLI command or runbook step: `docs/OPERATIONS.md`.
+- The first-run path (development environment, bootstrap order, PKCE
+  walkthrough): `docs/QUICKSTART.md`.
+- A new, renamed, or removed guide, or a change to an audience: the
+  `docs/README.md` index and the table in the root `README.md`.
 - Anything at all: the module map in [AGENTS.md](../AGENTS.md).
 
 Then run the link checker, which CI also runs:

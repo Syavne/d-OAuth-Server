@@ -1413,8 +1413,8 @@ async fn admin_bootstrap_migrate_seeds_no_admin() -> Result<(), TestError> {
 
 #[test]
 fn admin_bootstrap_runbook_matches_cli() -> Result<(), TestError> {
-  let runbook =
-    std::fs::read_to_string("RUNBOOK.md").map_err(|_| TestError::Missing("RUNBOOK.md"))?;
+  let runbook = std::fs::read_to_string("docs/RUNBOOK.md")
+    .map_err(|_| TestError::Missing("docs/RUNBOOK.md"))?;
   for command in [
     "admin bootstrap --email",
     "--password-file",

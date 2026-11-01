@@ -192,7 +192,7 @@ neither yields a value — a generated 256-bit password that prints exactly once
 and only to a TTY (a non-TTY stdout with a generated password is an error, so
 the secret can never leak into job logs). A `--password-file` must not be
 world-readable (use mode `0600`). The full replacement procedure is in
-`RUNBOOK.md`.
+[RUNBOOK.md](RUNBOOK.md).
 
 ### Initial access tokens (DCR)
 
@@ -752,7 +752,7 @@ survives a Redis loss.
 
 - First install: `migrate`, then `admin bootstrap`, then complete the forced
   password change and TOTP enrollment, then create a named admin. See
-  `RUNBOOK.md`.
+  [RUNBOOK.md](RUNBOOK.md).
 - Routine provisioning: `config sync` for scopes, redirect URIs, and
   entitlements; `user create` for users.
 - Key rotation: overlap the pepper for at least the refresh lifetime. Rotate the
@@ -780,4 +780,4 @@ survives a Redis loss.
   `totp rewrap`.
 - `src/crypto/field.rs` for the PII field codec and blind index.
 - `src/middleware/audit.rs` for the HTTP audit events.
-- `RUNBOOK.md` for the bootstrap and replacement procedure.
+- [RUNBOOK.md](RUNBOOK.md) for the bootstrap and replacement procedure.

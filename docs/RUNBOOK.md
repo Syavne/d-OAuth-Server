@@ -5,12 +5,12 @@ replace that bootstrap account immediately, and how to respond to a full
 database disclosure. There is no HTTP bootstrap endpoint: provisioning is
 CLI/Job only.
 
-> Task 48 owns `SECURITY.md`; this file is the task-47 operator runbook.
-> The threat model and the replace-immediately rationale live there.
+> [SECURITY.md](SECURITY.md) owns the threat model and the replace-immediately
+> rationale; this file is the operator procedure.
 
 This file covers admin bootstrap and breach response only. Onboarding a resource
 server (RFC 9728) is a separate operator runbook in
-[docs/OPERATIONS.md](docs/OPERATIONS.md#resource-server-onboarding-rfc-9728).
+[OPERATIONS.md](OPERATIONS.md#resource-server-onboarding-rfc-9728).
 
 ## Prerequisites
 
@@ -89,7 +89,7 @@ admin-gated actions deny it until both steps complete.
 - [ ] Create a named second admin:
       `d-oauth-server user create --admin --email <name>@example.com`
 - [ ] Log in as the named admin and verify full access.
-- [ ] Disable the bootstrap account: `d-oauth-server user disable --email ops@example.com`. `user disable` purges the account's Redis sessions, tokens, grants, codes, device records, and lockout counter before flipping the Postgres `disabled` flag, and fails closed (leaving the user enabled) if Redis is unavailable. Records with no subject (PAR, pending, replay markers, rotation map, TOTP replay, rate-limit counters) are untouched. See docs/OPERATIONS.md.
+- [ ] Disable the bootstrap account: `d-oauth-server user disable --email ops@example.com`. `user disable` purges the account's Redis sessions, tokens, grants, codes, device records, and lockout counter before flipping the Postgres `disabled` flag, and fails closed (leaving the user enabled) if Redis is unavailable. Records with no subject (PAR, pending, replay markers, rotation map, TOTP replay, rate-limit counters) are untouched. See [OPERATIONS.md](OPERATIONS.md).
 - [ ] Rotate/expire the bootstrap secret: delete the mounted
       `/run/secrets/bootstrap-password` material and revoke any copy of a
       generated one-time password.
@@ -113,7 +113,7 @@ and TOTP-enrolled outcomes are emitted by the login flow itself.
 
 Use this when a PostgreSQL dump, backup, or read replica has left your control
 on unknown terms. The blast radius and the rationale for the order below are in
-[docs/SECURITY.md](docs/SECURITY.md); this is the operator checklist. Preserve
+[SECURITY.md](SECURITY.md); this is the operator checklist. Preserve
 evidence first: capture the audit stream and keep the `X-Request-Id`
 correlation. No step below writes a secret to a log.
 
@@ -146,7 +146,7 @@ correlation. No step below writes a secret to a log.
       `d-oauth-server pii rotate` to re-encrypt every `_enc` value and recompute
       every blind index, verify with `d-oauth-server pii verify`, and only then
       retire the old key. See
-      [docs/OPERATIONS.md](docs/OPERATIONS.md#pii-and-totp-key-rotation).
+      [OPERATIONS.md](OPERATIONS.md#pii-and-totp-key-rotation).
 - [ ] **4. Rotate every confidential client secret.** Read the current metadata,
       then re-submit it through RFC 7592 `PUT /register/{client_id}` to mint a
       new secret and a new registration token:
@@ -174,7 +174,7 @@ correlation. No step below writes a secret to a log.
       both dependencies up:
       `d-oauth-server healthcheck [--url http://127.0.0.1:8081/health/ready]`
       (readiness; liveness is `/health/live` as in
-      [docs/OPERATIONS.md](docs/OPERATIONS.md)).
+      [OPERATIONS.md](OPERATIONS.md)).
       A dependency outage during recovery must yield `503`, never a fail-open
       success.
 
@@ -192,7 +192,7 @@ correlation. No step below writes a secret to a log.
 Every rollout ships the signed `ghcr.io/syavne/d-oauth-server` image the
 `supply-chain.yml` `merge` job signed (step `Keyless sign (cosign, OIDC)`).
 Nothing ships from an unverified local tarball. The full path is in
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#deploy-path-use-the-ghcrio-image).
+[DEPLOYMENT.md](DEPLOYMENT.md#deploy-path-use-the-ghcrio-image).
 
 - [ ] Verify the signature before applying (the `latest` tag resolves to the
   current digest at verify time; signatures are cosign v3 OCI 1.1 referrers, so

@@ -2,9 +2,9 @@
 """Local documentation link checker for d-OAuth-Server.
 
 This is the "markdown-link-check" equivalent named by task 48. It validates
-every relative Markdown link in the root README.md, root AGENTS.md, and the
-docs/*.md guides, so CI fails when a doc points at a file or heading that no
-longer exists. External http(s), mailto:, and tel: targets are ignored: CI has
+every relative Markdown link in the root README.md, root AGENTS.md, root
+SECURITY.md, and the docs/*.md guides, so CI fails when a doc points at a file
+or heading that no longer exists. External http(s), mailto:, and tel: targets are ignored: CI has
 no network dependency and the RFC references are stable public URLs.
 
 Usage:
@@ -27,7 +27,7 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 EXTERNAL_PREFIXES = ("http://", "https://", "mailto:", "tel:", "data:")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_FILES = [REPO_ROOT / "README.md", REPO_ROOT / "AGENTS.md"]
+DEFAULT_FILES = [REPO_ROOT / "README.md", REPO_ROOT / "AGENTS.md", REPO_ROOT / "SECURITY.md"]
 DEFAULT_FILES += sorted((REPO_ROOT / "docs").glob("*.md"))
 
 

@@ -1,7 +1,7 @@
 # Documentation quality gate (task 48).
 #
-# Runs the local link checker over README.md, AGENTS.md, and docs/*.md so a
-# stale file or heading reference fails CI. This is the "markdown-link-check
+# Runs the local link checker over README.md, AGENTS.md, SECURITY.md, and
+# docs/*.md so a stale file or heading reference fails CI. This is the "markdown-link-check
 # equivalent" named by the task; it is deliberately offline (only relative
 # links are validated) so the job needs no network beyond checkout/setup.
 #
@@ -15,6 +15,7 @@ on:
     paths:
       - "README.md"
       - "AGENTS.md"
+      - "SECURITY.md"
       - "docs/**"
       - "scripts/check_doc_links.py"
       - ".github/workflows/docs.yml"
@@ -22,6 +23,7 @@ on:
     paths:
       - "README.md"
       - "AGENTS.md"
+      - "SECURITY.md"
       - "docs/**"
       - "scripts/check_doc_links.py"
       - ".github/workflows/docs.yml"

@@ -766,7 +766,7 @@ The seven security endpoints stay fail-closed throughout. A Postgres or Redis
 outage while responding returns `503 temporarily_unavailable` with
 `Retry-After: 1`, never a fail-open success; do not relax the policy to keep
 service up mid-rotation. The operator checklist with concrete commands is in
-[RUNBOOK.md](../RUNBOOK.md).
+[RUNBOOK.md](RUNBOOK.md).
 
 ## Edge cases
 
@@ -791,4 +791,4 @@ service up mid-rotation. The operator checklist with concrete commands is in
 - `src/config/policy.rs` for the fail-closed policy.
 - `src/middleware/` for redaction, rate limiting, and security headers.
 - `src/cli/admin.rs` for bootstrap.
-- `RUNBOOK.md` for the operator runbook (admin bootstrap, full-database-disclosure response).
+- [RUNBOOK.md](RUNBOOK.md) for the operator runbook (admin bootstrap, full-database-disclosure response).

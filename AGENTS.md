@@ -164,7 +164,11 @@ updates the relevant guide in the same commit:
 - Schema and migrations, disabled-user re-check: `docs/DATABASE.md`.
 - Redis keys, TTLs, durability, subject purge: `docs/REDIS.md`.
 - Image, manifests, probes: `docs/DEPLOYMENT.md`.
-- CLI and runbooks: `docs/OPERATIONS.md`, `RUNBOOK.md`.
+- CLI and runbooks: `docs/OPERATIONS.md`, `docs/RUNBOOK.md`.
+- First-run path (development environment, bootstrap order, PKCE walkthrough):
+  `docs/QUICKSTART.md`.
+- A new, renamed, or removed guide, or a changed audience: the `docs/README.md`
+  index and the table in the root `README.md`.
 - This file, when the module map or rules change.
 
 A change to the deployment surface (a new listener, mount, dependency class, or

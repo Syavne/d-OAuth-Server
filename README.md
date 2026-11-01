@@ -8,331 +8,105 @@ includes the host `localhost` only when `allow_localhost_redirect` is set).
 
 It implements the authorization-code, refresh-token, client-credentials,
 device-code, and token-exchange grants, with DPoP, mTLS, PAR, JAR, dynamic
-client registration, introspection, and revocation. Tokens are opaque and
-hashed at rest by default; a global enable switch plus a per-client `jwt`
-access-token format mints RFC 9068 `at+jwt` tokens verified against the AS
-JWKS. All
-durable domain state is in PostgreSQL and all ephemeral state is in Redis, so
-replicas are interchangeable.
+client registration, client ID metadata documents, introspection, and
+revocation. Tokens are opaque and hashed at rest by default; a global enable
+switch plus a per-client `jwt` access-token format mints RFC 9068 `at+jwt`
+tokens verified against the AS JWKS. All durable domain state is in PostgreSQL
+and all ephemeral state is in Redis, so replicas are interchangeable.
+Administration is CLI plus declarative configuration: there is no HTTP admin
+API and no default credential.
 
-- Protocol and deltas: [docs/OAUTH.md](docs/OAUTH.md)
-- Threat model and token design: [docs/SECURITY.md](docs/SECURITY.md)
-- Resource-server contract (RFC 9728): [docs/RS-CONTRACT.md](docs/RS-CONTRACT.md)
-- Vulnerability reporting policy: [SECURITY.md](SECURITY.md)
-- Module layout and request flow: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- Every configuration key: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
-- Schema and migrations: [docs/DATABASE.md](docs/DATABASE.md)
-- Redis keys and durability: [docs/REDIS.md](docs/REDIS.md)
-- Container and cluster: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
-- Admin CLI and runbooks: [docs/OPERATIONS.md](docs/OPERATIONS.md)
-- Resource-server onboarding runbook (RFC 9728): [docs/OPERATIONS.md](docs/OPERATIONS.md#resource-server-onboarding-rfc-9728)
-- Contributor guide: [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)
-- Changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
-- Admin bootstrap procedure: [RUNBOOK.md](RUNBOOK.md)
+## Run it
 
-## Prerequisites
+A self-contained local stack, from the repository root. `compose.yaml`
+generates a throwaway TLS certificate and dev-only key files, applies
+migrations exactly once, and starts one replica against its own Postgres and
+Redis:
 
-- Rust stable, as pinned by `rust-toolchain.toml`.
-- PostgreSQL 16 or newer with the `citext` extension available (the shipped
-  `compose.yaml` pins `postgres:18-alpine`).
-- Redis 8 or newer, with persistence enabled and eviction off.
-- A TLS certificate and key for the public listener.
-- Docker, for the container image, for the shared test Postgres and Redis in
-  `compose.test.yaml`, and for the handful of suites that still use
-  `testcontainers` because they need Redis nodes of their own (the keep-list is
-  under [Tests](#tests)).
-- `cargo-nextest` for the test suite:
-  `cargo install cargo-nextest --locked`.
+```bash
+docker compose -f compose.yaml up --build
+docker compose -f compose.yaml port app 8080   # host port of the TLS listener
+```
 
-## Build
+The listener uses that self-signed certificate, so probe it with `-k`. The
+discovery document advertises the configured issuer (`https://localhost:8080`),
+independent of the random host port:
+
+```bash
+curl -sk https://127.0.0.1:<host-port>/.well-known/oauth-authorization-server | jq .
+```
+
+From a checkout, against a Postgres and a Redis of your own, with the
+development environment exported as in
+[QUICKSTART.md](docs/QUICKSTART.md#development-configuration):
 
 ```bash
 cargo build --locked
-cargo build --locked --release
-```
-
-## Quick start
-
-The server reads configuration from `D_OAUTH_*` environment variables. Export a
-development configuration (values here are placeholders; see
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every key). The ports below
-are the local-dev defaults (Postgres `5432`, Redis `6379`); the shared test
-services use `5433`/`6380` (see Tests).
-
-```bash
-export D_OAUTH_ISSUER=https://localhost:8080
-export D_OAUTH_ENVIRONMENT=development
-export D_OAUTH_BIND_ADDR=0.0.0.0:8080
-export D_OAUTH_HEALTH_ADDR=0.0.0.0:8081
-export D_OAUTH_TLS__CERT_PATH=/path/to/tls.crt
-export D_OAUTH_TLS__KEY_PATH=/path/to/tls.key
-export D_OAUTH_DATABASE__URL='postgres://oauth:password@127.0.0.1:5432/oauth?sslmode=disable'
-export D_OAUTH_REDIS__URL=redis://127.0.0.1:6379
-export D_OAUTH_REDIS__DURABILITY=waitaof
-export D_OAUTH_TOKEN_PEPPER='replace-with-32-bytes-of-random-00'
-export D_OAUTH_TOTP_ENCRYPTION_KEY='replace-with-32-bytes-of-random-00'
-export D_OAUTH_PII_ENCRYPTION_KEY='replace-with-32-bytes-of-random-00'
-```
-
-Development relaxes the database TLS requirement. Production requires
-`sslmode=verify-full` (unless `database.require_verify_full` is set false) and an
-`issuer` on `https` (no trailing slash, non-empty authority, no whitespace).
-
-Validate the configuration, then apply the schema once:
-
-```bash
 cargo run --bin d-oauth-server -- config check
 cargo run --bin d-oauth-server -- migrate
-```
-
-Bootstrap the first administrator. It is created in a forced-change state and
-must change its password and enroll TOTP before it gains authority:
-
-```bash
 cargo run --bin d-oauth-server -- admin bootstrap --email admin@example.com
-```
-
-Apply the scope catalog, redirect URIs, and entitlements from a JSON file
-idempotently. The file format is in [docs/OPERATIONS.md](docs/OPERATIONS.md):
-
-```bash
-cargo run --bin d-oauth-server -- config sync --file ./oauth-config.json
-```
-
-Run the server. It serves TLS on `bind_addr` and plaintext health on
-`health_addr`; it never migrates:
-
-```bash
 cargo run --bin d-oauth-server -- serve
 ```
-
-Check it is alive and ready:
 
 ```bash
 curl -s http://127.0.0.1:8081/health/live
 curl -s http://127.0.0.1:8081/health/ready
-curl -sk https://localhost:8080/.well-known/oauth-authorization-server | jq .
 ```
 
-## Authorization-code and PKCE walkthrough
+That is the short version. The full first-run path, including creating a
+client and minting an access token with PKCE, is
+[QUICKSTART.md](docs/QUICKSTART.md).
 
-The flow is: start at `/authorize`, log in and consent, receive a code on the
-redirect, then redeem it at `/token` with the PKCE verifier.
+## Documentation
 
-1. Generate a verifier and its `S256` challenge:
+Comprehensive guides live in [`docs/`](docs/README.md), whose index maps every
+guide by audience and reading order.
 
-```bash
-VERIFIER=$(openssl rand -base64 64 | tr -d '=+/' | cut -c1-64)
-CHALLENGE=$(printf '%s' "$VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-```
+| I want to... | Start with |
+| --- | --- |
+| Run it, end to end, with a token | [QUICKSTART.md](docs/QUICKSTART.md) |
+| Look up a configuration key | [CONFIGURATION.md](docs/CONFIGURATION.md) |
+| Administer a live install | [OPERATIONS.md](docs/OPERATIONS.md), [RUNBOOK.md](docs/RUNBOOK.md) |
+| Deploy it to a cluster | [DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+| Integrate an OAuth client | [OAUTH.md](docs/OAUTH.md) |
+| Protect an API (resource server) | [RS-CONTRACT.md](docs/RS-CONTRACT.md) |
+| Understand or change the code | [ARCHITECTURE.md](docs/ARCHITECTURE.md), [CONTRIBUTING.md](docs/CONTRIBUTING.md) |
+| Review the security properties | [SECURITY.md](docs/SECURITY.md) |
+| Inspect the schema or the Redis keys | [DATABASE.md](docs/DATABASE.md), [REDIS.md](docs/REDIS.md) |
+| See what changed in a release | [CHANGELOG.md](docs/CHANGELOG.md) |
 
-2. Visit the authorization endpoint in a browser. A confidential client must
-   use PAR or a signed request object; a public client may use the query string:
+To report a vulnerability, use the [reporting policy](SECURITY.md), not a guide.
 
-```
-https://localhost:8080/authorize?response_type=code&client_id=example-client&redirect_uri=https://app.example.com/callback&scope=orders:read&state=xyz&code_challenge=$CHALLENGE&code_challenge_method=S256
-```
+## Before production
 
-3. Log in, approve consent, and read the `code` from the redirect.
+- There is no default credential and no HTTP admin API. Provision through the
+  CLI or a migration Job ([RUNBOOK.md](docs/RUNBOOK.md)).
+- The token pepper, TOTP encryption key, and PII field-encryption key are
+  required, must each be at least 32 bytes (`WeakKeyMaterial` otherwise), and
+  are live secrets: losing the pepper invalidates every opaque token, and losing
+  the PII key makes the sealed directory unreadable. Mount them as files, not
+  environment values ([DEPLOYMENT.md](docs/DEPLOYMENT.md#secret-material-as-files)).
+- Production requires an `https` issuer and, unless
+  `database.require_verify_full` is set false, a database URL with
+  `sslmode=verify-full`.
+- Redis must run with `noeviction` and persistence; the server asserts both at
+  startup and refuses to start otherwise
+  ([REDIS.md](docs/REDIS.md#the-durability-barrier)).
+- Security endpoints fail closed: when Postgres or Redis is unavailable they
+  return `503` rather than failing open. CORS is empty by default, so browser
+  clients need an explicit origin allowlist.
 
-4. Redeem the code at the token endpoint:
-
-```bash
-curl -sk https://localhost:8080/token \
-  -d grant_type=authorization_code \
-  -d code="$CODE" \
-  -d redirect_uri=https://app.example.com/callback \
-  -d client_id=example-client \
-  -d code_verifier="$VERIFIER"
-```
-
-5. A DPoP-bound public client (`dpop_bound_access_tokens: true`) must present
-   a DPoP proof with the token request; an unbound public client (the
-   default) mints `Bearer` tokens with no proof. A confidential client
-   authenticates with its secret or an mTLS certificate.
-
-Rollout note: unbound public clients become bearer-capable on upgrade.
-Operators wanting DPoP-mandatory public clients register them with
-`dpop_bound_access_tokens: true`.
-
-The `POST /token` dispatcher and the `/register*` DCR routes (RFC 7591/RFC
-7592) are wired, so step 4 redeems a code end to end; a client can also be
-created through `POST /register`. See [docs/OAUTH.md](docs/OAUTH.md) for the
-full grant behavior.
+The threat model and the full invariant list are in
+[SECURITY.md](docs/SECURITY.md).
 
 ## Tests
 
-The authoritative suite. The integration and end-to-end tests connect to the
-shared test Postgres and Redis from `compose.test.yaml` (test defaults:
-Postgres on `127.0.0.1:5433`, Redis on `127.0.0.1:6380` — not the dev
-`5432`/`6379`), so start the services first and
-tear them down with `down -v`:
-
-```bash
-docker compose -f compose.test.yaml up -d
-cargo nextest run --all-targets
-cargo test --doc
-docker compose -f compose.test.yaml down -v
-```
-
-Override the endpoints with `D_OAUTH_TEST_POSTGRES_URL` and
-`D_OAUTH_TEST_REDIS_URL`. Each test gets its own freshly created database and
-unique Redis key prefixes, so tests run in parallel and nothing flushes shared
-state. Killing the suite mid-run no longer orphans containers: the lifecycle
-tests still `rm` theirs on drop.
-
-Only these suites use `testcontainers`; every other unit and integration suite
-uses the shared `compose.test.yaml` services:
-
-- `src/test_guard.rs` and `src/state/test_support.rs`: the shared container
-  helpers the keep-list below is built on.
-- `tests/resilience.rs`: stop and restart lifecycle.
-- `src/state/tests_topology.rs`: Sentinel, Cluster, and `requirepass` topology.
-- The `--appendfsync always` refresh-token suite:
-  `src/protocol/token/grants/refresh_token/tests.rs` and
-  `src/protocol/token/grants/refresh_token/tests/failover.rs`.
-- The two Redis durability tests in `src/store/tests_store.rs`
-  (`store_persistence_survives_restart` and `store_durability_barrier_modes`).
-- `dcr_manage_token_survives_redis_flush` in
-  `src/protocol/dcr/manage/tests_delete.rs`, which starts a private Redis for
-  the flush.
-
-`tests/topology.rs` is separate: it spawns in-process `redis-test`
-Sentinel/Cluster fixtures that need a real `redis-server` binary. Docker must
-be running. To iterate on one area, filter by name:
-
-```bash
-cargo nextest run -E 'test(refresh_rotation)'
-cargo nextest run -E 'test(admin_bootstrap)'
-```
-
-Quality gates:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo nextest run --all-targets
-cargo test --doc
-cargo audit
-cargo deny check
-python3 scripts/check_doc_links.py
-```
-
-Coverage is a separate blocking gate. It runs every target under
-`cargo llvm-cov` against the shared services and checks the global (89.0),
-security (91.0), and per-module floors in `scripts/coverage_floors.json`:
-
-```bash
-cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
-python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
-```
-
-CI also builds the 14 fuzz targets, which none of the gates above compile: the
-original seven plus `jwt_access_verify`, `cimd_document`, `mtls_cert`,
-`params_form`, `ssrf_url`, `totp_input`, and `pkce`. Run it when a change adds
-or reshapes a type or function a target constructs:
-
-```bash
-cd fuzz && cargo fuzz build --target x86_64-unknown-linux-gnu
-```
-
-## Container
-
-Build both architectures with the bake definition, then run the image. The
-image is non-root, has no shell, and expects a read-only root filesystem:
-
-```bash
-# Both architectures (linux/amd64 + linux/arm64)
-docker buildx bake image
-
-# Single architecture (no arm64 QEMU emulation needed)
-docker buildx bake image --set image.platform=linux/amd64
-
-docker run --rm -p 8080:8080 --read-only \
-  --env-file ./oauth.env \
-  -v /path/to/tls:/certs:ro \
-  d-oauth-server:latest
-```
-
-Building `linux/arm64` on an amd64 host needs QEMU binfmt
-(`docker run --privileged --rm tonistiigi/binfmt --install arm64`); see
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-
-The container `HEALTHCHECK` uses the `healthcheck` subcommand, which probes the
-plaintext health listener without a shell or curl. See
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-
-For a local multi-replica proof, `compose.yaml` runs three app replicas
-against one Postgres and one Redis. It is the local
-analogue of the cluster manifests, and proves that a token issued by one replica
-is introspectable via another; see
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md):
-
-```bash
-docker compose -f compose.yaml up --scale app=3
-```
-
-Cluster deployment uses a separate migration Job, a PodDisruptionBudget, and
-probes on the health listener. In-process mTLS requires L4/TCP passthrough at
-the load balancer, because an L7 ingress that terminates TLS strips the client
-certificate.
-
-## Security caveats
-
-- OAuth 2.1 only. Do not point an OAuth 2.0 client that needs implicit or
-  password grant at this server.
-- The server targets `draft-ietf-oauth-v2-1-16` (published 3 September 2026;
-  an Internet-Draft, not an RFC):
-  https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1. There are no
-  open gaps against that draft; see [docs/OAUTH.md](docs/OAUTH.md).
-- There is no default credential and no HTTP admin API. Provision through the
-  CLI.
-- The token pepper, TOTP encryption key, and PII field-encryption key are
-  required; losing the pepper invalidates every live opaque token, and losing
-  the PII key makes the sealed directory unreadable.
-- Master keys (pepper, TOTP, and PII) must each be at least 32 bytes; shorter
-  values are refused at load (`WeakKeyMaterial`).
-- `user disable` purges the account's Redis sessions, tokens, grants, codes,
-  device records, and lockout counters before flipping `users.disabled`; that
-  user's live tokens then introspect inactive and refuse refresh
-  (`invalid_grant`).
-- Production requires `issuer` on `https` and, unless
-  `database.require_verify_full` is set false, a database URL with
-  `sslmode=verify-full`.
-- Redis must run with `noeviction` and persistence. The server asserts this at
-  startup and refuses to start otherwise, unless `redis.noeviction_required` or
-  `redis.aof_required` is set false (both default `true`).
-- When Postgres or Redis is unavailable, security endpoints return `503` rather
-  than failing open.
-- CORS is empty by default. Browser clients need an explicit origin allowlist.
-- Never commit a secret, a token, or key material. See
-  [docs/SECURITY.md](docs/SECURITY.md).
-
-## CLI pointers
-
-- Scope catalog: `scope create|list|enable|disable|delete`. Scopes are
-  runtime-managed and start empty.
-- Redirect URIs: `redirect-uri create|list|enable|disable|delete` and
-  `client attach-redirect-uri|detach-redirect-uri|redirect-uris`.
-  `redirect-uri create|enable|disable|delete` and
-  `client attach-redirect-uri|detach-redirect-uri` accept
-  `--kind authorize|post_logout` (default `authorize`); `post_logout` URIs are
-  the return targets for `POST /logout` (`GET /logout` is read-only).
-- Resource indicators: `resource-server create|list|enable|disable|delete`
-  manage the RFC 8707 resource-server catalog (exact identifiers, no wildcard).
-- Access-token format: `client set-access-token-format --client-id <id>
-  --format opaque|jwt` is the operator-only opt-in to JWT access tokens;
-  dynamic registration always stores `opaque`.
-- Users and entitlements: `user create|enroll-totp|disable|unlock|grant-scope|revoke-scope|scopes`.
-- Admin: `admin bootstrap` (see [RUNBOOK.md](RUNBOOK.md)).
-- Declarative apply: `config sync --file` and `config check`.
-- PII migration and rotation: `pii backfill`, `pii verify`, and `pii rotate`,
-  plus `totp rewrap` for the TOTP key. See [docs/OPERATIONS.md](docs/OPERATIONS.md).
-- DCR initial access:
-  `initial-access-token issue --uses <n> --ttl <seconds> [--label <text>] [--show-secret]`.
-- Utilities: `keygen` and `healthcheck`.
-
-Full flags are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+`cargo nextest run --all-targets` is the authoritative suite, backed by the
+shared Postgres and Redis from `compose.test.yaml`; `cargo test --doc` covers
+the doctests. The quality gates, the coverage floors, the fuzzing targets, and
+the exact commands are in [CONTRIBUTING.md](docs/CONTRIBUTING.md#quality-gates),
+with the measured baseline in
+[TEST-COVERAGE.md](docs/TEST-COVERAGE.md).
 
 ## License
 
