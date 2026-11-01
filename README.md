@@ -18,10 +18,46 @@ API and no default credential.
 
 ## Run it
 
-A self-contained local stack, from the repository root. `compose.yaml`
-generates a throwaway TLS certificate and dev-only key files, applies
-migrations exactly once, and starts one replica against its own Postgres and
-Redis:
+### With the published image
+
+`compose.ghcr.yaml` pulls the latest signed image,
+`ghcr.io/syavne/d-oauth-server:latest`, and starts it against its own Postgres
+and Redis. A one-shot service applies the schema, and throwaway TLS and key
+files are generated on first start, so there is nothing to build or export:
+
+```bash
+docker compose -f compose.ghcr.yaml up -d --pull always
+```
+
+The TLS listener is on `https://localhost:8080` with a self-signed certificate,
+so probe it with `-k`. Health stays on the plaintext listener at `8081`:
+
+```bash
+curl -s  http://127.0.0.1:8081/health/ready
+curl -sk https://localhost:8080/.well-known/oauth-authorization-server | jq .
+```
+
+Bootstrap the first administrator inside the running container. The password is
+read from stdin (nothing prompts), and the account must change it and enroll
+TOTP on first login:
+
+```bash
+ADMIN_PASSWORD=$(openssl rand -base64 24)
+printf '%s' "$ADMIN_PASSWORD" | docker compose -f compose.ghcr.yaml exec -T app \
+  /d-oauth-server admin bootstrap --email admin@example.com
+```
+
+Stop the stack and delete its data when you are done:
+
+```bash
+docker compose -f compose.ghcr.yaml down -v
+```
+
+### From a checkout
+
+`compose.yaml` builds the image from the working tree and runs one replica
+against its own Postgres and Redis, with a generated TLS certificate and
+dev-only key files:
 
 ```bash
 docker compose -f compose.yaml up --build
@@ -36,7 +72,7 @@ independent of the random host port:
 curl -sk https://127.0.0.1:<host-port>/.well-known/oauth-authorization-server | jq .
 ```
 
-From a checkout, against a Postgres and a Redis of your own, with the
+Or run the binary directly, against a Postgres and a Redis of your own, with the
 development environment exported as in
 [QUICKSTART.md](docs/QUICKSTART.md#development-configuration):
 

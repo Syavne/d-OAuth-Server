@@ -40,7 +40,9 @@ services:
       POSTGRES_PASSWORD: oauth-dev-only
       POSTGRES_DB: oauth
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # postgres 18 keeps PGDATA under a major-version subdirectory, so the
+      # volume mounts the parent (a mount on .../data is rejected by the image).
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U oauth -d oauth"]
       interval: 5s

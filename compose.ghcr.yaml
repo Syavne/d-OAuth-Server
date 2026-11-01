@@ -1,0 +1,151 @@
+# Run the published image end to end: the signed `ghcr.io` image plus its own
+# Postgres and Redis, a throwaway TLS certificate, and dev-only key files.
+#
+# This mirrors `compose.yaml`, but pulls `ghcr.io/syavne/d-oauth-server:latest`
+# instead of building from the checkout. Local evaluation only: fixed host
+# ports, self-signed TLS, placeholder secrets. Production guidance is in
+# docs/DEPLOYMENT.md.
+#
+#   docker compose -f compose.ghcr.yaml up -d --pull always
+#   docker compose -f compose.ghcr.yaml port app 8080
+
+name: d-oauth-ghcr
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: oauth
+      POSTGRES_PASSWORD: oauth-dev-only
+      POSTGRES_DB: oauth
+    volumes:
+      # postgres 18 keeps PGDATA under a major-version subdirectory, so the
+      # volume mounts the parent (a mount on .../data is rejected by the image).
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oauth -d oauth"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+    # The server asserts this contract at startup: noeviction + AOF.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: throwaway self-signed server cert for the local TLS listener.
+  gencerts:
+    image: alpine:3.21
+    volumes:
+      - certs:/certs
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache openssl >/dev/null
+        if [ ! -f /certs/tls.crt ]; then
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -keyout /certs/tls.key -out /certs/tls.crt \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+        fi
+        chown 65532:65532 /certs/tls.crt /certs/tls.key
+        chmod 600 /certs/tls.key
+        chmod 644 /certs/tls.crt
+
+  # One-shot: DEV-ONLY pepper/TOTP/PII key files, shaped like the cluster's
+  # 0400 files mounted at /run/secrets. Values are throwaway placeholders;
+  # never reuse them outside this local compose file.
+  gensecrets:
+    image: alpine:3.21
+    volumes:
+      - devsecrets:/run/secrets
+    command:
+      - sh
+      - -ec
+      - |
+        if [ ! -f /run/secrets/token-pepper ]; then
+          printf '%s' 'dev-only-pepper-ROTATE-IN-PROD-000000' > /run/secrets/token-pepper
+          printf '%s' 'dev-only-totp-key-ROTATE-IN-PROD-000' > /run/secrets/totp-encryption-key
+          printf '%s' 'dev-only-pii-key-ROTATE-IN-PROD-0000' > /run/secrets/pii-encryption-key
+        fi
+        chown 65532:65532 /run/secrets/token-pepper /run/secrets/totp-encryption-key /run/secrets/pii-encryption-key
+        chmod 400 /run/secrets/token-pepper /run/secrets/totp-encryption-key /run/secrets/pii-encryption-key
+
+  # Exactly-once migration (sqlx advisory lock). Replicas never migrate.
+  migrate:
+    image: ghcr.io/syavne/d-oauth-server:latest
+    entrypoint: ["/d-oauth-server"]
+    command: ["migrate"]
+    depends_on:
+      gencerts:
+        condition: service_completed_successfully
+      gensecrets:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      D_OAUTH_ISSUER: https://localhost:8080
+      D_OAUTH_ENVIRONMENT: development
+      D_OAUTH_BIND_ADDR: 0.0.0.0:8080
+      D_OAUTH_HEALTH_ADDR: 0.0.0.0:8081
+      D_OAUTH_TLS__CERT_PATH: /certs/tls.crt
+      D_OAUTH_TLS__KEY_PATH: /certs/tls.key
+      D_OAUTH_DATABASE__URL: postgres://oauth:oauth-dev-only@db:5432/oauth?sslmode=disable
+      D_OAUTH_REDIS__URL: redis://redis:6379
+      D_OAUTH_REDIS__DURABILITY: waitaof
+      D_OAUTH_TOKEN_PEPPER_FILE: /run/secrets/token-pepper
+      D_OAUTH_TOTP_ENCRYPTION_KEY_FILE: /run/secrets/totp-encryption-key
+      D_OAUTH_PII_ENCRYPTION_KEY_FILE: /run/secrets/pii-encryption-key
+    volumes:
+      - certs:/certs:ro
+      - devsecrets:/run/secrets:ro
+
+  app:
+    image: ghcr.io/syavne/d-oauth-server:latest
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      gensecrets:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      D_OAUTH_ISSUER: https://localhost:8080
+      D_OAUTH_ENVIRONMENT: development
+      D_OAUTH_BIND_ADDR: 0.0.0.0:8080
+      D_OAUTH_HEALTH_ADDR: 0.0.0.0:8081
+      D_OAUTH_TLS__CERT_PATH: /certs/tls.crt
+      D_OAUTH_TLS__KEY_PATH: /certs/tls.key
+      D_OAUTH_DATABASE__URL: postgres://oauth:oauth-dev-only@db:5432/oauth?sslmode=disable
+      D_OAUTH_REDIS__URL: redis://redis:6379
+      D_OAUTH_REDIS__DURABILITY: waitaof
+      D_OAUTH_TOKEN_PEPPER_FILE: /run/secrets/token-pepper
+      D_OAUTH_TOTP_ENCRYPTION_KEY_FILE: /run/secrets/totp-encryption-key
+      D_OAUTH_PII_ENCRYPTION_KEY_FILE: /run/secrets/pii-encryption-key
+    # Fixed host ports, so the configured issuer (https://localhost:8080)
+    # matches what you browse. If 8080 or 8081 is already taken, change the
+    # mapping here and D_OAUTH_ISSUER together.
+    ports:
+      - "8080:8080"
+      - "8081:8081"   # plaintext health listener; local-only, never publish it
+    read_only: true
+    volumes:
+      - certs:/certs:ro
+      - devsecrets:/run/secrets:ro
+
+volumes:
+  pgdata:
+  redisdata:
+  certs:
+  devsecrets:
