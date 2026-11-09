@@ -212,8 +212,9 @@ The gates, all exit 0: `cargo fmt --check`,
 `cd fuzz && cargo fmt --check`,
 `cd fuzz && cargo clippy --all-targets -- -D warnings`,
 `python3 scripts/check_doc_links.py`, `cargo audit`, and
-`cargo deny check`. `cargo audit` reports one allowed unmaintained warning
-(`basic-toml`, RUSTSEC-2026-0374); `cargo deny check` reports advisories, bans,
+`cargo deny check`. `cargo audit` reports two allowed unmaintained warnings
+(`basic-toml`, RUSTSEC-2026-0374, and `astral-tokio-tar`, RUSTSEC-2026-0440,
+both dev/compile-time only); `cargo deny check` reports advisories, bans,
 licenses, and sources all ok.
 
 The run used the shared Postgres and Redis from `compose.test.yaml` with

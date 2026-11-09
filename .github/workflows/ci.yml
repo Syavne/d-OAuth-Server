@@ -236,12 +236,6 @@ jobs:
         working-directory: fuzz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The `fuzz/rust-toolchain.toml` in the working directory selects
-      # nightly via rustup override; the root stable pin is untouched.
-      - name: Install cargo-fuzz (nightly, per fuzz/rust-toolchain.toml)
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
-        with:
-          tool: cargo-fuzz
       - name: Cache sccache directory
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -253,6 +247,15 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: "v0.18.0"
+      # Start sccache before installing cargo-fuzz: `RUSTC_WRAPPER=sccache` is
+      # job-wide, so a source-build fallback inside install-action would invoke
+      # a wrapper that is not on PATH yet if sccache started later.
+      # The `fuzz/rust-toolchain.toml` in the working directory selects
+      # nightly via rustup override; the root stable pin is untouched.
+      - name: Install cargo-fuzz (nightly, per fuzz/rust-toolchain.toml)
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-fuzz
       # Explicit gnu target: the prebuilt cargo-fuzz binary is musl-static,
       # so its default target is musl (ASan-incompatible, and musl std is
       # not installed). Never drop this flag without checking the default.
@@ -280,12 +283,6 @@ jobs:
         working-directory: fuzz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # `fuzz/rust-toolchain.toml` selects nightly; the root stable pin is
-      # untouched, exactly as in `fuzz-build`.
-      - name: Install cargo-fuzz (nightly)
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
-        with:
-          tool: cargo-fuzz
       - name: Cache sccache directory
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -297,6 +294,14 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: "v0.18.0"
+      # Same reason as `fuzz-build`: sccache must exist before install-action
+      # can fall back to a source build under the job-wide RUSTC_WRAPPER.
+      # `fuzz/rust-toolchain.toml` selects nightly; the root stable pin is
+      # untouched, exactly as in `fuzz-build`.
+      - name: Install cargo-fuzz (nightly)
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-fuzz
       # `uses` steps resolve paths from the workspace root, not the job's
       # `working-directory`; keep the fuzz/ prefix explicit.
       - name: Restore corpus for ${{ matrix.target }}
