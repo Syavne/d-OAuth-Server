@@ -6,23 +6,25 @@
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-# RUSTSEC-2023-0071 (rsa Marvin timing): no patched release exists upstream
-# ("No safe upgrade is available"); this crate uses RSA for signature
+# RUSTSEC-2023-0071 (rsa Marvin timing): fixed upstream in rsa 0.10.0
+# (crypto-bigint migration + constant-time mitigations), but jsonwebtoken
+# 11.1.0 pins rsa ^0.9.6, so the only path to the fix is the still-unmerged
+# Keats/jsonwebtoken#536 stack bump. This crate uses RSA for signature
 # verification only (JWK-selected `DecodingKey`), never RSA decryption, so
-# the padding-timing oracle does not apply. Re-evaluate when rsa ships a fix.
-# RUSTSEC-2026-0387 (crypto-bigint timing): patched only in crypto-bigint
-# >=0.7.6, which needs p256 0.14 via the still-unmerged jsonwebtoken bump
-# (Keats/jsonwebtoken#536); this is a real exposure on the ES256 signing path
-# (`src/jose/jwt_access.rs`), so drop the ignore as soon as jsonwebtoken
-# releases a p256 0.14 build rather than leaving it in place indefinitely.
+# the padding-timing oracle does not apply in the meantime.
+# RUSTSEC-2026-0387 (crypto-bigint timing): fixed upstream in crypto-bigint
+# >=0.7.6 (latest 0.7.11), reachable only through p256 0.14 (released) via
+# that same unmerged jsonwebtoken#536 bump; this is a real exposure on the
+# ES256 signing path (`src/jose/jwt_access.rs`), so drop both crypto ignores
+# as soon as jsonwebtoken releases that stack, not before.
 # RUSTSEC-2026-0440 (astral-tokio-tar unmaintained): "No safe upgrade is
 # available"; testcontainers 0.28.0 (latest) still requires astral-tokio-tar
 # ^0.6.1 and has not migrated to the recommended replacement. It is a
 # dev-dependency that only drives lifecycle tests, so it never enters the
 # runtime image graph. Re-evaluate when testcontainers drops it.
 ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "unpatched upstream; RSA verify-only, never decryption" },
-  { id = "RUSTSEC-2026-0387", reason = "unpatched in the p256 0.13 generation; fixed only in crypto-bigint >=0.7.6 via the unmerged jsonwebtoken p256 0.14 bump (Keats/jsonwebtoken#536); ES256 signing does run through it, so re-evaluate on that release" },
+  { id = "RUSTSEC-2023-0071", reason = "fixed upstream in rsa 0.10.0; blocked only on the unmerged Keats/jsonwebtoken#536 stack bump (jsonwebtoken 11.1.0 pins rsa ^0.9.6); RSA verify-only, never decryption" },
+  { id = "RUSTSEC-2026-0387", reason = "fixed upstream in crypto-bigint >=0.7.6 via p256 0.14 (released); blocked only on the unmerged Keats/jsonwebtoken#536 stack bump; ES256 signing does run through it, so drop both crypto ignores when that jsonwebtoken release lands" },
   { id = "RUSTSEC-2026-0374", reason = "unmaintained (no safe upgrade); basic-toml is a compile-time-only dep of the askama_derive proc macro, never in the runtime graph" },
   { id = "RUSTSEC-2026-0440", reason = "unmaintained (no safe upgrade); astral-tokio-tar is a testcontainers-only dev dependency for lifecycle tests, never in the runtime graph; drop when testcontainers migrates off it" },
 ]
