@@ -1,4 +1,7 @@
-# `cargo audit` policy (task 42). Mirrors the `deny.toml` triage.
+# `cargo audit` policy (task 42). Mirrors the `deny.toml` triage, plus the
+# entries that only exist in `Cargo.lock` because a lockfile resolves every
+# optional feature: `cargo deny` filters those out of the resolved graph and
+# never reports them, so they are listed here alone.
 # RUSTSEC-2023-0071 (rsa Marvin timing): fixed upstream in rsa 0.10.0
 # (crypto-bigint migration + constant-time mitigations), but jsonwebtoken
 # 11.1.0 pins rsa ^0.9.6, so the only path to the fix is the still-unmerged
@@ -10,5 +13,14 @@
 # that same unmerged jsonwebtoken#536 bump; this is a real exposure on the
 # ES256 signing path (`src/jose/jwt_access.rs`), so drop both crypto ignores
 # as soon as jsonwebtoken releases that stack, not before.
+# RUSTSEC-2026-0459 (libsqlite3-sys / CVE-2026-119375): lockfile-only, never
+# built. The sole consumer is `sqlx-sqlite`, which `Cargo.lock` carries because
+# a lockfile resolves every optional feature; the `sqlite` feature is not
+# enabled (see the `sqlx` features), so `libsqlite3-sys` is never compiled or
+# linked. There is no upgrade path either: `sqlx-sqlite` 0.9.0 requires
+# `libsqlite3-sys >=0.30.1, <0.38.0` and the fix is in `>=0.39.0`. `cargo deny`
+# does not report it because it filters the advisory check to the resolved
+# graph; `cargo audit` scans the whole lockfile and does. Re-evaluate if the
+# `sqlite` feature is ever enabled.
 [advisories]
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]
