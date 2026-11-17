@@ -2,12 +2,27 @@
 # `fuzz/fuzz_targets/` via `.clusterfuzzlite/` and fuzzes code-change
 # coverage on each pull request. No credential needed beyond the default
 # `GITHUB_TOKEN` (`contents: read` suffices).
+#
+# Path-scoped, unlike the scheduled `cflite-batch`: `build_fuzzers` compiles
+# all fourteen targets in the image, so an unscoped PR trigger paid that
+# compile on every docs-only or deploy-only PR and returned no coverage
+# signal for it. The allowlist below is the compile surface of those targets:
+# the crate, the fuzz workspace, either manifest, the pinned toolchain, and
+# the ClusterFuzzLite config itself.
 
 name: cflite-pr
 
 on:
   pull_request:
     branches: ["master"]
+    paths:
+      - "src/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".clusterfuzzlite/**"
+      - ".github/workflows/cflite_pr.yml"
 
 permissions:
   contents: read
