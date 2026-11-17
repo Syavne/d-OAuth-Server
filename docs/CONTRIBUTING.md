@@ -13,8 +13,9 @@ find any other guide through [the documentation index](README.md).
 
 ## Prerequisites
 
-- The Rust toolchain pinned in `rust-toolchain.toml` (stable, with `rustfmt`
-  and `clippy`). `rustup` installs it automatically on first build.
+- The Rust toolchain pinned in `rust-toolchain.toml` (an exact version, 1.100.0,
+  with `rustfmt`, `clippy`, and `llvm-tools-preview`). `rustup` installs it
+  automatically on first build.
 - [`cargo-nextest`](https://nexte.st/) for the test suite:
   `cargo install cargo-nextest --locked`.
 - Docker, to run the shared test Postgres and Redis from
@@ -72,13 +73,16 @@ matrix, and the exact reproduction commands are in
 
 The coverage job runs every target (lib, integration, and end-to-end) under
 `cargo llvm-cov nextest` and checks the recorded floors. There are two
-aggregate floors: global 89.0 and the security aggregate at 91.0 (the ten core
+aggregate floors: global 89.0 and the security aggregate at 90.0 (the ten core
 modules: crypto, jose, protocol, db, store, state, middleware, keys, error,
 routes). Each module also carries its own floor in
-`scripts/coverage_floors.json`: crypto 94.0, jose 91.0, protocol 92.0, db 90.0,
-store 87.0, state 75.0, middleware 94.0, ui 87.0, config 92.0, keys 87.0,
-error 88.0, routes 91.0, and tls 95.0. `ui`, `config`, and `tls` are outside
-the security aggregate.
+`scripts/coverage_floors.json`: crypto 93.0, jose 89.0, protocol 91.0, db 91.0,
+store 87.0, state 75.0, middleware 92.0, ui 87.0, config 94.0, keys 88.0,
+error 89.0, routes 92.0, and tls 94.0. `ui`, `config`, and `tls` are outside
+the security aggregate. Instrumented line counts follow the compiler's source
+attribution, so the floors are keyed to the toolchain pinned in
+`rust-toolchain.toml`: when the pin moves, re-measure the baseline and reset the
+floors in the same commit (see [TEST-COVERAGE.md](TEST-COVERAGE.md)).
 
 ```bash
 docker compose -f compose.test.yaml up -d

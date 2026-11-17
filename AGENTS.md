@@ -118,7 +118,10 @@ python3 scripts/check_doc_links.py
 
 Coverage is a separate blocking gate. It runs every target under
 `cargo llvm-cov` against the shared services and checks the global (89.0),
-security (91.0), and per-module floors in `scripts/coverage_floors.json`:
+security (90.0), and per-module floors in `scripts/coverage_floors.json`. The
+floors are keyed to the exact toolchain pinned in `rust-toolchain.toml`: bump
+the pin and recalibrate the floors (floor = truncate(baseline) - 1.0, see
+[docs/TEST-COVERAGE.md](docs/TEST-COVERAGE.md)) in the same commit.
 
 ```bash
 cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'

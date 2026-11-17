@@ -129,6 +129,16 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Changed
 
+- The Rust toolchain is pinned to an exact version (`1.100.0`) instead of
+  `stable`, and the pin now carries `llvm-tools-preview` so the coverage job's
+  instrumented build resolves inside the pinned toolchain. A `stable` release
+  changes which lines the compiler attributes coverage to: 1.100.0 moved
+  `src/middleware/audit.rs` from 105 to 143 instrumented lines and missed two
+  module floors with no source change. The floors in
+  `scripts/coverage_floors.json` are re-derived from the 1.100.0 baseline
+  (floor = truncate(baseline) - 1.0); the security aggregate floor moves to
+  90.0, and the `db`, `config`, `keys`, `error`, and `routes` floors rise.
+
 - Public clients are Bearer by default. DPoP is mandatory only when the client
   carries `dpop_bound_access_tokens: true`; a DPoP-bound public client still
   presents a fresh proof at every gate. Operators that require DPoP for public

@@ -15,7 +15,7 @@ every key, command, and endpoint is documented in the guides linked from
 
 ## Prerequisites
 
-- Rust stable, as pinned by `rust-toolchain.toml`.
+- Rust 1.100.0, as pinned by `rust-toolchain.toml`.
 - PostgreSQL 16 or newer with the `citext` extension available (the shipped
   `compose.yaml` pins `postgres:18-alpine`).
 - Redis 8 or newer, with persistence enabled and eviction off. The server

@@ -3,8 +3,8 @@
 # Per-PR legs (all must be green, except `coverage` which is report-only):
 #   fmt, clippy, audit, deny, sqlx-prepare-check, nextest, doc-tests,
 #   coverage (llvm-cov report upload over lib unit tests; non-blocking),
-#   fuzz-build (nightly leg inside `fuzz/`, so the pinned stable
-#   `rust-toolchain.toml` at the root is never violated).
+#   fuzz-build (nightly leg inside `fuzz/`, so the exact-version
+#   `rust-toolchain.toml` pin at the root is never violated).
 # Scheduled legs (not per-PR):
 #   mutants (weekly budgeted mutation run over the pure security modules),
 #   fuzz-run (bounded run of every fuzz target; the per-PR leg only builds),
@@ -251,7 +251,7 @@ jobs:
       # job-wide, so a source-build fallback inside install-action would invoke
       # a wrapper that is not on PATH yet if sccache started later.
       # The `fuzz/rust-toolchain.toml` in the working directory selects
-      # nightly via rustup override; the root stable pin is untouched.
+      # nightly via rustup override; the root toolchain pin is untouched.
       - name: Install cargo-fuzz (nightly, per fuzz/rust-toolchain.toml)
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
@@ -296,7 +296,7 @@ jobs:
           version: "v0.18.0"
       # Same reason as `fuzz-build`: sccache must exist before install-action
       # can fall back to a source build under the job-wide RUSTC_WRAPPER.
-      # `fuzz/rust-toolchain.toml` selects nightly; the root stable pin is
+      # `fuzz/rust-toolchain.toml` selects nightly; the root toolchain pin is
       # untouched, exactly as in `fuzz-build`.
       - name: Install cargo-fuzz (nightly)
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
@@ -425,7 +425,7 @@ jobs:
     # Scoped miri leg (T4-4). Scheduled only: the interpreter is slow and
     # nightly-only, so this never runs per-PR and never gates
     # (`continue-on-error`). Nightly is confined to this job; the root
-    # `rust-toolchain.toml` stable pin is untouched.
+    # `rust-toolchain.toml` toolchain pin is untouched.
     # Scope is the sync unit tests of the dependency-free helpers, plus the
     # sync subset of `jose::jar` (fetch-decode, request-URI-membership, and
     # alg-rejection tests only — never the async `resolve` path).

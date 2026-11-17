@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
-components = ["rustfmt", "clippy"]
+# Exact pin: the floors in `scripts/coverage_floors.json` are calibrated to this
+# toolchain's line attribution. Bump the pin and recalibrate in one commit.
+channel = "1.100.0"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

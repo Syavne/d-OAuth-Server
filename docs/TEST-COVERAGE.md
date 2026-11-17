@@ -2,37 +2,48 @@
 
 ## Baseline
 
-Authoritative all-targets baseline (orchestrator run, 1050/1050 tests,
-elapsed 767.6 s = 12.79 min):
+Authoritative all-targets baseline (rustc 1.100.0, the exact version pinned in
+`rust-toolchain.toml`; 1052/1052 tests, test phase 62.9 s). It reproduces the
+`coverage` job of the scheduled `ci` run of 2026-11-15 line for line, which is
+what the floors below are keyed to.
 
-- Global line coverage: 90.5% (22026/24335), floor 89.0.
+- Global line coverage: 90.1% (21663/24030), floor 89.0.
 - Security aggregate (the ten core modules: crypto, jose, protocol, db,
-  store, state, middleware, keys, error, routes): 92.2% (17230/18695),
-  floor 91.0.
+  store, state, middleware, keys, error, routes): 91.6% (16959/18510),
+  floor 90.0.
 
 Per-module baselines and floors (floor = truncate(baseline) - 1.0,
 enforced by `scripts/coverage_floors.json`):
 
 | Module     | Baseline | Hit / Found | Floor |
 |------------|----------|-------------|-------|
-| crypto     | 95.6%    | 1066/1115   | 94.0  |
-| jose       | 92.7%    | 1107/1194   | 91.0  |
-| protocol   | 93.3%    | 8312/8911   | 92.0  |
-| db         | 91.7%    | 1602/1747   | 90.0  |
-| store      | 88.6%    | 2091/2360   | 87.0  |
-| state      | 76.0%    | 355/467     | 75.0  |
-| middleware | 95.7%    | 986/1030    | 94.0  |
-| ui         | 88.7%    | 1362/1535   | 87.0  |
-| config     | 93.5%    | 907/970     | 92.0  |
-| keys       | 88.5%    | 184/208     | 87.0  |
-| error      | 89.7%    | 425/474     | 88.0  |
-| routes     | 92.7%    | 1102/1189   | 91.0  |
-| tls        | 96.1%    | 49/51       | 95.0  |
+| crypto     | 94.7%    | 1051/1110   | 93.0  |
+| jose       | 90.8%    | 1072/1180   | 89.0  |
+| protocol   | 92.5%    | 8149/8814   | 91.0  |
+| db         | 92.2%    | 1586/1720   | 91.0  |
+| store      | 88.8%    | 2074/2335   | 87.0  |
+| state      | 76.1%    | 348/457     | 75.0  |
+| middleware | 93.2%    | 951/1020    | 92.0  |
+| ui         | 88.7%    | 1323/1491   | 87.0  |
+| config     | 95.0%    | 911/959     | 94.0  |
+| keys       | 89.7%    | 192/214     | 88.0  |
+| error      | 90.9%    | 421/463     | 89.0  |
+| routes     | 93.1%    | 1115/1197   | 92.0  |
+| tls        | 95.9%    | 47/49       | 94.0  |
 
 The `ui`, `config`, and `tls` modules carry per-module floors only and are
 excluded from the security aggregate.
 
 Floors file: `scripts/coverage_floors.json`.
+
+Line counts are toolchain-dependent: the compiler attributes coverage to lines
+through macro expansions, so a toolchain release changes which lines are
+instrumented and moves denominators. Releasing `stable` onto 1.100.0 moved
+`src/middleware/audit.rs` from 105 to 143 instrumented lines and `jose` from
+92.6% to 90.8%, failing the floors gate with no source change. That is why
+`rust-toolchain.toml` pins an exact version: re-measure the baseline and reset
+the floors in the same commit that bumps the pin. The pre-pin (rustc 1.99-era)
+measurement stays under [Final gate run](#final-gate-run).
 
 Reproduce:
 
@@ -43,9 +54,13 @@ python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.jso
 docker compose -f compose.test.yaml down -v
 ```
 
-Note: the authoritative run used `--test-threads=1 --retries=3
+Note: the pre-pin authoritative run used `--test-threads=1 --retries=3
 --no-fail-fast` because WAITAOF barriers flaked under high local parallelism
-(host-specific; 1050/1050 passed).
+(host-specific; 1050/1050 passed). Never recalibrate from a run that did not
+report every test as passed: a cancelled run leaves a partial lcov report whose
+numbers look plausible but are not (a `temporarily_unavailable` failure in the
+four `protocol::cimd::tests_principal` tests, which fetch CIMD documents over
+the network, cut global coverage from 90.1% to 75.1% on one host).
 
 ## Flow matrix
 

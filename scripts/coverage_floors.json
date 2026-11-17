@@ -1,19 +1,19 @@
 {
   "global": 89.0,
-  "security": 91.0,
+  "security": 90.0,
   "modules": {
-    "crypto": 94.0,
-    "jose": 91.0,
-    "protocol": 92.0,
-    "db": 90.0,
+    "crypto": 93.0,
+    "jose": 89.0,
+    "protocol": 91.0,
+    "db": 91.0,
     "store": 87.0,
     "state": 75.0,
-    "middleware": 94.0,
+    "middleware": 92.0,
     "ui": 87.0,
-    "config": 92.0,
-    "keys": 87.0,
-    "error": 88.0,
-    "routes": 91.0,
-    "tls": 95.0
+    "config": 94.0,
+    "keys": 88.0,
+    "error": 89.0,
+    "routes": 92.0,
+    "tls": 94.0
   }
 }
