@@ -26,11 +26,10 @@ mod verify;
 
 use std::{collections::HashMap, time::Duration};
 
+pub use merge::MergedClaims;
 use merge::merge_claims;
 use request_uri::resolve_uri;
 use verify::verify_request_object;
-
-pub use merge::MergedClaims;
 
 use crate::{db::client_repo::Client, error::AppError, state::RedisConn, store::Store};
 

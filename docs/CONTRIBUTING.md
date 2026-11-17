@@ -26,7 +26,10 @@ find any other guide through [the documentation index](README.md).
   `cargo install sqlx-cli --locked --features runtime-tokio,tls-rustls-ring`.
 
 The crate uses edition 2024 and the rustfmt settings in `rustfmt.toml`
-(2-space indent, `StdExternalCrate` import grouping).
+(2-space indent, `StdExternalCrate` import grouping). Import grouping is an
+unstable rustfmt option, so check formatting with the dated nightly rustfmt
+that CI's `fmt` leg installs: `cargo +nightly-2026-10-01 fmt --check`
+(`rustup component add rustfmt --toolchain nightly-2026-10-01` once).
 
 ## Build
 
@@ -63,7 +66,7 @@ targets yourself when a change reshapes a type or function one of them uses
 (see [Fuzzing](#fuzzing)).
 
 ```bash
-cargo fmt --check
+cargo +nightly-2026-10-01 fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo nextest run --all-targets
 cargo test --doc

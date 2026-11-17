@@ -50,7 +50,8 @@ and call into it from the others.
 - Use constant-time comparison (`subtle`) for any secret or token compare.
 - No business logic in `main.rs`.
 - Keep files focused; split by responsibility rather than growing a module.
-- Import grouping is `StdExternalCrate`.
+- Import grouping is `StdExternalCrate`, applied by the pinned dated nightly
+  rustfmt; stable rustfmt ignores that option, so format with the nightly.
 
 ## Security checklist
 
@@ -107,7 +108,7 @@ fake over a mock. Assert the observable contract. Tear the services down with
 Quality gates for any change:
 
 ```bash
-cargo fmt --check
+cargo +nightly-2026-10-01 fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo nextest run --all-targets
 cargo test --doc

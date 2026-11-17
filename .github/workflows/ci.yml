@@ -140,9 +140,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          toolchain: nightly-2026-10-01
           components: rustfmt
+      # Dated nightly matching fuzz/rust-toolchain.toml: `group_imports` in
+      # rustfmt.toml is an unstable option that the stable toolchain pinned by
+      # the root rust-toolchain.toml silently ignores, so the `+` form is
+      # required to bypass that pin. The fuzz workspace resolves its own
+      # nightly from fuzz/rust-toolchain.toml.
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo +nightly-2026-10-01 fmt --check && cd fuzz && cargo fmt --check
 
   # clippy-driver artifacts are not rustc artifacts, so this leg owns its own
   # cache entry and shares nothing with the rustc legs.
