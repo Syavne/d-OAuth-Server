@@ -51,7 +51,8 @@ cargo sqlx prepare --workspace           # regenerate the cache
 Run all of these before opening a change. CI runs this set plus additional
 gates: `cargo sqlx prepare --check --workspace` (only when `migrations/`,
 `src/db/`, or `.sqlx/` changed), the fuzz targets (`cargo fuzz build`, only when
-`fuzz/` or `src/` changed), coverage on `master` only (see
+`fuzz/` or `src/` changed), the ClusterFuzzLite PR leg (path-scoped the same
+way, see [Fuzzing](#fuzzing)), coverage on `master` only (see
 [Coverage gate](#coverage-gate)), `cargo mutants`, `miri`, and the separate
 `.github/workflows/docs.yml` link check — the only link gate, because `ci.yml`
 ignores docs-only paths. In CI the suite runs as four
