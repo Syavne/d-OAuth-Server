@@ -45,12 +45,22 @@ instrumented and moves denominators. Releasing `stable` onto 1.100.0 moved
 the floors in the same commit that bumps the pin. The pre-pin (rustc 1.99-era)
 measurement stays under [Final gate run](#final-gate-run).
 
+The same commit also drifts between runs. Two CI runs of one SHA, 1052/1052
+tests passing in both, reported `jose` on both sides of a 91.0 floor and
+`middleware` 0.8 points under a 94.0 floor: a module of 1000-1100 instrumented
+lines moves a whole percentage point on a few lines of different attribution.
+The CI job answers that in two ways. It runs on `master` only, and it passes
+`--band 1.0`, which is a measurement allowance on the per-module rows only. The
+global and security aggregates (24k and 18.5k lines) stay hard, and a
+recalibrated floor must sit below the lowest measurement observed for a single
+commit on a single toolchain, not one point under the first number you see.
+
 Reproduce:
 
 ```bash
 docker compose -f compose.test.yaml up -d
 cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
-python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
+python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json   # CI adds --band 1.0
 docker compose -f compose.test.yaml down -v
 ```
 
@@ -137,7 +147,7 @@ Coverage, with the shared services up:
 ```bash
 docker compose -f compose.test.yaml up -d
 cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
-python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
+python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json   # CI adds --band 1.0
 docker compose -f compose.test.yaml down -v
 ```
 

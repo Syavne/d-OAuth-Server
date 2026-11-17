@@ -153,6 +153,94 @@ def test_one_module_below_its_floor_fails():
   assert "module 'crypto' below floor" in out, out
 
 
+def test_band_rescues_module_within_tolerance():
+  records: list = []
+  for name in CM.MODULE_ORDER:
+    if name == "crypto":
+      das = [(line_no, 1 if line_no <= 181 else 0) for line_no in range(1, 201)]
+      records.append((_module_path(name), das))
+    else:
+      records.extend(_module_records((name,), hits=1))
+  code, out = _run(
+    records,
+    "--module-floor",
+    "crypto=91.0",
+    "--global-floor",
+    "0.0",
+    "--security-floor",
+    "0.0",
+    "--band",
+    "1.0",
+  )
+  assert code == 0, out
+  assert "RESULT: PASS" in out, out
+  assert "band 1.0" in out, out
+
+
+def test_band_does_not_rescue_module_outside_tolerance():
+  records: list = []
+  for name in CM.MODULE_ORDER:
+    if name == "crypto":
+      das = [(line_no, 1 if line_no <= 179 else 0) for line_no in range(1, 201)]
+      records.append((_module_path(name), das))
+    else:
+      records.extend(_module_records((name,), hits=1))
+  code, out = _run(
+    records,
+    "--module-floor",
+    "crypto=91.0",
+    "--global-floor",
+    "0.0",
+    "--security-floor",
+    "0.0",
+    "--band",
+    "1.0",
+  )
+  assert code == 1, out
+  assert "module 'crypto' below floor" in out, out
+  assert "band 1.0" in out, out
+
+
+def test_band_does_not_rescue_global_aggregate():
+  records = _module_records(CM.MODULE_ORDER, hits=0)
+  code, out = _run(
+    records,
+    "--global-floor",
+    "1.0",
+    "--security-floor",
+    "0.0",
+    "--band",
+    "5.0",
+  )
+  assert code == 1, out
+  assert "global below floor" in out, out
+
+
+def test_negative_band_is_rejected():
+  directory = Path(tempfile.mkdtemp(prefix="check-coverage-"))
+  try:
+    lcov_path = _write_lcov(directory, _module_records(CM.MODULE_ORDER, hits=1))
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+      code = CM.main(
+        [
+          str(lcov_path),
+          "--global-floor",
+          "0.0",
+          "--security-floor",
+          "0.0",
+          "--band",
+          "-1.0",
+        ]
+      )
+    out = stdout.getvalue() + stderr.getvalue()
+  finally:
+    shutil.rmtree(directory, ignore_errors=True)
+  assert code == 1, out
+  assert "--band" in out, out
+
+
 def test_canonical_exclude_regex_matches_ci_contract():
   assert CM.EXCLUDE_PATTERN == CANONICAL_EXCLUDE
   assert CM.EXCLUDE_RE.pattern == CANONICAL_EXCLUDE

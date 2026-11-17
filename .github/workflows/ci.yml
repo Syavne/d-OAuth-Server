@@ -1,11 +1,19 @@
-# Main quality gate (task 42).
+# Main quality gate (task 42), restructured so each flavor of the crate is
+# compiled once per run and the test suite runs in parallel shards.
 #
-# Per-PR legs (all must be green, except `coverage` which is report-only):
-#   fmt, clippy, audit, deny, sqlx-prepare-check, nextest, doc-tests,
-#   coverage (llvm-cov report upload over lib unit tests; non-blocking),
-#   fuzz-build (nightly leg inside `fuzz/`, so the exact-version
-#   `rust-toolchain.toml` pin at the root is never violated).
-# Scheduled legs (not per-PR):
+# Legs that must be green on every change:
+#   fmt, clippy, audit, deny, build -> nextest x4 + nextest-topology,
+#   doc-tests; plus sqlx-prepare-check (only when the database surface
+#   changed) and fuzz-build (only when `fuzz/` or `src/` changed).
+# Master-only leg:
+#   coverage (push to `master`, schedule, or `workflow_dispatch`). It gates on
+#   the floors in `scripts/coverage_floors.json` and is not a per-PR leg,
+#   because the measurement moves even when the code does not: two Actions
+#   runs of the same commit (`a80ed41`) put `jose` above and below a 91.0%
+#   floor with 1052/1052 tests passing in both. The per-module rows run with
+#   the `--band` noise allowance (see the `coverage` job); the global and
+#   security aggregates stay hard.
+# Scheduled legs (never per-PR):
 #   mutants (weekly budgeted mutation run over the pure security modules),
 #   fuzz-run (bounded run of every fuzz target; the per-PR leg only builds),
 #   miri (scoped interpreter run over the sync crypto/JOSE helpers;
@@ -24,13 +32,52 @@
 # unit tests are selected); the whole leg is `continue-on-error` so it can
 # never gate a PR. If a `#[tokio::test]` or a real-verification test is ever
 # added under `jose::jar`, narrow the filter to the explicit sync test paths.
+#
+# Compilation cache: one `Swatinem/rust-cache` entry per compile flavor. It
+# replaces an sccache directory persisted by `actions/cache`, which did not
+# work: five legs shared one cache key, sccache keys on compiler + flags, so
+# `clippy` (which finishes first) wrote the entry and the four `rustc` legs
+# restored artifacts they could not use. Measured hit rates were clippy
+# 79-100%, `nextest` and `doc-tests` 12-13%, `coverage` 0%. sccache can never
+# cache the `coverage` leg at all (it refuses compilations that emit coverage
+# data, and every link step), and parallel jobs never see each other's caches
+# within a run, so five parallel jobs meant five cold compiles of 418 of the
+# 472 locked crates. rust-cache caches the registry plus the `target/`
+# dependency tree, and its key already hashes `Cargo.lock`, `Cargo.toml` and
+# the `rust-toolchain.toml` pin. The key does NOT include `RUSTFLAGS`, so
+# clippy, plain rustc and the instrumented build MUST keep separate
+# `shared-key`s or they poison one another. Saves are gated to `master`; PR
+# and branch runs restore from the `master` entry without writing their own
+# (a `pull_request` run can only write its own merge-ref entry, which nothing
+# else can ever read). Three `target/` entries carry the pipeline —
+# `stable-test`, `stable-clippy`, `fuzz-nightly` — against a 10 GB
+# repository-wide budget with 7-day LRU eviction.
+#
+# Test topology: a single `nextest` job spent ~156s compiling and ~306s
+# running 1052 tests. Four shards split the run, and `binary(topology)` gets a
+# job of its own because the test-group serialization that stops the
+# in-process redis-test fixtures from being handed the same port is a
+# per-process limit that sharding would break.
 
 name: ci
 
 on:
   push:
     branches: ["master"]
-  pull_request: {}
+    # A docs-only change is gated by the `link-check` job in `docs.yml`; it
+    # must not pay for five Rust compiles. Root-level markdown is matched by
+    # `*.md` (single path segment), the guides by `docs/**`.
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - ".github/workflows/docs.yml"
+      - "scripts/check_doc_links.py"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - ".github/workflows/docs.yml"
+      - "scripts/check_doc_links.py"
   schedule:
     # Weekly budgeted mutation run (Sunday 03:00 UTC).
     - cron: "0 3 * * 0"
@@ -42,17 +89,50 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
-  # Shared compilation cache: sccache runs in each compiling job below (except
-  # `miri`, whose cargo-miri overrides RUSTC_WRAPPER itself). It writes to a
-  # local on-disk dir (SCCACHE_DIR) persisted by actions/cache -- NOT the GitHub
-  # Actions cache backend, which stores one cache entry per compiled object
-  # (thousands per run, per-ref duplicated); SCCACHE_GHA_ENABLED is deliberately
-  # left unset. Incremental is useless on ephemeral runners and harms cross-run
-  # cache hits.
-  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  # Incremental compilation is useless on an ephemeral runner and works
+  # against the cached `target/` tree; rust-cache also sets this.
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Which of the two expensive optional legs the change can actually affect.
+  # A diff it cannot interpret (no reachable base, squashed or pruned history,
+  # first push) runs both: the leg is never skipped on a guess.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    outputs:
+      db: ${{ steps.scope.outputs.db }}
+      fuzz: ${{ steps.scope.outputs.fuzz }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Scope the database and fuzz legs to what they compile
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "base commit '${BASE_SHA:-<unset>}' is unreachable; running every scoped leg"
+            printf 'db=true\nfuzz=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `sqlx prepare` re-reads the queries in migrations and `src/db`, and
+          # writes the committed `.sqlx` cache they produce.
+          if git diff --name-only "$BASE_SHA" HEAD | grep -qE '^migrations/|^src/db/|^\.sqlx/'; then
+            echo "db=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "db=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The fuzz workspace builds this crate by path, so `src/` and the two
+          # lockfiles move its build too.
+          if git diff --name-only "$BASE_SHA" HEAD | grep -qE '^fuzz/|^src/|^Cargo\.(toml|lock)$|^fuzz/Cargo\.lock$'; then
+            echo "fuzz=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fuzz=false" >> "$GITHUB_OUTPUT"
+          fi
+
   fmt:
     name: fmt
     runs-on: ubuntu-24.04
@@ -64,29 +144,102 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+  # clippy-driver artifacts are not rustc artifacts, so this leg owns its own
+  # cache entry and shares nothing with the rustc legs.
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           components: clippy
-      - name: Cache sccache directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-
-      - name: Start sccache (shared compilation cache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: "v0.18.0"
+          shared-key: stable-clippy
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy (all targets, warnings denied)
         run: cargo clippy --all-targets -- -D warnings
+
+  # Four shards of the same suite. `slice:` distributes across test binaries
+  # (not per binary) and applies after the filter, so the excluded `topology`
+  # binaries are absent from every shard. Each shard restores the dependency
+  # tree and compiles this crate itself: a deps-warm rebuild of the crate plus
+  # all 37 test binaries measured 32s on a 32-core host, which is cheaper than
+  # shipping a 2 GB `cargo nextest archive` to every shard and unpacking it on
+  # a 14 GB runner.
+  nextest:
+    name: nextest (${{ matrix.shard }}/4)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Shared with `doc-tests`, `sqlx-prepare-check` and `mutants`: same
+          # toolchain, same profile, plain rustc. Parallel jobs cannot see
+          # each other's entries within a run, so every shard restores the
+          # `master` entry and the first shard to finish replaces it.
+          shared-key: stable-test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: nextest
+      - name: Install redis-server (in-process Sentinel/Cluster fixtures)
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Start shared test services (Postgres + Redis)
+        run: docker compose -f compose.test.yaml up -d
+      - name: Test shard ${{ matrix.shard }} of 4
+        run: cargo nextest run --all-targets --partition 'slice:${{ matrix.shard }}/4' -E '!binary(topology)'
+      - name: Stop shared test services
+        if: always()
+        run: docker compose -f compose.test.yaml down -v
+
+  # `tests/topology.rs` spawns in-process redis-test fixtures through a racy
+  # port allocator, so it needs the `redis-fixtures` test group of
+  # `.config/nextest.toml` (`max-threads = 1`) — a per-process limit that
+  # sharding would break. One process, no partition.
+  nextest-topology:
+    name: nextest (topology)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: stable-test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: nextest
+      - name: Install redis-server (in-process Sentinel/Cluster fixtures)
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Start shared test services (Postgres + Redis)
+        run: docker compose -f compose.test.yaml up -d
+      - name: Topology fixtures (Sentinel/Cluster, one process)
+        run: cargo nextest run --all-targets -E 'binary(topology)'
+      - name: Stop shared test services
+        if: always()
+        run: docker compose -f compose.test.yaml down -v
+
+  doc-tests:
+    name: doc-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: stable-test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Documentation tests
+        run: cargo test --doc
 
   audit:
     name: audit
@@ -117,8 +270,8 @@ jobs:
   sqlx-prepare-check:
     name: sqlx-prepare-check
     runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
+    needs: changes
+    if: needs.changes.outputs.db == 'true'
     services:
       postgres:
         image: postgres:16
@@ -136,17 +289,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - name: Cache sccache directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-
-      - name: Start sccache (shared compilation cache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: "v0.18.0"
+          shared-key: stable-test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install sqlx-cli
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
@@ -160,36 +306,36 @@ jobs:
           DATABASE_URL: postgres://postgres:sqlxcheck@127.0.0.1:5432/postgres
         run: cargo sqlx prepare --check --workspace
 
-  doc-links:
-    name: doc-links
+  coverage:
+    name: coverage
+    # Master-only: the leg re-instruments 418 crates and its per-module
+    # percentages drift from run to run on unchanged code, so a per-PR copy
+    # would be both the most expensive leg and the noisiest gate. It stays
+    # blocking on `master` (push, schedule, `workflow_dispatch`).
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.x"
-      - name: Check documentation links (markdown-link-check equivalent)
-        run: python3 scripts/check_doc_links.py
-
-  nextest:
-    name: nextest
-    runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - name: Cache sccache directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-
-      - name: Start sccache (shared compilation cache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          version: "v0.18.0"
+          # Registry only, deliberately: the instrumented dependency tree this
+          # leg would cache is the largest in the pipeline and buys ~124s, and
+          # the cache is a 10 GB repository-wide budget with 7-day LRU
+          # eviction — every extra `target/` entry risks evicting the one the
+          # test shards depend on. `stable-test` must never be reused here:
+          # rust-cache's key does not include RUSTFLAGS, so it would supply
+          # artifacts built without coverage instrumentation.
+          shared-key: coverage
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-llvm-cov
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
@@ -198,60 +344,46 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y redis-server
       - name: Start shared test services (Postgres + Redis)
         run: docker compose -f compose.test.yaml up -d
-      - name: Full test suite (shared services; testcontainers for lifecycle)
-        run: cargo nextest run --all-targets
+      - name: Coverage report (all targets; test files excluded by filename regex)
+        run: cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
+      # `--band 1.0` is a measurement allowance on the per-module rows only:
+      # a module is 1000-1100 lines, so a few lines of different attribution
+      # is a whole percentage point. The global and security aggregates
+      # (24k and 18.5k lines) are checked hard, with no band.
+      - name: Check coverage floors
+        run: python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json --band 1.0
       - name: Stop shared test services
         if: always()
         run: docker compose -f compose.test.yaml down -v
-
-  doc-tests:
-    name: doc-tests
-    runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - name: Cache sccache directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-
-      - name: Start sccache (shared compilation cache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: "v0.18.0"
-      - name: Documentation tests
-        run: cargo test --doc
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
 
   fuzz-build:
     name: fuzz-build
     runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
+    needs: changes
+    if: needs.changes.outputs.fuzz == 'true'
     defaults:
       run:
         working-directory: fuzz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Cache sccache directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-fuzz-
-      - name: Start sccache (shared compilation cache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: "v0.18.0"
-      # Start sccache before installing cargo-fuzz: `RUSTC_WRAPPER=sccache` is
-      # job-wide, so a source-build fallback inside install-action would invoke
-      # a wrapper that is not on PATH yet if sccache started later.
-      # The `fuzz/rust-toolchain.toml` in the working directory selects
-      # nightly via rustup override; the root toolchain pin is untouched.
+          # `workspaces` is resolved from the repository root, not from this
+          # job's `working-directory`; `fuzz/` is a standalone workspace with
+          # its own lockfile and dated nightly pin, so it can never share an
+          # entry with the stable workspace.
+          workspaces: fuzz
+          shared-key: fuzz-nightly
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      # The `fuzz/rust-toolchain.toml` in the working directory selects nightly
+      # via rustup override; the root toolchain pin is untouched.
       - name: Install cargo-fuzz (nightly, per fuzz/rust-toolchain.toml)
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
@@ -271,8 +403,6 @@ jobs:
     # `docs/CONTRIBUTING.md`); the remaining owner step is enabling it.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
     timeout-minutes: 70
     strategy:
       fail-fast: false
@@ -283,25 +413,13 @@ jobs:
         working-directory: fuzz
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Cache sccache directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-fuzz-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-fuzz-
-      - name: Start sccache (shared compilation cache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: "v0.18.0"
-      # Same reason as `fuzz-build`: sccache must exist before install-action
-      # can fall back to a source build under the job-wide RUSTC_WRAPPER.
-      # `fuzz/rust-toolchain.toml` selects nightly; the root toolchain pin is
-      # untouched, exactly as in `fuzz-build`.
-      - name: Install cargo-fuzz (nightly)
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
-        with:
-          tool: cargo-fuzz
+          workspaces: fuzz
+          shared-key: fuzz-nightly
+          # One restore for fourteen matrix jobs: they run in parallel and the
+          # first writer wins the key anyway.
+          save-if: false
       # `uses` steps resolve paths from the workspace root, not the job's
       # `working-directory`; keep the fuzz/ prefix explicit.
       - name: Restore corpus for ${{ matrix.target }}
@@ -336,23 +454,17 @@ jobs:
     # Scheduled budgeted job only: never blocks a PR.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - name: Cache sccache directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-
-      - name: Start sccache (shared compilation cache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: "v0.18.0"
+          # Restore-only: cargo-mutants mutates `src/`, so what it writes back
+          # is a mutated tree and the dependency half is already in the
+          # `stable-test` entry.
+          shared-key: stable-test
+          save-if: false
       - name: Install cargo-mutants
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
@@ -364,61 +476,6 @@ jobs:
           tool: nextest
       - name: Budgeted mutation run (see .cargo/mutants.toml)
         run: cargo mutants --timeout 1800 --test-tool nextest
-
-  coverage:
-    name: coverage
-    # All-targets coverage signal (lib + integration + e2e). Blocking on the
-    # recorded floors in `scripts/coverage_floors.json` (see docs/TEST-COVERAGE.md
-    # baseline): the `Check coverage floors` step fails the job when global,
-    # security, or any per-module floor is missed.
-    # Services mirror `nextest` (shared Postgres/Redis plus redis-server),
-    # because several lib unit tests are testcontainers-backed.
-    runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: llvm-tools-preview
-      - name: Cache sccache directory
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-
-      - name: Start sccache (shared compilation cache)
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: "v0.18.0"
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
-        with:
-          tool: cargo-llvm-cov
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
-        with:
-          tool: nextest
-      - name: Install redis-server (in-process Sentinel/Cluster fixtures)
-        run: sudo apt-get update && sudo apt-get install -y redis-server
-      - name: Start shared test services (Postgres + Redis)
-        run: docker compose -f compose.test.yaml up -d
-      - name: Coverage report (all targets; test files excluded by filename regex)
-        run: cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
-      - name: Check coverage floors
-        run: python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
-      - name: Stop shared test services
-        if: always()
-        run: docker compose -f compose.test.yaml down -v
-      - name: Upload coverage report
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: coverage-lcov
-          path: lcov.info
-          if-no-files-found: error
 
   miri:
     name: miri

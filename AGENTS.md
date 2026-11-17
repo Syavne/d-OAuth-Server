@@ -116,16 +116,21 @@ cargo deny check
 python3 scripts/check_doc_links.py
 ```
 
-Coverage is a separate blocking gate. It runs every target under
-`cargo llvm-cov` against the shared services and checks the global (89.0),
-security (90.0), and per-module floors in `scripts/coverage_floors.json`. The
-floors are keyed to the exact toolchain pinned in `rust-toolchain.toml`: bump
-the pin and recalibrate the floors (floor = truncate(baseline) - 1.0, see
-[docs/TEST-COVERAGE.md](docs/TEST-COVERAGE.md)) in the same commit.
+Coverage is a separate blocking gate, and CI runs it only on `master` (push,
+schedule, `workflow_dispatch`): its per-module percentages move from run to run
+on unchanged code, so a copy of it on every change was the noisiest gate in the
+pipeline. It runs every target under `cargo llvm-cov` against the shared
+services and checks the global (89.0), security (90.0), and per-module floors in
+`scripts/coverage_floors.json`. CI adds `--band 1.0`, a measurement allowance on
+the per-module rows only; the two aggregates stay hard. The floors are keyed to
+the exact toolchain pinned in `rust-toolchain.toml`: bump the pin and
+recalibrate the floors in the same commit (floor = truncate(baseline) - 1.0,
+never above the lowest measurement observed for a single commit, see
+[docs/TEST-COVERAGE.md](docs/TEST-COVERAGE.md)).
 
 ```bash
 cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
-python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
+python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json   # CI adds --band 1.0
 ```
 
 The `fuzz/` standalone workspace has 14 targets, and no gate above compiles
@@ -183,6 +188,7 @@ A command in a doc must match the real CLI. Then run the link check:
 python3 scripts/check_doc_links.py
 ```
 
-The `.github/workflows/docs.yml` `link-check` job (mirrored by the `doc-links`
-job in `.github/workflows/ci.yml`) runs the same check, so a stale file or
-heading reference fails the build.
+The `.github/workflows/docs.yml` `link-check` job runs the same check, so a
+stale file or heading reference fails the build. It is the only link gate:
+`ci.yml` ignores docs-only paths, so a change under `docs/` or a root-level
+`*.md` runs `docs.yml` and none of the Rust legs.
