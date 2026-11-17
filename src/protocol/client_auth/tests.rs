@@ -281,7 +281,8 @@ fn client_auth_assertion_hmac_rejected() -> TestResult {
   let token = encode(
     &Header::new(Algorithm::HS256),
     &claims,
-    &HmacKey::from_secret(b"client-secret-as-hmac-key"),
+    &HmacKey::from_secret(b"client-secret-as-hmac-key")
+      .map_err(|error| TestError::Crypto(format!("hs key failed: {error}")))?,
   )
   .map_err(|error| TestError::Crypto(format!("hs mint failed: {error}")))?;
   if validate_assertion(

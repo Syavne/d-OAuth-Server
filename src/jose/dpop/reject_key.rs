@@ -59,7 +59,7 @@ async fn dpop_hmac_alg_rejected() -> TestResult {
     "jti": unique_jti(),
     "jwk": key.jwk,
   });
-  let proof = encode(&header, &claims, &EncodingKey::from_secret(b"hmac-only"))?;
+  let proof = encode(&header, &claims, &EncodingKey::from_secret(b"hmac-only")?)?;
   let request = DpopRequest {
     proof: Some(&proof),
     htm: TEST_HTM,

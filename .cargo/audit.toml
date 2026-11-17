@@ -2,17 +2,10 @@
 # entries that only exist in `Cargo.lock` because a lockfile resolves every
 # optional feature: `cargo deny` filters those out of the resolved graph and
 # never reports them, so they are listed here alone.
-# RUSTSEC-2023-0071 (rsa Marvin timing): fixed upstream in rsa 0.10.0
-# (crypto-bigint migration + constant-time mitigations), but jsonwebtoken
-# 11.1.0 pins rsa ^0.9.6, so the only path to the fix is the still-unmerged
-# Keats/jsonwebtoken#536 stack bump. This crate uses RSA for signature
-# verification only (JWK-selected `DecodingKey`), never RSA decryption, so
-# the padding-timing oracle does not apply in the meantime.
-# RUSTSEC-2026-0387 (crypto-bigint timing): fixed upstream in crypto-bigint
-# >=0.7.6 (latest 0.7.11), reachable only through p256 0.14 (released) via
-# that same unmerged jsonwebtoken#536 bump; this is a real exposure on the
-# ES256 signing path (`src/jose/jwt_access.rs`), so drop both crypto ignores
-# as soon as jsonwebtoken releases that stack, not before.
+# RUSTSEC-2023-0071 (rsa Marvin) and RUSTSEC-2026-0387 (crypto-bigint timing)
+# were ignored here only while jsonwebtoken 11 kept rsa 0.9 / crypto-bigint 0.5
+# in the graph; jsonwebtoken 12.0.0 carries the fixed stack and both ignores
+# were dropped. Do not re-add them.
 # RUSTSEC-2026-0459 (libsqlite3-sys / CVE-2026-119375): lockfile-only, never
 # built. The sole consumer is `sqlx-sqlite`, which `Cargo.lock` carries because
 # a lockfile resolves every optional feature; the `sqlite` feature is not
@@ -23,4 +16,4 @@
 # graph; `cargo audit` scans the whole lockfile and does. Re-evaluate if the
 # `sqlite` feature is ever enabled.
 [advisories]
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]
+ignore = ["RUSTSEC-2026-0459"]

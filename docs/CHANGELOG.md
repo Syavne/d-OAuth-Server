@@ -187,6 +187,12 @@ While the version stays below `1.0.0`, a minor bump may carry a breaking change.
 
 ### Security
 
+- The JOSE crypto stack moved to jsonwebtoken 12, p256 0.14, and
+  ed25519-dalek 3, which carry the fixed RustCrypto chain (rsa 0.10,
+  crypto-bigint >=0.7.6). The RUSTSEC-2023-0071 (rsa Marvin timing) and
+  RUSTSEC-2026-0387 (crypto-bigint timing) ignores in `deny.toml` and
+  `.cargo/audit.toml` were dropped; both advisories are now patched in the
+  resolved graph, including the ES256 signing path.
 - Disabling or deleting a `resource_servers` row is a kill switch for that
   audience. Refresh and device mints re-validate the stored audience against the
   current enabled catalog, so a disabled/deleted member (or the indicator flag

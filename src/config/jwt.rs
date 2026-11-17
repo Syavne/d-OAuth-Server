@@ -178,9 +178,9 @@ impl fmt::Debug for JwtSigningKey {
 fn derive_public(alg: JwtSigningAlg, raw: &[u8]) -> Result<(DecodingKey, JwtPublicJwk), ()> {
   match alg {
     JwtSigningAlg::Es256 => {
-      use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+      use p256::elliptic_curve::sec1::ToSec1Point as _;
       let secret = p256::SecretKey::from_slice(raw).map_err(|_| ())?;
-      let point = secret.public_key().to_encoded_point(false);
+      let point = secret.public_key().to_sec1_point(false);
       let x = URL_SAFE_NO_PAD.encode(point.x().ok_or(())?);
       let y = URL_SAFE_NO_PAD.encode(point.y().ok_or(())?);
       let decoding = DecodingKey::from_ec_components(&x, &y).map_err(|_| ())?;
