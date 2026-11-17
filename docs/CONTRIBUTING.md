@@ -49,11 +49,17 @@ cargo sqlx prepare --workspace           # regenerate the cache
 ## Quality gates
 
 Run all of these before opening a change. CI runs this set plus additional
-gates: `cargo sqlx prepare --check --workspace`, the fuzz targets
-(`cargo fuzz build`), coverage, `cargo mutants`, `miri`, and the separate
-`.github/workflows/docs.yml` link check. Nothing in the set below compiles
-`fuzz/`, so build the targets yourself when a change reshapes a type or
-function one of them uses (see [Fuzzing](#fuzzing)).
+gates: `cargo sqlx prepare --check --workspace` (only when `migrations/`,
+`src/db/`, or `.sqlx/` changed), the fuzz targets (`cargo fuzz build`, only when
+`fuzz/` or `src/` changed), coverage on `master` only (see
+[Coverage gate](#coverage-gate)), `cargo mutants`, `miri`, and the separate
+`.github/workflows/docs.yml` link check — the only link gate, because `ci.yml`
+ignores docs-only paths. In CI the suite runs as four
+`cargo nextest run --all-targets --partition slice:<k>/4` shards plus a job of
+its own for `tests/topology.rs`, so a red shard is a subset of the same suite,
+not a different suite. Nothing in the set below compiles `fuzz/`, so build the
+targets yourself when a change reshapes a type or function one of them uses
+(see [Fuzzing](#fuzzing)).
 
 ```bash
 cargo fmt --check
@@ -84,12 +90,24 @@ attribution, so the floors are keyed to the toolchain pinned in
 `rust-toolchain.toml`: when the pin moves, re-measure the baseline and reset the
 floors in the same commit (see [TEST-COVERAGE.md](TEST-COVERAGE.md)).
 
+The CI job runs on `master` only (push, schedule, `workflow_dispatch`), and it
+passes `--band 1.0`, a measurement allowance on the per-module rows: a module is
+1000-1100 instrumented lines, so a few lines of different attribution is a whole
+percentage point. Two runs of one commit put `jose` above and below a 91.0 floor
+with 1052/1052 tests passing in both, which is what a floor inside that drift
+does. The global and security aggregates — 24k and 18.5k lines — are checked
+with no band, and a recalibrated floor must never sit above the lowest
+measurement observed for a single commit on a single toolchain.
+
 ```bash
 docker compose -f compose.test.yaml up -d
 cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info --ignore-filename-regex '(^|/)tests/|(^|/)tests\.rs$|(^|/)tests_[^/]*\.rs$|test_support\.rs$|test_guard\.rs$'
 python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
 docker compose -f compose.test.yaml down -v
 ```
+
+The local form above is stricter than CI, which appends `--band 1.0`; run the
+strict form locally when you are moving a floor.
 
 `scripts/check_coverage.py` reads the lcov report, normalizes the source paths,
 and exits non-zero when the global, security, or any per-module floor is

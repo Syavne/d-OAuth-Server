@@ -11,10 +11,17 @@ Usage:
   python3 scripts/check_coverage.py lcov.info --floors scripts/coverage_floors.json
   python3 scripts/check_coverage.py lcov.info --global-floor 81.0 \\
       --security-floor 88.0 --module-floor crypto=90.0
+  python3 scripts/check_coverage.py lcov.info --band 1.0
 
 The `security` aggregate is exactly the ten core modules: crypto, jose,
 protocol, db, store, state, middleware, keys, error, routes. `ui`, `config`,
 and `tls` carry per-module floors only and are excluded from the aggregate.
+
+`--band F` is a measurement-noise tolerance (percentage points) for the
+per-module checks only: a module passes when `pct + F >= floor`. Line
+attribution for small modules moves run to run (the same commit measured
+90.8% against a 91.0% floor once), while the global and security aggregates
+over 18k+ lines do not drift, so they stay strict (`pct >= floor`).
 
 Exit code 0 only when the global line percentage, the security aggregate, and
 every listed module meet their floors. A listed module that is missing from the
@@ -291,6 +298,12 @@ def build_parser() -> argparse.ArgumentParser:
     metavar="NAME=F",
     help="override one module floor (repeatable)",
   )
+  parser.add_argument(
+    "--band",
+    type=float,
+    default=0.0,
+    help="measurement-noise tolerance in percentage points for per-module checks only",
+  )
   return parser
 
 
@@ -308,6 +321,10 @@ def main(argv: list[str] | None = None) -> int:
     floors["modules"].update(parse_module_overrides(args.module_floor))
   except ValueError as exc:
     print(f"coverage check: {exc}")
+    return 1
+  band = float(args.band)
+  if band < 0.0:
+    print(f"coverage check: --band must be >= 0, got {args.band}", file=sys.stderr)
     return 1
 
   if not lcov_path.is_file():
@@ -355,7 +372,10 @@ def main(argv: list[str] | None = None) -> int:
     f"security: {security_pct:.1f}% ({security_hit}/{security_found} lines), "
     f"floor {security_floor:.1f}% -> {security_status}"
   )
-  print("per-module line coverage:")
+  if band > 0.0:
+    print(f"per-module line coverage (band {band:.1f}):")
+  else:
+    print("per-module line coverage:")
   for name in MODULE_ORDER:
     stats = counts[name]
     pct = percent(stats["hit"], stats["found"])
@@ -366,9 +386,15 @@ def main(argv: list[str] | None = None) -> int:
     elif stats["found"] == 0:
       status = "FAIL: zero executable lines (fail closed)"
       failures.append(f"module '{name}' has zero executable lines (fail closed)")
-    elif pct < floor:
-      status = f"FAIL: below floor ({floor:.1f}%)"
-      failures.append(f"module '{name}' below floor: {pct:.1f}% < {floor:.1f}%")
+    elif pct + band < floor:
+      if band > 0.0:
+        status = f"FAIL: below floor ({floor:.1f}%, band {band:.1f})"
+        failures.append(
+          f"module '{name}' below floor: {pct:.1f}% < {floor:.1f}% (band {band:.1f})"
+        )
+      else:
+        status = f"FAIL: below floor ({floor:.1f}%)"
+        failures.append(f"module '{name}' below floor: {pct:.1f}% < {floor:.1f}%")
     else:
       status = "OK"
     scope = "" if name in CORE_MODULES else "  (per-module only)"
